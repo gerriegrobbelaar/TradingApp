@@ -25,4 +25,10 @@ export interface Env {
   TOKEN_ENC_KEY_PREVIOUS?: string;
   /** One instance per Exact division ("exact:<division>"), plus token authorities. */
   EXACT_GATE: DurableObjectNamespace<ExactGate>;
+  /**
+   * TEST ONLY. workerd (Miniflare) does not implement Durable Object jurisdictions, so the vitest
+   * config sets this to "1" to skip `.jurisdiction("eu")`. Never set it in wrangler.toml or as a
+   * Workers variable: the deploy guard refuses a config that mentions it (docs/decisions/0018).
+   */
+  DO_JURISDICTION_DISABLED?: string;
 }

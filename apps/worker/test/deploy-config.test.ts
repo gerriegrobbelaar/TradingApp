@@ -37,6 +37,13 @@ describe("deploy config guard", () => {
     expect(p.join("\n")).toContain("EXACT_REDIRECT_URI");
   });
 
+  it("refuses a config that disables the Durable Object jurisdiction (test-only switch)", () => {
+    const t = ready.replace("[vars]", '[vars]\nDO_JURISDICTION_DISABLED = "1"');
+    expect(deployConfigProblems(t)).toEqual([
+      "DO_JURISDICTION_DISABLED is test-only and must not be set (EU Durable Objects)",
+    ]);
+  });
+
   it("passes a filled-in config", () => {
     expect(deployConfigProblems(ready)).toEqual([]);
   });

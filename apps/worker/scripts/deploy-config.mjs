@@ -42,6 +42,9 @@ export function deployConfigProblems(toml) {
   ) {
     problems.push("the ExactGate Durable Object binding or its migration is missing");
   }
+  if (/DO_JURISDICTION_DISABLED/.test(text)) {
+    problems.push("DO_JURISDICTION_DISABLED is test-only and must not be set (EU Durable Objects)");
+  }
   if (!/^\s*(routes?\s*=|\[\[routes\]\])/m.test(text)) {
     problems.push("no routes set (workers_dev is off, so the Worker would be unreachable)");
   }

@@ -21,6 +21,8 @@ export default defineConfig(async () => {
             EXACT_CLIENT_SECRET: "test-exact-client-secret",
             EXACT_REDIRECT_URI: "https://app.test/api/connections/exact/callback",
             // 32 bytes, base64. Test-only.
+            // workerd does not implement DO jurisdictions; see src/env.ts and ADR 0018.
+            DO_JURISDICTION_DISABLED: "1",
             TOKEN_ENC_KEY: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
           },
         },

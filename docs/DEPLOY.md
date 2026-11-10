@@ -37,6 +37,14 @@ Record what you saw (command output or screenshot, date) in `docs/decisions/` an
 
 Paste the `database_id` into `apps/worker/wrangler.toml`, replacing the all-zero placeholder.
 
+**Durable Objects are EU-only too.** The code creates every `ExactGate` object through
+`env.EXACT_GATE.jurisdiction("eu")` (docs/decisions/0018). Object ids depend on the jurisdiction,
+so this is fixed from the first deploy: do not remove it later. Do not add
+`DO_JURISDICTION_DISABLED` to `wrangler.toml` or to the Workers variables (it is test-only, the
+deploy check refuses it). After the first deploy, confirm in the dashboard (Workers, Durable
+Objects) that the `ExactGate` objects are listed under the EU jurisdiction. `wrangler dev` does not
+implement jurisdictions: for local work put `DO_JURISDICTION_DISABLED=1` in `.dev.vars` only.
+
 ## 2. Create the Google OAuth client
 
 In the Google Cloud project that owns the OAuth client (open decision 8 in CLAUDE.md): create an

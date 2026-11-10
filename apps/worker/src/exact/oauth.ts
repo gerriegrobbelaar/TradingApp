@@ -11,7 +11,12 @@ export interface TokenSet {
   expiresInS: number;
 }
 
-export type TokenFailure = "invalid_grant" | "rejected" | "unavailable" | "malformed";
+/**
+ * "rejected" is any 4xx other than a clear invalid_grant, a redirect, or a body we cannot classify:
+ * it may be a premature refresh (ADR 0016), so callers treat it as retryable, never as a lost grant.
+ * "bad_host" is our own configuration (not an Exact host) and is not worth retrying.
+ */
+export type TokenFailure = "invalid_grant" | "rejected" | "unavailable" | "malformed" | "bad_host";
 
 export class TokenEndpointError extends Error {
   readonly failure: TokenFailure;
@@ -45,7 +50,7 @@ export function authorizeUrl(
 
 async function post(client: OAuthClient, form: Record<string, string>): Promise<TokenSet> {
   // The client secret and the refresh token go in the body: only ever to an Exact host.
-  if (!isExactHost(client.host)) throw new TokenEndpointError("rejected");
+  if (!isExactHost(client.host)) throw new TokenEndpointError("bad_host");
   let res: Response;
   try {
     res = await fetch(`https://${client.host}/api/oauth2/token`, {
