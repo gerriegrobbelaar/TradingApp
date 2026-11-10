@@ -529,3 +529,218 @@ describe("no secrets in logs or errors", () => {
     spies.forEach((s) => s.mockRestore());
   });
 });
+
+describe("review E2: single-flight refresh lives only in the token authority", () => {
+  it("a division gate refuses to refresh and makes no token call", async () => {
+    const id = await seedConnection({ expiresInMs: 1000 });
+    const div = freshDivision();
+    await go(div); // the instance is now a division gate (one refresh, via the authority)
+    expect(stub.tokenCalls).toHaveLength(1);
+    await db
+      .prepare("UPDATE connections SET expires_at = ?1")
+      .bind(new Date(0).toISOString())
+      .run();
+    const r = await gateStub(gateName(div)).refreshAccessToken(id);
+    expect(r).toEqual({ ok: false, code: "wrong_token_authority", retryable: false });
+    expect(stub.tokenCalls).toHaveLength(1);
+  });
+
+  it("the token authority refuses to act as a division gate", async () => {
+    const id = await seedConnection();
+    const authority = gateStub(`exact-token:${id}`);
+    expect((await authority.refreshAccessToken(id)).ok).toBe(true);
+    const out = await authority.call(req(freshDivision()));
+    expect(out).toEqual({
+      ok: false,
+      error: { kind: "api", status: 400, code: "division_mismatch" },
+    });
+    expect(stub.apiCalls).toHaveLength(0);
+  });
+
+  it("an authority for one connection never refreshes another", async () => {
+    const id = await seedConnection({ expiresInMs: 1000 });
+    const authority = gateStub(`exact-token:${id}`);
+    expect((await authority.refreshAccessToken(id)).ok).toBe(true);
+    const r = await authority.refreshAccessToken(id + 1000);
+    expect(r).toMatchObject({ ok: false, code: "wrong_token_authority" });
+    expect(stub.tokenCalls).toHaveLength(1);
+  });
+
+  it("parallel refreshes across many division gates hit the token endpoint once", async () => {
+    await seedConnection({ expiresInMs: 1000 });
+    const divs = Array.from({ length: 5 }, () => freshDivision());
+    await Promise.all(divs.flatMap((d) => [go(d), go(d)]));
+    expect(stub.tokenCalls).toHaveLength(1);
+    expect(new Set(stub.apiCalls.map((c) => c.headers.authorization))).toEqual(
+      new Set(["Bearer acc-1"]),
+    );
+  });
+});
+
+describe("review E2: headers can only tighten the limiter", () => {
+  it("ignores a remaining count or limits above the configured caps", async () => {
+    await seedConnection();
+    const div = freshDivision();
+    const clock = await fakeClock(gateName(div));
+    await runInDurableObject(gateStub(gateName(div)), (g: ExactGate) => {
+      g.limits.perDay = 100;
+    });
+    stub.api = () =>
+      Response.json(
+        { d: { results: [] } },
+        {
+          headers: {
+            "x-ratelimit-limit": "1000000",
+            "x-ratelimit-remaining": "999999",
+            "x-ratelimit-reset": String(clock.t + 3600_000),
+            "x-ratelimit-minutely-limit": "100000",
+            "x-ratelimit-minutely-remaining": "100000",
+          },
+        },
+      );
+    await go(div);
+    const usage = await gateStub(gateName(div)).usage();
+    expect(usage.remaining).toBe(99);
+    // The minute bucket stays at 60: 61 more calls need one refill wait.
+    await Promise.all(
+      Array.from({ length: 61 }, (_, i) => go(div, { query: { $top: String(i) } })),
+    );
+    expect(clock.sleeps.length).toBeGreaterThanOrEqual(1);
+    // Reserve is 10% of the configured 100, not of the header's 1,000,000.
+    for (let i = 0; i < 100; i++) {
+      const r = await go(div, { priority: "job", jobId: "big" }).catch((e: unknown) => e);
+      if (r instanceof ExactRateLimitedError) break;
+    }
+    expect((await gateStub(gateName(div)).usage()).remaining).toBe(10);
+  });
+
+  it("keeps Exact's window across UTC midnight until its own reset", async () => {
+    await seedConnection();
+    const div = freshDivision();
+    const clock = await fakeClock(gateName(div));
+    const midnight = new Date(clock.t);
+    midnight.setUTCHours(24, 0, 0, 0);
+    clock.t = midnight.getTime() - 60_000; // 23:59 UTC
+    stub.api = () =>
+      Response.json(
+        { d: { results: [] } },
+        {
+          headers: {
+            "x-ratelimit-limit": "5000",
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": String(midnight.getTime() + 3600_000), // 01:00 UTC
+          },
+        },
+      );
+    await go(div);
+    clock.t = midnight.getTime() + 60_000; // 00:01 UTC: new local day, Exact not yet reset
+    const err = await go(div).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ExactRateLimitedError);
+    expect((err as ExactRateLimitedError).retryAfterMs).toBe(3600_000 - 60_000);
+    expect(stub.apiCalls).toHaveLength(1);
+  });
+});
+
+describe("review E2: priority without starvation", () => {
+  it("lets a waiting job through after a burst of user calls", async () => {
+    await seedConnection();
+    const div = freshDivision();
+    await fakeClock(gateName(div));
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((r) => (release = r));
+    stub.api = async (_c, n) => {
+      if (n === 1) await held;
+      return Response.json({ d: { results: [] } });
+    };
+    const first = go(div, { query: { $top: "u0" } });
+    await vi.waitFor(() => expect(stub.apiCalls).toHaveLength(1));
+    const job = go(div, { priority: "job", jobId: "j", query: { $top: "job" } });
+    const users = Array.from({ length: 10 }, (_, i) => go(div, { query: { $top: `u${i + 1}` } }));
+    await new Promise((r) => setTimeout(r, 50));
+    release();
+    await Promise.all([first, job, ...users]);
+    const order = stub.apiCalls.map((c) => c.url.searchParams.get("$top"));
+    // u0 was in flight; then 5 user calls jump ahead, then the job, then the rest.
+    expect(order.indexOf("job")).toBe(6);
+  });
+});
+
+describe("review E2: budget accounting", () => {
+  it("a 401 retry costs a second call from the job's budget", async () => {
+    await seedConnection({ expiresInMs: 3600_000 });
+    const div = freshDivision();
+    await fakeClock(gateName(div));
+    const gate = gateStub(gateName(div));
+    await gate.startJob("r", 2);
+    stub.api = (_c, n) =>
+      n === 1 ? new Response("", { status: 401 }) : Response.json({ d: { results: [] } });
+    expect((await go(div, { priority: "job", jobId: "r" })).status).toBe(200);
+    await expect(go(div, { priority: "job", jobId: "r" })).rejects.toBeInstanceOf(
+      ExactBudgetExhaustedError,
+    );
+    expect(await gate.endJob("r")).toEqual({ used: 2 });
+  });
+
+  it("a job's budget survives an instance restart (persisted per job)", async () => {
+    await seedConnection();
+    const div = freshDivision();
+    await fakeClock(gateName(div));
+    const gate = gateStub(gateName(div));
+    await gate.startJob("p", 3);
+    await go(div, { priority: "job", jobId: "p" });
+    const saved = await runInDurableObject(gate, (_g: ExactGate, state) =>
+      state.storage.get<{ used: number }>("job:p"),
+    );
+    expect(saved?.used).toBe(1);
+  });
+});
+
+describe("review E2: RPC failures are typed and retryable", () => {
+  it("turns a failed gate RPC (eviction, reset) into ExactApiError 503 gate_unavailable", async () => {
+    const fakeNs = {
+      idFromName: () => ({}) as DurableObjectId,
+      get: () => ({
+        call: () => Promise.reject(new Error("Durable Object reset because its code was updated")),
+      }),
+    } as unknown as DurableObjectNamespace<ExactGate>;
+    const transport = createGateTransport({ EXACT_GATE: fakeNs }, 5);
+    const err = await transport(req(5)).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ExactApiError);
+    expect(err).toMatchObject({ status: 503, code: "gate_unavailable" });
+  });
+
+  it("an unknown error inside the gate crosses as 503 gate_unavailable without details", async () => {
+    const { toWire } = await import("../src/exact/wire");
+    expect(toWire(new Error("secret detail"))).toEqual({
+      kind: "api",
+      status: 503,
+      code: "gate_unavailable",
+    });
+  });
+});
+
+describe("review E2: token endpoint hygiene", () => {
+  it("never follows a redirect from the token endpoint and keeps the tokens", async () => {
+    const id = await seedConnection({ expiresInMs: 1000 });
+    stub.token = () =>
+      new Response(null, { status: 307, headers: { location: "https://evil.test/t" } });
+    await expect(go(freshDivision())).rejects.toBeInstanceOf(ExactAuthError);
+    const tokenInit = vi
+      .mocked(globalThis.fetch)
+      .mock.calls.map((c) => c[1])
+      .find((i) => String(i?.body ?? "").includes("grant_type"));
+    expect(tokenInit?.redirect).toBe("manual");
+    expect(await storedTokens(id)).toMatchObject({ status: "active", refresh: "ref-0" });
+  });
+
+  it("refuses to send the client secret to a non-Exact region_host", async () => {
+    const id = await seedConnection({ expiresInMs: 1000 });
+    await db
+      .prepare("UPDATE connections SET region_host = 'evil.test' WHERE id = ?1")
+      .bind(id)
+      .run();
+    const r = await gateStub(`exact-token:${id}`).refreshAccessToken(id);
+    expect(r).toMatchObject({ ok: false, code: "token_rejected" });
+    expect(stub.tokenCalls).toHaveLength(0);
+  });
+});

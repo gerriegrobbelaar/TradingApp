@@ -16,6 +16,14 @@ EXACT_REDIRECT_URI = "https://finance.camelthorncapital.com/api/connections/exac
 [[d1_databases]]
 binding = "DB"
 database_id = "6f1c2a8e-1b2c-4d5e-8f90-123456789abc"
+
+[[durable_objects.bindings]]
+name = "EXACT_GATE"
+class_name = "ExactGate"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ExactGate"]
 `;
 
 describe("deploy config guard", () => {
@@ -63,5 +71,24 @@ describe("deploy config guard", () => {
     }
     const empty = ready.replace(/EXACT_CLIENT_ID = .*/, 'EXACT_CLIENT_ID = ""');
     expect(deployConfigProblems(empty)).toEqual(["EXACT_CLIENT_ID is empty"]);
+  });
+});
+
+describe("review E2: Exact deploy checks", () => {
+  it("blocks an Exact callback on another origin or path", () => {
+    const other = ready.replace(
+      "https://finance.camelthorncapital.com/api/connections/exact/callback",
+      "https://other.camelthorncapital.com/api/connections/exact/callback",
+    );
+    expect(deployConfigProblems(other).join("\n")).toContain("EXACT_REDIRECT_URI must be");
+    const path = ready.replace("/api/connections/exact/callback", "/api/exact/cb");
+    expect(deployConfigProblems(path).join("\n")).toContain("EXACT_REDIRECT_URI must be");
+  });
+
+  it("blocks a config without the ExactGate Durable Object or its migration", () => {
+    const noMigration = ready.replace('new_sqlite_classes = ["ExactGate"]', "");
+    expect(deployConfigProblems(noMigration).join("\n")).toContain("ExactGate");
+    const commented = ready.replace('class_name = "ExactGate"', '# class_name = "ExactGate"');
+    expect(deployConfigProblems(commented).join("\n")).toContain("ExactGate");
   });
 });

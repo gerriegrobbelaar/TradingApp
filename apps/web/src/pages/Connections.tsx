@@ -67,6 +67,21 @@ export function Connections() {
   const [dialog, setDialog] = useState<Dialog>(null);
   const [busy, setBusy] = useState(false);
   const [sheetError, setSheetError] = useState<string | null>(null);
+  // The control that opened a sheet. `busy` disables it while the sheet opens, so the Sheet's own
+  // focus restore would land on <body>; put focus back here instead (or on the first action).
+  const trigger = useRef<HTMLElement | null>(null);
+  const actions = useRef<HTMLDivElement | null>(null);
+  const remember = (e: { currentTarget: HTMLElement }) => {
+    trigger.current = e.currentTarget;
+  };
+  useEffect(() => {
+    if (dialog !== null || busy || trigger.current === null) return;
+    const el = trigger.current.isConnected
+      ? trigger.current
+      : actions.current?.querySelector<HTMLElement>("button:not([disabled])");
+    trigger.current = null;
+    el?.focus();
+  }, [dialog, busy]);
 
   const load = useCallback(async () => {
     try {
@@ -200,16 +215,25 @@ export function Connections() {
               </div>
             )}
             {isAdmin ? (
-              <div className="chips">
+              <div className="chips" ref={actions}>
                 <Button
                   variant="primary"
                   disabled={busy || !data.exactConfigured}
-                  onClick={() => void connect()}
+                  onClick={(e) => {
+                    remember(e);
+                    void connect();
+                  }}
                 >
                   {state === "not_connected" ? "Connect Exact Online" : "Re-authorise"}
                 </Button>
                 {state !== "not_connected" && (
-                  <Button disabled={busy} onClick={() => setDialog("disconnect")}>
+                  <Button
+                    disabled={busy}
+                    onClick={(e) => {
+                      remember(e);
+                      setDialog("disconnect");
+                    }}
+                  >
                     Disconnect
                   </Button>
                 )}

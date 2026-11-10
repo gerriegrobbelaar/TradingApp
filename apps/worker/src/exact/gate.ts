@@ -68,6 +68,13 @@ const REFRESH_MARGIN_MS = 60_000;
 const MAX_BLOCK_MS = 24 * 3600 * 1000;
 const JOB_ID_RE = /^[A-Za-z0-9_.:-]{1,100}$/;
 const JOB_TTL_MS = 24 * 3600 * 1000;
+/**
+ * Fairness: after this many user calls in a row while a job call is waiting, the oldest job call
+ * goes next. Users still jump the queue, but a steady stream of UI clicks cannot starve a job.
+ */
+const USER_BURST = 5;
+/** Instance roles; an instance takes one on first use and refuses the other (see `claimRole`). */
+type GateRole = `division:${number}` | `authority:${number}`;
 
 interface RemoteDay {
   dayLimit: number;
@@ -129,13 +136,31 @@ export class ExactGate extends DurableObject<Env> {
   private refreshing: { connectionId: number; promise: Promise<TokenResult> } | null = null;
   private dirty = false;
   private alarmScheduled = false;
+  private role: GateRole | null = null;
+  /** User calls dispatched in a row while a job call was waiting (see USER_BURST). */
+  private userStreak = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     void ctx.blockConcurrencyWhile(async () => {
       const saved = await ctx.storage.get<LimiterState>("rl");
       this.st = saved ?? this.freshState(Date.now());
+      this.role = (await ctx.storage.get<GateRole>("role")) ?? null;
     });
+  }
+
+  /**
+   * An instance is either a division gate or a connection's token authority, never both. The
+   * role is persisted on first use, so a refresh can only ever run in the one instance that
+   * first acted as the authority for that connection (`exact-token:<id>`), and a division gate
+   * that is (wrongly) asked to refresh refuses instead of racing the authority.
+   */
+  private async claimRole(role: GateRole): Promise<boolean> {
+    if (this.role === role) return true;
+    if (this.role !== null) return false;
+    this.role = role;
+    await this.ctx.storage.put("role", role);
+    return true;
   }
 
   private freshState(now: number): LimiterState {
@@ -169,6 +194,9 @@ export class ExactGate extends DurableObject<Env> {
 
   async request(req: ExactRequest): Promise<ExactResponse> {
     validateRequest(req);
+    if (!(await this.claimRole(`division:${req.division}`))) {
+      throw new ExactApiError(400, "wrong gate for division", "division_mismatch");
+    }
     if (this.st.division === null) {
       this.st.division = req.division;
       await this.persist();
@@ -276,7 +304,15 @@ export class ExactGate extends DurableObject<Env> {
     if (this.refreshing && this.refreshing.connectionId === connectionId) {
       return this.refreshing.promise;
     }
-    const promise = this.doRefresh(connectionId, staleExpiresAt).finally(() => {
+    const promise = (async (): Promise<TokenResult> => {
+      if (!Number.isSafeInteger(connectionId) || connectionId < 1) {
+        return { ok: false, code: "not_connected", retryable: false };
+      }
+      if (!(await this.claimRole(`authority:${connectionId}`))) {
+        return { ok: false, code: "wrong_token_authority", retryable: false };
+      }
+      return this.doRefresh(connectionId, staleExpiresAt);
+    })().finally(() => {
       if (this.refreshing?.promise === promise) this.refreshing = null;
     });
     this.refreshing = { connectionId, promise };
@@ -338,7 +374,13 @@ export class ExactGate extends DurableObject<Env> {
         return { ok: false, code: "needs_reauth", retryable: false };
       }
       const refreshToken = await decryptToken(keys, row.refresh_token_enc, aad(row.id, "refresh"));
-      const cfg = loadExactConfig(this.env, new URL(this.env.EXACT_REDIRECT_URI).origin);
+      let origin: string;
+      try {
+        origin = new URL(this.env.EXACT_REDIRECT_URI).origin;
+      } catch {
+        return { ok: false, code: "server_misconfigured", retryable: false };
+      }
+      const cfg = loadExactConfig(this.env, origin);
       if (!cfg.ok) return { ok: false, code: "server_misconfigured", retryable: false };
 
       let tokens;
@@ -428,8 +470,32 @@ export class ExactGate extends DurableObject<Env> {
   // Queue and limiter
   // ---------------------------------------------------------------------------------------
 
+  /**
+   * User calls first, oldest first, except that after USER_BURST user calls in a row with a job
+   * call waiting the oldest job call goes (so jobs are delayed, never starved).
+   */
   private pickNext(): Queued | undefined {
-    return this.queue.find((q) => q.req.priority === "user") ?? this.queue[0];
+    const user = this.queue.find((q) => q.req.priority === "user");
+    const job = this.queue.find((q) => q.req.priority === "job");
+    if (user && job && this.userStreak >= USER_BURST) return job;
+    return user ?? job;
+  }
+
+  /** Fails every waiting call that has been queued longer than maxQueueWaitMs. */
+  private expireWaiting(): void {
+    const now = this.now();
+    for (const q of [...this.queue]) {
+      if (now - q.enqueuedAt > this.limits.maxQueueWaitMs) {
+        this.unqueue(q);
+        q.reject(new ExactRateLimitedError(1000, "queued too long"));
+      }
+    }
+  }
+
+  private noteDispatch(item: Queued): void {
+    if (item.req.priority === "job") this.userStreak = 0;
+    else if (this.queue.some((q) => q.req.priority === "job")) this.userStreak++;
+    else this.userStreak = 0;
   }
 
   private unqueue(item: Queued): void {
@@ -444,6 +510,7 @@ export class ExactGate extends DurableObject<Env> {
       // Let requests enqueued in the same tick all be visible before choosing the first.
       await Promise.resolve();
       for (;;) {
+        this.expireWaiting();
         const item = this.pickNext();
         if (!item) break;
         try {
@@ -453,8 +520,9 @@ export class ExactGate extends DurableObject<Env> {
             continue; // re-pick: a user request may have arrived meanwhile
           }
           this.unqueue(item);
+          this.noteDispatch(item);
           this.spend(item.req);
-          await this.persist();
+          await this.persist(item.req);
           const res = await this.execute(item);
           if (res) item.resolve(res);
         } catch (e) {
@@ -528,18 +596,27 @@ export class ExactGate extends DurableObject<Env> {
       return;
     }
     if (this.dirty) void this.flushUsage().catch(() => undefined); // yesterday's final numbers
-    Object.assign(this.st, { day, used: 0, userUsed: 0, jobUsed: 0, limited: 0, remote: null });
+    // Exact's own window may end later than UTC midnight; keep its numbers until it says reset.
+    const r = this.st.remote;
+    const remote = r && r.dayResetMs !== null && now < r.dayResetMs ? r : null;
+    Object.assign(this.st, { day, used: 0, userUsed: 0, jobUsed: 0, limited: 0, remote });
   }
 
-  /** Exact's own remaining count wins over the local counter while its window is current. */
+  /**
+   * The smaller of Exact's own remaining count (while its window is current) and the local
+   * counter. Headers can only lower the allowance, never raise it above the configured cap.
+   */
   private dayRemaining(now: number): number {
+    const local = Math.max(0, this.limits.perDay - this.st.used);
     const r = this.st.remote;
-    if (r && (r.dayResetMs === null || now < r.dayResetMs)) return Math.max(0, r.dayRemaining);
-    return Math.max(0, this.limits.perDay - this.st.used);
+    if (r && (r.dayResetMs === null || now < r.dayResetMs)) {
+      return Math.min(local, Math.max(0, r.dayRemaining));
+    }
+    return local;
   }
 
   private reserve(): number {
-    const limit = this.st.remote?.dayLimit ?? this.limits.perDay;
+    const limit = Math.min(this.st.remote?.dayLimit ?? this.limits.perDay, this.limits.perDay);
     return Math.ceil(limit * this.limits.userReserveFraction);
   }
 
@@ -561,11 +638,13 @@ export class ExactGate extends DurableObject<Env> {
     }
   }
 
-  private async persist(): Promise<void> {
-    await this.ctx.storage.put("rl", this.st);
-    const job = [...this.jobs.entries()];
-    if (job.length > 0) {
-      await this.ctx.storage.put(Object.fromEntries(job.map(([id, j]) => [`job:${id}`, j])));
+  /** Saves the limiter state, plus the budget of the job the request belongs to (if any). */
+  private async persist(req?: ExactRequest): Promise<void> {
+    const job = req?.priority === "job" ? this.jobs.get(req.jobId) : undefined;
+    if (req && job) {
+      await this.ctx.storage.put({ rl: this.st, [`job:${req.jobId}`]: job });
+    } else {
+      await this.ctx.storage.put("rl", this.st);
     }
   }
 
@@ -649,7 +728,7 @@ export class ExactGate extends DurableObject<Env> {
       outHeaders[k.toLowerCase()] = v;
     });
     this.readRateHeaders(outHeaders, this.now());
-    await this.persist();
+    await this.persist(req);
 
     if (res.status === 429) {
       const retryMs = this.blockFor429(outHeaders, this.now());
@@ -711,17 +790,24 @@ export class ExactGate extends DurableObject<Env> {
       const reset = num("x-ratelimit-reset");
       const resetMs = reset === null ? null : toEpochMs(reset);
       s.remote = {
-        dayLimit: num("x-ratelimit-limit") ?? s.remote?.dayLimit ?? this.limits.perDay,
+        dayLimit: Math.min(
+          num("x-ratelimit-limit") ?? s.remote?.dayLimit ?? this.limits.perDay,
+          this.limits.perDay,
+        ),
         dayRemaining: Math.max(0, dayRemaining),
         dayResetMs: resetMs !== null && resetMs > now ? resetMs : null,
       };
     }
     const minuteLimit = num("x-ratelimit-minutely-limit");
-    if (minuteLimit !== null && minuteLimit > 0) s.capacity = minuteLimit;
+    // Never above the configured per-minute cap: a header may only tighten the limiter.
+    if (minuteLimit !== null && minuteLimit >= 1) {
+      s.capacity = Math.min(Math.floor(minuteLimit), this.limits.perMinute);
+    }
     const minuteRemaining = num("x-ratelimit-minutely-remaining");
     if (minuteRemaining !== null) {
-      s.tokens = Math.min(s.capacity, Math.max(0, minuteRemaining));
-      s.tokensAt = now;
+      // Lower the local bucket to Exact's count, never raise it (that would exceed perMinute).
+      this.refill(now);
+      s.tokens = Math.min(s.tokens, s.capacity, Math.max(0, minuteRemaining));
       const reset = num("x-ratelimit-minutely-reset");
       const resetMs = reset === null ? null : toEpochMs(reset);
       if (minuteRemaining < 1 && resetMs !== null && resetMs > now) {

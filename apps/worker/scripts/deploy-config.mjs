@@ -24,6 +24,24 @@ export function deployConfigProblems(toml) {
   if (!exactRedirect.startsWith("https://") || /example\.(com|org|net)\b/.test(exactRedirect)) {
     problems.push("EXACT_REDIRECT_URI is still the app.example.com placeholder or not https");
   }
+  // The Exact callback must live on the app's own origin (the CSRF origin) at the fixed path.
+  // Only checked once both URIs are real https values (otherwise that is already reported).
+  const placeholder = (u) => !u.startsWith("https://") || /example\.(com|org|net)\b/.test(u);
+  if (!placeholder(redirect) && !placeholder(exactRedirect)) {
+    const g = new URL(redirect);
+    const e = new URL(exactRedirect);
+    if (e.origin !== g.origin || e.pathname !== "/api/connections/exact/callback") {
+      problems.push(
+        "EXACT_REDIRECT_URI must be <OAUTH_REDIRECT_URI origin>/api/connections/exact/callback",
+      );
+    }
+  }
+  if (
+    !/^\s*class_name\s*=\s*"ExactGate"/m.test(text) ||
+    !/^\s*new_sqlite_classes\s*=\s*\[[^\]]*"ExactGate"/m.test(text)
+  ) {
+    problems.push("the ExactGate Durable Object binding or its migration is missing");
+  }
   if (!/^\s*(routes?\s*=|\[\[routes\]\])/m.test(text)) {
     problems.push("no routes set (workers_dev is off, so the Worker would be unreachable)");
   }

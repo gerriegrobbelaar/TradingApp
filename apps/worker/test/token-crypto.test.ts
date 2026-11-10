@@ -81,3 +81,17 @@ describe("token crypto", () => {
     expect(keyring({ TOKEN_ENC_KEY: K1, TOKEN_ENC_KEY_PREVIOUS: "" })).toEqual([K1]);
   });
 });
+
+describe("review E2: TOKEN_ENC_KEY format", () => {
+  it("accepts only standard padded base64 of exactly 32 bytes", async () => {
+    const { isValidEncKey } = await import("../src/crypto/token-crypto");
+    const good = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    expect(isValidEncKey(good)).toBe(true);
+    expect(isValidEncKey(` ${good}\n`)).toBe(true); // surrounding whitespace from `wrangler secret put`
+    expect(isValidEncKey(good.slice(0, -1))).toBe(false); // unpadded
+    expect(isValidEncKey(good.replace("AAEC", "AA EC"))).toBe(false); // inner space
+    expect(isValidEncKey("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8-")).toBe(false); // base64url
+    expect(isValidEncKey("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHg==")).toBe(false); // 31 bytes
+    expect(isValidEncKey("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gIQ==")).toBe(false); // 34 bytes
+  });
+});

@@ -3,6 +3,7 @@
  * callback and the ExactGate token authority. Nothing here logs; errors carry codes only.
  * Assumptions about Exact's exact wire format: docs/decisions/0016-exact-oauth-assumptions.md.
  */
+import { isExactHost } from "./config";
 export interface TokenSet {
   accessToken: string;
   refreshToken: string;
@@ -43,6 +44,8 @@ export function authorizeUrl(
 }
 
 async function post(client: OAuthClient, form: Record<string, string>): Promise<TokenSet> {
+  // The client secret and the refresh token go in the body: only ever to an Exact host.
+  if (!isExactHost(client.host)) throw new TokenEndpointError("rejected");
   let res: Response;
   try {
     res = await fetch(`https://${client.host}/api/oauth2/token`, {
@@ -53,11 +56,14 @@ async function post(client: OAuthClient, form: Record<string, string>): Promise<
         client_id: client.clientId,
         client_secret: client.clientSecret,
       }).toString(),
+      // A 307/308 would re-send the secret to wherever it points: never follow.
+      redirect: "manual",
       signal: AbortSignal.timeout(20_000),
     });
   } catch {
     throw new TokenEndpointError("unavailable");
   }
+  if (res.status >= 300 && res.status < 400) throw new TokenEndpointError("rejected");
   let data: unknown;
   try {
     data = await res.json();

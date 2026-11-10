@@ -8,6 +8,8 @@ export default defineConfig(async () => {
       cloudflareTest({
         wrangler: { configPath: "./wrangler.toml" },
         miniflare: {
+          // Scratch database for the migration test (applies 0001-0003, adds rows, then 0004).
+          d1Databases: ["MIGRATE_DB"],
           bindings: {
             TEST_MIGRATIONS: migrations,
             // Test-only values; real ones are a Workers var and secrets (see README.md).

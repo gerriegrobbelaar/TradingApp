@@ -287,13 +287,36 @@ describe("POST /api/connections/exact/disconnect", () => {
     expect(stub.apiCalls).toHaveLength(0);
   });
 
-  it("a second disconnect is a clean 409 and writes no audit row", async () => {
+  it("is idempotent: a second disconnect is 200, changes nothing and writes no audit row", async () => {
     await seedConnection();
-    await post();
+    expect(await (await post()).json()).toEqual({ ok: true, changed: true });
     const n = await auditActions("connection.exact_disconnected");
     const res = await post();
-    expect(res.status).toBe(409);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, changed: false });
     expect(await auditActions("connection.exact_disconnected")).toBe(n);
+  });
+
+  it("is a no-op without any connection row", async () => {
+    const n = await auditActions("connection.exact_disconnected");
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, changed: false });
+    expect(await auditActions("connection.exact_disconnected")).toBe(n);
+  });
+
+  it("audits the change without any token material in before/after", async () => {
+    const id = await seedConnection({ access: "acc-AUDIT", refresh: "ref-AUDIT" });
+    await post();
+    const rows = await db
+      .prepare(
+        "SELECT before_json, after_json FROM audit_log WHERE entity = 'connection' AND entity_id = ?1",
+      )
+      .bind(String(id))
+      .all<{ before_json: string | null; after_json: string | null }>();
+    const text = JSON.stringify(rows.results);
+    expect(rows.results.length).toBeGreaterThan(0);
+    for (const bad of ["acc-AUDIT", "ref-AUDIT", "v1.", "token"]) expect(text).not.toContain(bad);
   });
 
   it("needs admin and a recent sign-in", async () => {

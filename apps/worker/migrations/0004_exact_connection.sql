@@ -1,12 +1,24 @@
 -- 0004 Exact connection: encrypted OAuth tokens on `connections`, plus a daily usage summary.
 -- Tokens are AES-GCM ciphertext (apps/worker/src/crypto/token-crypto.ts), never plaintext.
+--
 -- SQLite cannot change a CHECK constraint, so `connections` is rebuilt to allow status
--- 'needs_reauth'. Child tables keep referencing it by name; no data exists yet in a fresh deploy
--- and existing rows are copied over.
+-- 'needs_reauth'. divisions, bank_accounts and bank_transactions reference it (no ON DELETE
+-- actions, no indexes or triggers on connections). D1 cannot turn foreign keys off, so:
+--   1. copy the rows aside, 2. drop the table (with defer_foreign_keys the implicit delete only
+--   counts deferred violations instead of failing), 3. create the new table under the SAME name,
+--   4. insert the rows back: each insert into the parent resolves its children's violations, so the
+--   counter is zero again at commit. Building `connections_new` and renaming it does NOT work: the
+--   rows go into a table no child references yet, the counter never goes down and the commit fails
+--   with FOREIGN KEY constraint failed (test/migration-0004.test.ts).
+-- The AUTOINCREMENT sequence restarts at the highest kept id; Phase 1 never deleted connections.
 
 PRAGMA defer_foreign_keys = true;
 
-CREATE TABLE connections_new (
+CREATE TABLE connections_0004_copy AS SELECT * FROM connections;
+
+DROP TABLE connections;
+
+CREATE TABLE connections (
   id                   INTEGER PRIMARY KEY AUTOINCREMENT,
   kind                 TEXT NOT NULL CHECK (kind IN ('exact', 'revolut')),
   name                 TEXT NOT NULL,
@@ -28,11 +40,11 @@ CREATE TABLE connections_new (
   UNIQUE (kind, name)
 );
 
-INSERT INTO connections_new (id, kind, name, status, token_ref, expires_at, creates_bank_entries, created_at)
-  SELECT id, kind, name, status, token_ref, expires_at, creates_bank_entries, created_at FROM connections;
+INSERT INTO connections (id, kind, name, status, token_ref, expires_at, creates_bank_entries, created_at)
+  SELECT id, kind, name, status, token_ref, expires_at, creates_bank_entries, created_at
+  FROM connections_0004_copy;
 
-DROP TABLE connections;
-ALTER TABLE connections_new RENAME TO connections;
+DROP TABLE connections_0004_copy;
 
 -- One row per Exact division and UTC day, written by ExactGate (hot counters live in the DO).
 CREATE TABLE exact_usage (

@@ -195,6 +195,6 @@ export interface ConnectionsResponse {
 
 export const listConnections = () => request<ConnectionsResponse>("/api/connections");
 export const disconnectExact = () =>
-  request<{ ok: true }>("/api/connections/exact/disconnect", { method: "POST" });
+  request<{ ok: true; changed: boolean }>("/api/connections/exact/disconnect", { method: "POST" });
 /** Full-page navigation: the Worker redirects to Exact and back to /settings/connections. */
 export const EXACT_START_URL = "/api/connections/exact/start";

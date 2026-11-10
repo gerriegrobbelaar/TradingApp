@@ -31,10 +31,15 @@ interface LoadedKey {
   key: CryptoKey;
 }
 
+/** Standard base64 of exactly 32 bytes: 43 characters plus one "=" (`openssl rand -base64 32`). */
+const KEY_B64_RE = /^[A-Za-z0-9+/]{43}=$/;
+
 function rawKey(b64: string): Uint8Array {
+  const t = b64.trim();
+  if (!KEY_B64_RE.test(t)) throw new TokenCryptoError("key must be 32 bytes of base64");
   let bytes: Uint8Array;
   try {
-    const bin = atob(b64.trim());
+    const bin = atob(t);
     bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
   } catch {
     throw new TokenCryptoError("key is not base64");

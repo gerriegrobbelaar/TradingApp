@@ -34,7 +34,9 @@ export function toWire(e: unknown): WireError {
 export function fromWire(w: WireError): Error {
   switch (w.kind) {
     case "rate_limited":
-      return new ExactRateLimitedError(w.retryAfterMs);
+      return new ExactRateLimitedError(
+        Number.isFinite(w.retryAfterMs) && w.retryAfterMs > 0 ? Math.ceil(w.retryAfterMs) : 1000,
+      );
     case "budget":
       return new ExactBudgetExhaustedError(w.jobId);
     case "auth":

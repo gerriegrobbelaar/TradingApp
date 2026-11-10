@@ -146,6 +146,24 @@ describe("Settings, Connections", () => {
     expect(await screen.findByRole("dialog", { name: "Confirm it's you" })).toBeTruthy();
   });
 
+  it("returns keyboard focus to the button that opened a sheet", async () => {
+    mockFetch({
+      "GET /api/auth/me": () => ({ body: { ...ADMIN, stepUpFresh: false } }),
+      ...list(EXACT_ACTIVE),
+    });
+    const user = userEvent.setup();
+    renderApp("/settings/connections");
+    const reauth = await screen.findByRole("button", { name: "Re-authorise" });
+    await user.click(reauth);
+    const sheet = await screen.findByRole("dialog", { name: "Confirm it's you" });
+    await user.click(within(sheet).getByRole("button", { name: "Cancel" }));
+    await vi.waitFor(() => expect(document.activeElement).toBe(reauth));
+    const disc = screen.getByRole("button", { name: "Disconnect" });
+    await user.click(disc);
+    await user.keyboard("{Escape}");
+    await vi.waitFor(() => expect(document.activeElement).toBe(disc));
+  });
+
   it("reports the result of the connect round trip once and cleans the URL", async () => {
     mockFetch({ ...ME_OK(ADMIN), ...list(EXACT_ACTIVE) });
     renderApp("/settings/connections?exact=connected");

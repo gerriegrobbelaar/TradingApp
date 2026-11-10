@@ -314,7 +314,7 @@ export function registerExactRoutes(router: Router): void {
         )
         .bind(before?.id ?? 0),
     ]);
-    if ((results[0]?.meta.changes ?? 0) !== 1) return json({ error: "not_connected" }, 409);
-    return json({ ok: true });
+    // Idempotent: disconnecting what is already disconnected changes nothing and audits nothing.
+    return json({ ok: true, changed: (results[1]?.meta.changes ?? 0) === 1 });
   });
 }
