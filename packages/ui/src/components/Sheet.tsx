@@ -37,7 +37,11 @@ export function Sheet({ open, title, onClose, children }: SheetProps) {
       const first = items[0] as HTMLElement;
       const last = items[items.length - 1] as HTMLElement;
       const active = document.activeElement;
-      if (e.shiftKey && (active === first || active === node)) {
+      if (!node.contains(active)) {
+        // Focus escaped (e.g. a click on the page behind); bring it back inside.
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+      } else if (e.shiftKey && (active === first || active === node)) {
         e.preventDefault();
         last.focus();
       } else if (!e.shiftKey && active === last) {
@@ -48,7 +52,7 @@ export function Sheet({ open, title, onClose, children }: SheetProps) {
     document.addEventListener("keydown", onKey);
     return () => {
       document.removeEventListener("keydown", onKey);
-      previous?.focus();
+      if (previous?.isConnected) previous.focus();
     };
   }, [open]);
 

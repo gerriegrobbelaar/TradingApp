@@ -142,6 +142,27 @@ describe("Toast", () => {
     expect(onDismiss).toHaveBeenCalledTimes(1);
     vi.useRealTimers();
   });
+
+  it("does not auto-dismiss while Undo has keyboard focus", () => {
+    vi.useFakeTimers();
+    const onDismiss = vi.fn();
+    render(<Toast message="Matched" onUndo={() => {}} onDismiss={onDismiss} durationMs={1000} />);
+    act(() => {
+      screen.getByRole("button", { name: "Undo" }).focus();
+    });
+    act(() => {
+      vi.advanceTimersByTime(5000);
+    });
+    expect(onDismiss).not.toHaveBeenCalled();
+    act(() => {
+      screen.getByRole("button", { name: "Undo" }).blur();
+    });
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
 });
 
 describe("Sheet", () => {
@@ -201,6 +222,15 @@ describe("Sheet", () => {
     await userEvent.tab({ shift: true });
     expect(screen.getByRole("button", { name: "Last" })).toHaveFocus();
   });
+
+  it("pulls focus back inside when it has escaped the dialog", async () => {
+    render(<Harness />);
+    const trigger = screen.getByRole("button", { name: "Open sheet" });
+    await userEvent.click(trigger);
+    trigger.focus();
+    await userEvent.tab();
+    expect(screen.getByRole("button", { name: "First" })).toHaveFocus();
+  });
 });
 
 describe("Skeleton and Stamp", () => {
@@ -217,6 +247,11 @@ describe("Skeleton and Stamp", () => {
     const t = screen.getByText("Updated 5 min ago");
     expect(t.tagName).toBe("TIME");
     expect(t).toHaveAttribute("dateTime", "2026-01-01T10:00:00.000Z");
+  });
+
+  it("stamp survives an invalid date", () => {
+    render(<Stamp at={Number.NaN} />);
+    expect(screen.getByText("Not updated yet")).toBeInTheDocument();
   });
 
   it("stamp refreshes on its own clock", () => {

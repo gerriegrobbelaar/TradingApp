@@ -9,8 +9,10 @@ describe("formatAgo", () => {
     [0, "just now"],
     [s(44), "just now"],
     [s(45), "1 min ago"],
-    [s(90), "2 min ago"],
+    [s(90), "1 min ago"],
+    [s(120), "2 min ago"],
     [s(60 * 59), "59 min ago"],
+    [s(3599), "59 min ago"],
     [s(60 * 60), "1 h ago"],
     [s(3600 * 23 + 3599), "23 h ago"],
     [s(86400), "1 day ago"],
@@ -21,6 +23,11 @@ describe("formatAgo", () => {
 
   it("treats future timestamps as just now", () => {
     expect(formatAgo(T, T + s(300))).toBe("just now");
+  });
+
+  it("returns an empty string for invalid dates", () => {
+    expect(formatAgo(T, Number.NaN)).toBe("");
+    expect(formatAgo(T, new Date("not a date"))).toBe("");
   });
 
   it("accepts Date objects", () => {

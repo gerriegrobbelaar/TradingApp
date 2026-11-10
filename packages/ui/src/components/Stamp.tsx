@@ -15,11 +15,20 @@ export function Stamp({ at, now }: StampProps) {
     const id = setInterval(() => setTick(Date.now()), 30_000);
     return () => clearInterval(id);
   }, [now]);
-  const iso = new Date(Number(at)).toISOString();
+  const ms = Number(at);
+  // An invalid date must not crash the screen (toISOString throws RangeError).
+  if (!Number.isFinite(ms)) {
+    return (
+      <span className="stamp">
+        <i aria-hidden="true" />
+        Not updated yet
+      </span>
+    );
+  }
   return (
     <span className="stamp">
       <i aria-hidden="true" />
-      <time dateTime={iso}>Updated {formatAgo(now ?? tick, at)}</time>
+      <time dateTime={new Date(ms).toISOString()}>Updated {formatAgo(now ?? tick, ms)}</time>
     </span>
   );
 }
