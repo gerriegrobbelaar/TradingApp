@@ -7,6 +7,7 @@
   --shadow:0 24px 60px rgba(3,8,18,.45); --sheet:rgba(18,30,50,.88);
   --fill:rgba(255,255,255,.09); --fill-2:rgba(255,255,255,.15); --sunken:rgba(0,0,0,.22); --line:rgba(255,255,255,.10); --hover:rgba(255,255,255,.05);
   --seg-on:rgba(255,255,255,.22); --seg-on-ink:#ffffff;
+  --control-line:#7f8ca1; --track-off:rgba(255,255,255,.15); --knob:#ffffff;
   --orb-1:rgba(143,209,188,.40); --orb-2:rgba(104,146,236,.42); --orb-3:rgba(198,154,62,.24);
   --in:#8fd1bc; --out:#7fa7e8; --paper:#fbfbf9; --sk:rgba(255,255,255,.08); --scrim:rgba(4,9,18,.5);
 }
@@ -19,6 +20,7 @@
   --shadow:0 20px 50px rgba(30,50,80,.14); --sheet:rgba(255,255,255,.92);
   --fill:rgba(15,27,45,.06); --fill-2:rgba(15,27,45,.10); --sunken:rgba(15,27,45,.07); --line:rgba(15,27,45,.10); --hover:rgba(15,27,45,.04);
   --seg-on:#ffffff; --seg-on-ink:#0f1b2d;
+  --control-line:#738096; --track-off:#738096; --knob:#ffffff;
   --orb-1:rgba(143,209,188,.55); --orb-2:rgba(127,167,232,.45); --orb-3:rgba(224,184,98,.35);
   --in:#2f9a7f; --out:#4f7fd1; --sk:rgba(15,27,45,.07); --scrim:rgba(15,27,45,.25);
 }
@@ -32,6 +34,7 @@
     --shadow:0 20px 50px rgba(30,50,80,.14); --sheet:rgba(255,255,255,.92);
     --fill:rgba(15,27,45,.06); --fill-2:rgba(15,27,45,.10); --sunken:rgba(15,27,45,.07); --line:rgba(15,27,45,.10); --hover:rgba(15,27,45,.04);
     --seg-on:#ffffff; --seg-on-ink:#0f1b2d;
+    --control-line:#738096; --track-off:#738096; --knob:#ffffff;
     --orb-1:rgba(143,209,188,.55); --orb-2:rgba(127,167,232,.45); --orb-3:rgba(224,184,98,.35);
     --in:#2f9a7f; --out:#4f7fd1; --sk:rgba(15,27,45,.07); --scrim:rgba(15,27,45,.25);
   }
