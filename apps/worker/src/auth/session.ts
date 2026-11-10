@@ -26,19 +26,28 @@ const iso = (ms: number): string => new Date(ms).toISOString();
 /**
  * Returns the raw token (for the cookie). Only its SHA-256 hex is stored. `lastAuthMs` is when
  * Google says the user actually authenticated (auth_time); it drives the step-up window.
+ *
+ * `withStatements` run in the SAME batch (one D1 transaction) after the insert: callers pass the
+ * sign-in audit row (and the removal of the previous session) so the session and its audit row
+ * commit together or not at all.
  */
 export async function createSession(
   db: D1Database,
   userId: number,
   nowMs: number,
   lastAuthMs: number,
+  withStatements: readonly D1PreparedStatement[] = [],
 ): Promise<string> {
   const token = randomBase64Url(32);
   const hash = await sha256Hex(token);
   await db.batch([
-    // Opportunistic cleanup of dead sessions.
+    // Opportunistic cleanup of dead sessions, bounded so one sign-in never does unbounded work.
     db
-      .prepare("DELETE FROM sessions WHERE expires_at <= ?1 OR last_seen_at <= ?2")
+      .prepare(
+        `DELETE FROM sessions WHERE token_hash IN (
+           SELECT token_hash FROM sessions
+           WHERE expires_at <= ?1 OR last_seen_at <= ?2 LIMIT 100)`,
+      )
       .bind(iso(nowMs), iso(nowMs - IDLE_TIMEOUT_MS)),
     db
       .prepare(
@@ -46,6 +55,7 @@ export async function createSession(
          VALUES (?1, ?2, ?3, ?3, ?4, ?5)`,
       )
       .bind(hash, userId, iso(nowMs), iso(nowMs + ABSOLUTE_CAP_MS), iso(lastAuthMs)),
+    ...withStatements,
   ]);
   return token;
 }
@@ -61,6 +71,8 @@ export async function loadSession(
     .prepare(
       `SELECT s.user_id, s.last_seen_at, s.last_auth_at, u.email
        FROM sessions s JOIN users u ON u.id = s.user_id
+       -- sessions.revoked_at is never written today (revocation deletes the row); the filter is
+       -- kept as defence in depth. Dropping the column needs a migration, left for later.
        WHERE s.token_hash = ?1 AND s.revoked_at IS NULL AND s.expires_at > ?2
          AND s.last_seen_at > ?3 AND u.disabled_at IS NULL`,
     )
@@ -86,11 +98,12 @@ export async function loadSession(
   };
 }
 
-export async function deleteSessionByToken(db: D1Database, token: string): Promise<void> {
-  await db
-    .prepare("DELETE FROM sessions WHERE token_hash = ?1")
-    .bind(await sha256Hex(token))
-    .run();
+/** Prepared (not executed) delete of one session, for use inside a batch. */
+export async function deleteSessionByTokenStatement(
+  db: D1Database,
+  token: string,
+): Promise<D1PreparedStatement> {
+  return db.prepare("DELETE FROM sessions WHERE token_hash = ?1").bind(await sha256Hex(token));
 }
 
 export function deleteSessionsForUser(db: D1Database, userId: number): D1PreparedStatement {

@@ -170,3 +170,10 @@ export const setUserRoles = (id: number, roles: Role[]) =>
   });
 export const removeUser = (id: number) =>
   request<{ id: number }>(`/api/users/${id}`, { method: "DELETE" });
+export const revokeInvite = (id: number) =>
+  request<{ id: number }>(`/api/users/invites/${id}`, { method: "DELETE" });
+export const restoreUser = (id: number, roles: Role[]) =>
+  request<{ id: number; roles: Role[] }>(`/api/users/${id}/restore`, {
+    method: "POST",
+    body: { roles },
+  });

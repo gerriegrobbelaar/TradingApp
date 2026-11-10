@@ -1,12 +1,27 @@
 /**
  * Append-only audit log (CLAUDE.md 5). Before storage, IBANs are masked and secrets
  * (tokens, keys, passwords, email bodies) are redacted, both by key name and by value shape.
+ *
+ * PATTERN, all writes: batch change+audit. Every mutation runs its change and its audit row in
+ * ONE `db.batch([...change, auditStatement(...)])` (a single D1 transaction), so a change can
+ * never exist without its audit row or the other way round. Use `writeAudit` only for events
+ * with no accompanying change. When a change is conditional (a guard such as "last admin"), put
+ * the same condition on the audit statement via `guard`, then read the audit statement's
+ * `meta.changes` (1 = it happened, 0 = the guard blocked everything).
  */
+export const LAST_INSERT_ID = Symbol("last-insert-id");
+
 export interface AuditEntry {
   actorEmail: string;
   action: string;
   entity: string;
-  entityId?: string | number | null;
+  /**
+   * `LAST_INSERT_ID` uses SQLite's `last_insert_rowid()`: the row id of the insert directly
+   * before this statement in the same batch. Only use it right after an UNCONDITIONAL single-row
+   * INSERT; after an insert that wrote nothing (guarded, ON CONFLICT DO NOTHING) it would carry a
+   * stale id from an earlier insert on the connection.
+   */
+  entityId?: string | number | null | typeof LAST_INSERT_ID;
   before?: unknown;
   after?: unknown;
 }
@@ -69,23 +84,44 @@ function toJson(value: unknown): string | null {
   return JSON.stringify(maskDeep(value));
 }
 
-export async function writeAudit(db: D1Database, entry: AuditEntry): Promise<void> {
+/**
+ * Optional condition for the audit row: a SQL boolean expression using placeholders from ?7
+ * upward (?1-?6 are the audit columns), with its bind values in order.
+ */
+export interface AuditGuard {
+  sql: string;
+  binds: readonly (string | number | null)[];
+}
+
+/** Prepared (not executed) audit insert, to be run inside the same `db.batch` as the change. */
+export function auditStatement(
+  db: D1Database,
+  entry: AuditEntry,
+  guard?: AuditGuard,
+): D1PreparedStatement {
   const actor = entry.actorEmail.trim().toLowerCase();
   if (actor === "") throw new Error("audit entry needs an actor");
-  await db
+  const id = entry.entityId;
+  const fromInsert = id === LAST_INSERT_ID;
+  const entityId =
+    id === undefined || id === null || id === LAST_INSERT_ID ? null : maskString(String(id));
+  return db
     .prepare(
       `INSERT INTO audit_log (actor_email, action, entity, entity_id, before_json, after_json)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+       SELECT ?1, ?2, ?3, ${fromInsert ? "CAST(last_insert_rowid() AS TEXT)" : "?4"}, ?5, ?6
+       WHERE ${guard ? guard.sql : "1"}`,
     )
     .bind(
       actor,
       entry.action,
       entry.entity,
-      entry.entityId === undefined || entry.entityId === null
-        ? null
-        : maskString(String(entry.entityId)),
+      entityId,
       toJson(entry.before),
       toJson(entry.after),
-    )
-    .run();
+      ...(guard?.binds ?? []),
+    );
+}
+
+export async function writeAudit(db: D1Database, entry: AuditEntry): Promise<void> {
+  await auditStatement(db, entry).run();
 }

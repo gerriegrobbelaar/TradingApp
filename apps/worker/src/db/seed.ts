@@ -20,6 +20,13 @@ export async function seedInitialAdmin(
   if (normalised === "") return "skipped";
   if (!EMAIL_RE.test(normalised)) throw new Error("INITIAL_ADMIN_EMAIL is not a valid email");
 
+  // Common case after the first run: marker present, so no write transaction at all.
+  const marked = await db
+    .prepare("SELECT 1 AS x FROM settings WHERE key = ?1")
+    .bind(SEED_MARKER)
+    .first();
+  if (marked) return "exists";
+
   // Every statement is guarded by "not seeded yet and no admin yet". D1 runs a batch as one
   // transaction and serialises writes, so concurrent isolates cannot both seed.
   const guard = `NOT EXISTS (SELECT 1 FROM settings WHERE key = '${SEED_MARKER}')

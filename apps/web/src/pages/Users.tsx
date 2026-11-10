@@ -7,6 +7,8 @@ import {
   inviteUser,
   listUsers,
   removeUser,
+  restoreUser,
+  revokeInvite,
   setUserRoles,
   stepUp,
   type InviteRow,
@@ -31,9 +33,10 @@ export function validateInviteEmail(raw: string): string | null {
 const ERROR_TEXT: Record<string, string> = {
   invalid_email: `Use an @${ALLOWED_DOMAIN} email address.`,
   invalid_roles: "Choose at least one role.",
-  already_exists: "That person already has access or a pending invite.",
+  already_exists: "That person already has access or was already added.",
   last_admin: "There must always be one admin. Make someone else an admin first.",
-  user_disabled: "That user was already removed.",
+  user_disabled: "That person was removed earlier. Restore them from the list.",
+  not_disabled: "That person already has access. Reload the list.",
   not_found: "That user no longer exists. Reload the list.",
   forbidden: "Only admins can manage users.",
 };
@@ -80,7 +83,12 @@ function RolePicker({
 }
 
 type Dialog =
-  null | { kind: "stepup" } | { kind: "roles"; user: UserRow } | { kind: "remove"; user: UserRow };
+  | null
+  | { kind: "stepup" }
+  | { kind: "roles"; user: UserRow }
+  | { kind: "remove"; user: UserRow }
+  | { kind: "restore"; user: UserRow }
+  | { kind: "revoke"; invite: InviteRow };
 
 function countLine(users: number, invites: number): string {
   const people = `${users} ${users === 1 ? "person" : "people"} with access`;
@@ -125,13 +133,23 @@ export function Users() {
     try {
       const clean = email.trim().toLowerCase();
       await inviteUser(clean, inviteRoles);
-      toast.show(`Invited ${clean}.`);
+      toast.show(`Added ${clean}. They can sign in with Google now.`);
       setEmail("");
       setInviteRoles(["viewer"]);
       await load();
     } catch (err) {
       if (err instanceof StepUpRequired) setDialog({ kind: "stepup" });
-      else setInviteError(describe(err));
+      else if (err instanceof ApiError && err.code === "user_disabled") {
+        // Removed earlier: offer Restore instead of a dead end.
+        const removed = data?.users.find(
+          (u) => u.disabled && u.email === email.trim().toLowerCase(),
+        );
+        if (removed) {
+          openDialog({ kind: "restore", user: removed });
+          // Start from the roles the admin just picked in the form.
+          if (inviteRoles.length > 0) setSheetRoles(inviteRoles);
+        } else setInviteError(describe(err));
+      } else setInviteError(describe(err));
     } finally {
       setBusy(false);
     }
@@ -144,6 +162,7 @@ export function Users() {
   function openDialog(d: Dialog) {
     setSheetError(null);
     if (d?.kind === "roles") setSheetRoles(d.user.roles);
+    if (d?.kind === "restore") setSheetRoles(["viewer"]);
     setDialog(d);
   }
 
@@ -166,9 +185,10 @@ export function Users() {
   return (
     <>
       <Card>
-        <h2 className="h2">Invite someone</h2>
+        <h2 className="h2">Add a person</h2>
         <p className="lede">
-          People can sign in only after an admin invites their @{ALLOWED_DOMAIN} email.
+          People can sign in with Google only after an admin adds their @{ALLOWED_DOMAIN} email. No
+          email is sent, so let them know they can sign in.
         </p>
         <form onSubmit={submitInvite} noValidate className="form">
           <label className="field">
@@ -192,7 +212,7 @@ export function Users() {
           )}
           <div>
             <Button type="submit" variant="primary" disabled={busy}>
-              Send invite
+              Add person
             </Button>
           </div>
         </form>
@@ -252,6 +272,11 @@ export function Users() {
                       )}
                     </td>
                     <td className="r">
+                      {u.disabled && (
+                        <Button size="sm" onClick={() => openDialog({ kind: "restore", user: u })}>
+                          Restore<span className="sr-only"> {u.email}</span>
+                        </Button>
+                      )}
                       {!u.disabled && (
                         <span className="chips">
                           <Button size="sm" onClick={() => openDialog({ kind: "roles", user: u })}>
@@ -276,7 +301,11 @@ export function Users() {
                         ))}
                       </span>
                     </td>
-                    <td />
+                    <td className="r">
+                      <Button size="sm" onClick={() => openDialog({ kind: "revoke", invite: i })}>
+                        Revoke<span className="sr-only"> invite for {i.email}</span>
+                      </Button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -334,6 +363,77 @@ export function Users() {
                 }
               >
                 Save roles
+              </Button>
+              <Button onClick={() => setDialog(null)}>Cancel</Button>
+            </div>
+          </>
+        )}
+      </Sheet>
+
+      <Sheet
+        open={dialog?.kind === "restore"}
+        title="Restore this person"
+        onClose={() => setDialog(null)}
+      >
+        {dialog?.kind === "restore" && (
+          <>
+            <p className="lede">
+              {dialog.user.email} was removed. Choose the roles they get back. Their old roles are
+              not kept.
+            </p>
+            <RolePicker legend="Roles" value={sheetRoles} onChange={setSheetRoles} />
+            {sheetRoles.length === 0 && <p className="lede">Choose at least one role.</p>}
+            {sheetError && (
+              <p role="alert" className="notice warn">
+                {sheetError}
+              </p>
+            )}
+            <div className="chips">
+              <Button
+                variant="primary"
+                disabled={busy || sheetRoles.length === 0}
+                onClick={() =>
+                  void runSheet(
+                    () => restoreUser(dialog.user.id, sheetRoles),
+                    `Restored ${dialog.user.email}.`,
+                  )
+                }
+              >
+                Restore person
+              </Button>
+              <Button onClick={() => setDialog(null)}>Cancel</Button>
+            </div>
+          </>
+        )}
+      </Sheet>
+
+      <Sheet
+        open={dialog?.kind === "revoke"}
+        title="Revoke this invite"
+        onClose={() => setDialog(null)}
+      >
+        {dialog?.kind === "revoke" && (
+          <>
+            <p className="lede">
+              {dialog.invite.email} will no longer be able to sign in. You can add them again later.
+            </p>
+            {sheetError && (
+              <p role="alert" className="notice warn">
+                {sheetError}
+              </p>
+            )}
+            <div className="chips">
+              <Button
+                variant="primary"
+                disabled={busy}
+                onClick={() =>
+                  void runSheet(
+                    () => revokeInvite(dialog.invite.id),
+                    `Revoked the invite for ${dialog.invite.email}.`,
+                  )
+                }
+              >
+                Revoke invite
               </Button>
               <Button onClick={() => setDialog(null)}>Cancel</Button>
             </div>
