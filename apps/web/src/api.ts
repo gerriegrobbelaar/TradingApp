@@ -198,3 +198,44 @@ export const disconnectExact = () =>
   request<{ ok: true; changed: boolean }>("/api/connections/exact/disconnect", { method: "POST" });
 /** Full-page navigation: the Worker redirects to Exact and back to /settings/connections. */
 export const EXACT_START_URL = "/api/connections/exact/start";
+
+export type SyncStatus = "running" | "ok" | "partial" | "error" | "needs_reauth";
+
+export interface DivisionInfo {
+  /** Our id (divisions.id), used by every division route. Not the Exact division number. */
+  id: number;
+  division: number;
+  name: string;
+  currency: string;
+  connectionStatus: ConnectionStatus;
+  syncing: boolean;
+  lastSync: {
+    status: SyncStatus | null;
+    mode: "full" | "incremental" | null;
+    error: string | null;
+    finishedAt: string;
+    completedAt: string | null;
+  } | null;
+}
+
+export interface DivisionsResponse {
+  selectedId: number | null;
+  divisions: DivisionInfo[];
+}
+
+export interface SyncResponse {
+  status: Exclude<SyncStatus, "running">;
+  mode: "full" | "incremental";
+  callsUsed: number;
+  finishedAt: string;
+  entities: Record<
+    string,
+    { status: string; rows: number; calls: number; closed?: number; error?: string }
+  >;
+}
+
+export const listDivisions = () => request<DivisionsResponse>("/api/divisions");
+export const setMyDivision = (divisionId: number) =>
+  request<{ selectedId: number }>("/api/me/division", { method: "PUT", body: { divisionId } });
+export const runSync = (divisionId: number, mode: "full" | "incremental") =>
+  request<SyncResponse>(`/api/divisions/${divisionId}/sync`, { method: "POST", body: { mode } });

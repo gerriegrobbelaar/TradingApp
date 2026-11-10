@@ -10,6 +10,7 @@ import {
 import { Button } from "@camelthorn/ui";
 import { logout, nav } from "./api";
 import { AuthProvider, useMe } from "./auth";
+import { DivisionProvider } from "./division";
 import { TopNav } from "./components/TopNav";
 import { PLACEHOLDERS } from "./routes";
 import { ToastProvider, useToast } from "./toasts";
@@ -71,20 +72,22 @@ function SignedInShell() {
   }, [pathname, navType]);
   if (auth.status !== "ready") return null;
   return (
-    <div className="wrap">
-      <TopNav />
-      <main ref={mainRef} id="main" tabIndex={-1} className="main">
-        <Routes>
-          <Route path="/" element={<Navigate to="/today" replace />} />
-          {PLACEHOLDERS.map((p) => (
-            <Route key={p.to} path={p.to} element={<ComingSoon path={p.to} title={p.label} />} />
-          ))}
-          <Route path="/settings/:tab?" element={<Settings />} />
-          <Route path="*" element={<NotFound />} />
-        </Routes>
-      </main>
-      <Footer email={auth.me.email} />
-    </div>
+    <DivisionProvider>
+      <div className="wrap">
+        <TopNav />
+        <main ref={mainRef} id="main" tabIndex={-1} className="main">
+          <Routes>
+            <Route path="/" element={<Navigate to="/today" replace />} />
+            {PLACEHOLDERS.map((p) => (
+              <Route key={p.to} path={p.to} element={<ComingSoon path={p.to} title={p.label} />} />
+            ))}
+            <Route path="/settings/:tab?" element={<Settings />} />
+            <Route path="*" element={<NotFound />} />
+          </Routes>
+        </main>
+        <Footer email={auth.me.email} />
+      </div>
+    </DivisionProvider>
   );
 }
 

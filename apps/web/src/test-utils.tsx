@@ -46,8 +46,14 @@ export const USERS: UsersResponse = {
   invites: [],
 };
 
+/** Default for the administration switcher: no divisions, so nothing extra renders. */
+const DEFAULT_HANDLERS: Record<string, Handler> = {
+  "GET /api/divisions": () => ({ body: { selectedId: null, divisions: [] } }),
+};
+
 /** Stubs global fetch. Unknown routes answer 404 so a missing mock is loud. */
-export function mockFetch(handlers: Record<string, Handler>) {
+export function mockFetch(overrides: Record<string, Handler>) {
+  const handlers = { ...DEFAULT_HANDLERS, ...overrides };
   const calls: Call[] = [];
   const fn = vi.fn(async (url: string, init?: RequestInit) => {
     const call: Call = {

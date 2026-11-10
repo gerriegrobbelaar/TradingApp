@@ -105,9 +105,10 @@ describe("session ending while signed in", () => {
     expect(new URL(link.getAttribute("href") ?? "", "http://x").searchParams.get("return_to")).toBe(
       "/settings/users",
     );
-    // Session check once, users list once: nothing retries by itself.
-    expect(calls.map((c) => `${c.method} ${c.url}`)).toEqual([
+    // Session check once, divisions once, users list once: nothing retries by itself.
+    expect(calls.map((c) => `${c.method} ${c.url}`).sort()).toEqual([
       "GET /api/auth/me",
+      "GET /api/divisions",
       "GET /api/users",
     ]);
     expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();

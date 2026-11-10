@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { NavLink, useLocation } from "react-router";
 import { NAV, isGroup, type NavLeaf } from "../routes";
+import { DivisionSwitcher } from "./DivisionSwitcher";
 
 function GearIcon() {
   return (
@@ -144,6 +145,7 @@ export function TopNav() {
           Camelthorn <span>Finance</span>
         </span>
       </div>
+      <DivisionSwitcher />
       <div className="track">
         {NAV.map((item) =>
           isGroup(item) ? (

@@ -14,6 +14,8 @@ import {
   type ConnectionsResponse,
 } from "../api";
 import { useSignedIn } from "../auth";
+import { useDivision } from "../division";
+import { SyncPanel } from "./SyncPanel";
 import { useToast } from "../toasts";
 
 const RESULT_MESSAGE: Record<string, string> = {
@@ -61,6 +63,9 @@ export function Connections() {
   const toast = useToast();
   const me = useSignedIn();
   const isAdmin = me.roles.includes("admin");
+  const canSync = isAdmin || me.roles.includes("finance");
+  const { selected } = useDivision();
+  const lastSync = selected?.lastSync?.finishedAt;
   const [params, setParams] = useSearchParams();
   const [data, setData] = useState<(ConnectionsResponse & { at: number }) | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -151,7 +156,12 @@ export function Connections() {
       <Card aria-busy={!data && !loadError}>
         <div className="row-between">
           <h2 className="h2">Exact Online</h2>
-          {data && <Stamp at={data.at} />}
+          {data &&
+            (lastSync ? (
+              <Stamp at={Date.parse(lastSync)} />
+            ) : (
+              <span className="stamp">Not synced yet</span>
+            ))}
         </div>
         {loadError && (
           <p role="alert" className="notice warn">
@@ -244,6 +254,8 @@ export function Connections() {
           </>
         )}
       </Card>
+
+      <SyncPanel canSync={canSync} />
 
       <Sheet open={dialog === "stepup"} title="Confirm it's you" onClose={() => setDialog(null)}>
         <p className="lede">

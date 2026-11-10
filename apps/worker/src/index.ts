@@ -1,6 +1,8 @@
 import { registerAuthRoutes } from "./auth/routes";
 import { registerUserRoutes } from "./auth/users-routes";
 import { registerExactRoutes } from "./exact/routes";
+import { runScheduledExactSync } from "./exact/scheduled";
+import { registerSyncRoutes } from "./exact/sync-routes";
 import { ensureSeeded } from "./db/seed";
 import type { Env } from "./env";
 import { json, Router } from "./router";
@@ -24,6 +26,7 @@ const router = new Router();
 registerAuthRoutes(router);
 registerUserRoutes(router);
 registerExactRoutes(router);
+registerSyncRoutes(router);
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -36,7 +39,13 @@ export default {
     return env.ASSETS.fetch(request);
   },
 
-  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+  async scheduled(controller: ScheduledController, env: Env): Promise<void> {
     await seedSafely(env);
+    // STOPGAP until the Phase 3 scheduler (exact/scheduled.ts): hourly Exact sync.
+    try {
+      await runScheduledExactSync(env, controller.scheduledTime);
+    } catch (err) {
+      console.error("scheduled exact sync crashed", err instanceof Error ? err.name : "");
+    }
   },
 } satisfies ExportedHandler<Env>;

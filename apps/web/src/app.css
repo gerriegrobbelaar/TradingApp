@@ -17,6 +17,33 @@
     min-width: 0;
   }
 }
+/* Administration switcher in the top nav. */
+.app .division-switch {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex: 0 1 220px;
+}
+.app .division-switch .input {
+  height: 36px;
+  width: 100%;
+  min-width: 0;
+  text-overflow: ellipsis;
+}
+.app .division-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (max-width: 560px) {
+  .app .division-switch {
+    flex: 1 1 100%;
+    order: 3;
+  }
+}
 .signin {
   min-height: 70vh;
   display: grid;

@@ -17,6 +17,12 @@ preview_urls = false
 # or, on an existing proxied hostname:
 # routes = [{ pattern = "app.example.com/*", zone_name = "example.com" }]
 
+# STOPGAP (Phase 3 replaces it with the jobs table and Queues): one tick per hour (UTC). The handler
+# decides from the Amsterdam wall clock whether the tick is the daily full sync (02:00) or an
+# incremental one, so daylight saving needs no second cron. See src/exact/scheduled.ts.
+[triggers]
+crons = ["0 * * * *"]
+
 [observability]
 enabled = true
 # Sampling: 1 = keep every request log. Lower this (for example 0.1) if log volume or cost grows.

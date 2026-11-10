@@ -66,6 +66,11 @@ export function stubExact(): ExactStub {
 /** Wipes Exact-related rows (audit_log is append-only and left alone). */
 export async function resetExact(): Promise<void> {
   await db.batch([
+    db.prepare("DELETE FROM user_prefs"),
+    db.prepare("DELETE FROM sync_locks"),
+    db.prepare("DELETE FROM sync_state"),
+    db.prepare("DELETE FROM open_items"),
+    db.prepare("DELETE FROM relations"),
     db.prepare("DELETE FROM divisions"),
     db.prepare("DELETE FROM exact_usage"),
     db.prepare("DELETE FROM connections"),
