@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { isEmailInDomain, isValidEmail, normalizeEmail } from "@camelthorn/core";
 import { Button, Card, Chip, Sheet, Skeleton, Stamp } from "@camelthorn/ui";
 import {
   ApiError,
@@ -18,20 +19,17 @@ import {
 import { useSignedIn } from "../auth";
 import { useToast } from "../toasts";
 
-export const ALLOWED_DOMAIN = "camelthorncapital.com";
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
 /** Returns an error message, or null when the address may be invited. */
-export function validateInviteEmail(raw: string): string | null {
-  const email = raw.trim().toLowerCase();
+export function validateInviteEmail(raw: string, domain: string): string | null {
+  const email = normalizeEmail(raw);
   if (!email) return "Enter an email address.";
-  if (!EMAIL_RE.test(email)) return "Enter a valid email address.";
-  if (!email.endsWith(`@${ALLOWED_DOMAIN}`)) return `Use an @${ALLOWED_DOMAIN} email address.`;
+  if (!isValidEmail(email)) return "Enter a valid email address.";
+  if (!isEmailInDomain(email, domain)) return `Use an @${domain} email address.`;
   return null;
 }
 
-const ERROR_TEXT: Record<string, string> = {
-  invalid_email: `Use an @${ALLOWED_DOMAIN} email address.`,
+const errorText = (domain: string): Record<string, string> => ({
+  invalid_email: `Use an @${domain} email address.`,
   invalid_roles: "Choose at least one role.",
   already_exists: "That person already has access or was already added.",
   last_admin: "There must always be one admin. Make someone else an admin first.",
@@ -39,10 +37,10 @@ const ERROR_TEXT: Record<string, string> = {
   not_disabled: "That person already has access. Reload the list.",
   not_found: "That user no longer exists. Reload the list.",
   forbidden: "Only admins can manage users.",
-};
+});
 
-function describe(e: unknown): string {
-  if (e instanceof ApiError) return ERROR_TEXT[e.code] ?? "Something went wrong. Try again.";
+function describe(e: unknown, domain: string): string {
+  if (e instanceof ApiError) return errorText(domain)[e.code] ?? "Something went wrong. Try again.";
   return "Could not reach the server. Try again.";
 }
 
@@ -98,6 +96,7 @@ function countLine(users: number, invites: number): string {
 export function Users() {
   const toast = useToast();
   const me = useSignedIn();
+  const domain = me.allowedDomain;
   const [data, setData] = useState<{ users: UserRow[]; invites: InviteRow[]; at: number } | null>(
     null,
   );
@@ -110,9 +109,9 @@ export function Users() {
       setData({ ...r, at: Date.now() });
       setLoadError(null);
     } catch (e) {
-      setLoadError(describe(e));
+      setLoadError(describe(e, domain));
     }
-  }, []);
+  }, [domain]);
   useEffect(() => {
     void load();
   }, [load]);
@@ -126,7 +125,8 @@ export function Users() {
   async function submitInvite(e: FormEvent) {
     e.preventDefault();
     const problem =
-      validateInviteEmail(email) ?? (inviteRoles.length === 0 ? "Choose at least one role." : null);
+      validateInviteEmail(email, domain) ??
+      (inviteRoles.length === 0 ? "Choose at least one role." : null);
     if (problem) return setInviteError(problem);
     setInviteError(null);
     setBusy(true);
@@ -148,8 +148,8 @@ export function Users() {
           openDialog({ kind: "restore", user: removed });
           // Start from the roles the admin just picked in the form.
           if (inviteRoles.length > 0) setSheetRoles(inviteRoles);
-        } else setInviteError(describe(err));
-      } else setInviteError(describe(err));
+        } else setInviteError(describe(err, domain));
+      } else setInviteError(describe(err, domain));
     } finally {
       setBusy(false);
     }
@@ -176,7 +176,7 @@ export function Users() {
       await load();
     } catch (err) {
       if (err instanceof StepUpRequired) setDialog({ kind: "stepup" });
-      else setSheetError(describe(err));
+      else setSheetError(describe(err, domain));
     } finally {
       setBusy(false);
     }
@@ -187,8 +187,8 @@ export function Users() {
       <Card>
         <h2 className="h2">Add a person</h2>
         <p className="lede">
-          People can sign in with Google only after an admin adds their @{ALLOWED_DOMAIN} email. No
-          email is sent, so let them know they can sign in.
+          People can sign in with Google only after an admin adds their @{domain} email. No email is
+          sent, so let them know they can sign in.
         </p>
         <form onSubmit={submitInvite} noValidate className="form">
           <label className="field">
@@ -199,9 +199,9 @@ export function Users() {
               autoComplete="off"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              aria-invalid={inviteError !== null && validateInviteEmail(email) !== null}
+              aria-invalid={inviteError !== null && validateInviteEmail(email, domain) !== null}
               aria-describedby={inviteError ? "invite-error" : undefined}
-              placeholder={`name@${ALLOWED_DOMAIN}`}
+              placeholder={`name@${domain}`}
             />
           </label>
           <RolePicker legend="Roles" value={inviteRoles} onChange={setInviteRoles} />

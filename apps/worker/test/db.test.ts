@@ -1,7 +1,11 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { maskDeep, maskIban, writeAudit } from "../src/db/audit";
-import { claimIdempotencyKey, completeIdempotencyKey } from "../src/db/idempotency";
+import {
+  claimIdempotencyKey,
+  claimOnceAndPurge,
+  completeIdempotencyKey,
+} from "../src/db/idempotency";
 import { ensureSeeded, resetSeedMemoForTests, seedInitialAdmin } from "../src/db/seed";
 
 const db = env.DB;
@@ -393,6 +397,42 @@ describe("audit log", () => {
 });
 
 describe("idempotency keys", () => {
+  it("claimOnceAndPurge: one winner, bounded purge, refuses non-ephemeral scopes", async () => {
+    const opts = { nowMs: Date.now(), retentionMs: 3600_000, purgeLimit: 2 };
+    const old = new Date(Date.now() - 2 * 3600_000).toISOString();
+    await db.batch(
+      ["a", "b", "c"].map((k) =>
+        db
+          .prepare(
+            "INSERT INTO idempotency_keys (scope, key, status, created_at) VALUES (?1, ?2, 'completed', ?3)",
+          )
+          .bind("auth.flow", k, old),
+      ),
+    );
+    await db
+      .prepare(
+        "INSERT INTO idempotency_keys (scope, key, status, created_at) VALUES ('revolut.pay', 'p', 'pending', ?1)",
+      )
+      .bind(old)
+      .run();
+    const results = await Promise.all(
+      Array.from({ length: 4 }, () => claimOnceAndPurge(db, "once", "auth.flow", opts)),
+    );
+    expect(results.filter(Boolean)).toHaveLength(1);
+    const left = await db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM idempotency_keys WHERE scope = 'auth.flow' AND key IN ('a','b','c')",
+      )
+      .first<{ n: number }>();
+    expect(left?.n).toBeLessThan(3); // purged, but at most purgeLimit per call
+    expect(await count("idempotency_keys")).toBeGreaterThanOrEqual(2); // payment key + claim
+    await expect(claimOnceAndPurge(db, "x", "revolut.pay", opts)).rejects.toThrow(/not purgeable/);
+    const pay = await db
+      .prepare("SELECT 1 AS x FROM idempotency_keys WHERE scope = 'revolut.pay' AND key = 'p'")
+      .first();
+    expect(pay).not.toBeNull();
+  });
+
   it("claims once, then reports duplicates", async () => {
     expect(await claimIdempotencyKey(db, "k1", "revolut.pay")).toEqual({ status: "claimed" });
     expect(await claimIdempotencyKey(db, "k1", "revolut.pay")).toEqual({

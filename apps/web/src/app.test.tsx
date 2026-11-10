@@ -56,14 +56,28 @@ describe("signed-out screens", () => {
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
   });
 
-  it("shows the denied message without exclamation marks", async () => {
-    mockFetch(SIGNED_OUT);
+  it("shows the denied message with the domain from the Worker, no exclamation marks", async () => {
+    mockFetch({
+      ...SIGNED_OUT,
+      "GET /api/config": () => ({ body: { allowedDomain: "example.org" } }),
+    });
     renderApp("/?auth=denied");
-    const alert = await screen.findByRole("alert");
+    await screen.findByText(/@example\.org/);
+    const alert = screen.getByRole("alert");
     expect(alert.textContent).toBe(
-      "That Google account has no access. Ask an admin to invite your @camelthorncapital.com email.",
+      "That Google account has no access. Ask an admin to invite your @example.org email.",
     );
     expect(alert.textContent).not.toContain("!");
+  });
+
+  it("falls back to generic denied text when the config is unavailable", async () => {
+    mockFetch(SIGNED_OUT); // /api/config answers 404
+    renderApp("/?auth=denied");
+    const alert = await screen.findByRole("alert");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(alert.textContent).toBe(
+      "That Google account has no access. Ask an admin to invite your company email.",
+    );
   });
 
   it("has no axe violations", async () => {

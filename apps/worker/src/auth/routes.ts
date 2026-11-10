@@ -1,8 +1,10 @@
+import { safeReturnTo } from "@camelthorn/core";
 import { auditStatement } from "../db/audit";
+import { claimOnceAndPurge } from "../db/idempotency";
 import { json, type Router } from "../router";
 import { clearCookie, FLOW_COOKIE, parseCookies, SESSION_COOKIE, setCookie } from "./cookies";
 import { randomBase64Url, safeEqual, sha256Base64Url, sha256Hex } from "./crypto";
-import { FLOW_TTL_SECONDS, openFlow, safeReturnTo, sealFlow } from "./flow-cookie";
+import { FLOW_TTL_SECONDS, openFlow, sealFlow } from "./flow-cookie";
 import { AuthError, buildAuthUrl, exchangeCode, verifyIdToken } from "./google";
 import {
   ABSOLUTE_CAP_MS,
@@ -91,21 +93,12 @@ export function registerAuthRoutes(router: Router): void {
       // Single use: the same callback (cookie + state) can never create a second session,
       // even if the authorization code were accepted again. Claimed only after a verified
       // ID token, so anonymous traffic cannot grow the table.
-      const [claim] = await ctx.env.DB.batch([
-        ctx.env.DB.prepare(
-          `INSERT INTO idempotency_keys (scope, key, status, completed_at)
-           VALUES (?1, ?2, 'completed', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-           ON CONFLICT (scope, key) DO NOTHING`,
-        ).bind(FLOW_SCOPE, await sha256Hex(flow.state)),
-        // Opportunistic retention: a flow cookie lives 10 minutes, so day-old claims are dead
-        // weight. Bounded, and only this scope (other scopes are payment keys, kept for good).
-        ctx.env.DB.prepare(
-          `DELETE FROM idempotency_keys WHERE rowid IN (
-             SELECT rowid FROM idempotency_keys
-             WHERE scope = ?1 AND created_at < ?2 LIMIT ?3)`,
-        ).bind(FLOW_SCOPE, new Date(ctx.nowMs - FLOW_KEY_RETENTION_MS).toISOString(), PURGE_BATCH),
-      ]);
-      if (claim?.meta.changes !== 1) throw new AuthError("flow_replayed");
+      const claimed = await claimOnceAndPurge(ctx.env.DB, await sha256Hex(flow.state), FLOW_SCOPE, {
+        nowMs: ctx.nowMs,
+        retentionMs: FLOW_KEY_RETENTION_MS,
+        purgeLimit: PURGE_BATCH,
+      });
+      if (!claimed) throw new AuthError("flow_replayed");
 
       // A new session per sign-in (also on step-up); the old one is dropped. Old-session
       // removal, the new session and the sign-in audit row commit in one transaction.
@@ -173,6 +166,12 @@ export function registerAuthRoutes(router: Router): void {
       roles: s.roles,
       stepUpFresh: isStepUpFresh(s, ctx.nowMs),
       lastAuthAt: s.lastAuthAt,
+      allowedDomain: ctx.config.allowedHd,
     });
   });
+
+  // Public, no secrets: lets the signed-out screen name the allowed Google Workspace domain.
+  router.add("GET", "/api/config", { public: true }, (ctx) =>
+    json({ allowedDomain: ctx.config.allowedHd }, 200, { "cache-control": "no-store" }),
+  );
 }

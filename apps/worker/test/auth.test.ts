@@ -3,7 +3,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { sha256Base64Url, sha256Hex } from "../src/auth/crypto";
 import { loadAuthConfig } from "../src/auth/config";
 import { resetJwksCacheForTests } from "../src/auth/google";
-import { safeReturnTo } from "../src/auth/flow-cookie";
+import { safeReturnTo } from "@camelthorn/core";
 import {
   CLIENT_ID,
   HD,
@@ -175,6 +175,16 @@ describe("callback", () => {
       .prepare("SELECT actor_email, action FROM audit_log WHERE action = 'auth.login'")
       .first();
     expect(audit).toEqual({ actor_email: ADMIN, action: "auth.login" });
+  });
+
+  it("exposes the allowed domain on /api/auth/me and on the public /api/config", async () => {
+    await addUser(ADMIN, ["admin"], { sub: null });
+    const r = await doLogin(stubWith());
+    const me = await authed("/api/auth/me", r.sessionToken ?? "");
+    expect(await me.json()).toMatchObject({ allowedDomain: HD });
+    const cfg = await call("/api/config");
+    expect(cfg.status).toBe(200);
+    expect(await cfg.json()).toEqual({ allowedDomain: HD });
   });
 
   it("accepts an unaccepted invite on first sign-in and grants its roles", async () => {

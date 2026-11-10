@@ -1,15 +1,28 @@
+import { useEffect, useState } from "react";
 import { useLocation } from "react-router";
 import { Card, Skeleton } from "@camelthorn/ui";
-import { loginUrl } from "../api";
+import { loginUrl, publicConfig } from "../api";
 
-export const DENIED_MESSAGE =
-  "That Google account has no access. Ask an admin to invite your @camelthorncapital.com email.";
+/** The domain comes from the Worker (ALLOWED_HD); without it the text stays generic. */
+export function deniedMessage(domain: string | null): string {
+  const what = domain ? `your @${domain} email` : "your company email";
+  return `That Google account has no access. Ask an admin to invite ${what}.`;
+}
 
 export const EXPIRED_MESSAGE = "Your session ended. Sign in again to continue.";
 
 export function SignedOut({ expired = false }: { expired?: boolean }) {
   const { pathname, search } = useLocation();
   const denied = new URLSearchParams(search).get("auth") === "denied";
+  const [domain, setDomain] = useState<string | null>(null);
+  useEffect(() => {
+    if (!denied) return;
+    let live = true;
+    void publicConfig().then((c) => live && setDomain(c?.allowedDomain ?? null));
+    return () => {
+      live = false;
+    };
+  }, [denied]);
   // Back to the page the user was on (the Worker re-validates return_to).
   const returnTo = pathname === "/" && !search ? "/" : `${pathname}${search}`;
   return (
@@ -20,7 +33,7 @@ export function SignedOut({ expired = false }: { expired?: boolean }) {
         <p className="lede">Sign in with your company Google account to continue.</p>
         {denied && (
           <p role="alert" className="notice warn">
-            {DENIED_MESSAGE}
+            {deniedMessage(domain)}
           </p>
         )}
         {expired && !denied && (

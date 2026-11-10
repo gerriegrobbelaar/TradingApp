@@ -1,3 +1,4 @@
+import { isEmailInDomain, normalizeEmail } from "@camelthorn/core";
 import { fromBase64Url } from "./crypto";
 import type { AuthConfig } from "./config";
 
@@ -183,11 +184,11 @@ export async function verifyIdToken(
   if (claims.email_verified !== true) throw new AuthError("email_unverified");
   if (typeof claims.sub !== "string" || claims.sub === "") throw new AuthError("no_sub");
   if (typeof claims.email !== "string" || claims.email === "") throw new AuthError("no_email");
-  const email = claims.email.trim().toLowerCase();
+  const email = normalizeEmail(claims.email);
   if (typeof claims.hd !== "string" || claims.hd.toLowerCase() !== cfg.allowedHd) {
     throw new AuthError("bad_hd");
   }
-  if (!email.endsWith(`@${cfg.allowedHd}`)) throw new AuthError("bad_email_domain");
+  if (!isEmailInDomain(email, cfg.allowedHd)) throw new AuthError("bad_email_domain");
 
   return {
     sub: claims.sub,

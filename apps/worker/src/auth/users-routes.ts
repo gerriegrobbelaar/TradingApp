@@ -8,12 +8,12 @@
  * changes (last admin, user still disabled, invite still open) put the same condition on every
  * statement including the audit row, so a blocked request writes nothing at all.
  */
+import { isEmailInDomain, isRole, isValidEmail, normalizeEmail } from "@camelthorn/core";
 import { auditStatement, LAST_INSERT_ID } from "../db/audit";
 import { json, type Ctx, type Router } from "../router";
-import { ROLES, type Role } from "./session";
+import type { Role } from "./session";
 import { parseInviteRoles } from "./signin";
 
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const ADMIN_ONLY = { roles: ["admin"] } as const;
 const ADMIN_STEP_UP = { roles: ["admin"], stepUp: true } as const;
 
@@ -28,7 +28,7 @@ async function readJson(request: Request): Promise<Record<string, unknown> | nul
 
 function parseRoles(v: unknown): Role[] | null {
   if (!Array.isArray(v)) return null;
-  if (!v.every((r) => typeof r === "string" && ROLES.includes(r as Role))) return null;
+  if (!v.every(isRole)) return null;
   return [...new Set(v as Role[])].sort();
 }
 
@@ -110,9 +110,9 @@ export function registerUserRoutes(router: Router): void {
 
   router.add("POST", "/api/users/invite", ADMIN_STEP_UP, async (ctx) => {
     const body = await readJson(ctx.request);
-    const email = typeof body?.email === "string" ? body.email.trim().toLowerCase() : "";
+    const email = typeof body?.email === "string" ? normalizeEmail(body.email) : "";
     const roles = parseRoles(body?.roles);
-    if (!EMAIL_RE.test(email) || !email.endsWith(`@${ctx.config.allowedHd}`)) {
+    if (!isValidEmail(email) || !isEmailInDomain(email, ctx.config.allowedHd)) {
       return json({ error: "invalid_email" }, 400);
     }
     if (!roles || roles.length === 0) return json({ error: "invalid_roles" }, 400);

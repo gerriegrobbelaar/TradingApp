@@ -17,11 +17,13 @@ export const ADMIN: Me = {
   email: "gerrie@camelthorncapital.com",
   roles: ["admin"],
   stepUpFresh: true,
+  allowedDomain: "camelthorncapital.com",
 };
 export const VIEWER: Me = {
   email: "v@camelthorncapital.com",
   roles: ["viewer"],
   stepUpFresh: true,
+  allowedDomain: "camelthorncapital.com",
 };
 
 export const USERS: UsersResponse = {

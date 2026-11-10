@@ -3,14 +3,15 @@
  * example the seeded admin) or an open invite for the email must exist. Email compare is
  * lowercase. The Google `sub` is bound on first sign-in and must match from then on.
  */
+import { isRole } from "@camelthorn/core";
 import { auditStatement } from "../db/audit";
 import { AuthError, type GoogleIdentity } from "./google";
-import { ROLES, type Role } from "./session";
+import type { Role } from "./session";
 
 export function parseInviteRoles(raw: string): Role[] {
   try {
     const v: unknown = JSON.parse(raw);
-    if (Array.isArray(v)) return v.filter((r): r is Role => ROLES.includes(r as Role));
+    if (Array.isArray(v)) return v.filter(isRole);
   } catch {
     /* fall through */
   }

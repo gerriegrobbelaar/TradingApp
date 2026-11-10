@@ -1,3 +1,4 @@
+import type { Role } from "@camelthorn/core";
 import { randomBase64Url, sha256Hex } from "./crypto";
 
 export const IDLE_TIMEOUT_MS = 12 * 3600 * 1000;
@@ -6,12 +7,7 @@ export const STEP_UP_WINDOW_MS = 15 * 60 * 1000;
 /** last_seen_at is only rewritten when older than this, to avoid a D1 write per request. */
 const TOUCH_INTERVAL_MS = 60 * 1000;
 
-/**
- * Roles are NOT hierarchical: a user holds exactly the roles granted explicitly. Admin does not
- * imply finance, approver or viewer. Routes list every role that may use them.
- */
-export type Role = "admin" | "approver" | "finance" | "viewer";
-export const ROLES: readonly Role[] = ["admin", "approver", "finance", "viewer"];
+export type { Role } from "@camelthorn/core";
 
 export interface Session {
   tokenHash: string;

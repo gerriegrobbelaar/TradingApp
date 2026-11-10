@@ -1,12 +1,19 @@
 /** Thin typed client for the Worker API. Same-origin; the session cookie does the auth. */
 
-export type Role = "admin" | "approver" | "finance" | "viewer";
-export const ROLES: readonly Role[] = ["admin", "approver", "finance", "viewer"];
+import { safeReturnTo, type Role } from "@camelthorn/core";
+
+export { ROLES, safeReturnTo, type Role } from "@camelthorn/core";
 
 export interface Me {
   email: string;
   roles: Role[];
   stepUpFresh: boolean;
+  /** Google Workspace domain people must belong to (from the Worker's ALLOWED_HD). */
+  allowedDomain: string;
+}
+
+export interface PublicConfig {
+  allowedDomain: string;
 }
 
 export interface UserRow {
@@ -55,27 +62,6 @@ export const nav = {
     window.location.assign(url);
   },
 };
-
-/**
- * A same-origin relative path for return_to, or "/". Mirrors the Worker's safeReturnTo (which
- * re-checks it): must start with a single "/", no backslashes or control characters, and drop
- * the one-shot `auth` flag so a denied notice is not replayed after sign-in.
- */
-export function safeReturnTo(value: string): string {
-  if (!value.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/";
-  // eslint-disable-next-line no-control-regex
-  if (/[\u0000-\u001f\u007f]/.test(value) || value.length > 2048) return "/";
-  let u: URL;
-  try {
-    u = new URL(value, "https://app.invalid");
-  } catch {
-    return "/";
-  }
-  if (u.origin !== "https://app.invalid") return "/";
-  u.searchParams.delete("auth");
-  const out = `${u.pathname}${u.search}`;
-  return out.startsWith("/") && !out.startsWith("//") ? out : "/";
-}
 
 export function currentPath(): string {
   return safeReturnTo(`${window.location.pathname}${window.location.search}`);
@@ -150,6 +136,16 @@ export async function me(): Promise<Me | null> {
   } catch (e) {
     if (e instanceof ApiError && e.status === 401) return null;
     throw e;
+  }
+}
+
+/** Public (no session). Resolves to null when the Worker cannot say; callers must cope. */
+export async function publicConfig(): Promise<PublicConfig | null> {
+  try {
+    const c = await request<PublicConfig>("/api/config", { notifyOn401: false });
+    return typeof c.allowedDomain === "string" && c.allowedDomain !== "" ? c : null;
+  } catch {
+    return null;
   }
 }
 

@@ -53,25 +53,3 @@ export async function openFlow(
     return null;
   }
 }
-
-/**
- * Only same-origin relative paths; anything else becomes "/". The value is resolved against the
- * app origin and must stay on it, so "//host", "/\\host", "https://host", "/\thost" and their
- * percent-decoded forms are all refused. The result is the URL's own (percent-encoded)
- * path + query + fragment, safe to put in a Location header.
- */
-export function safeReturnTo(value: string | null, appOrigin: string): string {
-  if (!value || value.length > 2048) return "/";
-  if (!value.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/";
-  // eslint-disable-next-line no-control-regex
-  if (/[\u0000-\u001f\u007f]/.test(value)) return "/";
-  let u: URL;
-  try {
-    u = new URL(value, appOrigin);
-  } catch {
-    return "/";
-  }
-  if (u.origin !== appOrigin) return "/";
-  const out = `${u.pathname}${u.search}${u.hash}`;
-  return out.startsWith("/") && !out.startsWith("//") ? out : "/";
-}

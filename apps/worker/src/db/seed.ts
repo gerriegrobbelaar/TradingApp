@@ -7,18 +7,19 @@
  * is written in the same transaction. So if admins later remove the seeded admin (even
  * leaving no admin at all), a restart never silently re-grants admin to that email.
  */
+import { isValidEmail, normalizeEmail } from "@camelthorn/core";
+
 export type SeedResult = "created" | "exists" | "skipped";
 
 const SEED_MARKER = "seed.initial_admin";
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export async function seedInitialAdmin(
   db: D1Database,
   email: string | undefined,
 ): Promise<SeedResult> {
-  const normalised = (email ?? "").trim().toLowerCase();
+  const normalised = normalizeEmail(email ?? "");
   if (normalised === "") return "skipped";
-  if (!EMAIL_RE.test(normalised)) throw new Error("INITIAL_ADMIN_EMAIL is not a valid email");
+  if (!isValidEmail(normalised)) throw new Error("INITIAL_ADMIN_EMAIL is not a valid email");
 
   // Common case after the first run: marker present, so no write transaction at all.
   const marked = await db
