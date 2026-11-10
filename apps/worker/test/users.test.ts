@@ -85,6 +85,17 @@ describe("POST /api/users/invite", () => {
   });
 });
 
+describe("POST /api/users/invite (races)", () => {
+  it("two concurrent invites for the same email: one 201, one 409, no 500", async () => {
+    const body = { email: "race@camelthorncapital.com", roles: ["viewer"] };
+    const rs = await Promise.all([
+      authed("/api/users/invite", adminTok, { method: "POST", json: body }),
+      authed("/api/users/invite", adminTok, { method: "POST", json: body }),
+    ]);
+    expect(rs.map((r) => r.status).sort()).toEqual([201, 409]);
+  });
+});
+
 describe("PATCH /api/users/:id/roles", () => {
   it("changes roles, audits before/after, and kills sessions when a role is removed", async () => {
     const uid = await addUser("f@camelthorncapital.com", ["finance", "approver"]);
@@ -141,6 +152,25 @@ describe("PATCH /api/users/:id/roles", () => {
     expect(again.status).toBe(409);
   });
 
+  it("last-admin guard holds under concurrent demotions and removals", async () => {
+    const second = await addUser("b@camelthorncapital.com", ["admin"]);
+    const secondTok = await addSession(second);
+    const results = await Promise.all([
+      authed(`/api/users/${adminId}/roles`, secondTok, {
+        method: "PATCH",
+        json: { roles: ["viewer"] },
+      }),
+      authed(`/api/users/${second}`, adminTok, { method: "DELETE" }),
+    ]);
+    expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+    expect(
+      await count(
+        `SELECT COUNT(*) AS n FROM user_roles r JOIN users u ON u.id = r.user_id
+         WHERE r.role = 'admin' AND u.disabled_at IS NULL`,
+      ),
+    ).toBe(1);
+  });
+
   it("a disabled admin does not count as another admin", async () => {
     await addUser("gone@camelthorncapital.com", ["admin"], { disabled: true });
     const res = await authed(`/api/users/${adminId}/roles`, adminTok, {
@@ -159,10 +189,17 @@ describe("PATCH /api/users/:id/roles", () => {
         })
       ).status,
     ).toBe(400);
-    expect(
-      (await authed("/api/users/abc/roles", adminTok, { method: "PATCH", json: { roles: [] } }))
-        .status,
-    ).toBe(400);
+    for (const bad of ["abc", "1e0", "0x1", "%201", "-1", "0", "1.0", "99999999999999999999"]) {
+      expect(
+        (
+          await authed(`/api/users/${bad}/roles`, adminTok, {
+            method: "PATCH",
+            json: { roles: [] },
+          })
+        ).status,
+        bad,
+      ).toBe(400);
+    }
     expect(
       (await authed("/api/users/9999/roles", adminTok, { method: "PATCH", json: { roles: [] } }))
         .status,

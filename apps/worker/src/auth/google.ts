@@ -63,6 +63,7 @@ interface Jwk {
   kid?: string;
   kty?: string;
   alg?: string;
+  use?: string;
   n?: string;
   e?: string;
 }
@@ -102,6 +103,7 @@ async function findKey(kid: string, nowMs: number): Promise<Jwk> {
 export interface GoogleIdentity {
   sub: string;
   email: string;
+  /** `auth_time` claim (epoch seconds): when the user last actually authenticated at Google. */
   authTime?: number;
 }
 
@@ -127,7 +129,15 @@ export async function verifyIdToken(
   if (header.alg !== "RS256" || typeof header.kid !== "string") throw new AuthError("jwt_alg");
 
   const jwk = await findKey(header.kid, nowMs);
-  if (jwk.kty !== "RSA" || !jwk.n || !jwk.e) throw new AuthError("jwk_unusable");
+  if (
+    jwk.kty !== "RSA" ||
+    !jwk.n ||
+    !jwk.e ||
+    (jwk.alg !== undefined && jwk.alg !== "RS256") ||
+    (jwk.use !== undefined && jwk.use !== "sig")
+  ) {
+    throw new AuthError("jwk_unusable");
+  }
   const key = await crypto.subtle.importKey(
     "jwk",
     { kty: "RSA", n: jwk.n, e: jwk.e, alg: "RS256", ext: true },
@@ -145,17 +155,27 @@ export async function verifyIdToken(
 
   const nowS = Math.floor(nowMs / 1000);
   if (typeof claims.iss !== "string" || !ISSUERS.has(claims.iss)) throw new AuthError("bad_iss");
+  // Exactly our client: a string, or a one-element array. Multi-audience tokens are refused.
   const aud = claims.aud;
   const audOk =
     typeof aud === "string"
       ? aud === cfg.clientId
-      : Array.isArray(aud) && aud.includes(cfg.clientId);
+      : Array.isArray(aud) && aud.length === 1 && aud[0] === cfg.clientId;
   if (!audOk) throw new AuthError("bad_aud");
+  if (claims.azp !== undefined && claims.azp !== cfg.clientId) throw new AuthError("bad_azp");
   if (typeof claims.exp !== "number" || claims.exp + CLOCK_SKEW_SECONDS <= nowS) {
     throw new AuthError("expired");
   }
-  if (typeof claims.iat === "number" && claims.iat - CLOCK_SKEW_SECONDS > nowS) {
-    throw new AuthError("iat_future");
+  if (typeof claims.iat !== "number" || claims.iat - CLOCK_SKEW_SECONDS > nowS) {
+    throw new AuthError("bad_iat");
+  }
+  if (
+    claims.auth_time !== undefined &&
+    (typeof claims.auth_time !== "number" ||
+      !Number.isFinite(claims.auth_time) ||
+      claims.auth_time - CLOCK_SKEW_SECONDS > nowS)
+  ) {
+    throw new AuthError("bad_auth_time");
   }
   if (typeof claims.nonce !== "string" || claims.nonce !== expectedNonce) {
     throw new AuthError("bad_nonce");

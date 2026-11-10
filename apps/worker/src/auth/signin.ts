@@ -58,31 +58,40 @@ export async function resolveUser(db: D1Database, id: GoogleIdentity): Promise<n
   if (!invite) throw new AuthError("not_invited");
 
   const roles = parseInviteRoles(invite.roles);
-  let userId: number;
+  // One transaction: the user row, its roles and the invite acceptance land together or not
+  // at all. Every statement is guarded on the invite still being open, so a concurrent accept
+  // or a revoke in between leaves nothing behind.
+  const open = (p: string): string =>
+    `EXISTS (SELECT 1 FROM invites WHERE id = ${p} AND accepted_at IS NULL AND revoked_at IS NULL)`;
+  let results: D1Result[];
   try {
-    const ins = await db
-      .prepare(
-        `INSERT INTO users (email, google_sub, last_login_at)
-         VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))`,
-      )
-      .bind(id.email, id.sub)
-      .run();
-    userId = ins.meta.last_row_id;
-  } catch {
-    throw new AuthError("sub_already_bound");
-  }
-  await db.batch([
-    ...roles.map((role) =>
+    results = await db.batch([
       db
-        .prepare("INSERT INTO user_roles (user_id, role, granted_by) VALUES (?1, ?2, 'invite')")
-        .bind(userId, role),
-    ),
-    db
-      .prepare(
-        "UPDATE invites SET accepted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
-      )
-      .bind(invite.id),
-  ]);
+        .prepare(
+          `INSERT INTO users (email, google_sub, last_login_at)
+           SELECT ?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE ${open("?3")}`,
+        )
+        .bind(id.email, id.sub, invite.id),
+      ...roles.map((role) =>
+        db
+          .prepare(
+            `INSERT INTO user_roles (user_id, role, granted_by)
+             SELECT id, ?2, 'invite' FROM users WHERE google_sub = ?1 AND ${open("?3")}`,
+          )
+          .bind(id.sub, role, invite.id),
+      ),
+      db
+        .prepare(
+          `UPDATE invites SET accepted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+           WHERE id = ?1 AND accepted_at IS NULL AND revoked_at IS NULL`,
+        )
+        .bind(invite.id),
+    ]);
+  } catch {
+    throw new AuthError("sub_already_bound"); // UNIQUE: this Google account belongs to another row
+  }
+  if (results[0]?.meta.changes !== 1) throw new AuthError("invite_closed");
+  const userId = results[0].meta.last_row_id;
   await writeAudit(db, {
     actorEmail: id.email,
     action: "invite.accept",

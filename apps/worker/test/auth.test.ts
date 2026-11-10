@@ -86,12 +86,46 @@ describe("login redirect", () => {
     expect(u.searchParams.get("max_age")).toBe("0");
   });
 
-  it("only accepts relative return_to paths", () => {
-    expect(safeReturnTo("/today")).toBe("/today");
-    expect(safeReturnTo("//evil.test")).toBe("/");
-    expect(safeReturnTo("https://evil.test")).toBe("/");
-    expect(safeReturnTo("/\\evil")).toBe("/");
-    expect(safeReturnTo(null)).toBe("/");
+  it("only accepts same-origin relative return_to paths", () => {
+    const o = "https://app.test";
+    expect(safeReturnTo("/today", o)).toBe("/today");
+    expect(safeReturnTo("/invoices?x=1#top", o)).toBe("/invoices?x=1#top");
+    expect(safeReturnTo("/%2F%2Fevil.test", o)).toBe("/%2F%2Fevil.test"); // stays a path
+    expect(safeReturnTo("/caf\u00e9/\u20ac", o)).toBe("/caf%C3%A9/%E2%82%AC"); // header-safe
+    for (const bad of [
+      "//evil.test",
+      "///evil.test",
+      "https://evil.test",
+      "http:/evil.test",
+      "javascript:alert(1)",
+      "/\\evil",
+      "\\\\evil",
+      "/\t/evil.test",
+      "/\n/evil.test",
+      "/../..//evil.test",
+      "/./\u0000",
+      "today",
+      "",
+      "/" + "a".repeat(3000),
+    ]) {
+      expect(safeReturnTo(bad, o), bad).toBe("/");
+    }
+    expect(safeReturnTo(null, o)).toBe("/");
+  });
+
+  it("carries a decoded but hostile return_to through as / (end to end)", async () => {
+    await addUser(ADMIN, ["admin"], { sub: null });
+    // URLSearchParams decodes %2F%2F and %5C before our check sees them.
+    for (const rt of ["//evil.test", "/\\evil.test", "https://evil.test/x"]) {
+      await resetDb();
+      await addUser(ADMIN, ["admin"], { sub: null });
+      const r = await doLogin(stubWith(), { returnTo: rt });
+      expect(r.callback.headers.get("location")).toBe("/");
+    }
+    await resetDb();
+    await addUser(ADMIN, ["admin"], { sub: null });
+    const ok = await doLogin(stubWith(), { returnTo: "/payables?tab=open" });
+    expect(ok.callback.headers.get("location")).toBe("/payables?tab=open");
   });
 });
 
@@ -133,8 +167,9 @@ describe("callback", () => {
     const dump = JSON.stringify((await db.prepare("SELECT * FROM sessions").all()).results);
     expect(dump).not.toContain(token);
 
+    // A plain login without auth_time does not count as a fresh sign-in for step-up.
     const me = await authed("/api/auth/me", token ?? "");
-    expect(await me.json()).toMatchObject({ email: ADMIN, roles: ["admin"], stepUpFresh: true });
+    expect(await me.json()).toMatchObject({ email: ADMIN, roles: ["admin"], stepUpFresh: false });
 
     const audit = await db
       .prepare("SELECT actor_email, action FROM audit_log WHERE action = 'auth.login'")
@@ -171,6 +206,17 @@ describe("callback", () => {
     ["email not verified", { email_verified: false }],
     ["wrong hd", { hd: "gmail.com" }],
     ["missing hd", { hd: undefined }],
+    ["hd in different case but email outside domain", { email: "x@gmail.com" }],
+    ["subdomain email", { email: "gerrie.grobbelaar@evil.camelthorncapital.com" }],
+    ["email_verified as string", { email_verified: "true" }],
+    ["multi-audience", { aud: [CLIENT_ID, "other-client"] }],
+    ["azp of another client", { azp: "other-client" }],
+    ["missing iat", { iat: undefined }],
+    ["iat in the future", { iat: Math.floor(Date.now() / 1000) + 600 }],
+    ["auth_time in the future", { auth_time: Math.floor(Date.now() / 1000) + 600 }],
+    ["auth_time not a number", { auth_time: "now" }],
+    ["missing exp", { exp: undefined }],
+    ["missing nonce", { nonce: undefined }],
   ])("denies: %s", async (_name, over) => {
     await addUser(ADMIN, ["admin"], { sub: null });
     const r = await doLogin(stubWith(over));
@@ -185,11 +231,90 @@ describe("callback", () => {
     await expectDenied(await doLogin(stub));
   });
 
-  it("denies alg other than RS256", async () => {
+  it.each(["none", "HS256", "RS384", "PS256", "ES256", undefined])(
+    "denies alg %s (RS256 only)",
+    async (alg) => {
+      await addUser(ADMIN, ["admin"], { sub: null });
+      const stub = newStub([key], (nonce, k) => signJwt(k, claims({ nonce }), { alg }));
+      stubGoogle(stub);
+      await expectDenied(await doLogin(stub));
+    },
+  );
+
+  it("denies an HS256 token MAC'd with the public key (key confusion)", async () => {
     await addUser(ADMIN, ["admin"], { sub: null });
-    const stub = newStub([key], (nonce, k) => signJwt(k, claims({ nonce }), { alg: "none" }));
+    const stub = newStub([key], async (nonce) => {
+      const enc = new TextEncoder();
+      const b64 = (o: unknown): string =>
+        btoa(JSON.stringify(o)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      const h = b64({ alg: "HS256", typ: "JWT", kid: key.kid });
+      const p = b64(claims({ nonce }));
+      const k = await crypto.subtle.importKey(
+        "raw",
+        enc.encode(key.jwk.n ?? ""),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"],
+      );
+      const sig = new Uint8Array(await crypto.subtle.sign("HMAC", k, enc.encode(`${h}.${p}`)));
+      let bin = "";
+      for (const b of sig) bin += String.fromCharCode(b);
+      return `${h}.${p}.${btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")}`;
+    });
     stubGoogle(stub);
     await expectDenied(await doLogin(stub));
+  });
+
+  it("denies a token whose kid is missing or unknown, and a JWK for another alg", async () => {
+    await addUser(ADMIN, ["admin"], { sub: null });
+    const noKid = newStub([key], (nonce, k) => signJwt(k, claims({ nonce }), { kid: undefined }));
+    stubGoogle(noKid);
+    await expectDenied(await doLogin(noKid));
+    expect(noKid.jwksFetches).toBe(0);
+
+    const unknown = newStub([key], (nonce, k) => signJwt(k, claims({ nonce }), { kid: "nope" }));
+    stubGoogle(unknown);
+    await expectDenied(await doLogin(unknown));
+
+    const wrongAlg: TestKey = { ...key, jwk: { ...key.jwk, alg: "RS512" } };
+    const stub = newStub([wrongAlg], (nonce, k) => signJwt(k, claims({ nonce })));
+    stubGoogle(stub);
+    await expectDenied(await doLogin(stub));
+  });
+
+  it("fails closed when the JWKS cannot be fetched or is malformed", async () => {
+    await addUser(ADMIN, ["admin"], { sub: null });
+    for (const jwks of [
+      new Response("down", { status: 503 }),
+      new Response("not json", { status: 200 }),
+      Response.json({ nokeys: true }),
+    ]) {
+      const stub = stubWith();
+      const real = globalThis.fetch;
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        if (url === "https://www.googleapis.com/oauth2/v3/certs") return jwks.clone();
+        return real(input, init);
+      });
+      await expectDenied(await doLogin(stub));
+    }
+  });
+
+  it("a replayed callback (same flow cookie, state and code) cannot create a second session", async () => {
+    await addUser(ADMIN, ["admin"], { sub: null });
+    const r = await doLogin(stubWith());
+    expect(r.sessionToken).toBeTruthy();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const again = await r.replay();
+    expect(again.headers.get("location")).toBe("/?auth=denied");
+    expect(warn).toHaveBeenLastCalledWith("sign-in denied", "flow_replayed");
+    expect(setCookies(again).some((c) => /^__Host-session=[^;]+;/.test(c))).toBe(false);
+    expect(await db.prepare("SELECT COUNT(*) AS n FROM sessions").first<{ n: number }>()).toEqual({
+      n: 1,
+    });
+    // The flow cookie is cleared on success too.
+    expect(setCookies(r.callback).some((c) => c.startsWith("__Host-oauth=;"))).toBe(true);
   });
 
   it("accepts the bare accounts.google.com issuer", async () => {
@@ -290,7 +415,10 @@ describe("callback", () => {
   it("step-up login replaces the old session and refreshes last_auth_at", async () => {
     const id = await addUser(ADMIN, ["admin"], { sub: "google-sub-1" });
     const old = await addSession(id, { lastAuthAgoMs: 60 * 60 * 1000 });
-    const r = await doLogin(stubWith(), { stepUp: true, existingSession: old });
+    const r = await doLogin(stubWith({ auth_time: Math.floor(Date.now() / 1000) - 5 }), {
+      stepUp: true,
+      existingSession: old,
+    });
     expect(r.sessionToken).toBeTruthy();
     expect((await authed("/api/auth/me", old)).status).toBe(401);
     const me = await authed("/api/auth/me", r.sessionToken ?? "");
@@ -303,6 +431,61 @@ describe("callback", () => {
       stepUp: true,
     });
     expect(id).toBeGreaterThan(0);
+    await expectDenied(r);
+  });
+});
+
+describe("step-up cannot be refreshed without re-authenticating", () => {
+  it("step-up denies when Google omits auth_time", async () => {
+    await addUser(ADMIN, ["admin"], { sub: "google-sub-1" });
+    await expectDenied(await doLogin(stubWith(), { stepUp: true }));
+  });
+
+  it("a plain (silent SSO) login does not make the session step-up fresh", async () => {
+    const id = await addUser(ADMIN, ["admin"], { sub: "google-sub-1" });
+    const stale = await addSession(id, { lastAuthAgoMs: 60 * 60 * 1000 });
+    // Google reports the original authentication an hour ago.
+    const r = await doLogin(stubWith({ auth_time: Math.floor(Date.now() / 1000) - 3600 }), {
+      existingSession: stale,
+    });
+    expect(r.sessionToken).toBeTruthy();
+    const body = { email: "x@camelthorncapital.com", roles: ["viewer"] };
+    const res = await authed("/api/users/invite", r.sessionToken ?? "", {
+      method: "POST",
+      json: body,
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "step_up_required" });
+
+    // Without auth_time at all: also not fresh.
+    const r2 = await doLogin(stubWith());
+    const me = await authed("/api/auth/me", r2.sessionToken ?? "");
+    expect(await me.json()).toMatchObject({ stepUpFresh: false });
+  });
+
+  it("a plain login whose auth_time is genuinely recent counts as a sign-in within 15 minutes", async () => {
+    await addUser(ADMIN, ["admin"], { sub: "google-sub-1" });
+    const r = await doLogin(stubWith({ auth_time: Math.floor(Date.now() / 1000) - 60 }));
+    const me = await authed("/api/auth/me", r.sessionToken ?? "");
+    expect(await me.json()).toMatchObject({ stepUpFresh: true });
+  });
+
+  it("the step_up flag in the flow cookie cannot be flipped", async () => {
+    await addUser(ADMIN, ["admin"], { sub: "google-sub-1" });
+    const r = await doLogin(stubWith(), {
+      flowCookie: (c) => {
+        const [payload, sig] = c.split(".");
+        const json = JSON.parse(atob((payload ?? "").replace(/-/g, "+").replace(/_/g, "/"))) as {
+          stepUp: boolean;
+        };
+        json.stepUp = !json.stepUp;
+        const p = btoa(JSON.stringify(json))
+          .replace(/\+/g, "-")
+          .replace(/\//g, "_")
+          .replace(/=+$/, "");
+        return `${p}.${sig ?? ""}`;
+      },
+    });
     await expectDenied(r);
   });
 });
@@ -346,6 +529,25 @@ describe("sessions", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("set-cookie")).toContain("Max-Age=0");
     expect((await authed("/api/auth/me", t)).status).toBe(401);
+  });
+
+  it("logout of an expired or unknown session still clears the cookie, and needs CSRF", async () => {
+    const res = await authed("/api/auth/logout", "a".repeat(43), { method: "POST" });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("set-cookie")).toContain("__Host-session=; Path=/");
+    expect(res.headers.get("set-cookie")).toContain("Max-Age=0");
+    const noCsrf = await call("/api/auth/logout", { method: "POST" });
+    expect(noCsrf.status).toBe(403);
+  });
+
+  it("logout is audited under the user's email", async () => {
+    const id = await addUser("a@camelthorncapital.com", ["viewer"]);
+    const t = await addSession(id);
+    await authed("/api/auth/logout", t, { method: "POST" });
+    const row = await db
+      .prepare("SELECT actor_email, after_json FROM audit_log WHERE action = 'auth.logout'")
+      .first();
+    expect(row).toEqual({ actor_email: "a@camelthorncapital.com", after_json: null });
   });
 
   it("garbage tokens are rejected", async () => {

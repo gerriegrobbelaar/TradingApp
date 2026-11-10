@@ -121,6 +121,8 @@ export interface LoginResult {
   callback: Response;
   sessionToken: string | undefined;
   authUrl: URL;
+  /** Replays the exact same callback request (same cookies, code and state). */
+  replay: () => Promise<Response>;
 }
 
 /**
@@ -134,9 +136,14 @@ export async function doLogin(
     state?: (s: string) => string;
     flowCookie?: (c: string) => string | undefined;
     existingSession?: string;
+    returnTo?: string;
   } = {},
 ): Promise<LoginResult> {
-  const login = await call(`/api/auth/login${opts.stepUp ? "?step_up=1" : ""}`);
+  const q = new URLSearchParams();
+  if (opts.stepUp) q.set("step_up", "1");
+  if (opts.returnTo !== undefined) q.set("return_to", opts.returnTo);
+  const qs = q.toString();
+  const login = await call(`/api/auth/login${qs ? `?${qs}` : ""}`);
   const authUrl = new URL(login.headers.get("location") ?? "");
   lastNonce = authUrl.searchParams.get("nonce") ?? "";
   let flow = cookieFrom(login, "__Host-oauth");
@@ -150,13 +157,17 @@ export async function doLogin(
   ]
     .filter(Boolean)
     .join("; ");
-  const callback = await call(
-    `/api/auth/callback?code=abc&state=${encodeURIComponent(state ?? "")}`,
-    {
+  const send = (): Promise<Response> =>
+    call(`/api/auth/callback?code=abc&state=${encodeURIComponent(state ?? "")}`, {
       headers: cookies ? { cookie: cookies } : {},
-    },
-  );
-  return { callback, authUrl, sessionToken: cookieFrom(callback, "__Host-session") };
+    });
+  const callback = await send();
+  return {
+    callback,
+    authUrl,
+    sessionToken: cookieFrom(callback, "__Host-session"),
+    replay: send,
+  };
 }
 
 export function newStub(
@@ -207,7 +218,7 @@ export async function addSession(
   userId: number,
   opts: { lastAuthAgoMs?: number; lastSeenAgoMs?: number } = {},
 ): Promise<string> {
-  const token = await createSession(db, userId, Date.now());
+  const token = await createSession(db, userId, Date.now(), Date.now());
   const hash = await sha256Hex(token);
   const iso = (ago: number): string => new Date(Date.now() - ago).toISOString();
   await db

@@ -23,11 +23,15 @@ export interface Session {
 
 const iso = (ms: number): string => new Date(ms).toISOString();
 
-/** Returns the raw token (for the cookie). Only its SHA-256 hex is stored. */
+/**
+ * Returns the raw token (for the cookie). Only its SHA-256 hex is stored. `lastAuthMs` is when
+ * Google says the user actually authenticated (auth_time); it drives the step-up window.
+ */
 export async function createSession(
   db: D1Database,
   userId: number,
   nowMs: number,
+  lastAuthMs: number,
 ): Promise<string> {
   const token = randomBase64Url(32);
   const hash = await sha256Hex(token);
@@ -39,9 +43,9 @@ export async function createSession(
     db
       .prepare(
         `INSERT INTO sessions (token_hash, user_id, created_at, last_seen_at, expires_at, last_auth_at)
-         VALUES (?1, ?2, ?3, ?3, ?4, ?3)`,
+         VALUES (?1, ?2, ?3, ?3, ?4, ?5)`,
       )
-      .bind(hash, userId, iso(nowMs), iso(nowMs + ABSOLUTE_CAP_MS)),
+      .bind(hash, userId, iso(nowMs), iso(nowMs + ABSOLUTE_CAP_MS), iso(lastAuthMs)),
   ]);
   return token;
 }

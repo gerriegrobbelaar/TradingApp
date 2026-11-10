@@ -28,7 +28,9 @@ function parseRoles(v: unknown): Role[] | null {
 }
 
 function parseId(ctx: Ctx): number | null {
-  const n = Number(ctx.params.id);
+  const raw = ctx.params.id ?? "";
+  if (!/^[1-9][0-9]{0,15}$/.test(raw)) return null;
+  const n = Number(raw);
   return Number.isSafeInteger(n) && n > 0 ? n : null;
 }
 
@@ -102,10 +104,16 @@ export function registerUserRoutes(router: Router): void {
       .first();
     if (existing) return json({ error: "already_exists" }, 409);
     const actor = ctx.session?.email ?? "";
-    const ins = await db
-      .prepare("INSERT INTO invites (email, roles, invited_by) VALUES (?1, ?2, ?3)")
-      .bind(email, JSON.stringify(roles), actor)
-      .run();
+    let ins: D1Result;
+    try {
+      ins = await db
+        .prepare("INSERT INTO invites (email, roles, invited_by) VALUES (?1, ?2, ?3)")
+        .bind(email, JSON.stringify(roles), actor)
+        .run();
+    } catch {
+      // A concurrent invite for the same email won the partial unique index.
+      return json({ error: "already_exists" }, 409);
+    }
     await writeAudit(db, {
       actorEmail: actor,
       action: "user.invite",
