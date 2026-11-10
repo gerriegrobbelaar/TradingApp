@@ -144,8 +144,11 @@ export function Users() {
         const removed = data?.users.find(
           (u) => u.disabled && u.email === email.trim().toLowerCase(),
         );
-        if (removed) openDialog({ kind: "restore", user: removed });
-        else setInviteError(describe(err));
+        if (removed) {
+          openDialog({ kind: "restore", user: removed });
+          // Start from the roles the admin just picked in the form.
+          if (inviteRoles.length > 0) setSheetRoles(inviteRoles);
+        } else setInviteError(describe(err));
       } else setInviteError(describe(err));
     } finally {
       setBusy(false);
@@ -185,7 +188,7 @@ export function Users() {
         <h2 className="h2">Add a person</h2>
         <p className="lede">
           People can sign in with Google only after an admin adds their @{ALLOWED_DOMAIN} email. No
-          email is sent. Once added, they can sign in with Google now.
+          email is sent, so let them know they can sign in.
         </p>
         <form onSubmit={submitInvite} noValidate className="form">
           <label className="field">

@@ -106,7 +106,18 @@ describe("atomic change + audit", () => {
     expect(
       await n("SELECT COUNT(*) AS n FROM user_roles WHERE user_id = ?1 AND role = 'finance'", uid),
     ).toBe(1);
-    expect(await auditCount("user.roles_changed")).toBe(2);
+    // The later one may see the role already present and then writes nothing (no-op).
+    const audits = await auditCount("user.roles_changed");
+    expect(audits === 1 || audits === 2).toBe(true);
+  });
+
+  it("a PATCH that changes nothing writes no audit row and keeps sessions", async () => {
+    const uid = await addUser("f@camelthorncapital.com", ["viewer", "finance"]);
+    await addSession(uid);
+    const res = await patch(uid, adminTok, ["finance", "viewer"]);
+    expect(res.status).toBe(200);
+    expect(await auditCount("user.roles_changed")).toBe(0);
+    expect(await n("SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?1", uid)).toBe(1);
   });
 
   it("a failing batch leaves neither the change nor the audit row", async () => {
@@ -426,5 +437,216 @@ describe("seed marker short-circuit", () => {
     } as unknown as D1Database;
     expect(await seedInitialAdmin(counting, "seed@camelthorncapital.com")).toBe("exists");
     expect(batches).toBe(0);
+  });
+});
+
+describe("F1 review: sign-in, logout and headers", () => {
+  let key: TestKey;
+  beforeAll(async () => {
+    key = await makeKey("k-f1r");
+  });
+  const loginAs = (email: string, sub: string, stepUp = false) => {
+    const stub = newStub([key], (nonce, k) =>
+      signJwt(k, claims({ nonce, email, sub, auth_time: Math.floor(Date.now() / 1000) })),
+    );
+    stubGoogle(stub);
+    return doLogin(stub, { stepUp });
+  };
+
+  it("an invite revoked through the API cannot be used to sign in", async () => {
+    const res = await authed("/api/users/invite", adminTok, {
+      method: "POST",
+      json: { email: "rv@camelthorncapital.com", roles: ["finance"] },
+    });
+    const { id } = (await res.json()) as { id: number };
+    expect((await authed(`/api/users/invites/${id}`, adminTok, { method: "DELETE" })).status).toBe(
+      200,
+    );
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const r = await loginAs("rv@camelthorncapital.com", "sub-rv");
+    expect(r.sessionToken).toBeUndefined();
+    expect(r.callback.headers.get("location")).toBe("/?auth=denied");
+    expect(
+      await n("SELECT COUNT(*) AS n FROM users WHERE email = 'rv@camelthorncapital.com'"),
+    ).toBe(0);
+    expect(await auditCount("invite.accept")).toBe(0);
+  });
+
+  it("a restored user can sign in again with the same Google account", async () => {
+    const uid = await addUser("back@camelthorncapital.com", ["viewer"], {
+      sub: "sub-back",
+      disabled: true,
+    });
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    expect((await loginAs("back@camelthorncapital.com", "sub-back")).sessionToken).toBeUndefined();
+    const restored = await authed(`/api/users/${uid}/restore`, adminTok, {
+      method: "POST",
+      json: { roles: ["finance"] },
+    });
+    expect(restored.status).toBe(200);
+    expect((await loginAs("back@camelthorncapital.com", "sub-back")).sessionToken).toBeTruthy();
+  });
+
+  it("concurrent invites each audit their own invite id (last_insert_rowid in a batch)", async () => {
+    const emails = Array.from({ length: 6 }, (_, i) => `c${i}@camelthorncapital.com`);
+    const rs = await Promise.all(
+      emails.map((email) =>
+        authed("/api/users/invite", adminTok, {
+          method: "POST",
+          json: { email, roles: ["viewer"] },
+        }),
+      ),
+    );
+    expect(rs.every((r) => r.status === 201)).toBe(true);
+    const { results } = await db
+      .prepare(
+        `SELECT a.entity_id, json_extract(a.after_json, '$.email') AS email, i.id AS invite_id
+         FROM audit_log a JOIN invites i ON i.email = json_extract(a.after_json, '$.email')
+         WHERE a.action = 'user.invite' AND a.id > ?1`,
+      )
+      .bind(auditBaseline)
+      .all<{ entity_id: string; email: string; invite_id: number }>();
+    expect(results).toHaveLength(emails.length);
+    for (const r of results) expect(r.entity_id).toBe(String(r.invite_id));
+  });
+
+  it("sign-in commits the session and its auth.login audit row together", async () => {
+    await addUser("s1@camelthorncapital.com", ["viewer"], { sub: "sub-s1" });
+    // The auth.login audit insert fails (wherever it runs): the session must not survive it,
+    // which only holds when session and audit row commit in one batch.
+    const real = env.DB;
+    const sqlOf = new WeakMap<D1PreparedStatement, string>();
+    const isAudit = (s: D1PreparedStatement): boolean =>
+      sqlOf.get(s)?.includes("INSERT INTO audit_log") ?? false;
+    const wrap = (st: D1PreparedStatement, q: string): D1PreparedStatement => {
+      sqlOf.set(st, q);
+      const bind = st.bind.bind(st);
+      const run = st.run.bind(st);
+      st.bind = (...v: unknown[]) => wrap(bind(...v), q);
+      st.run = (() =>
+        q.includes("INSERT INTO audit_log")
+          ? Promise.reject(new Error("audit write failed"))
+          : run()) as D1PreparedStatement["run"];
+      return st;
+    };
+    const broken = {
+      prepare: (q: string) => wrap(real.prepare(q), q),
+      batch: (stmts: D1PreparedStatement[]) =>
+        stmts.some(isAudit)
+          ? real.batch([...stmts, real.prepare("SELECT * FROM table_that_does_not_exist")])
+          : real.batch(stmts),
+    } as unknown as D1Database;
+    const stub = newStub([key], (nonce, k) =>
+      signJwt(k, claims({ nonce, email: "s1@camelthorncapital.com", sub: "sub-s1" })),
+    );
+    stubGoogle(stub);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const login = await worker.fetch(new Request(`${ORIGIN}/api/auth/login`), env);
+    const authUrl = new URL(login.headers.get("location") ?? "");
+    const flow = (login.headers as Headers & { getSetCookie(): string[] })
+      .getSetCookie()
+      .find((c) => c.startsWith("__Host-oauth="))
+      ?.split(";")[0];
+    // The helper's token stub reads the nonce from the last doLogin; drive one real login first.
+    const ok = await loginAs("s1@camelthorncapital.com", "sub-s1");
+    expect(ok.sessionToken).toBeTruthy();
+    const before = await auditCount("auth.login");
+    const sessionsBefore = await n("SELECT COUNT(*) AS n FROM sessions");
+    const stub2 = newStub([key], (_nonce, k) =>
+      signJwt(
+        k,
+        claims({
+          nonce: authUrl.searchParams.get("nonce"),
+          email: "s1@camelthorncapital.com",
+          sub: "sub-s1",
+        }),
+      ),
+    );
+    stubGoogle(stub2);
+    const cb = await worker.fetch(
+      new Request(
+        `${ORIGIN}/api/auth/callback?code=x&state=${encodeURIComponent(authUrl.searchParams.get("state") ?? "")}`,
+        { headers: { cookie: flow ?? "" } },
+      ),
+      { ...env, DB: broken },
+    );
+    expect(cb.headers.get("location")).toBe("/?auth=denied");
+    // Denied because the session batch failed, not for an earlier reason.
+    expect(warn).toHaveBeenLastCalledWith("sign-in denied", "internal_error");
+    expect(
+      await n("SELECT COUNT(*) AS n FROM idempotency_keys WHERE scope = 'auth.flow'"),
+    ).toBeGreaterThan(0);
+    expect(await auditCount("auth.login")).toBe(before);
+    expect(await n("SELECT COUNT(*) AS n FROM sessions")).toBe(sessionsBefore);
+  });
+
+  it("step-up sign-in replaces the old session and audits auth.step_up once", async () => {
+    await addUser("s2@camelthorncapital.com", ["viewer"], { sub: "sub-s2" });
+    const first = await loginAs("s2@camelthorncapital.com", "sub-s2");
+    const stub = newStub([key], (nonce, k) =>
+      signJwt(
+        k,
+        claims({
+          nonce,
+          email: "s2@camelthorncapital.com",
+          sub: "sub-s2",
+          auth_time: Math.floor(Date.now() / 1000),
+        }),
+      ),
+    );
+    stubGoogle(stub);
+    const second = await doLogin(stub, { stepUp: true, existingSession: first.sessionToken });
+    expect(second.sessionToken).toBeTruthy();
+    const uid = await n("SELECT id AS n FROM users WHERE email = 's2@camelthorncapital.com'");
+    expect(await n("SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?1", uid)).toBe(1);
+    expect(await auditCount("auth.step_up")).toBe(1);
+  });
+
+  it("concurrent logouts of one session write exactly one auth.logout row", async () => {
+    const t = await addSession(adminId);
+    const rs = await Promise.all([
+      authed("/api/auth/logout", t, { method: "POST" }),
+      authed("/api/auth/logout", t, { method: "POST" }),
+    ]);
+    expect(rs.map((r) => r.status)).toEqual([200, 200]);
+    expect(await auditCount("auth.logout")).toBe(1);
+    expect((await authed("/api/auth/me", t)).status).toBe(401);
+  });
+
+  it("router-generated 401, 403, 404, 405 and CSRF answers carry no-store and nosniff", async () => {
+    const fin = await addSession(await addUser("h@camelthorncapital.com", ["finance"]));
+    const stale = await addSession(adminId, { lastAuthAgoMs: 3600_000 });
+    const responses = [
+      await worker.fetch(new Request(`${ORIGIN}/api/users`), env), // 401
+      await authed("/api/users", fin), // 403
+      await authed("/api/users/invite", stale, { method: "POST", json: {} }), // 401 step-up
+      await worker.fetch(new Request(`${ORIGIN}/api/nope`), env), // 404
+      await authed("/api/users", adminTok, { method: "PUT" }), // 405
+      await worker.fetch(new Request(`${ORIGIN}/api/auth/logout`, { method: "POST" }), env), // csrf
+    ];
+    expect(responses.map((r) => r.status)).toEqual([401, 403, 401, 404, 405, 403]);
+    for (const r of responses) {
+      expect(r.headers.get("cache-control")).toBe("no-store");
+      expect(r.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(r.headers.get("content-type")).toContain("application/json");
+    }
+  });
+
+  it("a handler that returns an error Response is passed through untouched", async () => {
+    const router = new Router().add("GET", "/api/teapot", { public: true }, () =>
+      json({ error: "teapot" }, 418),
+    );
+    const res = await router.handle(new Request(`${ORIGIN}/api/teapot`), env);
+    expect(res?.status).toBe(418);
+    expect(await res?.json()).toEqual({ error: "teapot" });
+  });
+
+  it("a malformed path escape answers 400 json, not 500", async () => {
+    const res = await authed("/api/users/%E0%A4%A/restore", adminTok, {
+      method: "POST",
+      json: { roles: ["viewer"] },
+    });
+    expect(res.status).toBe(400);
+    expect(res.headers.get("cache-control")).toBe("no-store");
   });
 });

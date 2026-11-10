@@ -15,7 +15,12 @@ export interface AuditEntry {
   actorEmail: string;
   action: string;
   entity: string;
-  /** `LAST_INSERT_ID` uses the row id of the insert directly before this statement in a batch. */
+  /**
+   * `LAST_INSERT_ID` uses SQLite's `last_insert_rowid()`: the row id of the insert directly
+   * before this statement in the same batch. Only use it right after an UNCONDITIONAL single-row
+   * INSERT; after an insert that wrote nothing (guarded, ON CONFLICT DO NOTHING) it would carry a
+   * stale id from an earlier insert on the connection.
+   */
   entityId?: string | number | null | typeof LAST_INSERT_ID;
   before?: unknown;
   after?: unknown;

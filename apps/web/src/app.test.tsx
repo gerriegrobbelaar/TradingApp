@@ -436,7 +436,8 @@ describe("users", () => {
     expect(calls.some((c) => c.method === "DELETE")).toBe(false);
     const sheet = await screen.findByRole("dialog", { name: "Revoke this invite" });
     await user.click(within(sheet).getByRole("button", { name: "Revoke invite" }));
-    expect(calls.some((c) => c.method === "DELETE" && c.url === "/api/users/invites/9")).toBe(true);
+    const del = calls.find((c) => c.method === "DELETE" && c.url === "/api/users/invites/9");
+    expect(del?.headers["X-Requested-With"]).toBe("camelthorn");
     expect(await screen.findByText("Revoked the invite for n@camelthorncapital.com.")).toBeTruthy();
   });
 
@@ -457,7 +458,9 @@ describe("users", () => {
     );
     await user.click(within(sheet).getByRole("checkbox", { name: "Finance" }));
     await user.click(within(sheet).getByRole("button", { name: "Restore person" }));
-    expect(calls.find((c) => c.method === "POST")?.body).toEqual({ roles: ["finance"] });
+    const post = calls.find((c) => c.method === "POST");
+    expect(post?.body).toEqual({ roles: ["finance"] });
+    expect(post?.headers["X-Requested-With"]).toBe("camelthorn");
     expect(await screen.findByText("Restored gone@camelthorncapital.com.")).toBeTruthy();
   });
 
@@ -471,7 +474,10 @@ describe("users", () => {
     renderApp("/settings/users");
     await user.type(await screen.findByLabelText("Email"), "Gone@camelthorncapital.com");
     await user.click(screen.getByRole("button", { name: "Add person" }));
-    expect(await screen.findByRole("dialog", { name: "Restore this person" })).toBeTruthy();
+    const sheet = await screen.findByRole("dialog", { name: "Restore this person" });
+    // Starts from the roles picked in the form (viewer by default), never the old ones.
+    expect(within(sheet).getByRole("checkbox", { name: "Viewer" })).toHaveProperty("checked", true);
+    expect(within(sheet).getByRole("checkbox", { name: "Admin" })).toHaveProperty("checked", false);
   });
 
   it("changes roles and shows the server's plain-language error", async () => {

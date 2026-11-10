@@ -205,6 +205,10 @@ export function registerUserRoutes(router: Router): void {
     const before = await rolesOf(db, id);
     const removed = before.filter((r) => !roles.includes(r));
     const added = roles.filter((r) => !before.includes(r));
+    // Nothing to change: no write and no audit noise.
+    if (removed.length === 0 && added.length === 0) {
+      return json({ id, email: target.email, roles });
+    }
     const actor = ctx.session?.email ?? "";
 
     // One condition on every statement: the user is still enabled and, when the admin role is

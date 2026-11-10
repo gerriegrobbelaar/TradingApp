@@ -1,4 +1,4 @@
-import { writeAudit } from "../db/audit";
+import { auditStatement } from "../db/audit";
 import { json, type Router } from "../router";
 import { clearCookie, FLOW_COOKIE, parseCookies, SESSION_COOKIE, setCookie } from "./cookies";
 import { randomBase64Url, safeEqual, sha256Base64Url, sha256Hex } from "./crypto";
@@ -7,7 +7,7 @@ import { AuthError, buildAuthUrl, exchangeCode, verifyIdToken } from "./google";
 import {
   ABSOLUTE_CAP_MS,
   createSession,
-  deleteSessionByToken,
+  deleteSessionByTokenStatement,
   isStepUpFresh,
   loadSession,
 } from "./session";
@@ -107,16 +107,18 @@ export function registerAuthRoutes(router: Router): void {
       ]);
       if (claim?.meta.changes !== 1) throw new AuthError("flow_replayed");
 
-      // A new session per sign-in (also on step-up); the old one is dropped.
+      // A new session per sign-in (also on step-up); the old one is dropped. Old-session
+      // removal, the new session and the sign-in audit row commit in one transaction.
       const oldToken = cookies.get(SESSION_COOKIE);
-      if (oldToken) await deleteSessionByToken(ctx.env.DB, oldToken);
-      const token = await createSession(ctx.env.DB, userId, ctx.nowMs, lastAuthMs);
-      await writeAudit(ctx.env.DB, {
-        actorEmail: identity.email,
-        action: flow.stepUp ? "auth.step_up" : "auth.login",
-        entity: "user",
-        entityId: userId,
-      });
+      const token = await createSession(ctx.env.DB, userId, ctx.nowMs, lastAuthMs, [
+        ...(oldToken ? [await deleteSessionByTokenStatement(ctx.env.DB, oldToken)] : []),
+        auditStatement(ctx.env.DB, {
+          actorEmail: identity.email,
+          action: flow.stepUp ? "auth.step_up" : "auth.login",
+          entity: "user",
+          entityId: userId,
+        }),
+      ]);
 
       const headers = new Headers({ location: flow.returnTo, "cache-control": "no-store" });
       headers.append("set-cookie", clearCookie(FLOW_COOKIE));
@@ -134,15 +136,30 @@ export function registerAuthRoutes(router: Router): void {
   router.add("POST", "/api/auth/logout", { public: true }, async (ctx) => {
     const token = parseCookies(ctx.request.headers.get("cookie")).get(SESSION_COOKIE);
     if (token) {
-      const session = await loadSession(ctx.env.DB, token, ctx.nowMs);
-      await deleteSessionByToken(ctx.env.DB, token);
+      const db = ctx.env.DB;
+      const session = await loadSession(db, token, ctx.nowMs);
+      const del = await deleteSessionByTokenStatement(db, token);
       if (session) {
-        await writeAudit(ctx.env.DB, {
-          actorEmail: session.email,
-          action: "auth.logout",
-          entity: "user",
-          entityId: session.userId,
-        });
+        // Delete and audit in one transaction; the audit row only lands if this call really
+        // removed the session (a concurrent logout leaves exactly one row).
+        await db.batch([
+          auditStatement(
+            db,
+            {
+              actorEmail: session.email,
+              action: "auth.logout",
+              entity: "user",
+              entityId: session.userId,
+            },
+            {
+              sql: "EXISTS (SELECT 1 FROM sessions WHERE token_hash = ?7)",
+              binds: [session.tokenHash],
+            },
+          ),
+          del,
+        ]);
+      } else {
+        await del.run();
       }
     }
     return json({ ok: true }, 200, { "set-cookie": clearCookie(SESSION_COOKIE) });

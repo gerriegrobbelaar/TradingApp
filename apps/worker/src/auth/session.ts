@@ -26,12 +26,17 @@ const iso = (ms: number): string => new Date(ms).toISOString();
 /**
  * Returns the raw token (for the cookie). Only its SHA-256 hex is stored. `lastAuthMs` is when
  * Google says the user actually authenticated (auth_time); it drives the step-up window.
+ *
+ * `withStatements` run in the SAME batch (one D1 transaction) after the insert: callers pass the
+ * sign-in audit row (and the removal of the previous session) so the session and its audit row
+ * commit together or not at all.
  */
 export async function createSession(
   db: D1Database,
   userId: number,
   nowMs: number,
   lastAuthMs: number,
+  withStatements: readonly D1PreparedStatement[] = [],
 ): Promise<string> {
   const token = randomBase64Url(32);
   const hash = await sha256Hex(token);
@@ -50,6 +55,7 @@ export async function createSession(
          VALUES (?1, ?2, ?3, ?3, ?4, ?5)`,
       )
       .bind(hash, userId, iso(nowMs), iso(nowMs + ABSOLUTE_CAP_MS), iso(lastAuthMs)),
+    ...withStatements,
   ]);
   return token;
 }
@@ -92,11 +98,12 @@ export async function loadSession(
   };
 }
 
-export async function deleteSessionByToken(db: D1Database, token: string): Promise<void> {
-  await db
-    .prepare("DELETE FROM sessions WHERE token_hash = ?1")
-    .bind(await sha256Hex(token))
-    .run();
+/** Prepared (not executed) delete of one session, for use inside a batch. */
+export async function deleteSessionByTokenStatement(
+  db: D1Database,
+  token: string,
+): Promise<D1PreparedStatement> {
+  return db.prepare("DELETE FROM sessions WHERE token_hash = ?1").bind(await sha256Hex(token));
 }
 
 export function deleteSessionsForUser(db: D1Database, userId: number): D1PreparedStatement {
