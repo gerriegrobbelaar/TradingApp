@@ -1,8 +1,6 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { describe, expect, it } from "vitest";
+import { render, screen } from "@testing-library/react";
 import { Button, readStoredTheme } from "@camelthorn/ui";
-
-afterEach(cleanup);
 
 describe("@camelthorn/ui from apps/web", () => {
   it("imports components and theme helpers", () => {

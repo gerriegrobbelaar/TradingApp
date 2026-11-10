@@ -1,0 +1,135 @@
+/* App-level layout helpers on top of @camelthorn/ui styles. Tokens only; no new colours. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+.app .skip {
+  position: absolute;
+  left: 16px;
+  top: -80px;
+  z-index: 50;
+  padding: 10px 16px;
+  border-radius: 999px;
+  background: var(--sheet);
+  color: var(--ink);
+  border: 1px solid var(--line);
+}
+.app .skip:focus {
+  top: 12px;
+}
+.app #main:focus {
+  outline: none;
+}
+.app .main {
+  gap: 20px;
+}
+.app .h1 {
+  overflow-wrap: anywhere;
+}
+@media (max-width: 760px) {
+  .app .h1 {
+    font-size: 30px;
+    line-height: 36px;
+  }
+  .app .topnav .brand {
+    min-width: 0;
+  }
+}
+.signin {
+  min-height: 70vh;
+  display: grid;
+  place-items: center;
+}
+.signin-card {
+  width: min(460px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  align-items: flex-start;
+}
+.notice {
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 14px;
+  font-size: 13px;
+  background: var(--sunken);
+  color: var(--ink);
+}
+.notice.warn {
+  background: var(--warn-soft);
+  color: var(--warn-text);
+}
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.stack-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+.row-between {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin-top: 12px;
+}
+.chips {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.roles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  border: 0;
+  margin: 0;
+  padding: 0;
+}
+.roles legend {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+  padding: 0;
+  margin-bottom: 6px;
+}
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  min-height: 32px;
+}
+.check input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+.scroll {
+  overflow-x: auto;
+  margin-top: 8px;
+}
+.tbl caption {
+  text-align: left;
+}
+.settings-seg {
+  align-self: flex-start;
+}
