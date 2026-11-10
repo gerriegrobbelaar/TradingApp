@@ -11,5 +11,6 @@ export default tseslint.config(
     files: ["packages/**/*.{ts,tsx}"],
     rules: { "@typescript-eslint/no-explicit-any": "error" },
   },
-  { files: ["apps/web/**/*.{ts,tsx}"], languageOptions: { globals: { ...globals.browser } } },
+  { files: ["apps/web/**/*.{ts,tsx,js}"], languageOptions: { globals: { ...globals.browser } } },
+  { files: ["apps/*/scripts/**/*.mjs"], languageOptions: { globals: { ...globals.node } } },
 );

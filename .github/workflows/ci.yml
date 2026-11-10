@@ -17,6 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      # TODO(N7): pin these actions by commit SHA (uses: owner/repo@<sha> # v4). The SHAs could not
+      # be verified from the build environment (GitHub API access was unavailable), so the major
+      # tags are kept for now rather than guessing hashes.
       - uses: actions/checkout@v4
       # Version comes from "packageManager" in package.json.
       - uses: pnpm/action-setup@v4
@@ -27,5 +30,12 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm lint
-      - run: pnpm test
+      # Build before tests so apps/web/src/headers.test.ts also checks the built dist/_headers.
       - run: pnpm --filter @camelthorn/web build
+      - run: pnpm test
+      # Validates config, assets and bundle without publishing or needing Cloudflare credentials.
+      # It does not run the placeholder guard (scripts/check-deploy-config.mjs); `pnpm run deploy`
+      # does, so committed placeholders cannot be deployed by that path.
+      - run: pnpm --filter @camelthorn/worker exec wrangler deploy --dry-run
+        env:
+          WRANGLER_SEND_METRICS: "false"

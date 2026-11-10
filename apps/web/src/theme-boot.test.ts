@@ -3,9 +3,10 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { THEME_STORAGE_KEY } from "@camelthorn/ui";
 
-/** The inline script in index.html that sets the theme before React loads. */
+/** public/theme-boot.js, loaded synchronously from <head> in index.html (CSP: no inline script). */
 const html = readFileSync(join(__dirname, "..", "index.html"), "utf8");
-const inline = /<script>([\s\S]*?)<\/script>/.exec(html)?.[1] ?? "";
+const inline = readFileSync(join(__dirname, "..", "public", "theme-boot.js"), "utf8");
+const tag = '<script src="/theme-boot.js"></script>';
 
 function run(storage: Partial<Storage> | (() => never)) {
   const root = document.documentElement;
@@ -28,8 +29,11 @@ describe("theme boot script in index.html", () => {
 
   it("runs in <head>, before the app bundle", () => {
     expect(inline).not.toBe("");
-    expect(html.indexOf(inline)).toBeLessThan(html.indexOf("</head>"));
-    expect(html.indexOf(inline)).toBeLessThan(html.indexOf('type="module"'));
+    expect(html).not.toMatch(/<script>/); // no inline scripts, the CSP forbids them
+    expect(html.indexOf(tag)).toBeGreaterThan(-1);
+    expect(html.indexOf(tag)).toBeLessThan(html.indexOf("</head>"));
+    expect(html.indexOf(tag)).toBeLessThan(html.indexOf('type="module"'));
+    expect(tag).not.toMatch(/async|defer|module/); // must block, to run before first paint
   });
 
   it("uses the same storage key as @camelthorn/ui", () => {
