@@ -658,5 +658,21 @@ describe("configuration", () => {
     expect(await res.json()).toEqual({ error: "server_misconfigured" });
     const health = await worker.fetch(new Request("https://app.test/api/health"), broken);
     expect(health.status).toBe(200);
+    // /api/config fails closed too; the signed-out screen then shows generic text.
+    const cfg = await worker.fetch(new Request("https://app.test/api/config"), broken);
+    expect(cfg.status).toBe(500);
+    expect(await cfg.json()).toEqual({ error: "server_misconfigured" });
+  });
+
+  it("/api/config is public, uncached and carries only the domain", async () => {
+    const res = await call("/api/config");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(res.headers.get("set-cookie")).toBeNull();
+    const text = await res.text();
+    expect(JSON.parse(text)).toEqual({ allowedDomain: HD });
+    for (const secret of [env.GOOGLE_CLIENT_SECRET, env.SESSION_SECRET, env.GOOGLE_CLIENT_ID]) {
+      if (secret) expect(text).not.toContain(secret);
+    }
   });
 });

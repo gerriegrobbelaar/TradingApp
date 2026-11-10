@@ -63,14 +63,23 @@ export async function completeIdempotencyKey(
   }
 }
 
-/** Scopes whose keys are short-lived by nature and may be purged. Payment scopes never are. */
-const PURGEABLE_SCOPE_PREFIX = "auth.";
+/**
+ * Scopes whose keys are short-lived by nature and may be purged: an exact allow-list, not a
+ * prefix, so no look-alike scope name can opt in. Payment and booking scopes never appear here.
+ */
+const PURGEABLE_SCOPES: ReadonlySet<string> = new Set(["auth.flow"]);
+/**
+ * Floor for retention. Purging a key while the token it guards is still usable would re-open
+ * replay, so callers may not go below this (the sign-in flow cookie lives 10 minutes).
+ */
+const MIN_RETENTION_MS = 3600 * 1000;
 
 /**
  * Single-use token claim for ephemeral scopes (the sign-in round trip). One batch (one D1
  * transaction): an atomic INSERT ... ON CONFLICT DO NOTHING stored as already completed, plus
  * a bounded purge of this scope's expired keys. Returns true only for the one caller that
- * claimed the key. Refuses any scope outside "auth." so a payment key can never be purged.
+ * claimed the key. Refuses any scope not in PURGEABLE_SCOPES so a payment key can never be
+ * purged, and a retention shorter than MIN_RETENTION_MS.
  */
 export async function claimOnceAndPurge(
   db: D1Database,
@@ -79,8 +88,14 @@ export async function claimOnceAndPurge(
   opts: { nowMs: number; retentionMs: number; purgeLimit: number },
 ): Promise<boolean> {
   assertKey(scope, key);
-  if (!scope.startsWith(PURGEABLE_SCOPE_PREFIX)) {
+  if (!PURGEABLE_SCOPES.has(scope)) {
     throw new Error(`scope ${scope} is not purgeable; use claimIdempotencyKey`);
+  }
+  if (!Number.isFinite(opts.nowMs) || !(opts.retentionMs >= MIN_RETENTION_MS)) {
+    throw new Error("claimOnceAndPurge: retention below the minimum");
+  }
+  if (!Number.isInteger(opts.purgeLimit) || opts.purgeLimit < 1 || opts.purgeLimit > 1000) {
+    throw new Error("claimOnceAndPurge: purgeLimit must be an integer 1-1000");
   }
   const [claim] = await db.batch([
     db

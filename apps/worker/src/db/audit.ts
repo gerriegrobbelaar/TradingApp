@@ -9,6 +9,7 @@
  * the same condition on the audit statement via `guard`, then read the audit statement's
  * `meta.changes` (1 = it happened, 0 = the guard blocked everything).
  */
+import { normalizeEmail } from "@camelthorn/core";
 export const LAST_INSERT_ID = Symbol("last-insert-id");
 
 export interface AuditEntry {
@@ -99,7 +100,7 @@ export function auditStatement(
   entry: AuditEntry,
   guard?: AuditGuard,
 ): D1PreparedStatement {
-  const actor = entry.actorEmail.trim().toLowerCase();
+  const actor = normalizeEmail(entry.actorEmail);
   if (actor === "") throw new Error("audit entry needs an actor");
   const id = entry.entityId;
   const fromInsert = id === LAST_INSERT_ID;

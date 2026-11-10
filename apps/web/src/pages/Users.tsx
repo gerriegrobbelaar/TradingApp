@@ -131,7 +131,7 @@ export function Users() {
     setInviteError(null);
     setBusy(true);
     try {
-      const clean = email.trim().toLowerCase();
+      const clean = normalizeEmail(email);
       await inviteUser(clean, inviteRoles);
       toast.show(`Added ${clean}. They can sign in with Google now.`);
       setEmail("");
@@ -141,9 +141,7 @@ export function Users() {
       if (err instanceof StepUpRequired) setDialog({ kind: "stepup" });
       else if (err instanceof ApiError && err.code === "user_disabled") {
         // Removed earlier: offer Restore instead of a dead end.
-        const removed = data?.users.find(
-          (u) => u.disabled && u.email === email.trim().toLowerCase(),
-        );
+        const removed = data?.users.find((u) => u.disabled && u.email === normalizeEmail(email));
         if (removed) {
           openDialog({ kind: "restore", user: removed });
           // Start from the roles the admin just picked in the form.

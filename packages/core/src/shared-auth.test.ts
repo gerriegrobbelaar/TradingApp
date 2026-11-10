@@ -31,6 +31,33 @@ describe("email", () => {
     expect(isEmailInDomain("x@sub.example.com", "example.com")).toBe(false);
     expect(isEmailInDomain("x@example.com", "")).toBe(false);
   });
+
+  it("refuses look-alike and suffix tricks for the allowed domain", () => {
+    const d = "camelthorncapital.com";
+    expect(isEmailInDomain(" Gerrie@CamelthornCapital.com ", d)).toBe(true);
+    for (const bad of [
+      "user@camelthorncapital.com.evil.com",
+      "user@evil.camelthorncapital.com.attacker.com",
+      "user@evil.camelthorncapital.com",
+      "user@evilcamelthorncapital.com",
+      "user@camelthorncapital.com@evil.com",
+      "user@evil.com@camelthorncapital.com",
+      "@camelthorncapital.com",
+      "camelthorncapital.com",
+      "user@camelthorncapit\u0430l.com", // Cyrillic a
+      "user@camelthorncapital.com\u200b", // zero-width space survives trim
+      "user@camelthorncapital.com.",
+      "user@camelthorncapital.co",
+    ]) {
+      expect(isEmailInDomain(bad, d), bad).toBe(false);
+    }
+  });
+
+  it("refuses control characters and multiple @ in the shape check", () => {
+    expect(isValidEmail("a\u0000b@c.de")).toBe(false);
+    expect(isValidEmail("a@b@c.de")).toBe(false);
+    expect(isValidEmail("a@b.c\u007f")).toBe(false);
+  });
 });
 
 describe("safeReturnTo", () => {
@@ -41,6 +68,11 @@ describe("safeReturnTo", () => {
     expect(safeReturnTo("/%2F%2Fevil.test", o)).toBe("/%2F%2Fevil.test");
     expect(safeReturnTo("/café/€", o)).toBe("/caf%C3%A9/%E2%82%AC");
     expect(safeReturnTo("/x?q=a+b%20c")).toBe("/x?q=a+b%20c");
+  });
+  it("keeps look-alike slashes inside the path (never a host)", () => {
+    expect(safeReturnTo("/\uff0f/e.test", o)).toBe("/%EF%BC%8F/e.test");
+    expect(safeReturnTo("/..%2F..%2F%2Fe.test", o)).toBe("/..%2F..%2F%2Fe.test");
+    expect(safeReturnTo("/a/../../b", o)).toBe("/b");
   });
   it("drops the one-shot auth flag", () => {
     expect(safeReturnTo("/?auth=denied")).toBe("/");
@@ -54,7 +86,15 @@ describe("safeReturnTo", () => {
       "javascript:alert(1)",
       "/\\e",
       "/\t/e",
+      "/\n/e.test",
       "/\u0000",
+      "/./\u0000",
+      "http:/e.test",
+      "\\\\e",
+      "/../..//e.test",
+      "\uff0f/e.test", // fullwidth solidus is not "/"
+      "%2F%2Fe.test",
+      " /today",
       "today",
       "",
       "/" + "a".repeat(3000),

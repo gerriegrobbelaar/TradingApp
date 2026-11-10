@@ -71,7 +71,10 @@ describe("signed-out screens", () => {
   });
 
   it("falls back to generic denied text when the config is unavailable", async () => {
-    mockFetch(SIGNED_OUT); // /api/config answers 404
+    mockFetch({
+      ...SIGNED_OUT,
+      "GET /api/config": () => ({ status: 500, body: { error: "server_misconfigured" } }),
+    });
     renderApp("/?auth=denied");
     const alert = await screen.findByRole("alert");
     await new Promise((r) => setTimeout(r, 20));

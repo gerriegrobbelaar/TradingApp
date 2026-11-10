@@ -397,40 +397,67 @@ describe("audit log", () => {
 });
 
 describe("idempotency keys", () => {
-  it("claimOnceAndPurge: one winner, bounded purge, refuses non-ephemeral scopes", async () => {
+  it("claimOnceAndPurge: one winner, bounded purge of old keys in its own scope only", async () => {
     const opts = { nowMs: Date.now(), retentionMs: 3600_000, purgeLimit: 2 };
     const old = new Date(Date.now() - 2 * 3600_000).toISOString();
-    await db.batch(
-      ["a", "b", "c"].map((k) =>
-        db
-          .prepare(
-            "INSERT INTO idempotency_keys (scope, key, status, created_at) VALUES (?1, ?2, 'completed', ?3)",
-          )
-          .bind("auth.flow", k, old),
-      ),
-    );
-    await db
-      .prepare(
-        "INSERT INTO idempotency_keys (scope, key, status, created_at) VALUES ('revolut.pay', 'p', 'pending', ?1)",
-      )
-      .bind(old)
-      .run();
+    const recent = new Date(Date.now() - 60_000).toISOString();
+    const put = (scope: string, k: string, at: string) =>
+      db
+        .prepare(
+          "INSERT INTO idempotency_keys (scope, key, status, created_at) VALUES (?1, ?2, 'completed', ?3)",
+        )
+        .bind(scope, k, at);
+    await db.batch([
+      put("auth.flow", "a", old),
+      put("auth.flow", "b", old),
+      put("auth.flow", "c", old),
+      put("auth.flow", "fresh", recent),
+      put("revolut.pay", "p", old),
+      put("auth.flowx", "q", old),
+    ]);
+    const n = async (sql: string) => (await db.prepare(sql).first<{ n: number }>())?.n;
+    const oldLeft = () =>
+      n(
+        "SELECT COUNT(*) AS n FROM idempotency_keys WHERE scope='auth.flow' AND key IN ('a','b','c')",
+      );
+
+    // One call purges exactly purgeLimit old keys.
+    expect(await claimOnceAndPurge(db, "first", "auth.flow", opts)).toBe(true);
+    expect(await oldLeft()).toBe(1);
+
+    // Concurrent claims of one key: exactly one winner, and the claim itself is never purged.
     const results = await Promise.all(
       Array.from({ length: 4 }, () => claimOnceAndPurge(db, "once", "auth.flow", opts)),
     );
     expect(results.filter(Boolean)).toHaveLength(1);
-    const left = await db
-      .prepare(
-        "SELECT COUNT(*) AS n FROM idempotency_keys WHERE scope = 'auth.flow' AND key IN ('a','b','c')",
-      )
-      .first<{ n: number }>();
-    expect(left?.n).toBeLessThan(3); // purged, but at most purgeLimit per call
-    expect(await count("idempotency_keys")).toBeGreaterThanOrEqual(2); // payment key + claim
-    await expect(claimOnceAndPurge(db, "x", "revolut.pay", opts)).rejects.toThrow(/not purgeable/);
-    const pay = await db
-      .prepare("SELECT 1 AS x FROM idempotency_keys WHERE scope = 'revolut.pay' AND key = 'p'")
-      .first();
-    expect(pay).not.toBeNull();
+    expect(await claimOnceAndPurge(db, "once", "auth.flow", opts)).toBe(false);
+    expect(await claimOnceAndPurge(db, "first", "auth.flow", opts)).toBe(false);
+    expect(await oldLeft()).toBe(0);
+
+    // Recent keys and other scopes are untouched.
+    expect(
+      await n("SELECT COUNT(*) AS n FROM idempotency_keys WHERE scope='auth.flow' AND key='fresh'"),
+    ).toBe(1);
+    expect(await n("SELECT COUNT(*) AS n FROM idempotency_keys WHERE scope<>'auth.flow'")).toBe(2);
+  });
+
+  it("claimOnceAndPurge refuses non-allow-listed scopes and unsafe options", async () => {
+    const opts = { nowMs: Date.now(), retentionMs: 3600_000, purgeLimit: 2 };
+    for (const scope of ["revolut.pay", "auth.", "auth.flowx", "auth.flow ", "AUTH.FLOW"]) {
+      await expect(claimOnceAndPurge(db, "x", scope, opts), scope).rejects.toThrow(/not purgeable/);
+    }
+    await expect(claimOnceAndPurge(db, "", "auth.flow", opts)).rejects.toThrow(/non-empty/);
+    for (const retentionMs of [0, -1, 60_000, Number.NaN]) {
+      await expect(
+        claimOnceAndPurge(db, "x", "auth.flow", { ...opts, retentionMs }),
+      ).rejects.toThrow(/retention/);
+    }
+    for (const purgeLimit of [0, -1, 1.5, 10_000]) {
+      await expect(
+        claimOnceAndPurge(db, "x", "auth.flow", { ...opts, purgeLimit }),
+      ).rejects.toThrow(/purgeLimit/);
+    }
+    expect(await count("idempotency_keys")).toBe(0);
   });
 
   it("claims once, then reports duplicates", async () => {
