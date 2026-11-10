@@ -11,6 +11,7 @@ import {
 } from "@camelthorn/ui";
 import { useSignedIn } from "../auth";
 import { PageHeader } from "../components/PageHeader";
+import { Connections } from "./Connections";
 import { Users } from "./Users";
 
 type Tab = "appearance" | "users" | "connections" | "schedules";
@@ -90,7 +91,7 @@ export function Settings() {
       </div>
       {current === "appearance" && <Appearance />}
       {current === "users" && <Users />}
-      {current === "connections" && <Soon what="Connections" />}
+      {current === "connections" && <Connections />}
       {current === "schedules" && <Soon what="Schedules" />}
     </>
   );

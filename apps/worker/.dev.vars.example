@@ -7,8 +7,14 @@ GOOGLE_CLIENT_SECRET=replace-with-google-oauth-client-secret
 # At least 32 random characters: openssl rand -base64 48
 SESSION_SECRET=replace-with-at-least-32-random-characters-xxxxxxxx
 
+# Exact Online (placeholders). TOKEN_ENC_KEY: openssl rand -base64 32
+EXACT_CLIENT_SECRET=replace-with-exact-app-secret
+TOKEN_ENC_KEY=replace-with-32-random-bytes-in-base64-xxxxxxxxxx=
+
 # Local overrides of public vars. The browser talks to the Vite dev server on 5173, which proxies
 # /api to the Worker on 8787, so the redirect URI uses port 5173.
 OAUTH_REDIRECT_URI=http://localhost:5173/api/auth/callback
+EXACT_REDIRECT_URI=http://localhost:5173/api/connections/exact/callback
+# EXACT_CLIENT_ID=your-exact-app-client-id
 # Needed locally until the committed placeholder is filled:
 # GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com

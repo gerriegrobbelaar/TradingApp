@@ -10,6 +10,8 @@ routes = [{ pattern = "finance.camelthorncapital.com", custom_domain = true }]
 [vars]
 GOOGLE_CLIENT_ID = "123-abc.apps.googleusercontent.com"
 OAUTH_REDIRECT_URI = "https://finance.camelthorncapital.com/api/auth/callback"
+EXACT_CLIENT_ID = "11111111-2222-3333-4444-555555555555"
+EXACT_REDIRECT_URI = "https://finance.camelthorncapital.com/api/connections/exact/callback"
 
 [[d1_databases]]
 binding = "DB"
@@ -23,6 +25,8 @@ describe("deploy config guard", () => {
     expect(p.join("\n")).toContain("GOOGLE_CLIENT_ID");
     expect(p.join("\n")).toContain("OAUTH_REDIRECT_URI");
     expect(p.join("\n")).toContain("routes");
+    expect(p.join("\n")).toContain("EXACT_CLIENT_ID");
+    expect(p.join("\n")).toContain("EXACT_REDIRECT_URI");
   });
 
   it("passes a filled-in config", () => {
@@ -45,5 +49,19 @@ describe("deploy config guard", () => {
     expect(deployConfigProblems(t)).toEqual([
       "OAUTH_REDIRECT_URI is still the app.example.com placeholder or not https",
     ]);
+  });
+
+  it("flags an Exact redirect URI that is the placeholder or plain http", () => {
+    for (const bad of [
+      "https://app.example.com/api/connections/exact/callback",
+      "http://finance.camelthorncapital.com/api/connections/exact/callback",
+    ]) {
+      const t = ready.replace(/EXACT_REDIRECT_URI = .*/, `EXACT_REDIRECT_URI = "${bad}"`);
+      expect(deployConfigProblems(t)).toEqual([
+        "EXACT_REDIRECT_URI is still the app.example.com placeholder or not https",
+      ]);
+    }
+    const empty = ready.replace(/EXACT_CLIENT_ID = .*/, 'EXACT_CLIENT_ID = ""');
+    expect(deployConfigProblems(empty)).toEqual(["EXACT_CLIENT_ID is empty"]);
   });
 });

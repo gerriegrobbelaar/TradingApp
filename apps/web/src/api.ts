@@ -173,3 +173,28 @@ export const restoreUser = (id: number, roles: Role[]) =>
     method: "POST",
     body: { roles },
   });
+
+export type ConnectionStatus = "pending" | "active" | "expired" | "disabled" | "needs_reauth";
+
+export interface ConnectionRow {
+  kind: "exact" | "revolut";
+  name: string;
+  status: ConnectionStatus;
+  expiresAt: string | null;
+  lastError: string | null;
+  connectedBy: string | null;
+  connectedAt: string | null;
+  divisions: { division: number; name: string; currency: string }[];
+}
+
+export interface ConnectionsResponse {
+  /** False while the Worker lacks Exact settings (client id, secret, encryption key). */
+  exactConfigured: boolean;
+  connections: ConnectionRow[];
+}
+
+export const listConnections = () => request<ConnectionsResponse>("/api/connections");
+export const disconnectExact = () =>
+  request<{ ok: true }>("/api/connections/exact/disconnect", { method: "POST" });
+/** Full-page navigation: the Worker redirects to Exact and back to /settings/connections. */
+export const EXACT_START_URL = "/api/connections/exact/start";

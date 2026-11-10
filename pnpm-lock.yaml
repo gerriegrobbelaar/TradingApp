@@ -84,6 +84,9 @@ importers:
       '@camelthorn/core':
         specifier: workspace:*
         version: link:../../packages/core
+      '@camelthorn/exact':
+        specifier: workspace:*
+        version: link:../../packages/exact
     devDependencies:
       '@cloudflare/vitest-plugin':
         specifier: ^1.7.0

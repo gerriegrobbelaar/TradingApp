@@ -1,0 +1,23 @@
+# ADR 0014: ExactGate, token authority, encrypted tokens
+Status: accepted 2026-11-10
+
+## Context
+CLAUDE.md 3: Exact allows about 60 calls/minute and 5,000/day per division; access tokens last about 10 minutes; refresh tokens are single use, so two refreshes at once log us out. User actions must jump the queue, and jobs need a call budget.
+
+## Decision
+- **Two kinds of `ExactGate` instance.** `exact:<division>` (one per division, division 0 for `/current/Me`) queues, rate-limits and sends calls. `exact-token:<connectionId>` is the connection's *token authority*: the only place a refresh happens. One Exact connection serves all its divisions, so refreshing inside each division's gate could run two refreshes at once. Division gates call `refreshAccessToken` on the authority over RPC, which is single-flight (concurrent callers share one promise) and re-reads D1 first so a refresh another gate already did is reused, not repeated.
+- **Rotation order.** After a refresh the new refresh token is encrypted and written to D1 (one retry) before the new access token is used. If it cannot be stored, the connection is marked `needs_reauth` (tokens wiped, audit row `connection.exact_needs_reauth`, actor `system`) and the request fails; the new token is dropped. `invalid_grant` does the same. A wrong client secret (`invalid_client`) or a 5xx is not a revoked grant: tokens stay, error is returned.
+- **Tokens at rest.** AES-256-GCM, random 96-bit IV per value, format `v1.<keyId>.<iv>.<ct>`, `keyId` = first 4 bytes of SHA-256 of the key, AAD `exact:<connId>:access|refresh` so a blob cannot be moved. `TOKEN_ENC_KEY` (+ optional `TOKEN_ENC_KEY_PREVIOUS` for rotation). Wrong key or tampering fails closed. Gates read the row from D1 on every call (no token cache), so a disconnect takes effect at once.
+- **Limiter.** A serial pump per gate. Minute token bucket (capacity 60, refill 1/s), daily counter (UTC day), both persisted in DO storage on every call. `X-RateLimit-*` response headers override the local numbers (remaining, reset, minutely remaining). 429 blocks the gate until `Retry-After` (else the reset headers, else 60 s) and the caller gets `ExactRateLimitedError(retryAfterMs)`. `user` requests are always picked before `job` requests. Jobs may not use the last 10% of the daily budget. A request that would wait longer than 90 s fails with `ExactRateLimitedError` instead of waiting. When the daily budget is gone, the error carries the time until reset.
+- **Job budgets.** `startJob(jobId, budget?)`; default is `jobs.exact_budget` for that job name, else 500. A job that never started gets the default on its first call. Over budget throws `ExactBudgetExhaustedError`. Only `job` priority is charged. State is persisted so an eviction does not hand out a fresh budget; stale job records are purged after 24 h.
+- **Eviction.** The queue is in memory by design. If an instance is evicted or redeployed while requests wait, those callers get `ExactApiError` 503 `gate_unavailable` and must retry. Counters and budgets survive.
+- **Errors over RPC.** Error classes and fields do not survive a Durable Object RPC call, so the gate answers with a plain envelope (`call()`) and `createGateTransport` rebuilds the typed errors from `packages/exact`.
+- **Usage summary.** Hot counters stay in the DO; a throttled flush (alarm, 30 s after the first unflushed call, and at day rollover) upserts `exact_usage(division, day, calls, user_calls, job_calls, rate_limited, remaining)` for the UI and data-quality rules.
+- **One Exact connection in v1** (`connections` row kind `exact`, name `exact`). Multiple connections would need the gate to resolve the connection from the division row.
+- **Request hygiene.** Paths are matched against an allow-list regex (no `..`, `//`, `%`, scheme, host), the host comes from an allow-list of Exact regional hosts, callers cannot set `Authorization`/`Host`, redirects are not followed (the bearer token is never forwarded), nothing logs bodies, URLs or tokens.
+
+## Consequences
+- The connect callback's two writes (tokens + `connection.exact_connected`, then division + `connection.exact_divisions_synced`) are each atomic with their audit row; between them the division is read through the gate. If that read fails the connection stays active and the UI asks to re-authorise.
+- An empty `pending` connection row is inserted before the tokens (the ciphertext is bound to the row id); it carries no data and has no audit row.
+- A serial pump caps one division at the speed of one in-flight call; at the 60/minute limit that is not the bottleneck.
+- The XML API takes the division as the `_Division_` query parameter, not in the path (to verify, ADR 0015).

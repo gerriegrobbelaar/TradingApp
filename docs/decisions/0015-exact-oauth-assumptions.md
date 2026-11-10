@@ -1,0 +1,20 @@
+# ADR 0015: Exact OAuth and API assumptions (verify with real credentials)
+Status: open, 2026-11-10
+
+No Exact credentials existed when this was built; everything was tested against a stubbed `fetch`. CLAUDE.md 3 says to re-check the API docs. Each item below is from memory of Exact's documentation and must be confirmed on the first real connection. Where the item is wrong, the fix is local (a constant or one parser) as noted.
+
+1. **Endpoints.** Authorize: `https://start.exactonline.nl/api/oauth2/auth` with `client_id`, `redirect_uri`, `response_type=code`, `force_login=0`, `state`. Token: `POST https://start.exactonline.nl/api/oauth2/token`, form-encoded, `client_id` and `client_secret` in the body (not HTTP Basic). Code in `exact/oauth.ts`.
+2. **No PKCE.** Exact is assumed not to support PKCE or a `nonce`; CSRF protection is `state` in a signed single-use cookie bound to the admin's email. If Exact now supports PKCE, add it (the flow cookie already has a `verifier` field).
+3. **Token response.** `{access_token, token_type, expires_in, refresh_token}` with `expires_in` as a string of seconds (about `"600"`). Parsed with `Number()`.
+4. **Refresh token rotation.** Each refresh returns a new refresh token and the old one stops working; refresh tokens last about 30 days from issue. If tokens do not rotate, the persist-first order is merely redundant.
+5. **Error body.** A revoked or reused refresh token answers HTTP 400 with `{"error":"invalid_grant"}`. Anything else 4xx is treated as our configuration problem (tokens kept); 5xx and 429 as transient.
+6. **Authorization codes** are single use and expire within a few minutes.
+7. **`/api/v1/current/Me`** returns `{"d":{"results":[{"CurrentDivision":123456, "DivisionCustomerName":"...", ...}]}}`. `parseMe` also accepts `d` as an array and falls back to `Division <n>` if the name field is absent. The full list of divisions a user can reach (for example `system/Divisions`) is not read yet; only the current division is stored. Division currency defaults to EUR until the sync reads it.
+8. **Rate-limit headers.** `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` (daily, reset as epoch milliseconds) and `X-RateLimit-Minutely-Limit`, `-Remaining`, `-Reset`. Seconds-valued resets are tolerated (values below 1e11 are multiplied by 1000). `Retry-After` on 429 may be absent; then the reset headers, then 60 s are used. The daily window is assumed to reset at midnight UTC when Exact gives no reset time (it may be midnight in another zone; the header wins when present). Code in `exact/gate.ts` `readRateHeaders` / `blockFor429`.
+9. **Limits.** 60 calls/minute and 5,000/day per division are CLAUDE.md figures; the actual limits can differ per app and are overridden by the headers when sent.
+10. **XML API.** `https://start.exactonline.nl/docs/XMLUpload.aspx?Topic=...&_Division_=<n>` accepts `Authorization: Bearer` (OAuth) and takes the division as the `_Division_` query parameter. The XML paths allowed are only `/docs/XMLUpload.aspx` and `/docs/XMLDownload.aspx`. E3/E-matching must confirm the parameter name and that bearer auth works for MatchSets.
+11. **Regional host.** Fixed to `start.exactonline.nl` (CLAUDE.md). `connections.region_host` exists and is validated against an allow-list of Exact hosts, but the OAuth start route does not read it yet.
+12. **Revocation.** Exact has no known revoke endpoint, so Disconnect only deletes our copy of the tokens. An admin should also remove the app grant in Exact (My Exact Online, Connections) when decommissioning.
+13. **Redirect URI** registered on the Exact app must match `EXACT_REDIRECT_URI` exactly; local development needs a second registration for `http://localhost:5173/...` if Exact allows http.
+14. **Single connection.** One `exact` connection per deployment. A user with access to several Exact accounts would need one connection per account.
+15. **`jobs.exact_budget`.** The task text said `jobs.budget`; the schema column is `exact_budget` (migration 0003). The gate reads that.

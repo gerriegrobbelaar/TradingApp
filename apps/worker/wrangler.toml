@@ -43,6 +43,12 @@ GOOGLE_CLIENT_ID = ""
 # its origin is also the CSRF origin. For local dev override it in .dev.vars, see
 # .dev.vars.example (do not edit this value for local work).
 OAUTH_REDIRECT_URI = "https://app.example.com/api/auth/callback"
+# PLACEHOLDER. Client ID of the Exact Online app registration (apps.exactonline.com). Empty until
+# the app exists; while empty, /api/connections/exact/* answers 500 server_misconfigured.
+EXACT_CLIENT_ID = ""
+# PLACEHOLDER (app.example.com). Must equal the redirect URI registered on the Exact app and live on
+# the same origin as OAUTH_REDIRECT_URI: https://<app host>/api/connections/exact/callback
+EXACT_REDIRECT_URI = "https://app.example.com/api/connections/exact/callback"
 
 [[d1_databases]]
 binding = "DB"
@@ -52,3 +58,12 @@ database_name = "camelthorn-finance"
 # The jurisdiction cannot be changed later. See docs/DEPLOY.md.
 database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
+
+# One ExactGate per Exact division ("exact:<division>") plus one token authority per connection.
+[[durable_objects.bindings]]
+name = "EXACT_GATE"
+class_name = "ExactGate"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ExactGate"]

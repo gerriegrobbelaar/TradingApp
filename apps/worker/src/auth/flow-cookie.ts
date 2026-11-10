@@ -14,6 +14,8 @@ export interface FlowState {
   verifier: string;
   stepUp: boolean;
   returnTo: string;
+  /** Optional: email of the signed-in user the flow belongs to (used by the Exact connect flow). */
+  bind?: string;
   /** Expiry, epoch milliseconds. */
   exp: number;
 }
@@ -43,6 +45,7 @@ export async function openFlow(
       typeof f.verifier !== "string" ||
       typeof f.stepUp !== "boolean" ||
       typeof f.returnTo !== "string" ||
+      (f.bind !== undefined && typeof f.bind !== "string") ||
       typeof f.exp !== "number" ||
       f.exp < nowMs
     ) {

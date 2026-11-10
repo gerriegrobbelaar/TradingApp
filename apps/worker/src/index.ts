@@ -1,10 +1,12 @@
 import { registerAuthRoutes } from "./auth/routes";
 import { registerUserRoutes } from "./auth/users-routes";
+import { registerExactRoutes } from "./exact/routes";
 import { ensureSeeded } from "./db/seed";
 import type { Env } from "./env";
 import { json, Router } from "./router";
 
 export type { Env } from "./env";
+export { ExactGate } from "./exact/gate";
 
 /**
  * A failed seed (transient D1 error, bad INITIAL_ADMIN_EMAIL) must not take the app down; it is
@@ -21,6 +23,7 @@ async function seedSafely(env: Env): Promise<void> {
 const router = new Router();
 registerAuthRoutes(router);
 registerUserRoutes(router);
+registerExactRoutes(router);
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {

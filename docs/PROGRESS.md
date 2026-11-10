@@ -6,7 +6,7 @@ Orchestrator log. Update after every merge and every direct (trivial) edit.
 | # | Phase | Status |
 |---|---|---|
 | 1 | Foundation | Done (open go-live gate: confirm Google returns auth_time, ADR 0007) |
-| 2 | Exact connection | Not started |
+| 2 | Exact connection | In progress (E2 ExactGate + OAuth connect on build/E2; E1 typed client) |
 | 3 | Scheduler | Not started |
 | 4 | Read-only screens | Not started |
 | 5 | Revolut connection | Not started |
@@ -31,6 +31,7 @@ Orchestrator log. Update after every merge and every direct (trivial) edit.
 - 2026-11-10: F1-F4 review fixes merged (atomic audit batches, headers, deploy guard, contrast tokens, shared core logic, ADRs 0003-0013). CLAUDE.md §4.0 seed wording changed (seed at first Worker start, ADR 0004).
 - 2026-11-10: ADR 0001 (Workers only), ADR 0002 (camelthorncapital.com only, no external emails in v1). Direct edit (docs).
 - 2026-11-10: F3 (branch build/F3): shared auth logic moved to packages/core (roles, email, safeReturnTo), `allowedDomain` on /api/auth/me and public /api/config, auth.flow claim via idempotency helper; ADRs 0003-0013 written; CLAUDE.md 4.0 now says the admin is seeded at first Worker start.
+- 2026-11-10: E2 (branch build/E2): ExactGate Durable Object (rate limit, priority, job budgets, single-flight refresh via token authority), AES-GCM token storage, Exact OAuth connect flow, Settings → Connections tab; ADR 0014, 0015 (assumptions to verify with real credentials).
 
 ## Open decisions (CLAUDE.md §9)
 Answered: 7 (Workers only), 8 (domain only). Unanswered: 1-6 (needed from Phase 2 onward). Record answers as ADRs in `docs/decisions/`.

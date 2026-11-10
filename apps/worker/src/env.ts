@@ -1,3 +1,5 @@
+import type { ExactGate } from "./exact/gate";
+
 export interface Env {
   DB: D1Database;
   ASSETS: Fetcher;
@@ -11,4 +13,16 @@ export interface Env {
   GOOGLE_CLIENT_SECRET: string;
   /** Workers secret: HMAC key for the sign-in round-trip cookie (at least 32 characters). */
   SESSION_SECRET: string;
+  /** Workers var: OAuth client ID of the Exact app registration (empty placeholder until set). */
+  EXACT_CLIENT_ID: string;
+  /** Workers var: absolute callback URL, https://<app host>/api/connections/exact/callback. */
+  EXACT_REDIRECT_URI: string;
+  /** Workers secret: Exact app client secret. */
+  EXACT_CLIENT_SECRET: string;
+  /** Workers secret: 32-byte base64 key that encrypts stored Exact tokens (AES-GCM). */
+  TOKEN_ENC_KEY: string;
+  /** Workers secret, optional: previous TOKEN_ENC_KEY, accepted for decryption during rotation. */
+  TOKEN_ENC_KEY_PREVIOUS?: string;
+  /** One instance per Exact division ("exact:<division>"), plus token authorities. */
+  EXACT_GATE: DurableObjectNamespace<ExactGate>;
 }

@@ -16,6 +16,27 @@ Cloudflare Worker: HTTP API, webhooks, cron handler, queue consumers, Durable Ob
 If any of these is missing or malformed, every route except `/api/health` answers
 `500 server_misconfigured` (the log names the missing variables, never values).
 
+## Exact connection configuration (ADR 0014, 0015)
+
+| Name                     | Kind                  | Purpose                                                                                                      |
+| ------------------------ | --------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `EXACT_CLIENT_ID`        | var (`wrangler.toml`) | Client ID of the Exact app registration. Empty placeholder until it exists.                                  |
+| `EXACT_REDIRECT_URI`     | var                   | `https://<app host>/api/connections/exact/callback`; must share the origin of `OAUTH_REDIRECT_URI`.          |
+| `EXACT_CLIENT_SECRET`    | secret                | `wrangler secret put EXACT_CLIENT_SECRET`                                                                    |
+| `TOKEN_ENC_KEY`          | secret                | 32-byte base64 AES-GCM key for stored tokens: `openssl rand -base64 32 \| wrangler secret put TOKEN_ENC_KEY` |
+| `TOKEN_ENC_KEY_PREVIOUS` | secret, optional      | Old key, accepted for decryption while rotating.                                                             |
+
+If any is missing, `/api/connections/exact/start` and `/callback` answer
+`500 server_misconfigured`; `GET /api/connections` still works and reports `exactConfigured: false`.
+
+- `GET /api/connections` (any role): status, expiry, last error code, divisions. Never tokens.
+- `GET /api/connections/exact/start` (admin, step-up): redirects to Exact with a signed single-use
+  state cookie. `GET .../callback` (admin session that started the flow): exchanges the code,
+  stores AES-GCM encrypted tokens, reads `/current/Me` through the gate, stores the division.
+- `POST /api/connections/exact/disconnect` (admin, step-up): wipes the tokens.
+- Workers code calls Exact only through `createGateTransport(env, division)` (an `ExactTransport`
+  backed by the `ExactGate` Durable Object).
+
 ## Auth API
 
 - `GET /api/auth/login[?step_up=1&return_to=/path]` redirects to Google (PKCE S256, state, nonce;

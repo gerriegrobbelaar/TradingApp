@@ -272,7 +272,7 @@ describe("navigation", () => {
     const group = await screen.findByRole("group", { name: "Settings section" });
     const tab = within(group).getByRole("button", { name: "Connections" });
     await user.click(tab);
-    await screen.findByRole("heading", { level: 2, name: "Connections" });
+    await screen.findByRole("heading", { level: 2, name: "Exact Online" });
     expect(document.activeElement).toBe(tab);
   });
 

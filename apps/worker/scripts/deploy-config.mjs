@@ -19,6 +19,11 @@ export function deployConfigProblems(toml) {
   if (!redirect.startsWith("https://") || /example\.(com|org|net)\b/.test(redirect)) {
     problems.push("OAUTH_REDIRECT_URI is still the app.example.com placeholder or not https");
   }
+  if (!value("EXACT_CLIENT_ID")) problems.push("EXACT_CLIENT_ID is empty");
+  const exactRedirect = value("EXACT_REDIRECT_URI") ?? "";
+  if (!exactRedirect.startsWith("https://") || /example\.(com|org|net)\b/.test(exactRedirect)) {
+    problems.push("EXACT_REDIRECT_URI is still the app.example.com placeholder or not https");
+  }
   if (!/^\s*(routes?\s*=|\[\[routes\]\])/m.test(text)) {
     problems.push("no routes set (workers_dev is off, so the Worker would be unreachable)");
   }

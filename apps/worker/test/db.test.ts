@@ -71,6 +71,7 @@ describe("schema", () => {
       "sessions",
       "settings",
       "connections",
+      "exact_usage",
       "divisions",
       "bank_accounts",
       "bank_transactions",

@@ -1,5 +1,7 @@
 export const SESSION_COOKIE = "__Host-session";
 export const FLOW_COOKIE = "__Host-oauth";
+/** Round-trip cookie of the admin's Exact connect flow (separate from the Google sign-in one). */
+export const EXACT_FLOW_COOKIE = "__Host-exact-oauth";
 
 export function parseCookies(header: string | null): Map<string, string> {
   const out = new Map<string, string>();

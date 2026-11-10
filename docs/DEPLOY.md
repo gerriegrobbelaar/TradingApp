@@ -52,6 +52,9 @@ In `apps/worker/wrangler.toml`:
 - `OAUTH_REDIRECT_URI`: exactly the redirect URI registered in step 2. Its origin is also the
   CSRF origin.
 - `INITIAL_ADMIN_EMAIL`, `ALLOWED_HD`: check they are right.
+- `EXACT_CLIENT_ID` and `EXACT_REDIRECT_URI`: from the Exact Online app registration (see
+  "Exact Online app" below). The redirect URI must be `https://<app host>/api/connections/exact/callback`,
+  on the same origin as `OAUTH_REDIRECT_URI`.
 - Uncomment one `routes` line and set your hostname (same host as `OAUTH_REDIRECT_URI`).
   `workers_dev` and `preview_urls` stay `false`.
 
@@ -61,16 +64,31 @@ Check nothing is left over, then commit:
 pnpm run check:deploy
 ```
 
-It fails while the all-zero `database_id`, an empty `GOOGLE_CLIENT_ID`, the `app.example.com`
-redirect URI or a missing route remain.
+It fails while the all-zero `database_id`, an empty `GOOGLE_CLIENT_ID` or `EXACT_CLIENT_ID`, an
+`app.example.com` redirect URI (Google or Exact) or a missing route remain.
 
 ## 4. Set the secrets
 
 ```sh
 pnpm exec wrangler secret put GOOGLE_CLIENT_SECRET
 openssl rand -base64 48 | pnpm exec wrangler secret put SESSION_SECRET
+pnpm exec wrangler secret put EXACT_CLIENT_SECRET
+# 32 random bytes, base64: encrypts the stored Exact tokens (AES-256-GCM). Keep a copy in your
+# password manager; losing it means reconnecting Exact.
+openssl rand -base64 32 | pnpm exec wrangler secret put TOKEN_ENC_KEY
 ```
 
+Rotating `TOKEN_ENC_KEY`: put the old value in `TOKEN_ENC_KEY_PREVIOUS`, set the new
+`TOKEN_ENC_KEY`, deploy. Tokens are rewritten with the new key at their next refresh (within
+minutes while the connection is used); then delete `TOKEN_ENC_KEY_PREVIOUS`.
+
+### Exact Online app
+
+Register an app at the Exact App Center (apps.exactonline.com, "Register API keys") with the
+redirect URI above. Copy its client ID into `EXACT_CLIENT_ID` and its secret into
+`EXACT_CLIENT_SECRET`. Then, signed in as an admin with a fresh Google sign-in, use Settings,
+Connections, "Connect Exact Online". The first real connection is unverified: see
+`docs/decisions/0015-exact-oauth-assumptions.md` for what to check.
 Secrets live only in Workers secrets, never in the repo. If the Worker does not exist yet,
 `wrangler secret put` offers to create it; accept.
 
