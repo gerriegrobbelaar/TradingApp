@@ -4,7 +4,10 @@ import {
   ExactAuthError,
   ExactBudgetExhaustedError,
   ExactRateLimitedError,
+  OPEN_ITEM_LIST_FIELDS,
   createExactClient,
+  odataGuid,
+  odataString,
   resolveNextLink,
 } from "../src";
 import * as fx from "./fixtures";
@@ -51,7 +54,8 @@ describe("passthrough to the transport", () => {
       expect(call.path).not.toContain("/api/v1");
       expect(call.query?.["$select"]).toMatch(/^[A-Za-z,]+$/);
     }
-    expect(calls[0]?.path).toBe("/current/Me");
+    // Transport contract (E2 gate): division 0 + path "/Me" -> /api/v1/current/Me.
+    expect(calls[0]?.path).toBe("/Me");
     expect(calls[0]?.division).toBe(0);
     expect(calls.slice(1).every((x) => x.division === fx.DIV)).toBe(true);
   });
@@ -111,7 +115,11 @@ describe("open items", () => {
     expect(calls).toHaveLength(2);
     expect(calls[1]?.path).toBe("/read/financial/ReceivablesList");
     expect(calls[1]?.query?.["$skiptoken"]).toBe("guid'99999999-0000-0000-0000-000000000000'");
-    expect(calls[1]?.query?.["$select"]).toBe("ID,AccountId");
+    // $select is always ours, never the (narrower or wider) one from the link.
+    expect(calls[1]?.query).toEqual({
+      $select: OPEN_ITEM_LIST_FIELDS.join(","),
+      $skiptoken: "guid'99999999-0000-0000-0000-000000000000'",
+    });
     expect(items).toHaveLength(3);
     expect(items[0]).toMatchObject({
       kind: "receivable",
@@ -164,6 +172,52 @@ describe("open items", () => {
     ).rejects.toMatchObject({ code: "BAD_SHAPE" });
   });
 
+  it("uses the currency's own minor-unit scale", async () => {
+    const jpy = fx.PAYABLES.replace('"CurrencyCode":"EUR"', '"CurrencyCode":"JPY"');
+    const [a] = await createExactClient(scripted([ok(jpy)]).transport, base).listPayables();
+    // 1234567.89 JPY -> 1234568 yen (half away from zero), not 123456789.
+    expect(a?.amount).toEqual({ minor: 1234568, currency: "JPY" });
+    const kwd = fx.PAYABLES.replace('"CurrencyCode":"EUR"', '"CurrencyCode":"KWD"');
+    const [b] = await createExactClient(scripted([ok(kwd)]).transport, base).listPayables();
+    expect(b?.amount).toEqual({ minor: 1234567890, currency: "KWD" });
+  });
+
+  it("validates and lower-cases GUIDs from Exact", async () => {
+    const upper = fx.PAYABLES.replace(
+      "b0000000-0000-0000-0000-000000000001",
+      "B0000000-0000-0000-0000-0000000000AB",
+    );
+    const [a] = await createExactClient(scripted([ok(upper)]).transport, base).listPayables();
+    expect(a?.id).toBe("b0000000-0000-0000-0000-0000000000ab");
+    for (const bad of ['"ID":"x"', '"ID":42', '"ID":null']) {
+      const body = fx.PAYABLES.replace('"ID":"b0000000-0000-0000-0000-000000000001"', bad);
+      await expect(
+        createExactClient(scripted([ok(body)]).transport, base).listPayables(),
+      ).rejects.toMatchObject({ code: "BAD_SHAPE" });
+    }
+  });
+
+  it("rejects a missing amount and non-boolean flags", async () => {
+    const noAmount = fx.PAYABLES.replace('"Amount":1234567.89', '"Amount":null');
+    await expect(
+      createExactClient(scripted([ok(noAmount)]).transport, base).listPayables(),
+    ).rejects.toMatchObject({ code: "BAD_SHAPE" });
+    const strBool = fx.ACCOUNTS.replace('"IsSupplier":false', '"IsSupplier":"false"');
+    await expect(
+      createExactClient(scripted([ok(strBool)]).transport, base).listAccounts(),
+    ).rejects.toMatchObject({ code: "BAD_SHAPE" });
+    const nullBool = fx.ACCOUNTS.replace('"IsSupplier":false', '"IsSupplier":null');
+    const [acc] = await createExactClient(scripted([ok(nullBool)]).transport, base).listAccounts();
+    expect(acc?.isSupplier).toBe(false);
+  });
+
+  it("rejects an amount given with a leading zero (invalid JSON)", async () => {
+    const bad = fx.PAYABLES.replace('"Amount":1234567.89', '"Amount":01234567.89');
+    await expect(
+      createExactClient(scripted([ok(bad)]).transport, base).listPayables(),
+    ).rejects.toMatchObject({ code: "BAD_JSON" });
+  });
+
   it("accepts a bare array in d", async () => {
     const { transport } = scripted([ok(`{"d":[]}`)]);
     expect(await createExactClient(transport, base).listPayables()).toEqual([]);
@@ -171,19 +225,40 @@ describe("open items", () => {
 });
 
 describe("paging guards", () => {
-  const exp = { host: fx.HOST, division: fx.DIV, path: "/crm/Accounts", select: "ID" };
+  const exp = {
+    host: fx.HOST,
+    division: fx.DIV,
+    path: "/crm/Accounts",
+    baseQuery: { $select: "ID", $filter: "Timestamp gt 5L" },
+  };
   const good = `https://${fx.HOST}/api/v1/${fx.DIV}/crm/Accounts?$select=ID&$skiptoken=guid'abc'`;
 
   it("accepts a same-host, same-division, same-endpoint link", () => {
     expect(resolveNextLink(good, exp)).toEqual({
       path: "/crm/Accounts",
-      query: { $select: "ID", $skiptoken: "guid'abc'" },
+      query: { $select: "ID", $filter: "Timestamp gt 5L", $skiptoken: "guid'abc'" },
     });
   });
 
-  it("adds $select when the link drops it", () => {
-    const r = resolveNextLink(`https://${fx.HOST}/api/v1/${fx.DIV}/crm/Accounts?$skiptoken=1`, exp);
-    expect(r.query["$select"]).toBe("ID");
+  it("keeps our $select and $filter and drops anything else from the link", () => {
+    const r = resolveNextLink(
+      `https://${fx.HOST}/api/v1/${fx.DIV}/crm/Accounts?$select=*&$expand=BankAccounts&$filter=true&_Division_=9&$skiptoken=1`,
+      exp,
+    );
+    expect(r.query).toEqual({ $select: "ID", $filter: "Timestamp gt 5L", $skiptoken: "1" });
+  });
+
+  it("accepts the default port spelled out and a fragment", () => {
+    expect(() => resolveNextLink(good.replace(fx.HOST, `${fx.HOST}:443`), exp)).not.toThrow();
+    expect(() => resolveNextLink(`${good}#x`, exp)).not.toThrow();
+  });
+
+  it("decodes the skiptoken once", () => {
+    const r = resolveNextLink(
+      `https://${fx.HOST}/api/v1/${fx.DIV}/crm/Accounts?$skiptoken=guid%27a%2Fb%27`,
+      exp,
+    );
+    expect(r.query["$skiptoken"]).toBe("guid'a/b'");
   });
 
   it.each([
@@ -196,7 +271,20 @@ describe("paging guards", () => {
     ["other division", good.replace(String(fx.DIV), "999")],
     ["other endpoint", good.replace("/crm/Accounts", "/crm/Contacts")],
     ["relative", "/api/v1/1/crm/Accounts"],
-    ["duplicate key", `${good}&$select=Name`],
+    ["protocol-relative", `//evil.example/api/v1/${fx.DIV}/crm/Accounts?$skiptoken=1`],
+    ["backslash host", good.replace(`https://${fx.HOST}`, "https:\\\\evil.example")],
+    ["trailing-dot host", good.replace(fx.HOST, `${fx.HOST}.`)],
+    ["IPv6 host", good.replace(fx.HOST, "[::1]")],
+    ["IP host", good.replace(fx.HOST, "127.0.0.1")],
+    ["IDN lookalike", good.replace(fx.HOST, "start.exactonlíne.nl")],
+    ["encoded slash in path", good.replace("/crm/Accounts", "/crm%2FAccounts")],
+    ["encoded division", good.replace(`/${fx.DIV}/`, `/${fx.DIV}%2F..%2F999/`)],
+    ["dot-segment to other division", good.replace(`/${fx.DIV}/`, `/999/../${fx.DIV}x/`)],
+    ["sub-path", good.replace("/crm/Accounts", "/crm/Accounts/x")],
+    ["javascript scheme", "javascript:alert(1)"],
+    ["duplicate skiptoken", `${good}&$skiptoken=2`],
+    ["no skiptoken", `https://${fx.HOST}/api/v1/${fx.DIV}/crm/Accounts?$select=ID`],
+    ["empty skiptoken", `https://${fx.HOST}/api/v1/${fx.DIV}/crm/Accounts?$skiptoken=`],
     ["not a url", "::::"],
   ])("rejects %s", (_n, link) => {
     expect(() => resolveNextLink(link, exp)).toThrow(ExactApiError);
@@ -209,6 +297,12 @@ describe("paging guards", () => {
 
   it("is case-insensitive on the host", () => {
     expect(() => resolveNextLink(good.replace(fx.HOST, fx.HOST.toUpperCase()), exp)).not.toThrow();
+  });
+
+  it("accepts a dot-segment that normalises back to the same endpoint", () => {
+    expect(() =>
+      resolveNextLink(good.replace("/crm/Accounts", "/crm/x/../Accounts"), exp),
+    ).not.toThrow();
   });
 
   it("uses the 'current' segment for division 0", () => {
@@ -247,6 +341,33 @@ describe("paging guards", () => {
     ).rejects.toMatchObject({ code: "PAGE_CAP" });
     expect(calls).toHaveLength(3);
   });
+
+  it("validates client options", () => {
+    const t = scripted([]).transport;
+    expect(() => createExactClient(t, { ...base, maxPages: 0 })).toThrow(RangeError);
+    expect(() => createExactClient(t, { ...base, maxPages: 1.5 })).toThrow(RangeError);
+    expect(() => createExactClient(t, { ...base, division: 0 })).toThrow(RangeError);
+    expect(() => createExactClient(t, { ...base, division: -1 })).toThrow(RangeError);
+    expect(() => createExactClient(t, { ...base, jobId: "" })).toThrow(RangeError);
+  });
+});
+
+describe("OData literals", () => {
+  it("doubles single quotes in strings", () => {
+    expect(odataString("O'Brien")).toBe("'O''Brien'");
+    expect(odataString("'')")).toBe("''''')'");
+    expect(odataString("")).toBe("''");
+    expect(odataString("a&b=c")).toBe("'a&b=c'");
+    expect(() => odataString("a\nb")).toThrow(RangeError);
+  });
+
+  it("validates and lower-cases GUIDs", () => {
+    expect(odataGuid("C0000000-0000-0000-0000-0000000000F1")).toBe(
+      "guid'c0000000-0000-0000-0000-0000000000f1'",
+    );
+    expect(() => odataGuid("c0000000-0000-0000-0000-0000000000f1' or 1 eq 1")).toThrow(RangeError);
+    expect(() => odataGuid("")).toThrow(RangeError);
+  });
 });
 
 describe("sync endpoints", () => {
@@ -281,7 +402,8 @@ describe("sync endpoints", () => {
 
   it("stops at the page cap with a resumable cursor when maxPages is given", async () => {
     const { transport, calls } = scripted([ok(fx.SYNC_RECEIVABLES), ok(fx.SYNC_RECEIVABLES_2)]);
-    const page = await createExactClient(transport, { ...base, maxPages: 1 }).syncPayables("0", {
+    // Client default cap is 200: the per-call maxPages must really be the cap.
+    const page = await createExactClient(transport, base).syncPayables("0", {
       maxPages: 1,
     });
     expect(calls).toHaveLength(1);
@@ -291,10 +413,66 @@ describe("sync endpoints", () => {
     expect(page.items[0]?.kind).toBe("payable");
   });
 
+  it("stops (never throws) at the client page cap and resumes from the cursor", async () => {
+    const { transport, calls } = scripted([ok(fx.SYNC_RECEIVABLES), ok(fx.SYNC_RECEIVABLES_2)]);
+    const c = createExactClient(transport, { ...base, maxPages: 1 });
+    const first = await c.syncReceivables("0");
+    expect(first).toMatchObject({ complete: false, nextCursor: "500" });
+    const second = await c.syncReceivables(first.nextCursor);
+    expect(calls[1]?.query?.["$filter"]).toBe("Timestamp gt 500L");
+    expect(second).toMatchObject({ complete: true, nextCursor: "700" });
+  });
+
+  it("refuses a partial read whose rows are not in Timestamp order", async () => {
+    const row = (id: string, ts: number) =>
+      `{"ID":"a0000000-0000-0000-0000-00000000000${id}","Account":"c0000000-0000-0000-0000-000000000001","Amount":1,"Currency":"EUR","Timestamp":${ts}}`;
+    const unordered = `{"d":{"results":[${row("1", 500)},${row("2", 400)}],"__next":"https://${fx.HOST}/api/v1/${fx.DIV}/sync/Cashflow/Receivables?$skiptoken=1"}}`;
+    const { transport } = scripted([ok(unordered)]);
+    await expect(
+      createExactClient(transport, base).syncReceivables("0", { maxPages: 1 }),
+    ).rejects.toMatchObject({ code: "SYNC_ORDER" });
+  });
+
+  it("accepts unordered rows when the read is complete", async () => {
+    const unordered = fx.SYNC_ACCOUNTS.replace("9007199254740999", "3");
+    const page = await createExactClient(scripted([ok(unordered)]).transport, base).syncAccounts(
+      "0",
+    );
+    expect(page.nextCursor).toBe("9007199254740993");
+  });
+
+  it("rejects sync rows without a Timestamp", async () => {
+    const noTs = fx.SYNC_RECEIVABLES_2.replace(',"Timestamp":700', "");
+    await expect(
+      createExactClient(scripted([ok(noTs)]).transport, base).syncReceivables("0"),
+    ).rejects.toMatchObject({ code: "BAD_SHAPE" });
+  });
+
+  it("rejects Timestamps beyond 64 bits", async () => {
+    const big = fx.SYNC_RECEIVABLES_2.replace(
+      '"Timestamp":700',
+      '"Timestamp":18446744073709551616',
+    );
+    await expect(
+      createExactClient(scripted([ok(big)]).transport, base).syncReceivables("0"),
+    ).rejects.toMatchObject({ code: "BAD_SHAPE" });
+  });
+
+  it("normalises a zero-padded cursor", async () => {
+    const { transport, calls } = scripted([ok(fx.EMPTY)]);
+    const page = await createExactClient(transport, base).syncAccounts("0042");
+    expect(calls[0]?.query?.["$filter"]).toBe("Timestamp gt 42L");
+    expect(page.nextCursor).toBe("42");
+  });
+
   it("rejects a cursor that is not digits (filter injection)", async () => {
     const c = createExactClient(scripted([]).transport, base);
     await expect(c.syncAccounts("0 or true")).rejects.toThrow(RangeError);
     await expect(c.syncAccounts("-1")).rejects.toThrow(RangeError);
+    await expect(c.syncAccounts("")).rejects.toThrow(RangeError);
+    await expect(c.syncAccounts("0L or 1 eq 1")).rejects.toThrow(RangeError);
+    await expect(c.syncAccounts("18446744073709551616")).rejects.toThrow(RangeError);
+    await expect(c.syncAccounts("0", { maxPages: 0 })).rejects.toThrow(RangeError);
   });
 });
 
@@ -344,6 +522,7 @@ describe("GL balances", () => {
     await expect(c.listGlBalances({ year: 2025, upToPeriod: -1, currency: "EUR" })).rejects.toThrow(
       RangeError,
     );
+    await expect(c.listGlBalances({ year: 2025, currency: "eur" })).rejects.toThrow(RangeError);
   });
 
   it("rejects incomplete rows", async () => {
@@ -390,12 +569,12 @@ describe("errors and retries", () => {
 
   it("surfaces ExactRateLimitedError and budget errors from the transport without retry", async () => {
     const sleep = vi.fn(noSleep);
-    const rl = scripted([new ExactRateLimitedError("gate", 1234)]);
+    const rl = scripted([new ExactRateLimitedError(1234, "gate")]);
     await expect(
       createExactClient(rl.transport, { ...base, sleep }).listDivisions(),
     ).rejects.toMatchObject({ retryAfterMs: 1234 });
     expect(rl.calls).toHaveLength(1);
-    const bu = scripted([new ExactBudgetExhaustedError("spent", "job-1")]);
+    const bu = scripted([new ExactBudgetExhaustedError("job-1")]);
     await expect(
       createExactClient(bu.transport, { ...base, sleep }).listDivisions(),
     ).rejects.toMatchObject({
@@ -487,6 +666,43 @@ describe("errors and retries", () => {
     expect(c).toBeInstanceOf(ExactApiError);
   });
 
+  it("never puts body text into invalid-JSON errors (engine messages quote the input)", async () => {
+    const body = `{"d":{"results":[{"BankAccount":"NL91ABNA0417164300",}]}}`;
+    for (const call of ["currentMe", "listBankAccounts"] as const) {
+      const client = createExactClient(scripted([ok(body)]).transport, base);
+      const err = (await client[call]().catch((e: unknown) => e)) as ExactApiError;
+      expect(err).toBeInstanceOf(ExactApiError);
+      expect(err.code).toBe("BAD_JSON");
+      expect(err.message).not.toContain("NL91");
+      expect(String(err.stack)).not.toContain("NL91ABNA");
+    }
+  });
+
+  it("does not retry 4xx or 3xx", async () => {
+    for (const code of [400, 403, 404, 409, 302]) {
+      const sleep = vi.fn(noSleep);
+      const { transport, calls } = scripted([status(code), ok(fx.DIVISIONS)]);
+      await expect(
+        createExactClient(transport, { ...base, sleep }).listDivisions(),
+      ).rejects.toMatchObject({ status: code });
+      expect(calls).toHaveLength(1);
+      expect(sleep).not.toHaveBeenCalled();
+    }
+  });
+
+  it("does not retry a 5xx that hits a later page twice over", async () => {
+    const sleep = vi.fn(noSleep);
+    const { transport, calls } = scripted([
+      ok(fx.receivablesPage1()),
+      status(503),
+      ok(fx.RECEIVABLES_PAGE2),
+    ]);
+    const items = await createExactClient(transport, { ...base, sleep }).listReceivables();
+    expect(items).toHaveLength(3);
+    expect(calls).toHaveLength(3);
+    expect(calls[2]?.query?.["$skiptoken"]).toBe(calls[1]?.query?.["$skiptoken"]);
+  });
+
   it("never puts IBANs from data into BAD_SHAPE messages", async () => {
     const body = `{"d":{"results":[{"ID":1,"BankAccount":"NL91ABNA0417164300"}]}}`;
     const err = (await createExactClient(scripted([ok(body)]).transport, base)
@@ -519,6 +735,13 @@ describe("xmlUpload", () => {
     });
     expect(c?.body).toContain("<eExact");
     expect(c?.body).toContain("<MatchSets/>");
+  });
+
+  it("treats an HTML page with status 200 as an error, never as ok", async () => {
+    const { transport } = scripted([ok("<html><body>Log in</body></html>")]);
+    await expect(
+      createExactClient(transport, base).xmlUpload("MatchSets", "<MatchSets/>"),
+    ).rejects.toMatchObject({ code: "BAD_XML" });
   });
 
   it("rejects bad topic names", async () => {

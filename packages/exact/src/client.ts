@@ -2,13 +2,15 @@ import { type Money, money } from "@camelthorn/core";
 import {
   type Row,
   asRow,
+  badData,
   bigField,
   boolField,
   dateField,
   intField,
+  isGuid,
   minorField,
   parseJsonRawNumbers,
-  reqStr,
+  reqGuid,
   strField,
   trimField,
 } from "./json";
@@ -37,7 +39,7 @@ export interface ExactClientOptions {
   priority: ExactPriority;
   /** Host that `__next` links must point to. Default: the Dutch instance. */
   host?: string;
-  /** Max pages followed per read. Default 200. */
+  /** Max pages followed per read (positive integer). Default 200. */
   maxPages?: number;
   /** Injected so tests (and the worker) control backoff. Default: setTimeout. */
   sleep?: (ms: number) => Promise<void>;
@@ -208,15 +210,19 @@ function divisionSegment(division: number): string {
 
 /**
  * Turn an OData `__next` full URL back into a transport path + query, refusing anything that
- * leaves the expected host, scheme, division or endpoint. A hostile or buggy link must never make
- * us send the bearer token elsewhere or read another division.
+ * leaves the expected host, scheme, port, division or endpoint. A hostile or buggy link must never
+ * make us send the bearer token elsewhere or read another division.
+ *
+ * Only `$skiptoken` is taken from the link. Everything else (our `$select`, `$filter`,
+ * `$orderby`) is re-sent from `baseQuery`, so a link can neither widen `$select`, drop the sync
+ * cursor filter, nor add `$expand` or other parameters. The path sent is always `expected.path`.
  */
 export function resolveNextLink(
   next: string,
-  expected: { host: string; division: number; path: string; select: string },
+  expected: { host: string; division: number; path: string; baseQuery: Record<string, string> },
 ): { path: string; query: Record<string, string> } {
   const bad = (why: string): never => {
-    throw new ExactApiError(`Refusing Exact paging link: ${why}`, 200, "BAD_NEXT_LINK");
+    throw badData(`Refusing Exact paging link: ${why}`, "BAD_NEXT_LINK");
   };
   let url: URL;
   try {
@@ -232,13 +238,11 @@ export function resolveNextLink(
   if (url.pathname.toLowerCase() !== `${prefix}${expected.path}`.toLowerCase()) {
     bad("different division or endpoint");
   }
-  const query: Record<string, string> = {};
-  for (const [k, v] of url.searchParams) {
-    if (Object.prototype.hasOwnProperty.call(query, k)) bad("duplicate query key");
-    query[k] = v;
-  }
-  if (query["$select"] === undefined) query["$select"] = expected.select;
-  return { path: expected.path, query };
+  const tokens = url.searchParams.getAll("$skiptoken");
+  if (tokens.length !== 1) bad(tokens.length === 0 ? "no $skiptoken" : "duplicate $skiptoken");
+  const skiptoken = tokens[0] ?? "";
+  if (skiptoken === "" || skiptoken.length > 500) bad("bad $skiptoken");
+  return { path: expected.path, query: { ...expected.baseQuery, $skiptoken: skiptoken } };
 }
 
 function envelopeRows(parsed: unknown): { rows: Row[]; next: string | null } {
@@ -248,7 +252,7 @@ function envelopeRows(parsed: unknown): { rows: Row[]; next: string | null } {
   const body = asRow(d);
   const results = body["results"];
   if (!Array.isArray(results)) {
-    throw new ExactApiError("Unexpected response envelope from Exact", 200, "BAD_SHAPE");
+    throw badData("Unexpected response envelope from Exact", "BAD_SHAPE");
   }
   const next = body["__next"];
   return {
@@ -291,12 +295,23 @@ function errorDetail(body: string): { message: string; code?: string } {
 // Client
 // ---------------------------------------------------------------------------------------------
 
-const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const CURSOR_RE = /^\d{1,20}$/;
 
-function assertGuid(v: string): string {
-  if (!GUID_RE.test(v)) throw new RangeError("expected a GUID");
-  return v;
+/** OData v2 GUID literal for a $filter. Throws RangeError unless `v` is a GUID. */
+export function odataGuid(v: string): string {
+  if (!isGuid(v)) throw new RangeError("expected a GUID");
+  return `guid'${v.toLowerCase()}'`;
+}
+
+/**
+ * OData v2 string literal for a $filter: wrapped in single quotes, embedded quotes doubled
+ * (`O'Brien` -> `'O''Brien'`). Percent-encoding of the whole query value is the transport's job
+ * (URLSearchParams); never pre-encode here or the value is encoded twice.
+ */
+export function odataString(v: string): string {
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001F]/.test(v)) throw new RangeError("control characters in OData string");
+  return `'${v.replace(/'/g, "''")}'`;
 }
 
 function maxTimestamp(a: string, b: string | null): string {
@@ -304,9 +319,19 @@ function maxTimestamp(a: string, b: string | null): string {
   return BigInt(b) > BigInt(a) ? b : a;
 }
 
+function assertMaxPages(v: number): number {
+  if (!Number.isSafeInteger(v) || v < 1)
+    throw new RangeError("maxPages must be a positive integer");
+  return v;
+}
+
 export function createExactClient(transport: ExactTransport, options: ExactClientOptions) {
+  if (!Number.isSafeInteger(options.division) || options.division < 1) {
+    throw new RangeError("division must be a positive integer");
+  }
+  if (options.jobId === "") throw new RangeError("jobId is required");
   const host = options.host ?? DEFAULT_EXACT_HOST;
-  const maxPages = options.maxPages ?? DEFAULT_MAX_PAGES;
+  const maxPages = assertMaxPages(options.maxPages ?? DEFAULT_MAX_PAGES);
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const now = options.now ?? Date.now;
 
@@ -331,14 +356,14 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
       }
       if (res.status === 429) {
         throw new ExactRateLimitedError(
-          "Exact rate limit reached",
           retryAfterFromHeaders(lowerCaseHeaders(res.headers), now()),
+          "Exact rate limit reached",
         );
       }
       const detail = errorDetail(res.body);
       throw new ExactApiError(
-        `Exact API error ${res.status} on ${req.path}: ${detail.message}`,
         res.status,
+        `Exact API error ${res.status} on ${req.path}: ${detail.message}`,
         detail.code,
       );
     }
@@ -371,44 +396,38 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
     select: readonly string[],
     extra: Record<string, string>,
     onCap: "throw" | "stop",
-    division: number = options.division,
+    cap: number = maxPages,
   ): Promise<{ rows: Row[]; complete: boolean }> {
-    const selectValue = select.join(",");
-    let query: Record<string, string> = { $select: selectValue, ...extra };
+    const division = options.division;
+    // $select comes last so `extra` can never replace it.
+    const baseQuery: Record<string, string> = { ...extra, $select: select.join(",") };
+    let query = baseQuery;
     const rows: Row[] = [];
     for (let page = 1; ; page++) {
       const res = await restGet(path, query, division);
-      let parsed: unknown;
-      try {
-        parsed = parseJsonRawNumbers(res.body);
-      } catch {
-        throw new ExactApiError(`Exact returned invalid JSON for ${path}`, res.status, "BAD_JSON");
-      }
-      const { rows: pageRows, next } = envelopeRows(parsed);
+      const { rows: pageRows, next } = envelopeRows(parseJsonRawNumbers(res.body));
       rows.push(...pageRows);
       if (next === null) return { rows, complete: true };
-      if (page >= maxPages) {
+      if (page >= cap) {
         if (onCap === "stop") return { rows, complete: false };
-        throw new ExactApiError(
-          `Exact paging cap of ${maxPages} pages reached for ${path}`,
-          200,
-          "PAGE_CAP",
-        );
+        throw badData(`Exact paging cap of ${cap} pages reached for ${path}`, "PAGE_CAP");
       }
-      query = resolveNextLink(next, {
-        host,
-        division,
-        path,
-        select: selectValue,
-      }).query;
+      query = resolveNextLink(next, { host, division, path, baseQuery }).query;
     }
   }
 
   // --- mappers ---------------------------------------------------------------------------
 
+  /** Sync rows must carry a Timestamp, or the cursor could not advance past them. */
+  function reqTimestamp(r: Row): string {
+    const t = bigField(r, "Timestamp");
+    if (t === null) throw badData("Sync row without Timestamp", "BAD_SHAPE");
+    return t;
+  }
+
   function mapAccount(r: Row, withTimestamp: boolean): ExactAccount {
     return {
-      id: reqStr(r, "ID"),
+      id: reqGuid(r, "ID"),
       code: trimField(r, "Code"),
       name: strField(r, "Name") ?? "",
       email: trimField(r, "Email"),
@@ -417,26 +436,27 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
       isSupplier: boolField(r, "IsSupplier"),
       isSales: boolField(r, "IsSales"),
       status: trimField(r, "Status"),
-      timestamp: withTimestamp ? bigField(r, "Timestamp") : null,
+      timestamp: withTimestamp ? reqTimestamp(r) : null,
     };
   }
 
+  function moneyField(r: Row, key: string, rawCurrency: string | null): Money {
+    const currency = rawCurrency?.toUpperCase() ?? null;
+    if (currency === null || !/^[A-Z]{3}$/.test(currency)) {
+      throw badData("Row without a valid currency", "BAD_SHAPE");
+    }
+    // Scale follows the currency (JPY 0, EUR 2, KWD 3): minor units are the currency's own.
+    const minor = minorField(r, key, currency);
+    if (minor === null) throw badData(`Missing ${key}`, "BAD_SHAPE");
+    return money(minor, currency);
+  }
+
   function mapOpenItem(kind: OpenItemKind, r: Row, sync: boolean): OpenItem {
-    const minor = minorField(r, "Amount");
-    const currency = trimField(r, sync ? "Currency" : "CurrencyCode");
-    if (minor === null || currency === null) {
-      throw new ExactApiError("Open item without amount or currency", 200, "BAD_SHAPE");
-    }
-    let amount: Money;
-    try {
-      amount = money(minor, currency.toUpperCase());
-    } catch {
-      throw new ExactApiError("Open item with invalid currency", 200, "BAD_SHAPE");
-    }
+    const amount = moneyField(r, "Amount", trimField(r, sync ? "Currency" : "CurrencyCode"));
     return {
       kind,
-      id: reqStr(r, "ID"),
-      accountId: reqStr(r, sync ? "Account" : "AccountId"),
+      id: reqGuid(r, "ID"),
+      accountId: reqGuid(r, sync ? "Account" : "AccountId"),
       accountCode: trimField(r, "AccountCode"),
       accountName: trimField(r, "AccountName"),
       invoiceNumber: intField(r, "InvoiceNumber"),
@@ -445,7 +465,7 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
       invoiceDate: dateField(r, "InvoiceDate"),
       dueDate: dateField(r, "DueDate"),
       amount,
-      timestamp: sync ? bigField(r, "Timestamp") : null,
+      timestamp: sync ? reqTimestamp(r) : null,
     };
   }
 
@@ -454,21 +474,37 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
     select: readonly string[],
     cursor: string,
     map: (r: Row) => T,
-    maxPagesOverride?: number,
+    pagesOverride?: number,
   ): Promise<SyncPage<T>> {
-    if (!CURSOR_RE.test(cursor))
-      throw new RangeError("cursor must be a non-negative integer string");
+    if (!CURSOR_RE.test(cursor) || BigInt(cursor) > 18446744073709551615n) {
+      throw new RangeError("cursor must be a non-negative 64-bit integer string");
+    }
+    const cap = pagesOverride === undefined ? maxPages : assertMaxPages(pagesOverride);
     // Timestamp cursor pattern: ascending by Timestamp, strictly greater than the last one seen,
-    // so a resumed read never skips or repeats rows.
+    // so a resumed read never skips or repeats rows. At the page cap the read stops and returns
+    // complete: false with a resumable cursor (a sync never throws work away at the cap).
     const { rows, complete } = await readAll(
       path,
       select,
-      { $filter: `Timestamp gt ${cursor}L`, $orderby: "Timestamp" },
-      maxPagesOverride === undefined ? "throw" : "stop",
+      { $filter: `Timestamp gt ${BigInt(cursor).toString()}L`, $orderby: "Timestamp" },
+      "stop",
+      cap,
     );
     const items = rows.map(map);
-    let nextCursor = cursor;
-    for (const it of items) nextCursor = maxTimestamp(nextCursor, it.timestamp);
+    let nextCursor = BigInt(cursor).toString();
+    let ordered = true;
+    let prev: bigint | null = null;
+    for (const it of items) {
+      nextCursor = maxTimestamp(nextCursor, it.timestamp);
+      const t = it.timestamp === null ? null : BigInt(it.timestamp);
+      if (t !== null && prev !== null && t < prev) ordered = false;
+      if (t !== null) prev = t;
+    }
+    // Resuming a partial read from the max Timestamp is only safe if rows came in ascending
+    // order; otherwise rows below the max that were not read yet would be skipped forever.
+    if (!complete && !ordered) {
+      throw badData(`Exact sync rows for ${path} not in Timestamp order`, "SYNC_ORDER");
+    }
     return { items, nextCursor, complete };
   }
 
@@ -476,20 +512,21 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
 
   return {
     /**
-     * `/current/Me`: the one call without a division in the URL (sent with division 0, see
-     * transport.ts). Use `currentDivision` to start a client for the user's default division.
+     * `/api/v1/current/Me`: sent as path `/Me` with division 0, which the transport turns into
+     * the `current` segment (transport.ts). Use `currentDivision` to start a client for the
+     * user's default division.
      */
     async currentMe(): Promise<CurrentMe> {
-      const res = await restGet("/current/Me", { $select: ME_FIELDS.join(",") }, 0);
+      const res = await restGet("/Me", { $select: ME_FIELDS.join(",") }, 0);
       const { rows } = envelopeRows(parseJsonRawNumbers(res.body));
       const r = rows[0];
-      if (r === undefined) throw new ExactApiError("Empty /current/Me response", 200, "BAD_SHAPE");
+      if (r === undefined) throw badData("Empty /current/Me response", "BAD_SHAPE");
       const currentDivision = intField(r, "CurrentDivision");
-      if (currentDivision === null) {
-        throw new ExactApiError("Missing CurrentDivision", 200, "BAD_SHAPE");
+      if (currentDivision === null || currentDivision < 1) {
+        throw badData("Missing CurrentDivision", "BAD_SHAPE");
       }
       return {
-        userId: reqStr(r, "UserID"),
+        userId: reqGuid(r, "UserID"),
         userName: trimField(r, "UserName"),
         fullName: trimField(r, "FullName"),
         email: trimField(r, "Email"),
@@ -501,7 +538,7 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
       const { rows } = await readAll("/system/Divisions", DIVISION_FIELDS, {}, "throw");
       return rows.map((r) => {
         const code = intField(r, "Code");
-        if (code === null) throw new ExactApiError("Division without Code", 200, "BAD_SHAPE");
+        if (code === null || code < 1) throw badData("Division without Code", "BAD_SHAPE");
         return {
           code,
           description: trimField(r, "Description"),
@@ -534,15 +571,13 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
     /** IBANs per relation; pass accountId to restrict to one relation. */
     async listBankAccounts(opts: { accountId?: string } = {}): Promise<ExactBankAccount[]> {
       const extra: Record<string, string> =
-        opts.accountId === undefined
-          ? {}
-          : { $filter: `Account eq guid'${assertGuid(opts.accountId)}'` };
+        opts.accountId === undefined ? {} : { $filter: `Account eq ${odataGuid(opts.accountId)}` };
       const { rows } = await readAll("/crm/BankAccounts", BANK_ACCOUNT_FIELDS, extra, "throw");
       return rows.map((r) => {
         const iban = trimField(r, "BankAccount");
         return {
-          id: reqStr(r, "ID"),
-          accountId: reqStr(r, "Account"),
+          id: reqGuid(r, "ID"),
+          accountId: reqGuid(r, "Account"),
           iban: iban === null ? null : iban.replace(/\s+/g, "").toUpperCase(),
           bic: trimField(r, "BICCode"),
           bankName: trimField(r, "BankName"),
@@ -596,14 +631,17 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
     },
 
     /**
-     * GL account balances per reporting period for one year (cumulative through `upToPeriod`
-     * when given). Amounts are in the division currency.
+     * GL account balance rows for one reporting year, limited to periods <= `upToPeriod` when
+     * given. Rows are returned as Exact sends them (one per account/period, assumed per-period
+     * movements, not cumulative; ADR 0014 item 8): the caller sums. `currency` is the division
+     * currency and sets the minor-unit scale.
      */
     async listGlBalances(opts: {
       year: number;
       upToPeriod?: number;
       currency: string;
     }): Promise<GlBalance[]> {
+      if (!/^[A-Z]{3}$/.test(opts.currency)) throw new RangeError("invalid currency");
       if (!Number.isInteger(opts.year) || opts.year < 1900 || opts.year > 2200) {
         throw new RangeError("invalid reporting year");
       }
@@ -621,20 +659,19 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
         "throw",
       );
       return rows.map((r) => {
-        const minor = minorField(r, "Amount");
         const year = intField(r, "ReportingYear");
         const period = intField(r, "ReportingPeriod");
-        if (minor === null || year === null || period === null) {
-          throw new ExactApiError("Incomplete GL balance row", 200, "BAD_SHAPE");
+        if (year === null || period === null) {
+          throw badData("Incomplete GL balance row", "BAD_SHAPE");
         }
         return {
-          glAccountId: reqStr(r, "GLAccount"),
+          glAccountId: reqGuid(r, "GLAccount"),
           glAccountCode: trimField(r, "GLAccountCode"),
           glAccountDescription: trimField(r, "GLAccountDescription"),
           reportingYear: year,
           reportingPeriod: period,
           balanceType: trimField(r, "BalanceType"),
-          amount: money(minor, opts.currency),
+          amount: moneyField(r, "Amount", opts.currency),
         };
       });
     },

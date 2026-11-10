@@ -13,6 +13,8 @@ export function maskIban(iban: string): string {
 export function sanitizeForMessage(text: string, maxLength = 300): string {
   const cleaned = text
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [redacted]")
+    // Bare JWTs (header.payload[.signature]) wherever they appear.
+    .replace(/\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}(?:\.[A-Za-z0-9_-]*)?/g, "[redacted]")
     .replace(
       /("?(?:access_token|refresh_token|client_secret|id_token)"?\s*[:=]\s*)"?[^"&\s,}]+"?/gi,
       "$1[redacted]",

@@ -59,6 +59,8 @@ export const GL_BALANCES = `{"d":{"results":[
 
 export const ERROR_BODY = `{"error":{"code":"","message":{"lang":"","value":"Bad filter for NL91ABNA0417164300 with Bearer abc.def.ghi"}}}`;
 
-export const XML_OK = `<?xml version="1.0" encoding="utf-8"?><eExact><Topics><Topic code="MatchSets" count="1"><Data/><Messages><Message type="0"><Description>Created &amp; matched</Description></Message></Messages></Topic></Topics></eExact>`;
+// XML message types follow XML_MESSAGE_SEVERITY (0 error, 1 warning, 2 success, 3 fatal): a
+// recollection, not verified. See ADR 0014 item 13.
+export const XML_OK = `<?xml version="1.0" encoding="utf-8"?><eExact><Topics><Topic code="MatchSets" count="1"><Data/><Messages><Message type="2"><Description>Created &amp; matched</Description></Message></Messages></Topic></Topics></eExact>`;
 
-export const XML_ERR = `<?xml version="1.0" encoding="utf-8"?><eExact><Topics><Topic code="MatchSets"><Messages><Message type="2"><Description>Entry &lt;12&gt; is already matched</Description></Message><Message type="1"><Description>Warn</Description></Message></Messages></Topic></Topics></eExact>`;
+export const XML_ERR = `<?xml version="1.0" encoding="utf-8"?><eExact><Topics><Topic code="MatchSets"><Messages><Message type="0"><Description>Entry &lt;12&gt; is already matched</Description></Message><Message type="1"><Description>Warn</Description></Message></Messages></Topic></Topics></eExact>`;

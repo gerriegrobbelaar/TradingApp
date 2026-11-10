@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   addMoney,
+  compareMoney,
+  currencyScale,
+  formatMoney,
   formatMinor,
   isZeroMoney,
   money,
@@ -74,7 +77,33 @@ describe("Money helpers", () => {
 
   it("parses decimals into Money", () => {
     expect(moneyFromDecimal("12.34", "USD")).toEqual({ minor: 1234, currency: "USD" });
-    expect(moneyFromDecimal("1.234", "KWD", 3)).toEqual({ minor: 1234, currency: "KWD" });
+    expect(moneyFromDecimal("1.234", "KWD")).toEqual({ minor: 1234, currency: "KWD" });
+    expect(moneyFromDecimal("1234", "JPY")).toEqual({ minor: 1234, currency: "JPY" });
+    expect(moneyFromDecimal("1234.5", "JPY")).toEqual({ minor: 1235, currency: "JPY" });
+    expect(moneyFromDecimal("-1234.5", "JPY")).toEqual({ minor: -1235, currency: "JPY" });
+    expect(() => moneyFromDecimal("1", "eur")).toThrow(RangeError);
+  });
+
+  it("knows each currency's minor-unit exponent", () => {
+    expect(currencyScale("EUR")).toBe(2);
+    expect(currencyScale("ZAR")).toBe(2);
+    expect(currencyScale("JPY")).toBe(0);
+    expect(currencyScale("KWD")).toBe(3);
+    expect(currencyScale("CLF")).toBe(4);
+    expect(() => currencyScale("EURO")).toThrow(RangeError);
+  });
+
+  it("compares and refuses mixed currencies", () => {
+    expect(compareMoney(money(1, "EUR"), money(2, "EUR"))).toBe(-1);
+    expect(compareMoney(money(2, "EUR"), money(2, "EUR"))).toBe(0);
+    expect(compareMoney(money(3, "EUR"), money(2, "EUR"))).toBe(1);
+    expect(() => compareMoney(money(1, "EUR"), money(1, "USD"))).toThrow(/mismatch/);
+  });
+
+  it("refuses results outside the safe integer range", () => {
+    const max = money(Number.MAX_SAFE_INTEGER, "EUR");
+    expect(() => addMoney(max, money(1, "EUR"))).toThrow(RangeError);
+    expect(() => subMoney(negateMoney(max), money(1, "EUR"))).toThrow(RangeError);
   });
 
   it("adds, subtracts, negates", () => {
@@ -97,5 +126,13 @@ describe("Money helpers", () => {
     expect(formatMinor(1234, 0)).toBe("1234");
     expect(formatMinor(1234, 3)).toBe("1.234");
     expect(() => formatMinor(0.5)).toThrow(RangeError);
+    expect(() => formatMinor(1, -1)).toThrow(RangeError);
+    expect(() => formatMinor(1, 9)).toThrow(RangeError);
+  });
+
+  it("formats Money at the currency scale", () => {
+    expect(formatMoney(money(1205, "EUR"))).toBe("12.05");
+    expect(formatMoney(money(-1234, "JPY"))).toBe("-1234");
+    expect(formatMoney(money(1234, "KWD"))).toBe("1.234");
   });
 });
