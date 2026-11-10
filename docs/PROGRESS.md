@@ -5,7 +5,7 @@ Orchestrator log. Update after every merge and every direct (trivial) edit.
 ## Phase status
 | # | Phase | Status |
 |---|---|---|
-| 1 | Foundation | Review fixes in progress (no blockers) |
+| 1 | Foundation | Done (open go-live gate: confirm Google returns auth_time, ADR 0007) |
 | 2 | Exact connection | Not started |
 | 3 | Scheduler | Not started |
 | 4 | Read-only screens | Not started |
@@ -28,6 +28,7 @@ Orchestrator log. Update after every merge and every direct (trivial) edit.
   - Go-live check: confirm Google returns auth_time with max_age (step-up fails closed otherwise); see apps/worker/README.md.
 - 2026-11-10: T5 app shell, sign-in UI, Settings/Users merged (reviewer PASS, browser-checked at 360/1280 in both themes; screenshots in docs/design/screens/).
 - 2026-11-10: Phase 1 final review done: no blockers, see docs/reviews/phase-1-review.md. Fix tasks F1 (worker write pattern, errors, invite revoke/restore, cleanup), F2 (headers, deploy), F4 (contrast) started; F3 (dedupe + ADRs) follows F1.
+- 2026-11-10: F1-F4 review fixes merged (atomic audit batches, headers, deploy guard, contrast tokens, shared core logic, ADRs 0003-0013). CLAUDE.md §4.0 seed wording changed (seed at first Worker start, ADR 0004).
 - 2026-11-10: ADR 0001 (Workers only), ADR 0002 (camelthorncapital.com only, no external emails in v1). Direct edit (docs).
 - 2026-11-10: F3 (branch build/F3): shared auth logic moved to packages/core (roles, email, safeReturnTo), `allowedDomain` on /api/auth/me and public /api/config, auth.flow claim via idempotency helper; ADRs 0003-0013 written; CLAUDE.md 4.0 now says the admin is seeded at first Worker start.
 
