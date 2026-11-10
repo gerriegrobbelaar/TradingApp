@@ -156,8 +156,24 @@ export interface SyncPage<T> {
   items: T[];
   /** Resume point: pass as `cursor` next time. Equals the input cursor when nothing changed. */
   nextCursor: string;
-  /** False when the page cap stopped the read early; call again with `nextCursor`. */
+  /** False when the page cap (or an error after the first page) stopped the read early. */
   complete: boolean;
+  /**
+   * Set when a page after the first one failed: `items` and `nextCursor` still cover every page
+   * that was read, so the caller can save them and then rethrow this error. Without it a failure
+   * on page 4 would throw away pages 1-3 and a slow gate could keep a run from ever advancing.
+   */
+  error?: unknown;
+}
+
+/** One resumable chunk of a bulk list read (open receivables / payables). */
+export interface ListChunk<T> {
+  items: T[];
+  /** `$skiptoken` to continue from, or null when the list is complete. */
+  nextToken: string | null;
+  complete: boolean;
+  /** As for `SyncPage.error`: pages read before a failure are returned, not thrown away. */
+  error?: unknown;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -451,6 +467,57 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
     }
   }
 
+  /**
+   * Read up to `cap` pages of a collection starting at `token` (a `$skiptoken` saved from an
+   * earlier chunk, or null for the start). Returns the `$skiptoken` to continue from. If a page
+   * after the first fails, the pages already read are returned together with the error (the
+   * caller saves them and rethrows); a failure on the first page throws.
+   */
+  async function readChunk(
+    path: string,
+    select: readonly string[],
+    extra: Record<string, string>,
+    token: string | null,
+    cap: number,
+    needToken: boolean,
+  ): Promise<{ rows: Row[]; nextToken: string | null; complete: boolean; error?: unknown }> {
+    const division = options.division;
+    const baseQuery: Record<string, string> = { ...extra, $select: select.join(",") };
+    if (token !== null && (token === "" || token.length > 500)) {
+      throw new RangeError("bad $skiptoken");
+    }
+    let query: Record<string, string> =
+      token === null ? baseQuery : { ...baseQuery, $skiptoken: token };
+    const rows: Row[] = [];
+    let nextToken = token;
+    for (let page = 1; ; page++) {
+      let pageRows: Row[];
+      let next: string | null;
+      try {
+        const res = await restGet(path, query, division);
+        ({ rows: pageRows, next } = envelopeRows(parseJsonRawNumbers(res.body)));
+      } catch (e) {
+        if (page === 1) throw e;
+        return { rows, nextToken, complete: false, error: e };
+      }
+      rows.push(...pageRows);
+      if (next === null) return { rows, nextToken: null, complete: true };
+      // Sync reads resume from a Timestamp cursor and never need the link at the page cap.
+      if (page >= cap && !needToken) return { rows, nextToken, complete: false };
+      let resolved: { path: string; query: Record<string, string> };
+      try {
+        resolved = resolveNextLink(next, { host, division, path, baseQuery });
+      } catch (e) {
+        // Rows of this page are good, but there is no safe place to continue from.
+        if (page === 1) throw e;
+        return { rows, nextToken, complete: false, error: e };
+      }
+      nextToken = resolved.query["$skiptoken"] ?? null;
+      query = resolved.query;
+      if (page >= cap) return { rows, nextToken, complete: false };
+    }
+  }
+
   // --- mappers ---------------------------------------------------------------------------
 
   /** Sync rows must carry a Timestamp, or the cursor could not advance past them. */
@@ -547,12 +614,13 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
     // Timestamp cursor pattern: ascending by Timestamp, strictly greater than the last one seen,
     // so a resumed read never skips or repeats rows. At the page cap the read stops and returns
     // complete: false with a resumable cursor (a sync never throws work away at the cap).
-    const { rows, complete } = await readAll(
+    const { rows, complete, error } = await readChunk(
       path,
       select,
       { $filter: `Timestamp gt ${BigInt(cursor).toString()}L`, $orderby: "Timestamp" },
-      "stop",
+      null,
       cap,
+      false,
     );
     const items = rows.map(map);
     let nextCursor = BigInt(cursor).toString();
@@ -569,7 +637,24 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
     if (!complete && !ordered) {
       throw badData(`Exact sync rows for ${path} not in Timestamp order`, "SYNC_ORDER");
     }
-    return { items, nextCursor, complete };
+    return error === undefined
+      ? { items, nextCursor, complete }
+      : { items, nextCursor, complete, error };
+  }
+
+  async function listChunk(
+    kind: OpenItemKind,
+    token: string | null,
+    opts: { maxPages?: number },
+  ): Promise<ListChunk<OpenItem>> {
+    const cap = opts.maxPages === undefined ? maxPages : assertMaxPages(opts.maxPages);
+    const path =
+      kind === "receivable" ? "/read/financial/ReceivablesList" : "/read/financial/PayablesList";
+    const r = await readChunk(path, OPEN_ITEM_LIST_FIELDS, {}, token, cap, true);
+    const items = r.rows.map((row) => mapOpenItem(kind, row, false));
+    return r.error === undefined
+      ? { items, nextToken: r.nextToken, complete: r.complete }
+      : { items, nextToken: r.nextToken, complete: false, error: r.error };
   }
 
   // --- public API --------------------------------------------------------------------------
@@ -670,6 +755,26 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
         "throw",
       );
       return rows.map((r) => mapOpenItem("payable", r, false));
+    },
+
+    /**
+     * Resumable read of the open receivables list: up to `maxPages` pages from `token` (null =
+     * start). Save `nextToken` (a `$skiptoken`) to continue in a later run. ASSUMPTION to verify
+     * (ADR 0017): the token is stateless and the list order is stable between runs.
+     */
+    listReceivablesChunk(
+      token: string | null,
+      opts: { maxPages?: number } = {},
+    ): Promise<ListChunk<OpenItem>> {
+      return listChunk("receivable", token, opts);
+    },
+
+    /** Resumable read of the open payables list; see `listReceivablesChunk`. */
+    listPayablesChunk(
+      token: string | null,
+      opts: { maxPages?: number } = {},
+    ): Promise<ListChunk<OpenItem>> {
+      return listChunk("payable", token, opts);
     },
 
     /** Incremental receivables. Start with cursor "0". Endpoint to be verified (ADR 0014). */

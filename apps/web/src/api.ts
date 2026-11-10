@@ -40,11 +40,14 @@ export interface UsersResponse {
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
-  constructor(status: number, code: string) {
+  /** From a 429 `cooldown` answer: seconds until a new run is allowed. */
+  readonly retryAfterSeconds: number | undefined;
+  constructor(status: number, code: string, retryAfterSeconds?: number) {
     super(code);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -99,14 +102,23 @@ interface RequestOptions {
   notifyOn401?: boolean;
 }
 
-async function errorCode(res: Response): Promise<string> {
+async function errorInfo(res: Response): Promise<{ code: string; retryAfterSeconds?: number }> {
   try {
     const v: unknown = await res.json();
-    if (v && typeof v === "object" && "error" in v && typeof v.error === "string") return v.error;
+    if (v && typeof v === "object" && "error" in v && typeof v.error === "string") {
+      const wait = "retryAfterSeconds" in v ? v.retryAfterSeconds : undefined;
+      return typeof wait === "number" && Number.isFinite(wait) && wait > 0
+        ? { code: v.error, retryAfterSeconds: Math.ceil(wait) }
+        : { code: v.error };
+    }
   } catch {
     /* no JSON body */
   }
-  return "request_failed";
+  return { code: "request_failed" };
+}
+
+async function errorCode(res: Response): Promise<string> {
+  return (await errorInfo(res)).code;
 }
 
 export async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
@@ -125,7 +137,10 @@ export async function request<T>(path: string, opts: RequestOptions = {}): Promi
     if (opts.notifyOn401 ?? true) for (const fn of sessionEndedListeners) fn();
     throw new ApiError(401, code);
   }
-  if (!res.ok) throw new ApiError(res.status, await errorCode(res));
+  if (!res.ok) {
+    const info = await errorInfo(res);
+    throw new ApiError(res.status, info.code, info.retryAfterSeconds);
+  }
   return (await res.json()) as T;
 }
 
@@ -216,6 +231,8 @@ export interface DivisionInfo {
     finishedAt: string;
     completedAt: string | null;
   } | null;
+  /** Seconds a new manual run of each mode must wait; continuing a partial run is exempt. */
+  cooldown?: { full: number; incremental: number };
 }
 
 export interface DivisionsResponse {
@@ -223,14 +240,30 @@ export interface DivisionsResponse {
   divisions: DivisionInfo[];
 }
 
+export interface SyncProgress {
+  /** Rows read so far in this pass. */
+  read: number;
+  /** Estimate of the rows to read (what we held before the pass), or null when unknown. */
+  total: number | null;
+}
+
 export interface SyncResponse {
   status: Exclude<SyncStatus, "running">;
   mode: "full" | "incremental";
   callsUsed: number;
   finishedAt: string;
+  /** Full mode: everything the cycle covers has been read. */
+  cycleComplete?: boolean;
   entities: Record<
     string,
-    { status: string; rows: number; calls: number; closed?: number; error?: string }
+    {
+      status: string;
+      rows: number;
+      calls: number;
+      closed?: number;
+      error?: string;
+      progress?: SyncProgress;
+    }
   >;
 }
 

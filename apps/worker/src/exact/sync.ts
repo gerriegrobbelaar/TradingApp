@@ -1,19 +1,25 @@
 /**
- * Exact -> D1 sync for one division (Phase 2, task E3). See ADR 0017 for the assumptions.
+ * Exact -> D1 sync for one division (Phase 2, tasks E3 and G1). See ADR 0017.
  *
- * Entities, in order: divisions, relations (accounts via the Timestamp sync endpoint), bank_accounts
- * (IBANs of those relations), receivables, payables.
+ * Entities, in this order (what users look at first refreshes first): divisions, receivables,
+ * payables, relations (accounts via the Timestamp sync endpoint), bank_accounts (IBANs).
  *
  *  - Everything goes through the division's ExactGate with priority 'job' and a call budget
  *    (startJob ... endJob in a finally).
- *  - FULL mode reads open receivables/payables completely and, only after that read finished and
- *    was written, closes the items it did not see (rows carry last_seen_sync_id). A partial or
- *    failed read never closes anything. Relations restart from Timestamp 0 unless a previous FULL
- *    pass is half done, in which case it resumes from its saved cursor.
- *  - INCREMENTAL mode continues every entity from its saved Timestamp cursor and never closes by
- *    absence (it only sees changes). A zero open amount closes the item.
- *  - Budget, rate limit, time limit: save progress, finish as 'partial', the next run resumes.
- *    Auth failure: record 'needs_reauth' and stop (no retry loop).
+ *  - FULL mode works in CYCLES that may span many runs (sync_state.cycle_seq on the 'run' row,
+ *    abandoned after 36 h or on `restart`). Inside a cycle every entity is read completely once
+ *    and then skipped by later runs of the cycle. Receivables and payables are read from the bulk
+ *    lists in resumable chunks (the `$skiptoken` is saved with the rows). Only when the read of
+ *    that kind has COMPLETED, items last seen before the cycle began are closed; a partial,
+ *    failed, rate-limited or time-boxed run never closes anything. A guard refuses to close
+ *    more than max(5, 20 %) of the open items of a kind without `allowLargeClose`.
+ *  - IBANs (crm/BankAccounts) are read in scheduled FULL runs only (`readIbans`), never hourly.
+ *  - INCREMENTAL mode continues every cursor-based entity from its saved Timestamp and never
+ *    closes by absence. A zero open amount closes an item we know; unknown closed items are not
+ *    inserted (that would import the whole paid history).
+ *  - Budget, rate limit, time limit, transient failures: save progress, finish as 'partial', the
+ *    next run resumes. Transient failures are counted per Amsterdam day and become 'error' after
+ *    MAX_TRANSIENT_RETRIES. Auth failure: record 'needs_reauth' and stop (no retry loop).
  *  - One audit row per run, written in the same D1 batch as the final state (ADR 0013). IBAN
  *    changes get their own audit row (masked) because the four-eyes check reads them.
  *  - Re-runnable: rows are upserted on (division_id, exact_id). Two runs for one division never
@@ -33,20 +39,26 @@ import {
 import { auditStatement } from "../db/audit";
 import type { Env } from "../env";
 import { createGateTransport, gateName } from "./gate-transport";
-import { amsterdamDate } from "./local-time";
+import { amsterdamDate, amsterdamParts } from "./local-time";
 
 export type SyncMode = "full" | "incremental";
 export type RunStatus = "ok" | "partial" | "error" | "needs_reauth";
 export type EntityName = "divisions" | "relations" | "bank_accounts" | "receivables" | "payables";
 export const ENTITIES: readonly EntityName[] = [
   "divisions",
-  "relations",
-  "bank_accounts",
   "receivables",
   "payables",
+  "relations",
+  "bank_accounts",
 ];
 
 export const DEFAULT_SYNC_BUDGET = 300;
+/** A full cycle that has not finished after this long is abandoned and started again. */
+export const CYCLE_MAX_AGE_MS = 36 * 60 * 60 * 1000;
+/** Transient failures (502/503/504, network, gate unavailable, rate limit) per Amsterdam day. */
+export const MAX_TRANSIENT_RETRIES = 3;
+/** Rough rows per page of crm/BankAccounts, used to skip an IBAN read the budget cannot finish. */
+const IBAN_PAGE_GUESS = 50;
 /** Pages read per chunk of a cursor-based read; progress is saved after every chunk. */
 export const DEFAULT_CHUNK_PAGES = 5;
 const MAX_CHUNKS = 200;
@@ -77,12 +89,18 @@ export interface SubrequestMeter {
 export const newMeter = (limit = SUBREQUEST_LIMIT): SubrequestMeter => ({ used: 0, limit });
 
 /**
- * An empty but complete FULL list closes every open item of that kind. If more than this many
- * were open, that is far more likely a fault (wrong division, filter, licence) than every item
- * paid at once: nothing is closed and the entity ends as `error` / `empty_list_guard` until an
- * admin runs a full sync with `allowEmptyClose`.
+ * A complete FULL read closes every open item of that kind it did not see. If that would be more
+ * than max(CLOSE_GUARD_MIN, CLOSE_GUARD_FRACTION of the open items of that kind), it is far more
+ * likely a fault (wrong division, filter, licence, unstable paging) than a genuine mass payment:
+ * nothing is closed and the entity ends `error` / `close_guard` until an admin runs a full sync
+ * with `allowLargeClose`.
  */
-export const EMPTY_CLOSE_GUARD = 5;
+export const CLOSE_GUARD_MIN = 5;
+export const CLOSE_GUARD_FRACTION = 0.2;
+
+/** True when closing `stale` of `open` open items is allowed without the admin override. */
+export const closeAllowed = (stale: number, open: number): boolean =>
+  stale <= Math.max(CLOSE_GUARD_MIN, open * CLOSE_GUARD_FRACTION);
 
 /** A clean stop between Exact calls: deadline or subrequest limit. Ends the run as partial. */
 class SyncStop extends Error {
@@ -114,8 +132,17 @@ export interface SyncOptions {
   deadlineMs?: number;
   /** Subrequest meter of the invocation; a fresh one (SUBREQUEST_LIMIT) when omitted. */
   meter?: SubrequestMeter;
-  /** Full mode only: close all open items of a kind even when a complete list is empty. */
-  allowEmptyClose?: boolean;
+  /** Full mode only (admin): close a large share of the open items of a kind (close guard). */
+  allowLargeClose?: boolean;
+  /** Full mode: read crm/BankAccounts (nightly scheduled runs). Default true; manual runs pass false. */
+  readIbans?: boolean;
+  /** Full mode: abandon the open cycle and start a new one. */
+  restart?: boolean;
+  /**
+   * Manual slices: the first page of the first entity that has work is read even when the
+   * deadline has already passed, so every slice advances (no livelock under the inline limit).
+   */
+  guaranteeProgress?: boolean;
 }
 
 export interface JobGate {
@@ -139,6 +166,13 @@ export interface EntityResult {
   completeRead?: boolean;
   /** Closed by this run (full mode only). */
   closed?: number;
+  /**
+   * Rows read so far in the pass this run belongs to, and an estimate of the total (open items of
+   * that kind before the pass), or null when unknown. For "Read 1,240 of about 5,000 items".
+   */
+  progress?: { read: number; total: number | null };
+  /** The entity is finished for the current full cycle (this run or an earlier one). */
+  cycleDone?: boolean;
 }
 
 export interface SyncSummary {
@@ -150,6 +184,8 @@ export interface SyncSummary {
   startedAt: string;
   finishedAt: string;
   entities: Record<EntityName, EntityResult>;
+  /** Full mode: every entity of the cycle is finished (the cycle closed). */
+  cycleComplete: boolean;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -160,9 +196,27 @@ interface StateRow {
   mode: SyncMode | null;
   last_status: string | null;
   last_completed_at: string | null;
+  rows_seen: number;
+  cycle_seq: number | null;
+  cycle_started_at: string | null;
+  pass_cycle: number | null;
+  pass_token: string | null;
+  pass_rows: number;
+  pass_total: number | null;
+  done_cycle: number | null;
+  retry_count: number;
+  retry_day: string | null;
 }
 
-type Failure = { kind: "stop" | "continue"; status: RunStatus; code: string };
+type Failure = {
+  kind: "stop" | "continue";
+  status: RunStatus;
+  code: string;
+  /** Worth retrying soon (counted per day, bounded by MAX_TRANSIENT_RETRIES). */
+  transient?: boolean;
+};
+
+const TRANSIENT_STATUS: ReadonlySet<number> = new Set([502, 503, 504]);
 
 const SAFE_CODE = /^[A-Za-z0-9_.:-]{1,60}$/;
 const safeCode = (c: string | undefined, fallback: string): string =>
@@ -174,13 +228,19 @@ function classify(e: unknown): Failure {
     return { kind: "stop", status: "partial", code: "budget_exhausted" };
   }
   if (e instanceof ExactRateLimitedError) {
-    return { kind: "stop", status: "partial", code: "rate_limited" };
+    return { kind: "stop", status: "partial", code: "rate_limited", transient: true };
   }
   if (e instanceof ExactAuthError) {
     return { kind: "stop", status: "needs_reauth", code: safeCode(e.message, "auth_failed") };
   }
   if (e instanceof ExactApiError) {
-    return { kind: "continue", status: "error", code: safeCode(e.code, `http_${e.status}`) };
+    const code = safeCode(e.code, `http_${e.status}`);
+    // Bad gateway / unavailable / timeout, an unreachable Exact and an unavailable gate pass by
+    // themselves: stop the run (the next entities would fail the same way) and retry later.
+    if (TRANSIENT_STATUS.has(e.status) || e.code === "network" || e.code === "gate_unavailable") {
+      return { kind: "stop", status: "partial", code, transient: true };
+    }
+    return { kind: "continue", status: "error", code };
   }
   // A D1 or programming error. Name only: messages can carry row data.
   console.error("exact sync failed", e instanceof Error ? e.name : "unknown");
@@ -236,16 +296,41 @@ const cursorStmt = (
   mode: SyncMode,
   status: "partial" | "ok",
   startedAt: string,
+  cycle: number | null,
 ): D1PreparedStatement =>
   db
     .prepare(
-      `INSERT INTO sync_state (division_id, entity, cursor, mode, last_started_at, last_status)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+      `INSERT INTO sync_state (division_id, entity, cursor, mode, last_started_at, last_status,
+         pass_cycle)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
        ON CONFLICT (division_id, entity) DO UPDATE SET
          cursor = excluded.cursor, mode = excluded.mode, last_status = excluded.last_status,
-         last_started_at = excluded.last_started_at`,
+         last_started_at = excluded.last_started_at,
+         pass_cycle = COALESCE(excluded.pass_cycle, sync_state.pass_cycle)`,
     )
-    .bind(divisionId, entity, cursor, mode, startedAt, status);
+    .bind(divisionId, entity, cursor, mode, startedAt, status, cycle);
+
+/** Saves a resumable open-item pass (same batch as the rows it covers). */
+const passStmt = (
+  db: D1Database,
+  divisionId: number,
+  entity: EntityName,
+  startedAt: string,
+  cycle: number,
+  token: string | null,
+  rows: number,
+  total: number | null,
+): D1PreparedStatement =>
+  db
+    .prepare(
+      `INSERT INTO sync_state (division_id, entity, mode, last_started_at, last_status,
+         pass_cycle, pass_token, pass_rows, pass_total)
+       VALUES (?1, ?2, 'full', ?3, 'partial', ?4, ?5, ?6, ?7)
+       ON CONFLICT (division_id, entity) DO UPDATE SET
+         pass_cycle = excluded.pass_cycle, pass_token = excluded.pass_token,
+         pass_rows = excluded.pass_rows, pass_total = excluded.pass_total`,
+    )
+    .bind(divisionId, entity, startedAt, cycle, token, rows, total);
 
 function relationStmt(
   db: D1Database,
@@ -290,6 +375,8 @@ function openItemStmt(
   // currency; original_minor the invoice total when known. Original amount and rate describe the
   // booked invoice and are kept when a later read (the bulk list) does not carry them, unless the
   // currency changed. open_dc_minor is a snapshot of the open balance and is never kept stale.
+  // A closed item we have never seen is not inserted (the sync endpoints return the whole paid
+  // history from cursor 0); a closed item we do know is updated.
   // The DO UPDATE only applies when this run is not older than the run that last saw the row, so
   // a run that outlived its lease cannot overwrite (or un-see) what a newer run wrote.
   const original =
@@ -301,8 +388,10 @@ function openItemStmt(
          invoice_number, reference, currency, amount_minor, open_minor, invoice_date, due_date,
          status, closed_at, synced_at, entry_number, last_seen_sync_id, original_minor,
          open_dc_minor, dc_currency, rate)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?17, ?9), ?9, ?10, ?11, ?12, ?13, ?14,
-         ?15, ?16, ?17, ?18, ?19, ?20)
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?17, ?9), ?9, ?10, ?11, ?12, ?13, ?14,
+         ?15, ?16, ?17, ?18, ?19, ?20
+       WHERE ?12 = 'open'
+          OR EXISTS (SELECT 1 FROM open_items WHERE division_id = ?1 AND exact_id = ?2)
        ON CONFLICT (division_id, exact_id) DO UPDATE SET
          kind = excluded.kind, relation_id = excluded.relation_id,
          relation_name = excluded.relation_name, invoice_number = excluded.invoice_number,
@@ -362,25 +451,41 @@ function stateStmt(
   error: string | null,
   rows: number,
   calls: number,
+  /**
+   * Counts as the day's complete FULL sync (last_full_completed_at). Only a full run that also
+   * read the IBANs does: a manual full run skips them, and the nightly one must still run.
+   */
+  fullOk = false,
 ): D1PreparedStatement {
   return db
     .prepare(
       `INSERT INTO sync_state (division_id, entity, mode, last_started_at, last_finished_at,
          last_completed_at, last_full_completed_at, last_status, last_error, rows_seen, calls_used)
        VALUES (?1, ?2, ?3, ?4, ?5, CASE WHEN ?6 = 'ok' THEN ?5 ELSE NULL END,
-         CASE WHEN ?6 = 'ok' AND ?3 = 'full' THEN ?5 ELSE NULL END, ?6, ?7, ?8, ?9)
+         CASE WHEN ?6 = 'ok' AND ?10 = 1 THEN ?5 ELSE NULL END, ?6, ?7, ?8, ?9)
        ON CONFLICT (division_id, entity) DO UPDATE SET
          mode = excluded.mode, last_started_at = excluded.last_started_at,
          last_finished_at = excluded.last_finished_at,
          last_completed_at = CASE WHEN excluded.last_status = 'ok' THEN excluded.last_finished_at
                                   ELSE sync_state.last_completed_at END,
-         last_full_completed_at = CASE WHEN excluded.last_status = 'ok' AND excluded.mode = 'full'
+         last_full_completed_at = CASE WHEN excluded.last_status = 'ok' AND ?10 = 1
                                        THEN excluded.last_finished_at
                                        ELSE sync_state.last_full_completed_at END,
          last_status = excluded.last_status, last_error = excluded.last_error,
          rows_seen = excluded.rows_seen, calls_used = excluded.calls_used`,
     )
-    .bind(divisionId, entity, mode, startedAt, finishedAt, status, error, rows, calls);
+    .bind(
+      divisionId,
+      entity,
+      mode,
+      startedAt,
+      finishedAt,
+      status,
+      error,
+      rows,
+      calls,
+      fullOk ? 1 : 0,
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -441,39 +546,32 @@ export async function syncDivision(
   const actor = opts.actor ?? "system";
   const chunkPages = opts.chunkPages ?? DEFAULT_CHUNK_PAGES;
   const startedAt = iso(now());
+  const budget = opts.budget ?? DEFAULT_SYNC_BUDGET;
+  const readIbans = opts.mode === "full" && (opts.readIbans ?? true);
   const entities = Object.fromEntries(ENTITIES.map((e) => [e, emptyResult()])) as Record<
     EntityName,
     EntityResult
   >;
   const meter = opts.meter ?? newMeter();
   const holder = crypto.randomUUID();
+  const early = (status: "partial" | "locked", runSeq: number | null): SyncSummary => ({
+    status,
+    mode: opts.mode,
+    divisionId: division.id,
+    runSeq,
+    callsUsed: 0,
+    startedAt,
+    finishedAt: startedAt,
+    entities,
+    cycleComplete: false,
+  });
   if (meter.used + 1 + SUBREQUEST_RESERVE > meter.limit) {
     // Nothing left in this invocation: do not even take the lock.
-    return {
-      status: "partial",
-      mode: opts.mode,
-      divisionId: division.id,
-      runSeq: null,
-      callsUsed: 0,
-      startedAt,
-      finishedAt: startedAt,
-      entities,
-    };
+    return early("partial", null);
   }
   meter.used += 1;
   const runSeq = await acquireSyncLock(db, division.id, holder, now());
-  if (runSeq === null) {
-    return {
-      status: "locked",
-      mode: opts.mode,
-      divisionId: division.id,
-      runSeq: null,
-      callsUsed: 0,
-      startedAt,
-      finishedAt: startedAt,
-      entities,
-    };
-  }
+  if (runSeq === null) return early("locked", null);
 
   let callsUsed = 0;
   try {
@@ -481,19 +579,23 @@ export async function syncDivision(
     const baseTransport = deps.transport ?? createGateTransport(env, division.exactDivision);
     let current: EntityName = "divisions";
     const tally = new Map<EntityName, number>();
+    // True once a page of a real entity (not the divisions list) has been received.
+    let pageSeen = false;
+    // Past the deadline, except that a manual slice (guaranteeProgress) may still read the first
+    // page of its first entity, so that every slice advances.
+    const pastDeadline = (): boolean =>
+      opts.deadlineMs !== undefined &&
+      now() >= opts.deadlineMs &&
+      !(opts.guaranteeProgress === true && !pageSeen);
     // Every Exact call: stop cleanly at the deadline or before the invocation's subrequest limit
     // (SyncStop -> partial). Checked per call, so a long bulk read cannot overrun either.
-    const transport: ExactTransport = (req) => {
-      if (opts.deadlineMs !== undefined && now() >= opts.deadlineMs) {
-        return Promise.reject(new SyncStop("time_limit"));
-      }
-      try {
-        spend(meter);
-      } catch (e) {
-        return Promise.reject(e);
-      }
+    const transport: ExactTransport = async (req) => {
+      if (pastDeadline()) throw new SyncStop("time_limit");
+      spend(meter);
       tally.set(current, (tally.get(current) ?? 0) + 1);
-      return baseTransport(req);
+      const res = await baseTransport(req);
+      if (current !== "divisions") pageSeen = true;
+      return res;
     };
     const client = createExactClient(transport, {
       division: division.exactDivision,
@@ -509,22 +611,42 @@ export async function syncDivision(
 
     const stateRows = await db
       .prepare(
-        "SELECT entity, cursor, mode, last_status, last_completed_at FROM sync_state WHERE division_id = ?1",
+        `SELECT entity, cursor, mode, last_status, last_completed_at, rows_seen, cycle_seq,
+                cycle_started_at, pass_cycle, pass_token, pass_rows, pass_total, done_cycle,
+                retry_count, retry_day
+         FROM sync_state WHERE division_id = ?1`,
       )
       .bind(division.id)
       .all<StateRow>();
     const state = new Map(stateRows.results.map((r) => [r.entity, r]));
 
+    // FULL cycle: continue the open one (younger than CYCLE_MAX_AGE_MS, not restarted), else
+    // this run starts a new one. Its id is this run's sequence number.
+    const prevRun = state.get("run");
+    let cycle: number | null = null;
+    let cycleStartedAt = startedAt;
+    if (opts.mode === "full") {
+      const startedMs = prevRun?.cycle_started_at ? Date.parse(prevRun.cycle_started_at) : NaN;
+      const open =
+        prevRun?.cycle_seq != null &&
+        !Number.isNaN(startedMs) &&
+        now() - startedMs < CYCLE_MAX_AGE_MS &&
+        opts.restart !== true;
+      cycle = open ? (prevRun?.cycle_seq ?? runSeq) : runSeq;
+      if (open && prevRun?.cycle_started_at) cycleStartedAt = prevRun.cycle_started_at;
+    }
+
     let fatal: Failure | null = null;
     let stopFailure: Failure | null = null;
+    const transientEntities = new Set<EntityName>();
     let started = false;
     try {
       try {
         meter.used += 1;
-        await gate.startJob(opts.jobId, opts.budget ?? DEFAULT_SYNC_BUDGET);
+        await gate.startJob(opts.jobId, budget);
         started = true;
       } catch {
-        fatal = { kind: "stop", status: "error", code: "gate_unavailable" };
+        fatal = { kind: "stop", status: "partial", code: "gate_unavailable", transient: true };
       }
 
       const ctx: Ctx = {
@@ -533,24 +655,34 @@ export async function syncDivision(
         division,
         mode: opts.mode,
         runSeq,
+        cycle,
         startedAt,
         nowIso: () => iso(now()),
         actor,
         chunkPages,
         state,
-        deadlineMs: opts.deadlineMs,
-        now,
+        pastDeadline,
         progress: 0,
+        pass: null,
         meter,
+        budget,
+        callsSoFar: () => [...tally.values()].reduce((a, b) => a + b, 0),
       };
 
       for (const entity of ENTITIES) {
         if (fatal !== null) break;
         current = entity;
         ctx.progress = 0;
+        ctx.pass = null;
+        if (entity === "bank_accounts" && !readIbans) continue;
+        if (cycle !== null && entity !== "divisions" && state.get(entity)?.done_cycle === cycle) {
+          // Read completely earlier in this cycle: nothing to do.
+          entities[entity] = { status: "skipped", rows: 0, calls: 0, cycleDone: true };
+          continue;
+        }
         let result: EntityResult;
         let failure: Failure | null = null;
-        if (opts.deadlineMs !== undefined && now() >= opts.deadlineMs) {
+        if (pastDeadline()) {
           failure = { kind: "stop", status: "partial", code: "time_limit" };
           result = { status: "partial", rows: 0, calls: 0, error: failure.code };
         } else {
@@ -559,6 +691,7 @@ export async function syncDivision(
           } catch (e) {
             failure = classify(e);
             result = { status: failure.status, rows: ctx.progress, calls: 0, error: failure.code };
+            if (ctx.pass !== null) result.progress = ctx.pass;
           }
           const partialCode = result.status === "partial" ? result.error : undefined;
           if (failure === null && partialCode !== undefined) {
@@ -567,6 +700,7 @@ export async function syncDivision(
         }
         result.calls = tally.get(entity) ?? 0;
         entities[entity] = result;
+        if (failure?.transient === true) transientEntities.add(entity);
         if (failure?.kind === "stop") {
           stopFailure = failure;
           break;
@@ -583,31 +717,48 @@ export async function syncDivision(
       }
     }
 
-    // Empty-list guard (see EMPTY_CLOSE_GUARD): checked before the status is computed, so a
-    // refused close shows as an error on the entity and the run.
+    // Close guard (see CLOSE_GUARD_MIN): checked before the status is computed, so a refused
+    // close shows as an error on the entity and the run. The cycle stays open for that entity.
     for (const [entity, kind] of [
       ["receivables", "invoice"],
       ["payables", "bill"],
     ] as const) {
       const r = entities[entity];
-      if (opts.mode !== "full" || r.status !== "ok" || r.completeRead !== true || r.rows !== 0) {
-        continue;
-      }
-      if (opts.allowEmptyClose === true) continue;
+      if (cycle === null || r.status !== "ok" || r.completeRead !== true) continue;
+      if (opts.allowLargeClose === true) continue;
       meter.used += 1;
-      const open = await db
+      const counts = await db
         .prepare(
-          "SELECT COUNT(*) AS n FROM open_items WHERE division_id = ?1 AND kind = ?2 AND status = 'open'",
+          `SELECT COUNT(*) AS open,
+                  COALESCE(SUM(CASE WHEN COALESCE(last_seen_sync_id, 0) < ?3 THEN 1 ELSE 0 END), 0)
+                    AS stale
+           FROM open_items WHERE division_id = ?1 AND kind = ?2 AND status = 'open'`,
         )
-        .bind(division.id, kind)
-        .first<{ n: number }>();
-      if ((open?.n ?? 0) > EMPTY_CLOSE_GUARD) {
+        .bind(division.id, kind, cycle)
+        .first<{ open: number; stale: number }>();
+      if (!closeAllowed(counts?.stale ?? 0, counts?.open ?? 0)) {
         entities[entity] = {
           ...r,
           status: "error",
-          error: "empty_list_guard",
+          error: "close_guard",
           completeRead: false,
+          cycleDone: false,
         };
+      }
+    }
+
+    // Transient failures are retried by the next run, but only MAX_TRANSIENT_RETRIES times per
+    // Amsterdam day; after that they count as errors (and scheduledMode stops retrying a full).
+    const today = amsterdamParts(now()).date;
+    let retryCount = prevRun?.retry_count ?? 0;
+    let retryDay = prevRun?.retry_day ?? null;
+    if (fatal?.transient === true || transientEntities.size > 0) {
+      retryCount = (retryDay === today ? retryCount : 0) + 1;
+      retryDay = today;
+      if (retryCount > MAX_TRANSIENT_RETRIES) {
+        if (fatal?.transient === true) fatal = { ...fatal, status: "error" };
+        if (stopFailure?.transient === true) stopFailure = { ...stopFailure, status: "error" };
+        for (const e of transientEntities) entities[e] = { ...entities[e], status: "error" };
       }
     }
 
@@ -626,6 +777,12 @@ export async function syncDivision(
         ?.error ??
       null;
 
+    // The cycle is finished when every entity it covers is. IBANs are only part of it for runs
+    // that read them (a manual full run leaves them to the nightly one).
+    const required = ENTITIES.filter((e) => e !== "bank_accounts" || readIbans);
+    const cycleComplete =
+      cycle !== null && status === "ok" && required.every((e) => entities[e].cycleDone === true);
+
     const finishedAt = iso(now());
     const rowsTotal = results.reduce((n, r) => n + r.rows, 0);
     const statements: D1PreparedStatement[] = [];
@@ -635,11 +792,11 @@ export async function syncDivision(
       ["payables", "bill"],
     ] as const) {
       const r = entities[entity];
-      if (opts.mode === "full" && r.status === "ok" && r.completeRead === true) {
+      if (cycle !== null && r.status === "ok" && r.completeRead === true) {
         closing.push(entity);
-        // Only items an OLDER run saw (a newer run's rows are never touched), only of this
-        // division and kind, and only while this run still holds the lease: if the lease expired
-        // and another run took over, run_seq moved on and nothing is closed.
+        // Only items last seen BEFORE this cycle began (a newer run's rows are never touched),
+        // only of this division and kind, and only while this run still holds the lease: if the
+        // lease expired and another run took over, run_seq moved on and nothing is closed.
         statements.push(
           db
             .prepare(
@@ -649,9 +806,9 @@ export async function syncDivision(
                WHERE division_id = ?1 AND kind = ?2 AND status = 'open'
                  AND COALESCE(last_seen_sync_id, 0) < ?3
                  AND EXISTS (SELECT 1 FROM sync_locks
-                             WHERE division_id = ?1 AND holder = ?5 AND run_seq = ?3)`,
+                             WHERE division_id = ?1 AND holder = ?5 AND run_seq = ?6)`,
             )
-            .bind(division.id, kind, runSeq, finishedAt, holder),
+            .bind(division.id, kind, cycle, finishedAt, holder, runSeq),
         );
       }
     }
@@ -672,6 +829,31 @@ export async function syncDivision(
           r.calls,
         ),
       );
+      if (cycle !== null && entity !== "divisions" && r.status === "ok" && r.cycleDone === true) {
+        statements.push(
+          db
+            .prepare(
+              `UPDATE sync_state SET done_cycle = ?3, pass_token = NULL
+               WHERE division_id = ?1 AND entity = ?2`,
+            )
+            .bind(division.id, entity, cycle),
+        );
+      } else if (
+        cycle !== null &&
+        r.status === "error" &&
+        (entity === "receivables" || entity === "payables") &&
+        r.error !== "close_guard"
+      ) {
+        // A saved $skiptoken that keeps failing must not be retried until the cycle expires.
+        statements.push(
+          db
+            .prepare(
+              `UPDATE sync_state SET pass_token = NULL, pass_rows = 0
+               WHERE division_id = ?1 AND entity = ?2`,
+            )
+            .bind(division.id, entity),
+        );
+      }
     }
     statements.push(
       stateStmt(
@@ -685,7 +867,24 @@ export async function syncDivision(
         runError,
         rowsTotal,
         callsUsed,
+        cycleComplete && readIbans,
       ),
+      db
+        .prepare(
+          `UPDATE sync_state SET
+             cycle_seq = CASE WHEN ?2 = 1 THEN ?3 ELSE cycle_seq END,
+             cycle_started_at = CASE WHEN ?2 = 1 THEN ?4 ELSE cycle_started_at END,
+             retry_count = ?5, retry_day = ?6
+           WHERE division_id = ?1 AND entity = 'run'`,
+        )
+        .bind(
+          division.id,
+          opts.mode === "full" ? 1 : 0,
+          cycle === null || cycleComplete ? null : cycle,
+          cycle === null || cycleComplete ? null : cycleStartedAt,
+          retryCount,
+          retryDay,
+        ),
       auditStatement(db, {
         actorEmail: actor,
         action: "exact.sync",
@@ -695,7 +894,8 @@ export async function syncDivision(
           mode: opts.mode,
           status,
           error: runError,
-          ...(opts.allowEmptyClose === true ? { allowEmptyClose: true } : {}),
+          ...(opts.allowLargeClose === true ? { allowLargeClose: true } : {}),
+          ...(opts.mode === "full" ? { cycleComplete } : {}),
           callsUsed,
           entities: Object.fromEntries(
             ENTITIES.map((e) => [
@@ -726,6 +926,7 @@ export async function syncDivision(
       startedAt,
       finishedAt,
       entities,
+      cycleComplete,
     };
   } finally {
     meter.used += 1;
@@ -743,16 +944,22 @@ interface Ctx {
   division: DivisionRef;
   mode: SyncMode;
   runSeq: number;
+  /** Full mode: the cycle this run belongs to (its first run's sequence number). */
+  cycle: number | null;
   startedAt: string;
   nowIso: () => string;
   actor: string;
   chunkPages: number;
   state: Map<string, StateRow>;
-  deadlineMs: number | undefined;
-  now: () => number;
+  pastDeadline: () => boolean;
   /** Rows written so far for the entity being synced (kept when a later chunk fails). */
   progress: number;
+  /** Pass progress of the entity being synced (open-item lists), for the UI. */
+  pass: { read: number; total: number | null } | null;
   meter: SubrequestMeter;
+  /** The gate job budget and the Exact calls this run has spent so far. */
+  budget: number;
+  callsSoFar: () => number;
 }
 
 function runEntity(ctx: Ctx, entity: EntityName): Promise<EntityResult> {
@@ -764,9 +971,10 @@ function runEntity(ctx: Ctx, entity: EntityName): Promise<EntityResult> {
     case "bank_accounts":
       return syncIbans(ctx);
     case "receivables":
-      return syncOpenItems(ctx, "receivables");
     case "payables":
-      return syncOpenItems(ctx, "payables");
+      return ctx.mode === "full"
+        ? syncOpenItemsFull(ctx, entity)
+        : syncOpenItemsIncremental(ctx, entity);
   }
 }
 
@@ -792,20 +1000,26 @@ async function syncDivisions(ctx: Ctx): Promise<EntityResult> {
     return [stmt];
   });
   await runBatches(db, ctx.meter, units);
-  return { status: "ok", rows: list.length, calls: 0 };
+  return { status: "ok", rows: list.length, calls: 0, cycleDone: ctx.mode === "full" };
 }
 
-/** Where a cursor-based read starts: see the header comment. */
+/**
+ * Where a cursor-based read starts. Incremental: the saved Timestamp. Full: from 0, unless this
+ * entity's pass of the current cycle is under way (pass_cycle), in which case it continues from
+ * the saved cursor. Hourly incremental runs between the slices only move the same cursor forward.
+ */
 function startCursor(ctx: Ctx, entity: EntityName): string {
   const st = ctx.state.get(entity);
   if (!st) return "0";
   if (ctx.mode === "incremental") return st.cursor;
-  return st.last_status === "partial" && st.mode === "full" ? st.cursor : "0";
+  return ctx.cycle !== null && st.pass_cycle === ctx.cycle ? st.cursor : "0";
 }
 
 /**
  * Reads a Timestamp-cursor endpoint in chunks of `chunkPages` pages. After every chunk the rows
- * are written and the cursor saved, so a stop (budget, rate limit, time) loses at most one chunk.
+ * are written and the cursor saved, so a stop (budget, rate limit, time) loses at most one chunk
+ * (and not even that when the failure comes after the chunk's first page: the client hands back
+ * the pages it read together with the error, which is rethrown once they are written).
  */
 async function cursorLoop<T>(
   ctx: Ctx,
@@ -813,15 +1027,13 @@ async function cursorLoop<T>(
   read: (
     cursor: string,
     maxPages: number,
-  ) => Promise<{ items: T[]; nextCursor: string; complete: boolean }>,
+  ) => Promise<{ items: T[]; nextCursor: string; complete: boolean; error?: unknown }>,
   toStatements: (item: T) => D1PreparedStatement,
 ): Promise<{ rows: number; complete: boolean; stop?: string }> {
   let cursor = startCursor(ctx, entity);
   let rows = 0;
   for (let chunk = 0; chunk < MAX_CHUNKS; chunk++) {
-    if (ctx.deadlineMs !== undefined && ctx.now() >= ctx.deadlineMs) {
-      return { rows, complete: false, stop: "time_limit" };
-    }
+    if (ctx.pastDeadline()) return { rows, complete: false, stop: "time_limit" };
     const page = await read(cursor, ctx.chunkPages);
     const units = page.items.map((it) => [toStatements(it)]);
     units.push([
@@ -833,11 +1045,14 @@ async function cursorLoop<T>(
         ctx.mode,
         page.complete ? "ok" : "partial",
         ctx.startedAt,
+        ctx.mode === "full" ? ctx.cycle : null,
       ),
     ]);
     await runBatches(ctx.db, ctx.meter, units);
     rows += page.items.length;
     ctx.progress = rows;
+    ctx.pass = { read: rows, total: null };
+    if (page.error !== undefined) throw page.error;
     cursor = page.nextCursor;
     if (page.complete) return { rows, complete: true };
   }
@@ -853,27 +1068,16 @@ async function syncRelations(ctx: Ctx): Promise<EntityResult> {
     (a) => relationStmt(ctx.db, ctx.division.id, a, nowIso),
   );
   return r.complete
-    ? { status: "ok", rows: r.rows, calls: 0 }
+    ? { status: "ok", rows: r.rows, calls: 0, cycleDone: ctx.mode === "full" }
     : { status: "partial", rows: r.rows, calls: 0, error: r.stop ?? "partial" };
 }
 
-async function syncOpenItems(ctx: Ctx, entity: "receivables" | "payables"): Promise<EntityResult> {
+async function syncOpenItemsIncremental(
+  ctx: Ctx,
+  entity: "receivables" | "payables",
+): Promise<EntityResult> {
   const receivable = entity === "receivables";
   const nowIso = ctx.nowIso();
-  if (ctx.mode === "full") {
-    // One complete read of the bulk list; nothing is written (or closed) unless it finished.
-    const items = await (receivable ? ctx.client.listReceivables() : ctx.client.listPayables());
-    const seen = new Set<string>();
-    const units: D1PreparedStatement[][] = [];
-    for (const it of items) {
-      if (seen.has(it.id)) continue;
-      seen.add(it.id);
-      units.push([openItemStmt(ctx.db, ctx.division.id, it, ctx.runSeq, nowIso)]);
-    }
-    await runBatches(ctx.db, ctx.meter, units);
-    ctx.progress = units.length;
-    return { status: "ok", rows: units.length, calls: 0, completeRead: true };
-  }
   const r = await cursorLoop(
     ctx,
     entity,
@@ -889,13 +1093,96 @@ async function syncOpenItems(ctx: Ctx, entity: "receivables" | "payables"): Prom
 }
 
 /**
- * IBANs per relation from crm/BankAccounts. A relation can have several; the main one wins, else
+ * FULL read of the open receivables / payables list, resumable across runs. Every chunk writes
+ * its rows, the `$skiptoken` to continue from and the progress in ONE batch, so a stop anywhere
+ * (budget, rate limit, deadline, subrequests, a transient error) loses nothing. The read is
+ * COMPLETE only when Exact returns a last page; then (and only then) the caller closes the items
+ * last seen before the cycle began.
+ */
+async function syncOpenItemsFull(
+  ctx: Ctx,
+  entity: "receivables" | "payables",
+): Promise<EntityResult> {
+  const receivable = entity === "receivables";
+  const cycle = ctx.cycle as number;
+  const kind = receivable ? "invoice" : "bill";
+  const st = ctx.state.get(entity);
+  const resuming = st?.pass_cycle === cycle && st.pass_token !== null && st.pass_token !== "";
+  let token: string | null = resuming ? (st?.pass_token ?? null) : null;
+  let readTotal = resuming ? (st?.pass_rows ?? 0) : 0;
+  let total: number | null = resuming ? (st?.pass_total ?? null) : null;
+  if (!resuming) {
+    // Estimate for the progress line: the open items of this kind we hold before the pass.
+    ctx.meter.used += 1;
+    const n = await ctx.db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM open_items WHERE division_id = ?1 AND kind = ?2 AND status = 'open'",
+      )
+      .bind(ctx.division.id, kind)
+      .first<{ n: number }>();
+    total = (n?.n ?? 0) > 0 ? (n?.n ?? null) : null;
+  }
+  const nowIso = ctx.nowIso();
+  let rows = 0;
+  ctx.pass = { read: readTotal, total };
+  for (let chunk = 0; chunk < MAX_CHUNKS; chunk++) {
+    if (ctx.pastDeadline()) {
+      return { status: "partial", rows, calls: 0, error: "time_limit", progress: ctx.pass };
+    }
+    const page = await (receivable
+      ? ctx.client.listReceivablesChunk(token, { maxPages: ctx.chunkPages })
+      : ctx.client.listPayablesChunk(token, { maxPages: ctx.chunkPages }));
+    readTotal += page.items.length;
+    const units: D1PreparedStatement[][] = page.items.map((it) => [
+      openItemStmt(ctx.db, ctx.division.id, it, ctx.runSeq, nowIso),
+    ]);
+    units.push([
+      passStmt(
+        ctx.db,
+        ctx.division.id,
+        entity,
+        ctx.startedAt,
+        cycle,
+        page.nextToken,
+        readTotal,
+        total,
+      ),
+    ]);
+    await runBatches(ctx.db, ctx.meter, units);
+    rows += page.items.length;
+    ctx.progress = rows;
+    ctx.pass = { read: readTotal, total };
+    if (page.error !== undefined) throw page.error;
+    if (page.complete) {
+      return {
+        status: "ok",
+        rows,
+        calls: 0,
+        completeRead: true,
+        cycleDone: true,
+        progress: ctx.pass,
+      };
+    }
+    token = page.nextToken;
+  }
+  return { status: "partial", rows, calls: 0, error: "chunk_limit", progress: ctx.pass };
+}
+
+/**
+ * IBANs per relation from crm/BankAccounts (full runs that read IBANs only). A relation can have several; the main one wins, else
  * the lowest IBAN (stable). A changed IBAN, or a first IBAN on a relation that existed before the
  * previous IBAN pass, sets iban_changed_at and writes `relation.iban_changed` (masked) in the
  * same batch as the update. A relation that loses all its bank accounts keeps its last IBAN.
  */
 async function syncIbans(ctx: Ctx): Promise<EntityResult> {
   const { db, division } = ctx;
+  // The read is one piece (about rows / 50 calls). When the budget left cannot cover what the
+  // last read needed, do not start it: the next run begins with a fresh budget.
+  const prevRows = ctx.state.get("bank_accounts")?.rows_seen ?? 0;
+  const needed = Math.ceil(prevRows / IBAN_PAGE_GUESS);
+  if (needed > 0 && ctx.budget - ctx.callsSoFar() < needed) {
+    return { status: "partial", rows: 0, calls: 0, error: "budget_exhausted" };
+  }
   const accounts = await ctx.client.listBankAccounts();
   const best = new Map<string, { iban: string; main: boolean }>();
   for (const b of accounts) {
@@ -954,5 +1241,5 @@ async function syncIbans(ctx: Ctx): Promise<EntityResult> {
     ]);
   }
   await runBatches(db, ctx.meter, units);
-  return { status: "ok", rows: accounts.length, calls: 0 };
+  return { status: "ok", rows: accounts.length, calls: 0, cycleDone: true };
 }

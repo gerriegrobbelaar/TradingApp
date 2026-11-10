@@ -7,7 +7,7 @@ import {
   ExactRateLimitedError,
 } from "@camelthorn/exact";
 import {
-  EMPTY_CLOSE_GUARD,
+  CLOSE_GUARD_MIN,
   SUBREQUEST_LIMIT,
   SUBREQUEST_RESERVE,
   acquireSyncLock,
@@ -258,7 +258,8 @@ describe("full sync", () => {
       },
     });
     const s = await run("full");
-    expect(s.status).toBe("error");
+    // A gate that cannot start the job is transient: partial, retried by the next run.
+    expect(s.status).toBe("partial");
     expect(fx.calls).toHaveLength(0);
     expect(gate.ended).toHaveLength(0);
     expect((await stateRow("run"))?.last_error).toBe("gate_unavailable");
@@ -308,10 +309,11 @@ describe("closing items", () => {
   it("never closes anything when the read of the entity did not complete (budget mid-read)", async () => {
     seedData();
     await run("full");
-    fx.receivables = fx.receivables.slice(0, 1); // 102 and 103 look paid
-    // call 1 divisions, 2-3 relations (3 accounts, 2 per page), 4 banks, 5 first receivables page
+    fx.receivables = fx.receivables.slice(0, 2); // 103 looks paid
+    fx.pageSize = 1;
+    // call 1 divisions, 2 first receivables page, 3 second page: the budget ends here
     fx.beforeCall = (call, req) => {
-      if (req.path === "/read/financial/ReceivablesList" && call > 5) {
+      if (req.path === "/read/financial/ReceivablesList" && call > 2) {
         throw new ExactBudgetExhaustedError("x");
       }
     };
@@ -378,7 +380,8 @@ describe("resuming and cursors", () => {
     fx.pageSize = 1;
     fx.accounts = [10, 20, 30, 40, 50].map((ts, i) => ({ n: i + 1, name: `Rel ${i}`, ts }));
     fx.beforeCall = (call) => {
-      if (call === 4) throw new ExactBudgetExhaustedError("x"); // 1 divisions, 2-3 pages, 4 dies
+      // 1 divisions, 2 receivables, 3 payables, 4-5 relation pages, 6 dies
+      if (call === 6) throw new ExactBudgetExhaustedError("x");
     };
     const first = await run("full", { chunkPages: 1 });
     expect(first.status).toBe("partial");
@@ -469,7 +472,7 @@ describe("resuming and cursors", () => {
     fx.pageSize = 1;
     fx.accounts = [10, 20, 30].map((ts, i) => ({ n: i + 1, name: `R${i}`, ts }));
     fx.beforeCall = (call) => {
-      if (call === 3) throw new ExactRateLimitedError(30_000);
+      if (call === 5) throw new ExactRateLimitedError(30_000); // 2nd relation page
     };
     const s = await run("full", { chunkPages: 1 });
     expect(s.status).toBe("partial");
@@ -509,11 +512,11 @@ describe("authorisation failure", () => {
   it("a non-auth API error is recorded with a short code and the other entities still run", async () => {
     seedData();
     fx.beforeCall = (_n, req) => {
-      if (req.path === "/system/Divisions") throw new ExactApiError(503, "x", "gate_unavailable");
+      if (req.path === "/system/Divisions") throw new ExactApiError(400, "x", "bad_request");
     };
     const s = await run("full");
     expect(s.status).toBe("error");
-    expect(s.entities.divisions.error).toBe("gate_unavailable");
+    expect(s.entities.divisions.error).toBe("bad_request");
     expect(s.entities.relations.status).toBe("ok");
   });
 });
@@ -539,7 +542,7 @@ describe("IBAN changes", () => {
     expect(await auditRows("relation.iban_changed", relId(2))).toHaveLength(0);
 
     fx.banks = [{ n: 1, account: 2, iban: "DE89370400440532013000" }];
-    await run("incremental", { actor: "approver@camelthorncapital.com" });
+    await run("full", { actor: "approver@camelthorncapital.com" });
     expect(await relation(2)).toMatchObject({ iban: "DE89370400440532013000" });
     expect((await relation(2))?.iban_changed_at).not.toBeNull();
     const rows = await auditRows("relation.iban_changed", relId(2));
@@ -557,7 +560,7 @@ describe("IBAN changes", () => {
 
     // Case and spacing differences are not a change.
     fx.banks = [{ n: 1, account: 2, iban: "de89 3704 0044 0532 0130 00" }];
-    await run("incremental");
+    await run("full");
     expect(await auditRows("relation.iban_changed", relId(2))).toHaveLength(1);
   });
 
@@ -636,33 +639,33 @@ describe("closing guards (review E3)", () => {
 
   it("refuses to close everything when a complete list is suddenly empty (more than the guard)", async () => {
     seedData();
-    manyOpen(EMPTY_CLOSE_GUARD + 1);
+    manyOpen(CLOSE_GUARD_MIN + 1);
     await run("full");
     fx.receivables = [];
     const s = await run("full");
     expect(s.status).toBe("error");
-    expect(s.entities.receivables).toMatchObject({ status: "error", error: "empty_list_guard" });
+    expect(s.entities.receivables).toMatchObject({ status: "error", error: "close_guard" });
     expect(s.entities.receivables.closed).toBeUndefined();
     expect(Object.values(await itemStatus()).every((v) => v === "open")).toBe(true);
-    expect((await stateRow("receivables"))?.last_error).toBe("empty_list_guard");
+    expect((await stateRow("receivables"))?.last_error).toBe("close_guard");
     expect((await stateRow("run"))?.last_full_completed_at).not.toBeNull(); // from the first run
 
     // An admin override closes them, and is audited.
-    const forced = await run("full", { allowEmptyClose: true });
+    const forced = await run("full", { allowLargeClose: true });
     expect(forced.status).toBe("ok");
-    expect(forced.entities.receivables.closed).toBe(EMPTY_CLOSE_GUARD + 1);
+    expect(forced.entities.receivables.closed).toBe(CLOSE_GUARD_MIN + 1);
     const audit = await auditRows("exact.sync", div.id);
-    expect(JSON.parse(audit.at(-1)?.after_json ?? "{}")).toMatchObject({ allowEmptyClose: true });
+    expect(JSON.parse(audit.at(-1)?.after_json ?? "{}")).toMatchObject({ allowLargeClose: true });
   });
 
   it("closes a small set (at most the guard) when a complete list is empty", async () => {
     seedData();
-    manyOpen(EMPTY_CLOSE_GUARD);
+    manyOpen(CLOSE_GUARD_MIN);
     await run("full");
     fx.receivables = [];
     const s = await run("full");
     expect(s.status).toBe("ok");
-    expect(s.entities.receivables.closed).toBe(EMPTY_CLOSE_GUARD);
+    expect(s.entities.receivables.closed).toBe(CLOSE_GUARD_MIN);
   });
 
   it("never closes items of another division, nor of the other kind", async () => {

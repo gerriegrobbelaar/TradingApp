@@ -1,7 +1,15 @@
 import { env } from "cloudflare:test";
 import { ExactAuthError } from "@camelthorn/exact";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { runScheduledExactSync, scheduledMode } from "../src/exact/scheduled";
+import {
+  MAX_FULL_WINDOW_TICKS,
+  MAX_TICKS_PER_DAY,
+  SCHEDULED_FULL_BUDGET,
+  SCHEDULED_INCREMENTAL_BUDGET,
+  SCHEDULED_WORST_CASE_CALLS_PER_DAY,
+  runScheduledExactSync,
+  scheduledMode,
+} from "../src/exact/scheduled";
 import { SUBREQUEST_RESERVE, newMeter } from "../src/exact/sync";
 import { FakeExact, addDivision, db, fakeGate, resetSync } from "./sync-helpers";
 
@@ -103,12 +111,12 @@ describe("runScheduledExactSync", () => {
     const t1 = await runScheduledExactSync(env, clock, deps);
     expect(t1.ran).toEqual([{ divisionId: div.id, mode: "full", status: "ok" }]);
     expect(gate.started[0]?.jobId).toMatch(/^sync:full:/);
-    expect(gate.started[0]?.budget).toBe(600);
+    expect(gate.started[0]?.budget).toBe(SCHEDULED_FULL_BUDGET);
 
     clock = Date.parse("2026-07-15T01:00:00Z");
     const t2 = await runScheduledExactSync(env, clock, deps);
     expect(t2.ran).toEqual([{ divisionId: div.id, mode: "incremental", status: "ok" }]);
-    expect(gate.started[1]?.budget).toBe(120);
+    expect(gate.started[1]?.budget).toBe(SCHEDULED_INCREMENTAL_BUDGET);
 
     const audit = await db
       .prepare("SELECT actor_email FROM audit_log WHERE action = 'exact.sync' AND entity_id = ?1")
@@ -176,5 +184,57 @@ describe("runScheduledExactSync", () => {
     );
     expect(r.ran).toHaveLength(1);
     expect(meter.used).toBeLessThanOrEqual(meter.limit);
+  });
+});
+
+describe("budgets and fairness (review G1)", () => {
+  beforeEach(resetSync);
+
+  it("keeps the scheduled worst case per division at or below 2,000 Exact calls a day", () => {
+    // 25 ticks on the fall-back day, 5 of them in the 02:00-05:59 window (hours 2, 2, 3, 4, 5).
+    expect(MAX_TICKS_PER_DAY).toBe(25);
+    expect(MAX_FULL_WINDOW_TICKS).toBe(5);
+    const worst = 5 * SCHEDULED_FULL_BUDGET + 20 * SCHEDULED_INCREMENTAL_BUDGET;
+    expect(SCHEDULED_WORST_CASE_CALLS_PER_DAY).toBe(worst);
+    expect(worst).toBeLessThanOrEqual(2000);
+    // Exact allows 5,000 a day; at least 10 % of it stays for users and 1,000 for later jobs.
+    expect(5000 - worst).toBeGreaterThanOrEqual(500 + 1000);
+  });
+
+  it("stops retrying a full sync after too many transient failures today", () => {
+    const now = Date.parse("2026-07-15T02:00:00Z"); // 04:00 CEST
+    const base = { mode: "incremental", status: "ok", startedAt: "2026-07-15T01:00:00Z" };
+    expect(scheduledMode(now, null, { ...base, retryDay: "2026-07-15", retryCount: 3 })).toBe(
+      "full",
+    );
+    expect(scheduledMode(now, null, { ...base, retryDay: "2026-07-15", retryCount: 4 })).toBe(
+      "incremental",
+    );
+    // Yesterday's count does not carry over.
+    expect(scheduledMode(now, null, { ...base, retryDay: "2026-07-14", retryCount: 9 })).toBe(
+      "full",
+    );
+  });
+
+  it("takes the least recently completed division first, so a short invocation rotates", async () => {
+    const a = await addDivision();
+    const bRow = await db
+      .prepare("INSERT INTO divisions (connection_id, exact_division, name) VALUES (?1, ?2, 'B')")
+      .bind(a.connectionId, a.exactDivision + 1)
+      .run();
+    const b = bRow.meta.last_row_id;
+    const fx = new FakeExact(a.exactDivision);
+    fx.divisions = [];
+    const gate = fakeGate();
+    let clock = Date.parse("2026-07-15T12:00:00Z");
+    const deps = { transport: fx.transport, gate, now: () => clock };
+    const one = () => newMeter(SUBREQUEST_RESERVE * 2 + 15); // room for one division only
+    const order: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      clock += 3_600_000;
+      const r = await runScheduledExactSync(env, clock, deps, one());
+      order.push(...r.ran.map((x) => x.divisionId));
+    }
+    expect(order).toEqual([a.id, b, a.id, b]);
   });
 });

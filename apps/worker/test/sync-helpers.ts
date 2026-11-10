@@ -55,6 +55,9 @@ export class FakeExact {
   receivables: FakeItem[] = [];
   payables: FakeItem[] = [];
   pageSize = 2;
+  /** Page sizes per endpoint family when set (Exact: about 60 on list endpoints, 1,000 on sync). */
+  listPageSize: number | undefined;
+  syncPageSize: number | undefined;
   calls: ExactRequest[] = [];
   beforeCall: (n: number, req: ExactRequest) => void = () => undefined;
   /** Per-path override: return a response instead of data. */
@@ -69,10 +72,12 @@ export class FakeExact {
     if (over) return over();
     const rows = this.rows(req);
     const offset = Number(req.query?.["$skiptoken"] ?? 0);
-    const page = rows.slice(offset, offset + this.pageSize);
-    const more = offset + this.pageSize < rows.length;
+    const size =
+      (req.path.startsWith("/sync/") ? this.syncPageSize : this.listPageSize) ?? this.pageSize;
+    const page = rows.slice(offset, offset + size);
+    const more = offset + size < rows.length;
     const next = more
-      ? `,"__next":"https://${HOST}/api/v1/${this.division}${req.path}?$skiptoken=${offset + this.pageSize}"`
+      ? `,"__next":"https://${HOST}/api/v1/${this.division}${req.path}?$skiptoken=${offset + size}"`
       : "";
     return {
       status: 200,

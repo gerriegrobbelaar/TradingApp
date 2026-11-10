@@ -353,12 +353,104 @@ describe("describeSync", () => {
       callsUsed: 3,
       finishedAt: new Date().toISOString(),
       entities: {
-        receivables: { status: "error", rows: 0, calls: 1, error: "empty_list_guard" },
+        receivables: { status: "error", rows: 0, calls: 1, error: "close_guard" },
         payables: { status: "ok", rows: 2, calls: 1 },
       },
     });
-    expect(text).toContain("no open receivables");
+    expect(text).toContain("large share of the open receivables");
     expect(text).toContain("Nothing was closed");
     expect(text).not.toMatch(/!/);
+  });
+
+  const partial = (entities: SyncResponse["entities"], mode: "full" | "incremental" = "full") =>
+    describeSync("Alpha BV", {
+      status: "partial",
+      mode,
+      callsUsed: 60,
+      finishedAt: new Date().toISOString(),
+      entities,
+    });
+
+  it("says how far a partial run got, for every mode, and promises only what is true", () => {
+    const full = partial({
+      receivables: {
+        status: "partial",
+        rows: 60,
+        calls: 59,
+        error: "time_limit",
+        progress: { read: 1240, total: 5000 },
+      },
+    });
+    expect(full).toContain("Read 1,240 of about 5,000 receivables.");
+    expect(full).toContain("Sync again to continue where it stopped.");
+    expect(full).not.toMatch(/!/);
+
+    // Unknown total, or an estimate that the pass has already passed: no "of about".
+    for (const total of [null, 100]) {
+      const t = partial(
+        {
+          payables: {
+            status: "partial",
+            rows: 5,
+            calls: 5,
+            error: "budget_exhausted",
+            progress: { read: 1240, total },
+          },
+        },
+        "incremental",
+      );
+      expect(t).toContain("Read 1,240 payables so far.");
+      expect(t).not.toContain("of about");
+    }
+    const busy = partial({
+      receivables: { status: "partial", rows: 0, calls: 1, error: "rate_limited" },
+    });
+    expect(busy).toContain("Exact was busy or did not answer.");
+  });
+});
+
+describe("manual sync cooldown", () => {
+  it("tells the user to wait and disables the buttons while the cooldown runs", async () => {
+    mockFetch({
+      ...ME_OK(FINANCE),
+      ...CONNECTIONS,
+      ...divisions({ selectedId: 1, divisions: [div(1, "Alpha BV")] }),
+      "POST /api/divisions/1/sync": () => ({
+        status: 429,
+        body: { error: "cooldown", retryAfterSeconds: 45 },
+      }),
+    });
+    const user = userEvent.setup();
+    renderApp("/settings/connections");
+    await user.click(await screen.findByRole("button", { name: "Sync Alpha BV now" }));
+    expect(
+      (await screen.findAllByText("Wait 45 seconds before starting another sync of Alpha BV."))[0],
+    ).toBeTruthy();
+    await waitFor(() =>
+      expect(
+        (screen.getByRole("button", { name: "Sync Alpha BV now" }) as HTMLButtonElement).disabled,
+      ).toBe(true),
+    );
+    expect(screen.getByText(/Sync now again in \d+ s/)).toBeTruthy();
+  });
+
+  it("starts with the server's cooldown, but leaves a mode that continues a partial run open", async () => {
+    mockFetch({
+      ...ME_OK(FINANCE),
+      ...CONNECTIONS,
+      ...divisions({
+        selectedId: 1,
+        divisions: [div(1, "Alpha BV", { cooldown: { full: 0, incremental: 30 } })],
+      }),
+    });
+    renderApp("/settings/connections");
+    const inc = (await screen.findByRole("button", {
+      name: "Sync Alpha BV now",
+    })) as HTMLButtonElement;
+    const full = screen.getByRole("button", {
+      name: "Run a full sync of Alpha BV",
+    }) as HTMLButtonElement;
+    await waitFor(() => expect(inc.disabled).toBe(true));
+    expect(full.disabled).toBe(false);
   });
 });

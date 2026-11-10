@@ -12,15 +12,19 @@
  * resume on the next ticks without hammering the Exact budget all day. Only a PARTIAL (or
  * interrupted) full sync is retried in the window: a full sync that ended in `error` or
  * `needs_reauth` is not repeated that day (each attempt costs up to SCHEDULED_FULL_BUDGET of
- * the 5,000 daily calls), the next nightly run tries again.
+ * the 5,000 daily calls), and neither is one after MAX_TRANSIENT_RETRIES transient failures that
+ * day; the next nightly run tries again. A full sync spans as many ticks as it needs (it
+ * resumes, see sync.ts); the window is the only place a full sync can start.
  * One invocation shares a deadline (SCHEDULED_MAX_MS) and a subrequest meter across divisions;
- * once either runs out the remaining divisions wait for the next tick.
+ * once either runs out the remaining divisions wait for the next tick. Divisions are taken
+ * least recently completed first, so a slow division cannot starve the ones after it.
  * Skips silently when there is no Exact connection or it is not active (for example needs_reauth).
  * Never throws: every failure is caught and logged by name only.
  */
 import type { Env } from "../env";
 import { amsterdamParts } from "./local-time";
 import {
+  MAX_TRANSIENT_RETRIES,
   newMeter,
   SUBREQUEST_RESERVE,
   syncDivision,
@@ -31,8 +35,19 @@ import {
 
 export const FULL_SYNC_FIRST_HOUR = 2;
 export const FULL_SYNC_LAST_HOUR = 5;
-export const SCHEDULED_FULL_BUDGET = 600;
-export const SCHEDULED_INCREMENTAL_BUDGET = 120;
+/**
+ * Exact calls per run and division (review S2). Worst case per division and day, with the
+ * hourly cron: a day has at most 25 ticks (the fall-back day) and at most 5 of them fall into
+ * the full window (local hours 2, 2, 3, 4, 5), so 5 x 240 + 20 x 40 = 2,000 calls, which leaves
+ * 3,000 of Exact's 5,000 for the user reserve and the Phase 3+ jobs. See ADR 0017.
+ */
+export const SCHEDULED_FULL_BUDGET = 240;
+export const SCHEDULED_INCREMENTAL_BUDGET = 40;
+export const MAX_TICKS_PER_DAY = 25;
+export const MAX_FULL_WINDOW_TICKS = FULL_SYNC_LAST_HOUR - FULL_SYNC_FIRST_HOUR + 2;
+export const SCHEDULED_WORST_CASE_CALLS_PER_DAY =
+  MAX_FULL_WINDOW_TICKS * SCHEDULED_FULL_BUDGET +
+  (MAX_TICKS_PER_DAY - MAX_FULL_WINDOW_TICKS) * SCHEDULED_INCREMENTAL_BUDGET;
 /**
  * Wall time one scheduled invocation may spend syncing, checked before every Exact call. Below
  * the 15-minute Cron Trigger limit and the 15-minute sync lease.
@@ -44,6 +59,9 @@ export interface LastRun {
   mode: string | null;
   status: string | null;
   startedAt: string | null;
+  /** Transient failures recorded for `retryDay` (an Amsterdam date). */
+  retryCount?: number;
+  retryDay?: string | null;
 }
 
 const dayOf = (iso: string | null): string | null => {
@@ -72,6 +90,14 @@ export function scheduledMode(
   ) {
     return "incremental";
   }
+  // Transient failures (502/503/504, network, rate limit) retry, but not without end.
+  if (
+    lastRun !== null &&
+    lastRun.retryDay === local.date &&
+    (lastRun.retryCount ?? 0) > MAX_TRANSIENT_RETRIES
+  ) {
+    return "incremental";
+  }
   return "full";
 }
 
@@ -97,10 +123,11 @@ export async function runScheduledExactSync(
 
   const divisions = await env.DB.prepare(
     `SELECT d.id, d.connection_id, d.exact_division, d.base_currency, s.last_full_completed_at,
-            s.mode, s.last_status, s.last_started_at
+            s.mode, s.last_status, s.last_started_at, s.retry_count, s.retry_day
      FROM divisions d
      LEFT JOIN sync_state s ON s.division_id = d.id AND s.entity = 'run'
-     WHERE d.connection_id = ?1 ORDER BY d.id`,
+     WHERE d.connection_id = ?1
+     ORDER BY COALESCE(s.last_completed_at, '') ASC, d.id`,
   )
     .bind(conn.id)
     .all<{
@@ -112,6 +139,8 @@ export async function runScheduledExactSync(
       mode: string | null;
       last_status: string | null;
       last_started_at: string | null;
+      retry_count: number | null;
+      retry_day: string | null;
     }>();
 
   const stamp = new Date(nowMs).toISOString().slice(0, 13).replace(/\D/g, "");
@@ -123,6 +152,8 @@ export async function runScheduledExactSync(
       mode: d.mode,
       status: d.last_status,
       startedAt: d.last_started_at,
+      retryCount: d.retry_count ?? 0,
+      retryDay: d.retry_day,
     });
     try {
       const summary = await syncDivision(

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button, Card, Chip, Skeleton, Stamp, type ChipTone } from "@camelthorn/ui";
 import { ApiError, runSync, type DivisionInfo, type SyncResponse } from "../api";
 import { useDivision } from "../division";
@@ -28,6 +28,31 @@ const PLURAL: Record<string, [string, string]> = {
   payables: ["payable", "payables"],
 };
 
+const count = (n: number): string => n.toLocaleString("en-US");
+
+/** "Read 1,240 of about 5,000 receivables" for the entity a partial run stopped in. */
+function progressLine(r: SyncResponse): string | null {
+  for (const key of ["receivables", "payables", "relations"]) {
+    const e = r.entities[key];
+    if (e?.status !== "partial" || e.progress === undefined) continue;
+    const noun = PLURAL[key]?.[1] ?? key;
+    const { read, total } = e.progress;
+    return total !== null && total >= read
+      ? `Read ${count(read)} of about ${count(total)} ${noun}.`
+      : `Read ${count(read)} ${noun} so far.`;
+  }
+  return null;
+}
+
+/** Why a partial run stopped, in words. */
+function pauseReason(r: SyncResponse): string {
+  const codes = Object.values(r.entities).map((e) => e.error ?? "");
+  if (codes.some((c) => c === "rate_limited" || c === "gate_unavailable" || /^http_5/.test(c))) {
+    return "Exact was busy or did not answer.";
+  }
+  return "The sync paused at its time or call limit.";
+}
+
 /** Plain sentence for a finished sync; leads with the outcome, then the numbers. */
 export function describeSync(name: string, r: SyncResponse): string {
   const parts = Object.entries(PLURAL)
@@ -37,16 +62,22 @@ export function describeSync(name: string, r: SyncResponse): string {
     })
     .join(", ");
   const guarded = Object.entries(r.entities)
-    .filter(([, e]) => e.error === "empty_list_guard")
+    .filter(([, e]) => e.error === "close_guard")
     .map(([key]) => key);
   if (guarded.length > 0) {
-    return `Exact returned no open ${guarded.join(" or ")} for ${name}, while several are open here. Nothing was closed. Check the administration in Exact; an admin can confirm the close.`;
+    return `Exact no longer lists a large share of the open ${guarded.join(" and ")} of ${name}. Nothing was closed. Check the administration in Exact; an admin can confirm the close.`;
   }
   switch (r.status) {
     case "ok":
       return `${name} is up to date: ${parts}.`;
-    case "partial":
-      return `${name} is partly synced (${parts}). The sync paused at a limit. Sync again to continue where it stopped.`;
+    case "partial": {
+      const progress = progressLine(r);
+      const lead =
+        progress === null
+          ? `${name} is partly synced (${parts}).`
+          : `${name} is partly synced. ${progress}`;
+      return `${lead} ${pauseReason(r)} Sync again to continue where it stopped.`;
+    }
     case "needs_reauth":
       return "Exact Online needs to be re-authorised before it can sync.";
     case "error":
@@ -57,6 +88,12 @@ export function describeSync(name: string, r: SyncResponse): string {
 function describeFailure(name: string, e: unknown): string {
   if (e instanceof ApiError) {
     if (e.code === "sync_running") return `A sync of ${name} is already running.`;
+    if (e.code === "cooldown") {
+      const s = e.retryAfterSeconds;
+      return s === undefined
+        ? `Wait a moment before starting another sync of ${name}.`
+        : `Wait ${s} ${s === 1 ? "second" : "seconds"} before starting another sync of ${name}.`;
+    }
     if (e.code === "needs_reauth")
       return "Exact Online needs to be re-authorised before it can sync.";
     if (e.code === "not_connected") return "Exact Online is not connected.";
@@ -70,6 +107,36 @@ export function SyncPanel({ canSync }: { canSync: boolean }) {
   const toast = useToast();
   const [busy, setBusy] = useState<number | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  // When each (administration, mode) may start a new run; continuing a partial run is exempt.
+  const [until, setUntil] = useState<Record<string, number>>({});
+  const [tick, setTick] = useState(0);
+
+  useEffect(() => {
+    const next: Record<string, number> = {};
+    for (const d of divisions) {
+      for (const mode of ["full", "incremental"] as const) {
+        const secs = d.cooldown?.[mode] ?? 0;
+        if (secs > 0) next[`${d.id}:${mode}`] = Date.now() + secs * 1000;
+      }
+    }
+    // Keep a wait we learned from a 429 until it runs out, even if the list says 0 meanwhile.
+    setUntil((prev) => {
+      const merged = { ...next };
+      for (const [key, t] of Object.entries(prev)) {
+        if (t > Date.now() && t > (merged[key] ?? 0)) merged[key] = t;
+      }
+      return merged;
+    });
+  }, [divisions]);
+
+  useEffect(() => {
+    if (!Object.values(until).some((t) => t > Date.now())) return;
+    const timer = setTimeout(() => setTick((n) => n + 1), 1000);
+    return () => clearTimeout(timer);
+  }, [until, tick]);
+
+  const waitSeconds = (id: number, mode: "full" | "incremental"): number =>
+    Math.max(0, Math.ceil(((until[`${id}:${mode}`] ?? 0) - Date.now()) / 1000));
 
   async function start(d: DivisionInfo, mode: "full" | "incremental") {
     setBusy(d.id);
@@ -80,6 +147,12 @@ export function SyncPanel({ canSync }: { canSync: boolean }) {
       setMessage(text);
       toast.show(text);
     } catch (e) {
+      if (e instanceof ApiError && e.code === "cooldown" && e.retryAfterSeconds !== undefined) {
+        setUntil((u) => ({
+          ...u,
+          [`${d.id}:${mode}`]: Date.now() + (e.retryAfterSeconds ?? 0) * 1000,
+        }));
+      }
       const text = describeFailure(d.name, e);
       setMessage(text);
       toast.show(text);
@@ -92,7 +165,11 @@ export function SyncPanel({ canSync }: { canSync: boolean }) {
   return (
     <Card aria-busy={status === "loading"}>
       <h2 className="h2">Data sync</h2>
-      <p className="lede">Relations, open receivables and open payables are copied from Exact.</p>
+      <p className="lede">
+        Relations, open receivables and open payables are copied from Exact. A sync that does not
+        finish in one go continues where it stopped. Bank account numbers are refreshed by the
+        nightly sync.
+      </p>
       {status === "loading" && (
         <div className="stack" role="status" aria-label="Loading sync status">
           <Skeleton height={20} />
@@ -140,7 +217,12 @@ export function SyncPanel({ canSync }: { canSync: boolean }) {
                           <Button
                             size="sm"
                             variant="primary"
-                            disabled={busy !== null || d.syncing || !active}
+                            disabled={
+                              busy !== null ||
+                              d.syncing ||
+                              !active ||
+                              waitSeconds(d.id, "incremental") > 0
+                            }
                             aria-label={`Sync ${d.name} now`}
                             onClick={() => void start(d, "incremental")}
                           >
@@ -148,13 +230,23 @@ export function SyncPanel({ canSync }: { canSync: boolean }) {
                           </Button>
                           <Button
                             size="sm"
-                            disabled={busy !== null || d.syncing || !active}
+                            disabled={
+                              busy !== null || d.syncing || !active || waitSeconds(d.id, "full") > 0
+                            }
                             aria-label={`Run a full sync of ${d.name}`}
                             onClick={() => void start(d, "full")}
                           >
                             Full sync
                           </Button>
                         </div>
+                        {(["incremental", "full"] as const)
+                          .filter((m) => waitSeconds(d.id, m) > 0)
+                          .map((m) => (
+                            <p className="stamp" key={m}>
+                              {m === "full" ? "Full sync" : "Sync now"} again in{" "}
+                              {waitSeconds(d.id, m)} s
+                            </p>
+                          ))}
                       </td>
                     )}
                   </tr>

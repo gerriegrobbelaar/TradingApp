@@ -3,10 +3,16 @@
  *
  *  GET  /api/divisions            any signed-in role: divisions, the user's selection, last sync
  *  PUT  /api/me/division          any signed-in role: remember the chosen division (validated)
- *  POST /api/divisions/:id/sync   admin or finance: run a sync now, inline (no step-up).
- *                                 Body `{ mode?: "full" | "incremental", allowEmptyClose?: true }`;
- *                                 allowEmptyClose (full mode, admin only) overrides the
- *                                 empty-list guard (ADR 0017).
+ *  POST /api/divisions/:id/sync   admin or finance: run one time-boxed SLICE of a sync inline (no
+ *                                 step-up). Body `{ mode?: "full" | "incremental",
+ *                                 restart?: true, allowLargeClose?: true }`. A slice makes
+ *                                 guaranteed progress and answers `partial` with progress counts
+ *                                 when it has not finished; the next call continues it. Manual
+ *                                 full slices do not read IBANs (the nightly run does).
+ *                                 One new run per division per MANUAL_COOLDOWN_MS (429 `cooldown`
+ *                                 with `retryAfterSeconds`), except continuing a partial one.
+ *                                 allowLargeClose (full mode, admin only) overrides the close
+ *                                 guard (ADR 0017).
  *  GET  /api/sync/status          any signed-in role: per-division, per-entity sync state
  *
  * `:id` and `divisionId` are our divisions.id, never the raw Exact division number. A division
@@ -21,7 +27,10 @@ const SYNC_ROLES = { roles: ["admin", "finance"] } as const;
 
 /** A manual sync stops between steps after this long and answers `partial`. */
 export const MANUAL_SYNC_MAX_MS = 20_000;
-export const MANUAL_SYNC_BUDGET = 300;
+/** Exact calls per manual slice (about one minute of the 60/min limit). */
+export const MANUAL_SYNC_BUDGET = 60;
+/** One new manual run per division per this long, unless it continues a partial one. */
+export const MANUAL_COOLDOWN_MS = 60_000;
 
 interface DivisionJoin {
   id: number;
@@ -50,8 +59,23 @@ interface RunRow {
   mode: string | null;
   last_status: string | null;
   last_error: string | null;
+  last_started_at: string | null;
   last_finished_at: string | null;
   last_completed_at: string | null;
+}
+
+/**
+ * Seconds until a manual run of `mode` may start (0 = now). Continuing a partial run of the same
+ * mode is always allowed, except after a rate limit (then the cooldown applies); a run that is
+ * still marked running is left to the lease (409).
+ */
+export function cooldownSeconds(run: RunRow | undefined, mode: SyncMode, nowMs: number): number {
+  if (!run || run.last_started_at === null || run.last_status === "running") return 0;
+  if (run.last_status === "partial" && run.mode === mode && run.last_error !== "rate_limited") {
+    return 0;
+  }
+  const left = Date.parse(run.last_started_at) + MANUAL_COOLDOWN_MS - nowMs;
+  return left > 0 ? Math.ceil(left / 1000) : 0;
 }
 
 async function readJson(request: Request): Promise<Record<string, unknown> | null> {
@@ -92,7 +116,8 @@ export function registerSyncRoutes(router: Router): void {
     const runs = (
       await db
         .prepare(
-          `SELECT division_id, mode, last_status, last_error, last_finished_at, last_completed_at
+          `SELECT division_id, mode, last_status, last_error, last_started_at, last_finished_at,
+                  last_completed_at
            FROM sync_state WHERE entity = 'run'`,
         )
         .all<RunRow>()
@@ -125,6 +150,11 @@ export function registerSyncRoutes(router: Router): void {
                   completedAt: run.last_completed_at,
                 }
               : null,
+          // Seconds a new manual run must wait, per mode (continuing a partial run is exempt).
+          cooldown: {
+            full: cooldownSeconds(run, "full", ctx.nowMs),
+            incremental: cooldownSeconds(run, "incremental", ctx.nowMs),
+          },
         };
       }),
     });
@@ -169,11 +199,15 @@ export function registerSyncRoutes(router: Router): void {
     const rawMode = body["mode"] ?? "incremental";
     if (rawMode !== "full" && rawMode !== "incremental") return json({ error: "bad_request" }, 400);
     const mode: SyncMode = rawMode;
-    const rawAllow = body["allowEmptyClose"] ?? false;
-    if (typeof rawAllow !== "boolean") return json({ error: "bad_request" }, 400);
+    const rawAllow = body["allowLargeClose"] ?? false;
+    const rawRestart = body["restart"] ?? false;
+    if (typeof rawAllow !== "boolean" || typeof rawRestart !== "boolean") {
+      return json({ error: "bad_request" }, 400);
+    }
     if (rawAllow && (mode !== "full" || !session.roles.includes("admin"))) {
       return json({ error: "forbidden" }, 403);
     }
+    if (rawRestart && mode !== "full") return json({ error: "bad_request" }, 400);
 
     const division = (await listDivisions(ctx.env.DB)).find((d) => d.id === id);
     if (!division) return json({ error: "not_found" }, 404);
@@ -184,6 +218,21 @@ export function registerSyncRoutes(router: Router): void {
         },
         409,
       );
+    }
+    const run = (
+      await ctx.env.DB.prepare(
+        `SELECT division_id, mode, last_status, last_error, last_started_at, last_finished_at,
+                last_completed_at
+         FROM sync_state WHERE division_id = ?1 AND entity = 'run'`,
+      )
+        .bind(division.id)
+        .all<RunRow>()
+    ).results[0];
+    const wait = cooldownSeconds(run, mode, ctx.nowMs);
+    if (wait > 0) {
+      return json({ error: "cooldown", retryAfterSeconds: wait }, 429, {
+        "Retry-After": String(wait),
+      });
     }
     const summary = await syncDivision(
       ctx.env,
@@ -199,7 +248,10 @@ export function registerSyncRoutes(router: Router): void {
         budget: MANUAL_SYNC_BUDGET,
         actor: session.email,
         deadlineMs: Date.now() + MANUAL_SYNC_MAX_MS,
-        allowEmptyClose: rawAllow,
+        allowLargeClose: rawAllow,
+        restart: rawRestart,
+        readIbans: false,
+        guaranteeProgress: true,
       },
     );
     if (summary.status === "locked") return json({ error: "sync_running" }, 409);
@@ -208,6 +260,7 @@ export function registerSyncRoutes(router: Router): void {
       mode: summary.mode,
       callsUsed: summary.callsUsed,
       finishedAt: summary.finishedAt,
+      cycleComplete: summary.cycleComplete,
       entities: Object.fromEntries(
         Object.entries(summary.entities).map(([name, r]) => [
           name,
@@ -216,6 +269,7 @@ export function registerSyncRoutes(router: Router): void {
             rows: r.rows,
             calls: r.calls,
             ...(r.closed !== undefined ? { closed: r.closed } : {}),
+            ...(r.progress !== undefined ? { progress: r.progress } : {}),
             ...(r.error !== undefined ? { error: r.error } : {}),
           },
         ]),
@@ -230,7 +284,7 @@ export function registerSyncRoutes(router: Router): void {
       await db
         .prepare(
           `SELECT division_id, entity, mode, last_started_at, last_finished_at, last_completed_at,
-                  last_status, last_error, rows_seen, calls_used
+                  last_status, last_error, rows_seen, calls_used, pass_rows, pass_total
            FROM sync_state ORDER BY division_id, entity`,
         )
         .all<{
@@ -244,6 +298,8 @@ export function registerSyncRoutes(router: Router): void {
           last_error: string | null;
           rows_seen: number;
           calls_used: number;
+          pass_rows: number;
+          pass_total: number | null;
         }>()
     ).results;
     const locks = (
@@ -270,6 +326,8 @@ export function registerSyncRoutes(router: Router): void {
             completedAt: s.last_completed_at,
             rows: s.rows_seen,
             calls: s.calls_used,
+            passRows: s.pass_rows,
+            passTotal: s.pass_total,
           })),
       })),
     });

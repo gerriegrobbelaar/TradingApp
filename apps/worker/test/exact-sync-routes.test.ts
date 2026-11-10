@@ -1,5 +1,5 @@
 import { env } from "cloudflare:test";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { acquireSyncLock, syncDivision } from "../src/exact/sync";
 import { addSession, addUser, authed, call, resetDb } from "./helpers";
 import { freshDivision, seedConnection, stubExact, type ExactStub } from "./exact-helpers";
@@ -242,14 +242,14 @@ describe("POST /api/divisions/:id/sync", () => {
     expect(stub.apiCalls).toHaveLength(0);
   });
 
-  it("lets only an admin override the empty-list guard, and only in full mode", async () => {
+  it("lets only an admin override the close guard, and only in full mode", async () => {
     const fin = tokens["finance"] as string;
     const adm = tokens["admin"] as string;
-    expect((await post(fin, divA.id, { mode: "full", allowEmptyClose: true })).status).toBe(403);
-    expect((await post(adm, divA.id, { mode: "incremental", allowEmptyClose: true })).status).toBe(
+    expect((await post(fin, divA.id, { mode: "full", allowLargeClose: true })).status).toBe(403);
+    expect((await post(adm, divA.id, { mode: "incremental", allowLargeClose: true })).status).toBe(
       403,
     );
-    expect((await post(adm, divA.id, { mode: "full", allowEmptyClose: "yes" })).status).toBe(400);
+    expect((await post(adm, divA.id, { mode: "full", allowLargeClose: "yes" })).status).toBe(400);
     expect(stub.apiCalls).toHaveLength(0);
     expect(await auditRows("exact.sync", divA.id)).toHaveLength(0);
   });
@@ -311,11 +311,11 @@ describe("POST /api/divisions/:id/sync", () => {
     const summary = await syncDivision(
       env,
       { id: divA.id, connectionId: connId, exactDivision: divA.exact },
-      { jobId: `tiny-${Date.now()}`, mode: "full", budget: 3, chunkPages: 1, actor: ADMIN },
+      { jobId: `tiny-${Date.now()}`, mode: "full", budget: 5, chunkPages: 1, actor: ADMIN },
     );
     expect(summary.status).toBe("partial");
     expect(summary.entities.relations.error).toBe("budget_exhausted");
-    expect(stub.apiCalls.length).toBeLessThanOrEqual(3);
+    expect(stub.apiCalls.length).toBeLessThanOrEqual(5);
     const cursor = await db
       .prepare("SELECT cursor FROM sync_state WHERE division_id = ?1 AND entity = 'relations'")
       .bind(divA.id)
@@ -339,6 +339,94 @@ describe("POST /api/divisions/:id/sync", () => {
     const reauth = await post(t, divA.id);
     expect(reauth.status).toBe(409);
     expect(((await reauth.json()) as { error: string }).error).toBe("needs_reauth");
+    expect(stub.apiCalls).toHaveLength(0);
+  });
+});
+
+describe("manual slices (review G1)", () => {
+  const post = (token: string, json: unknown) =>
+    authed(`/api/divisions/${divA.id}/sync`, token, { method: "POST", json });
+  type Body = {
+    status: string;
+    cycleComplete: boolean;
+    entities: Record<
+      string,
+      { status: string; rows: number; progress?: { read: number; total: number | null } }
+    >;
+  };
+
+  it("answers partial with progress, continues without a cooldown, then asks to wait", async () => {
+    const fin = tokens["finance"] as string;
+    const fx = new FakeExact(divA.exact);
+    fx.divisions = [{ code: divA.exact, description: "Alpha" }];
+    fx.pageSize = 1; // one row per call
+    fx.receivables = Array.from({ length: 30 }, (_, i) => ({
+      n: 100 + i,
+      account: 1,
+      name: "Acme",
+      amount: 10,
+      currency: "EUR",
+      invoiceNumber: i,
+      ts: 10 + i,
+    }));
+    serve(fx);
+    // A clock that moves 2 s per reading: the 20 s slice deadline passes after a few pages.
+    let t = Date.now();
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => (t += 2000));
+    try {
+      let read = 0;
+      let slices = 0;
+      let last: Body | null = null;
+      while (slices < 40) {
+        slices++;
+        const res = await post(fin, { mode: "full" }); // continuing a partial run: no cooldown
+        expect(res.status).toBe(200);
+        last = (await res.json()) as Body;
+        const progress = last.entities["receivables"]?.progress;
+        if (last.status === "ok") break;
+        expect(last.status).toBe("partial");
+        expect(last.cycleComplete).toBe(false);
+        if (progress !== undefined) {
+          expect(progress.read).toBeGreaterThan(read); // every slice advances
+          read = progress.read;
+        }
+      }
+      expect(slices).toBeGreaterThan(1);
+      expect(last?.status).toBe("ok");
+      expect(last?.cycleComplete).toBe(true);
+      expect(read).toBe(30);
+      // Manual full runs leave the IBANs to the nightly run.
+      expect(stub.apiCalls.some((c) => c.url.pathname.endsWith("/crm/BankAccounts"))).toBe(false);
+
+      // A new run right after: 429 with a retry hint, nothing sent to Exact.
+      const calls = stub.apiCalls.length;
+      for (const mode of ["full", "incremental"]) {
+        const wait = await post(fin, { mode });
+        expect(wait.status).toBe(429);
+        const body = (await wait.json()) as { error: string; retryAfterSeconds: number };
+        expect(body.error).toBe("cooldown");
+        expect(body.retryAfterSeconds).toBeGreaterThan(0);
+        expect(body.retryAfterSeconds).toBeLessThanOrEqual(60);
+        expect(wait.headers.get("Retry-After")).toBe(String(body.retryAfterSeconds));
+      }
+      expect(stub.apiCalls.length).toBe(calls);
+      const list = (await (await authed("/api/divisions", tokens["viewer"] as string)).json()) as {
+        divisions: { id: number; cooldown: { full: number; incremental: number } }[];
+      };
+      expect(list.divisions.find((d) => d.id === divA.id)?.cooldown.full).toBeGreaterThan(0);
+
+      // After the cooldown a new run is allowed again.
+      t += 61_000;
+      expect((await post(fin, { mode: "incremental" })).status).toBe(200);
+    } finally {
+      spy.mockRestore();
+    }
+  }, 30_000);
+
+  it("validates restart (full mode only)", async () => {
+    const fin = tokens["finance"] as string;
+    expect((await post(fin, { mode: "incremental", restart: true })).status).toBe(400);
+    expect((await post(fin, { mode: "full", restart: "yes" })).status).toBe(400);
     expect(stub.apiCalls).toHaveLength(0);
   });
 });
