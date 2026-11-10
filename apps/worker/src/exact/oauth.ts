@@ -1,7 +1,7 @@
 /**
  * Exact OAuth 2.0 token endpoint calls (authorization code and refresh). Shared by the connect
  * callback and the ExactGate token authority. Nothing here logs; errors carry codes only.
- * Assumptions about Exact's exact wire format: docs/decisions/0015-exact-oauth-assumptions.md.
+ * Assumptions about Exact's exact wire format: docs/decisions/0016-exact-oauth-assumptions.md.
  */
 export interface TokenSet {
   accessToken: string;

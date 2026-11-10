@@ -1,4 +1,4 @@
-# ADR 0015: Exact OAuth and API assumptions (verify with real credentials)
+# 0016 Exact OAuth and API assumptions (verify with real credentials)
 Status: open, 2026-11-10
 
 No Exact credentials existed when this was built; everything was tested against a stubbed `fetch`. CLAUDE.md 3 says to re-check the API docs. Each item below is from memory of Exact's documentation and must be confirmed on the first real connection. Where the item is wrong, the fix is local (a constant or one parser) as noted.

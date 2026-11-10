@@ -88,7 +88,7 @@ Register an app at the Exact App Center (apps.exactonline.com, "Register API key
 redirect URI above. Copy its client ID into `EXACT_CLIENT_ID` and its secret into
 `EXACT_CLIENT_SECRET`. Then, signed in as an admin with a fresh Google sign-in, use Settings,
 Connections, "Connect Exact Online". The first real connection is unverified: see
-`docs/decisions/0015-exact-oauth-assumptions.md` for what to check.
+`docs/decisions/0016-exact-oauth-assumptions.md` for what to check.
 Secrets live only in Workers secrets, never in the repo. If the Worker does not exist yet,
 `wrangler secret put` offers to create it; accept.
 

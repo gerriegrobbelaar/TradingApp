@@ -1,7 +1,7 @@
 /**
  * ExactGate: one Durable Object per Exact division ("exact:<division>") that every Exact call
  * goes through, plus one "token authority" instance per connection ("exact-token:<id>") that is
- * the only place an OAuth refresh ever happens (docs/decisions/0014).
+ * the only place an OAuth refresh ever happens (docs/decisions/0015-exactgate-design.md).
  *
  * Why two kinds of instance: Exact refresh tokens are single use and one connection serves all
  * its divisions. If each division gate refreshed on its own, two gates could refresh at once and

@@ -1,7 +1,7 @@
 /**
  * D1 access for the Exact connection row. Tokens are encrypted before they reach this layer
  * (see crypto/token-crypto.ts) and the row type here never carries plaintext.
- * v1 has exactly one Exact connection (kind 'exact'); see ADR 0014.
+ * v1 has exactly one Exact connection (kind 'exact'); see ADR 0015.
  */
 import { auditStatement } from "../db/audit";
 

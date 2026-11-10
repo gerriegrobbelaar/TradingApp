@@ -16,7 +16,7 @@ Cloudflare Worker: HTTP API, webhooks, cron handler, queue consumers, Durable Ob
 If any of these is missing or malformed, every route except `/api/health` answers
 `500 server_misconfigured` (the log names the missing variables, never values).
 
-## Exact connection configuration (ADR 0014, 0015)
+## Exact connection configuration (ADR 0015, 0016)
 
 | Name                     | Kind                  | Purpose                                                                                                      |
 | ------------------------ | --------------------- | ------------------------------------------------------------------------------------------------------------ |

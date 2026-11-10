@@ -1,4 +1,4 @@
-# ADR 0014: ExactGate, token authority, encrypted tokens
+# 0015 ExactGate, token authority, encrypted tokens
 Status: accepted 2026-11-10
 
 ## Context
@@ -20,4 +20,4 @@ CLAUDE.md 3: Exact allows about 60 calls/minute and 5,000/day per division; acce
 - The connect callback's two writes (tokens + `connection.exact_connected`, then division + `connection.exact_divisions_synced`) are each atomic with their audit row; between them the division is read through the gate. If that read fails the connection stays active and the UI asks to re-authorise.
 - An empty `pending` connection row is inserted before the tokens (the ciphertext is bound to the row id); it carries no data and has no audit row.
 - A serial pump caps one division at the speed of one in-flight call; at the 60/minute limit that is not the bottleneck.
-- The XML API takes the division as the `_Division_` query parameter, not in the path (to verify, ADR 0015).
+- The XML API takes the division as the `_Division_` query parameter, not in the path (to verify, ADR 0016).
