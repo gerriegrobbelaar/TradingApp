@@ -340,7 +340,7 @@ describe("users", () => {
     const user = userEvent.setup();
     renderApp("/settings/users");
     await user.type(await screen.findByLabelText("Email"), "someone@gmail.com");
-    await user.click(screen.getByRole("button", { name: "Send invite" }));
+    await user.click(screen.getByRole("button", { name: "Add person" }));
     expect((await screen.findByRole("alert")).textContent).toBe(
       "Use an @camelthorncapital.com email address.",
     );
@@ -356,14 +356,18 @@ describe("users", () => {
     renderApp("/settings/users");
     await user.type(await screen.findByLabelText("Email"), " New.Person@CamelthornCapital.com ");
     await user.click(screen.getByRole("checkbox", { name: "Finance" }));
-    await user.click(screen.getByRole("button", { name: "Send invite" }));
+    await user.click(screen.getByRole("button", { name: "Add person" }));
     const post = calls.find((c) => c.method === "POST");
     expect(post?.body).toEqual({
       email: "new.person@camelthorncapital.com",
       roles: ["viewer", "finance"],
     });
     expect(post?.headers["X-Requested-With"]).toBe("camelthorn");
-    expect(await screen.findByText("Invited new.person@camelthorncapital.com.")).toBeTruthy();
+    expect(
+      await screen.findByText(
+        "Added new.person@camelthorncapital.com. They can sign in with Google now.",
+      ),
+    ).toBeTruthy();
   });
 
   it("asks to confirm identity on step_up_required and starts step-up on click", async () => {
@@ -375,7 +379,7 @@ describe("users", () => {
     const user = userEvent.setup();
     renderApp("/settings/users");
     await user.type(await screen.findByLabelText("Email"), "a@camelthorncapital.com");
-    await user.click(screen.getByRole("button", { name: "Send invite" }));
+    await user.click(screen.getByRole("button", { name: "Add person" }));
     const sheet = await screen.findByRole("dialog", { name: "Confirm it's you" });
     expect(assign).not.toHaveBeenCalled();
     await user.click(within(sheet).getByRole("button", { name: "Sign in again" }));
@@ -396,6 +400,78 @@ describe("users", () => {
     await user.click(within(sheet).getByRole("button", { name: "Remove user" }));
     expect(calls.some((c) => c.method === "DELETE")).toBe(true);
     expect(await screen.findByText("Removed v@camelthorncapital.com.")).toBeTruthy();
+  });
+
+  it("says no email is sent when adding a person", async () => {
+    mockFetch(base);
+    renderApp("/settings/users");
+    expect(await screen.findByText(/No email is sent/)).toBeTruthy();
+  });
+
+  const WITH_INVITE_AND_REMOVED = {
+    users: [
+      ...USERS.users,
+      { id: 3, email: "gone@camelthorncapital.com", roles: [], disabled: true, lastLoginAt: null },
+    ],
+    invites: [
+      {
+        id: 9,
+        email: "n@camelthorncapital.com",
+        roles: ["viewer" as const],
+        invitedBy: "gerrie@camelthorncapital.com",
+        createdAt: "2026-11-10T10:00:00Z",
+      },
+    ],
+  };
+
+  it("revokes a pending invite only after confirmation", async () => {
+    const calls = mockFetch({
+      ...ME_OK(ADMIN),
+      "GET /api/users": () => ({ body: WITH_INVITE_AND_REMOVED }),
+      "DELETE /api/users/invites/9": () => ({ body: { id: 9 } }),
+    });
+    const user = userEvent.setup();
+    renderApp("/settings/users");
+    await user.click(await screen.findByRole("button", { name: /Revoke invite for n@/ }));
+    expect(calls.some((c) => c.method === "DELETE")).toBe(false);
+    const sheet = await screen.findByRole("dialog", { name: "Revoke this invite" });
+    await user.click(within(sheet).getByRole("button", { name: "Revoke invite" }));
+    expect(calls.some((c) => c.method === "DELETE" && c.url === "/api/users/invites/9")).toBe(true);
+    expect(await screen.findByText("Revoked the invite for n@camelthorncapital.com.")).toBeTruthy();
+  });
+
+  it("restores a removed person with the chosen roles", async () => {
+    const calls = mockFetch({
+      ...ME_OK(ADMIN),
+      "GET /api/users": () => ({ body: WITH_INVITE_AND_REMOVED }),
+      "POST /api/users/3/restore": () => ({ body: { id: 3, roles: ["finance"] } }),
+    });
+    const user = userEvent.setup();
+    renderApp("/settings/users");
+    await user.click(await screen.findByRole("button", { name: /Restore gone@/ }));
+    const sheet = await screen.findByRole("dialog", { name: "Restore this person" });
+    await user.click(within(sheet).getByRole("checkbox", { name: "Viewer" }));
+    expect(within(sheet).getByRole("button", { name: "Restore person" })).toHaveProperty(
+      "disabled",
+      true,
+    );
+    await user.click(within(sheet).getByRole("checkbox", { name: "Finance" }));
+    await user.click(within(sheet).getByRole("button", { name: "Restore person" }));
+    expect(calls.find((c) => c.method === "POST")?.body).toEqual({ roles: ["finance"] });
+    expect(await screen.findByText("Restored gone@camelthorncapital.com.")).toBeTruthy();
+  });
+
+  it("offers Restore when adding someone who was removed earlier", async () => {
+    mockFetch({
+      ...ME_OK(ADMIN),
+      "GET /api/users": () => ({ body: WITH_INVITE_AND_REMOVED }),
+      "POST /api/users/invite": () => ({ status: 409, body: { error: "user_disabled" } }),
+    });
+    const user = userEvent.setup();
+    renderApp("/settings/users");
+    await user.type(await screen.findByLabelText("Email"), "Gone@camelthorncapital.com");
+    await user.click(screen.getByRole("button", { name: "Add person" }));
+    expect(await screen.findByRole("dialog", { name: "Restore this person" })).toBeTruthy();
   });
 
   it("changes roles and shows the server's plain-language error", async () => {

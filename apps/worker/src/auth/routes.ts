@@ -24,6 +24,8 @@ const NOT_FRESH_MS = 0;
 
 /** Scope in idempotency_keys used to make each sign-in round trip single-use. */
 const FLOW_SCOPE = "auth.flow";
+const FLOW_KEY_RETENTION_MS = 24 * 3600 * 1000;
+const PURGE_BATCH = 100;
 
 function denied(clearFlow = true): Response {
   const headers = new Headers({ location: "/?auth=denied", "cache-control": "no-store" });
@@ -32,7 +34,7 @@ function denied(clearFlow = true): Response {
 }
 
 export function registerAuthRoutes(router: Router): void {
-  router.add("GET", "/api/health", { public: true, noConfig: true }, () => json({ ok: true }));
+  router.addNoConfig("GET", "/api/health", () => json({ ok: true }));
 
   router.add("GET", "/api/auth/login", { public: true }, async (ctx) => {
     const state = randomBase64Url(32);
@@ -89,14 +91,21 @@ export function registerAuthRoutes(router: Router): void {
       // Single use: the same callback (cookie + state) can never create a second session,
       // even if the authorization code were accepted again. Claimed only after a verified
       // ID token, so anonymous traffic cannot grow the table.
-      const claim = await ctx.env.DB.prepare(
-        `INSERT INTO idempotency_keys (scope, key, status, completed_at)
-         VALUES (?1, ?2, 'completed', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-         ON CONFLICT (scope, key) DO NOTHING`,
-      )
-        .bind(FLOW_SCOPE, await sha256Hex(flow.state))
-        .run();
-      if (claim.meta.changes !== 1) throw new AuthError("flow_replayed");
+      const [claim] = await ctx.env.DB.batch([
+        ctx.env.DB.prepare(
+          `INSERT INTO idempotency_keys (scope, key, status, completed_at)
+           VALUES (?1, ?2, 'completed', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+           ON CONFLICT (scope, key) DO NOTHING`,
+        ).bind(FLOW_SCOPE, await sha256Hex(flow.state)),
+        // Opportunistic retention: a flow cookie lives 10 minutes, so day-old claims are dead
+        // weight. Bounded, and only this scope (other scopes are payment keys, kept for good).
+        ctx.env.DB.prepare(
+          `DELETE FROM idempotency_keys WHERE rowid IN (
+             SELECT rowid FROM idempotency_keys
+             WHERE scope = ?1 AND created_at < ?2 LIMIT ?3)`,
+        ).bind(FLOW_SCOPE, new Date(ctx.nowMs - FLOW_KEY_RETENTION_MS).toISOString(), PURGE_BATCH),
+      ]);
+      if (claim?.meta.changes !== 1) throw new AuthError("flow_replayed");
 
       // A new session per sign-in (also on step-up); the old one is dropped.
       const oldToken = cookies.get(SESSION_COOKIE);

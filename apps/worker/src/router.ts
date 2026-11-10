@@ -21,27 +21,35 @@ export interface Ctx {
   nowMs: number;
 }
 
+/** Context for routes that must work without a valid auth configuration (health). */
+export type NoConfigCtx = Omit<Ctx, "config"> & { config: AuthConfig | null };
+
 export type Handler = (ctx: Ctx) => Promise<Response> | Response;
+export type NoConfigHandler = (ctx: NoConfigCtx) => Promise<Response> | Response;
 
 export interface Access {
   public?: true;
-  /** Skip the auth configuration check (health only). */
-  noConfig?: true;
   roles?: readonly Role[];
   stepUp?: true;
 }
 
-interface Route {
+type Route = {
   method: string;
+  /** "METHOD /path/:param" as registered; safe to log (no request data). */
+  pattern: string;
   segments: string[];
-  handler: Handler;
   access: Access;
-}
+} & ({ noConfig: false; handler: Handler } | { noConfig: true; handler: NoConfigHandler });
 
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
-export const json = (body: unknown, status = 200, headers?: HeadersInit): Response =>
-  Response.json(body, { status, ...(headers ? { headers } : {}) });
+/** API JSON is never cached and never sniffed into another content type. */
+export const json = (body: unknown, status = 200, headers?: HeadersInit): Response => {
+  const h = new Headers(headers);
+  h.set("cache-control", "no-store");
+  h.set("x-content-type-options", "nosniff");
+  return Response.json(body, { status, headers: h });
+};
 
 /**
  * CSRF defence for cookie sessions: every unsafe request must carry the custom header
@@ -59,7 +67,27 @@ export class Router {
   private routes: Route[] = [];
 
   add(method: string, path: string, access: Access, handler: Handler): this {
-    this.routes.push({ method, segments: path.split("/").filter(Boolean), handler, access });
+    this.routes.push({
+      method,
+      pattern: `${method} ${path}`,
+      segments: path.split("/").filter(Boolean),
+      access,
+      noConfig: false,
+      handler,
+    });
+    return this;
+  }
+
+  /** Public route that still works when the auth configuration is incomplete (health only). */
+  addNoConfig(method: string, path: string, handler: NoConfigHandler): this {
+    this.routes.push({
+      method,
+      pattern: `${method} ${path}`,
+      segments: path.split("/").filter(Boolean),
+      access: { public: true },
+      noConfig: true,
+      handler,
+    });
     return this;
   }
 
@@ -101,16 +129,32 @@ export class Router {
     if (m === null) return null;
     if (m === "method") return json({ error: "method_not_allowed" }, 405);
     const { route, params } = m;
+    try {
+      return await this.dispatch(route, params, request, url, env, nowMs);
+    } catch (err) {
+      // Error name and route pattern only: never the message, URL or body, which may carry
+      // tokens, IBANs or emails (CLAUDE.md 5).
+      console.error("unhandled error", err instanceof Error ? err.name : "unknown", route.pattern);
+      return json({ error: "internal_error" }, 500);
+    }
+  }
 
+  private async dispatch(
+    route: Route,
+    params: Record<string, string>,
+    request: Request,
+    url: URL,
+    env: Env,
+    nowMs: number,
+  ): Promise<Response> {
     const cfg = loadAuthConfig(env);
-    if (!cfg.ok && !route.access.noConfig) {
+    if (!cfg.ok && !route.noConfig) {
       // Names of the missing settings only, never values.
       console.error("auth configuration incomplete", cfg.missing.join(","));
       return json({ error: "server_misconfigured" }, 500);
     }
-    const config = cfg.ok ? cfg.config : (null as unknown as AuthConfig);
 
-    if (cfg.ok && !csrfOk(request, config.appOrigin)) return json({ error: "csrf" }, 403);
+    if (cfg.ok && !csrfOk(request, cfg.config.appOrigin)) return json({ error: "csrf" }, 403);
 
     let session: Session | null = null;
     if (!route.access.public) {
@@ -125,6 +169,9 @@ export class Router {
         return json({ error: "step_up_required" }, 401);
       }
     }
-    return route.handler({ request, env, url, params, config, session, nowMs });
+    const base = { request, env, url, params, session, nowMs };
+    if (route.noConfig) return route.handler({ ...base, config: cfg.ok ? cfg.config : null });
+    if (!cfg.ok) return json({ error: "server_misconfigured" }, 500); // unreachable; narrows type
+    return route.handler({ ...base, config: cfg.config });
   }
 }

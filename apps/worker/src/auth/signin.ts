@@ -3,7 +3,7 @@
  * example the seeded admin) or an open invite for the email must exist. Email compare is
  * lowercase. The Google `sub` is bound on first sign-in and must match from then on.
  */
-import { writeAudit } from "../db/audit";
+import { auditStatement } from "../db/audit";
 import { AuthError, type GoogleIdentity } from "./google";
 import { ROLES, type Role } from "./session";
 
@@ -26,16 +26,27 @@ export async function resolveUser(db: D1Database, id: GoogleIdentity): Promise<n
   if (user) {
     if (user.disabled_at !== null) throw new AuthError("user_disabled");
     if (user.google_sub === null) {
+      // First sign-in binds the Google account. Change and audit row in one batch, both only
+      // while the sub is still unbound (a concurrent bind leaves nothing behind).
+      let bound: D1Result[];
       try {
-        const r = await db
-          .prepare("UPDATE users SET google_sub = ?1 WHERE id = ?2 AND google_sub IS NULL")
-          .bind(id.sub, user.id)
-          .run();
-        if (r.meta.changes !== 1) throw new AuthError("sub_mismatch");
-      } catch (err) {
-        if (err instanceof AuthError) throw err;
+        bound = await db.batch([
+          auditStatement(
+            db,
+            { actorEmail: id.email, action: "user.bind_google", entity: "user", entityId: user.id },
+            {
+              sql: "EXISTS (SELECT 1 FROM users WHERE id = ?7 AND google_sub IS NULL)",
+              binds: [user.id],
+            },
+          ),
+          db
+            .prepare("UPDATE users SET google_sub = ?1 WHERE id = ?2 AND google_sub IS NULL")
+            .bind(id.sub, user.id),
+        ]);
+      } catch {
         throw new AuthError("sub_already_bound"); // UNIQUE: this Google account belongs to another row
       }
+      if (bound[1]?.meta.changes !== 1) throw new AuthError("sub_mismatch");
     } else if (user.google_sub !== id.sub) {
       throw new AuthError("sub_mismatch");
     }
@@ -80,6 +91,17 @@ export async function resolveUser(db: D1Database, id: GoogleIdentity): Promise<n
           )
           .bind(id.sub, role, invite.id),
       ),
+      auditStatement(
+        db,
+        {
+          actorEmail: id.email,
+          action: "invite.accept",
+          entity: "invite",
+          entityId: invite.id,
+          after: { roles },
+        },
+        { sql: open("?7"), binds: [invite.id] },
+      ),
       db
         .prepare(
           `UPDATE invites SET accepted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -91,13 +113,5 @@ export async function resolveUser(db: D1Database, id: GoogleIdentity): Promise<n
     throw new AuthError("sub_already_bound"); // UNIQUE: this Google account belongs to another row
   }
   if (results[0]?.meta.changes !== 1) throw new AuthError("invite_closed");
-  const userId = results[0].meta.last_row_id;
-  await writeAudit(db, {
-    actorEmail: id.email,
-    action: "invite.accept",
-    entity: "user",
-    entityId: userId,
-    after: { roles },
-  });
-  return userId;
+  return results[0].meta.last_row_id;
 }

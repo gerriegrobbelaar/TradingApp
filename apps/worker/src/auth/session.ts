@@ -36,9 +36,13 @@ export async function createSession(
   const token = randomBase64Url(32);
   const hash = await sha256Hex(token);
   await db.batch([
-    // Opportunistic cleanup of dead sessions.
+    // Opportunistic cleanup of dead sessions, bounded so one sign-in never does unbounded work.
     db
-      .prepare("DELETE FROM sessions WHERE expires_at <= ?1 OR last_seen_at <= ?2")
+      .prepare(
+        `DELETE FROM sessions WHERE token_hash IN (
+           SELECT token_hash FROM sessions
+           WHERE expires_at <= ?1 OR last_seen_at <= ?2 LIMIT 100)`,
+      )
       .bind(iso(nowMs), iso(nowMs - IDLE_TIMEOUT_MS)),
     db
       .prepare(
@@ -61,6 +65,8 @@ export async function loadSession(
     .prepare(
       `SELECT s.user_id, s.last_seen_at, s.last_auth_at, u.email
        FROM sessions s JOIN users u ON u.id = s.user_id
+       -- sessions.revoked_at is never written today (revocation deletes the row); the filter is
+       -- kept as defence in depth. Dropping the column needs a migration, left for later.
        WHERE s.token_hash = ?1 AND s.revoked_at IS NULL AND s.expires_at > ?2
          AND s.last_seen_at > ?3 AND u.disabled_at IS NULL`,
     )
