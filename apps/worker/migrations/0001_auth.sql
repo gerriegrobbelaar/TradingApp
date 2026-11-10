@@ -34,8 +34,10 @@ CREATE TABLE invites (
 CREATE UNIQUE INDEX idx_invites_pending_email ON invites (email)
   WHERE accepted_at IS NULL AND revoked_at IS NULL;
 
+-- The cookie carries a random token; only its SHA-256 (lowercase hex) is stored, never the raw token.
+-- last_auth_at = time of the last Google sign-in, used for the 15-minute step-up check.
 CREATE TABLE sessions (
-  id           TEXT PRIMARY KEY,
+  token_hash   TEXT PRIMARY KEY CHECK (length(token_hash) = 64 AND token_hash NOT GLOB '*[^0-9a-f]*'),
   user_id      INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
   created_at   TEXT NOT NULL,
   last_seen_at TEXT NOT NULL,

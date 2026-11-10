@@ -25,7 +25,7 @@ CREATE TABLE divisions (
   connection_id  INTEGER NOT NULL REFERENCES connections (id),
   exact_division INTEGER NOT NULL,
   name           TEXT NOT NULL,
-  base_currency  TEXT NOT NULL DEFAULT 'EUR',
+  base_currency  TEXT NOT NULL DEFAULT 'EUR' CHECK (length(base_currency) = 3 AND base_currency = upper(base_currency)),
   UNIQUE (connection_id, exact_division)
 );
 
@@ -36,7 +36,7 @@ CREATE TABLE bank_accounts (
   external_id   TEXT NOT NULL,
   name          TEXT NOT NULL,
   iban          TEXT,
-  currency      TEXT NOT NULL,
+  currency      TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency)),
   balance_minor INTEGER,
   balance_at    TEXT,
   UNIQUE (connection_id, external_id)
@@ -47,9 +47,10 @@ CREATE TABLE bank_transactions (
   connection_id     INTEGER NOT NULL REFERENCES connections (id),
   bank_account_id   INTEGER NOT NULL REFERENCES bank_accounts (id),
   external_id       TEXT NOT NULL,
-  state             TEXT NOT NULL,
+  -- Revolut transaction state; only final states (completed/failed/reverted/declined) are booked.
+  state             TEXT NOT NULL CHECK (state IN ('created', 'pending', 'completed', 'declined', 'failed', 'reverted')),
   amount_minor      INTEGER NOT NULL,
-  currency          TEXT NOT NULL,
+  currency          TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency)),
   counterparty_name TEXT,
   counterparty_iban TEXT,
   reference         TEXT,
@@ -72,10 +73,11 @@ CREATE TABLE open_items (
   relation_iban  TEXT,
   invoice_number TEXT,
   reference      TEXT,
-  currency       TEXT NOT NULL,
+  currency       TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency)),
   amount_minor   INTEGER NOT NULL,
   open_minor     INTEGER NOT NULL,
-  rate           TEXT,
+  -- Booked FX rate as a decimal string (never REAL).
+  rate           TEXT CHECK (rate IS NULL OR (rate GLOB '[0-9]*' AND rate NOT GLOB '*[^0-9.]*' AND rate NOT GLOB '*.*.*')),
   invoice_date   TEXT,
   due_date       TEXT,
   status         TEXT NOT NULL DEFAULT 'open',
@@ -101,24 +103,29 @@ CREATE TABLE matches (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
   bank_transaction_id INTEGER NOT NULL REFERENCES bank_transactions (id),
   open_item_id        INTEGER REFERENCES open_items (id),
+  ledger_account      TEXT,
   amount_minor        INTEGER NOT NULL,
-  currency            TEXT NOT NULL,
+  currency            TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency)),
   mode                TEXT NOT NULL CHECK (mode IN ('auto', 'manual')),
   score               INTEGER,
   exact_matchset_id   TEXT,
   matched_by          TEXT NOT NULL,
   matched_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   undone_at           TEXT,
-  undone_by           TEXT
+  undone_by           TEXT,
+  CHECK (open_item_id IS NOT NULL OR ledger_account IS NOT NULL)
 );
 CREATE INDEX idx_matches_tx ON matches (bank_transaction_id);
+-- No double booking: one live match per (bank line, open item).
+CREATE UNIQUE INDEX idx_matches_live ON matches (bank_transaction_id, open_item_id)
+  WHERE undone_at IS NULL AND open_item_id IS NOT NULL;
 CREATE INDEX idx_matches_item ON matches (open_item_id);
 
 CREATE TABLE payment_batches (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   status      TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'waiting_approval', 'paying', 'paid', 'failed')),
   total_minor INTEGER NOT NULL DEFAULT 0,
-  currency    TEXT NOT NULL,
+  currency    TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency)),
   created_by  TEXT NOT NULL,
   created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -129,8 +136,8 @@ CREATE TABLE payments (
   batch_id         INTEGER REFERENCES payment_batches (id),
   bank_account_id  INTEGER REFERENCES bank_accounts (id),
   status           TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'waiting_approval', 'paying', 'paid', 'failed')),
-  amount_minor     INTEGER NOT NULL,
-  currency         TEXT NOT NULL,
+  amount_minor     INTEGER NOT NULL CHECK (amount_minor > 0),
+  currency         TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency)),
   beneficiary_iban TEXT NOT NULL,
   reference        TEXT,
   request_id       TEXT NOT NULL UNIQUE,
@@ -141,6 +148,10 @@ CREATE TABLE payments (
 );
 CREATE INDEX idx_payments_item ON payments (open_item_id);
 CREATE INDEX idx_payments_status ON payments (status);
+CREATE INDEX idx_payments_batch ON payments (batch_id);
+-- At most one in-flight payment per open item (no double pay while waiting or paying).
+CREATE UNIQUE INDEX idx_payments_in_flight ON payments (open_item_id)
+  WHERE status IN ('waiting_approval', 'paying');
 
 CREATE TABLE approvals (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,10 +168,11 @@ CREATE TABLE approvals (
 CREATE INDEX idx_approvals_subject ON approvals (subject_type, subject_id);
 CREATE INDEX idx_approvals_status ON approvals (status);
 
+-- ECB reference rate: units of currency per 1 EUR, stored as a decimal string (never REAL).
 CREATE TABLE fx_rates (
-  currency   TEXT NOT NULL,
+  currency   TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency)),
   rate_date  TEXT NOT NULL,
-  rate       TEXT NOT NULL,
+  rate       TEXT NOT NULL CHECK (rate GLOB '[0-9]*' AND rate NOT GLOB '*[^0-9.]*' AND rate NOT GLOB '*.*.*'),
   source     TEXT NOT NULL DEFAULT 'ECB',
   fetched_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   PRIMARY KEY (currency, rate_date)
@@ -172,6 +184,7 @@ CREATE TABLE fx_revaluations (
   period           TEXT NOT NULL,
   status           TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'approved', 'booked', 'reversed')),
   difference_minor INTEGER NOT NULL DEFAULT 0,
+  currency         TEXT NOT NULL DEFAULT 'EUR' CHECK (length(currency) = 3 AND currency = upper(currency)),
   exact_journal_id TEXT,
   created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   UNIQUE (division_id, period)
@@ -180,6 +193,7 @@ CREATE TABLE fx_revaluations (
 CREATE TABLE jobs (
   name         TEXT PRIMARY KEY,
   cron         TEXT NOT NULL,
+  timezone     TEXT NOT NULL DEFAULT 'Europe/Amsterdam',
   enabled      INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
   exact_budget INTEGER NOT NULL DEFAULT 0,
   last_run_at  TEXT,
