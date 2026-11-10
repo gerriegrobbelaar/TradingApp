@@ -10,9 +10,11 @@
  *    abandoned after 36 h or on `restart`). Inside a cycle every entity is read completely once
  *    and then skipped by later runs of the cycle. Receivables and payables are read from the bulk
  *    lists in resumable chunks (the `$skiptoken` is saved with the rows). Only when the read of
- *    that kind has COMPLETED, items last seen before the cycle began are closed; a partial,
- *    failed, rate-limited or time-boxed run never closes anything. A guard refuses to close
- *    more than max(5, 20 %) of the open items of a kind without `allowLargeClose`.
+ *    that kind has COMPLETED, items last seen before the cycle began get a strike; they close
+ *    after two strikes in a row, or one from a read done in a single run (two-strike rule,
+ *    `strikesToClose`). A partial, failed, rate-limited or time-boxed run never strikes or closes
+ *    anything. A guard refuses more than max(5, 20 %) of the open items of a kind without
+ *    `allowLargeClose`. Progress and cycle state are only saved while the run holds its lease.
  *  - IBANs (crm/BankAccounts) are read in scheduled FULL runs only (`readIbans`), never hourly.
  *  - INCREMENTAL mode continues every cursor-based entity from its saved Timestamp and never
  *    closes by absence. A zero open amount closes an item we know; unknown closed items are not
@@ -38,7 +40,7 @@ import {
 } from "@camelthorn/exact";
 import { auditStatement } from "../db/audit";
 import type { Env } from "../env";
-import { createGateTransport, gateName } from "./gate-transport";
+import { createGateTransport, gateName, getExactGate } from "./gate-transport";
 import { amsterdamDate, amsterdamParts } from "./local-time";
 
 export type SyncMode = "full" | "incremental";
@@ -98,6 +100,17 @@ export const newMeter = (limit = SUBREQUEST_LIMIT): SubrequestMeter => ({ used: 
 export const CLOSE_GUARD_MIN = 5;
 export const CLOSE_GUARD_FRACTION = 0.2;
 
+/**
+ * Two-strike rule (ADR 0017): complete reads an open item must be missing from before it is
+ * closed. 2 when the read was carried across runs by a saved $skiptoken (an unstable list order
+ * between runs could skip a row once; twice in a row at the same item is very unlikely); 1 when
+ * the whole list was read in one run (as before G1) or an admin confirmed with allowLargeClose.
+ */
+export const strikesToClose = (
+  r: Pick<EntityResult, "singleRunRead">,
+  opts: Pick<SyncOptions, "allowLargeClose">,
+): 1 | 2 => (r.singleRunRead === true || opts.allowLargeClose === true ? 1 : 2);
+
 /** True when closing `stale` of `open` open items is allowed without the admin override. */
 export const closeAllowed = (stale: number, open: number): boolean =>
   stale <= Math.max(CLOSE_GUARD_MIN, open * CLOSE_GUARD_FRACTION);
@@ -143,6 +156,20 @@ export interface SyncOptions {
    * deadline has already passed, so every slice advances (no livelock under the inline limit).
    */
   guaranteeProgress?: boolean;
+  /**
+   * Manual runs: decides, UNDER the sync lock, whether the run may start, from the previous run
+   * (seconds to wait; 0 = go). Checked after the lease is taken, so two requests racing past the
+   * route's own check still cannot both start a new run inside the cooldown.
+   */
+  admit?: (prev: PrevRun | null) => number;
+}
+
+/** The previous run of a division as `admit` sees it (sync_state entity 'run'). */
+export interface PrevRun {
+  mode: string | null;
+  last_status: string | null;
+  last_error: string | null;
+  last_started_at: string | null;
 }
 
 export interface JobGate {
@@ -173,10 +200,19 @@ export interface EntityResult {
   progress?: { read: number; total: number | null };
   /** The entity is finished for the current full cycle (this run or an earlier one). */
   cycleDone?: boolean;
+  /**
+   * Full open-item reads: the whole list was read in this run, from the first page to the last
+   * (no `$skiptoken` carried over from an earlier run). One strike is then enough to close.
+   */
+  singleRunRead?: boolean;
+  /** Open items of that kind this complete read did not see (closed or waiting for a 2nd miss). */
+  missed?: number;
 }
 
 export interface SyncSummary {
-  status: RunStatus | "locked";
+  status: RunStatus | "locked" | "cooldown";
+  /** status 'cooldown': seconds until a new run may start (see SyncOptions.admit). */
+  retryAfterSeconds?: number;
   mode: SyncMode;
   divisionId: number;
   runSeq: number | null;
@@ -195,6 +231,8 @@ interface StateRow {
   cursor: string;
   mode: SyncMode | null;
   last_status: string | null;
+  last_error: string | null;
+  last_started_at: string | null;
   last_completed_at: string | null;
   rows_seen: number;
   cycle_seq: number | null;
@@ -277,7 +315,8 @@ async function runBatches(
 }
 
 function defaultGate(env: Env, exactDivision: number): JobGate {
-  const stub = env.EXACT_GATE.get(env.EXACT_GATE.idFromName(gateName(exactDivision)));
+  // The same EU-jurisdiction object that serves the calls (ADR 0018), so the budget applies.
+  const stub = getExactGate(env, gateName(exactDivision));
   return {
     startJob: (id, budget) => stub.startJob(id, budget),
     endJob: (id) => stub.endJob(id),
@@ -288,6 +327,17 @@ function defaultGate(env: Env, exactDivision: number): JobGate {
 // Statements
 // ---------------------------------------------------------------------------------------------
 
+/** The run that wrote a statement still holds the division's lease (?1 = division_id). */
+const leaseHeld = (holderParam: string, seqParam: string): string =>
+  `EXISTS (SELECT 1 FROM sync_locks WHERE division_id = ?1 AND holder = ${holderParam}
+           AND run_seq = ${seqParam})`;
+
+/** Identifies the run for the lease guard. */
+interface Lease {
+  holder: string;
+  runSeq: number;
+}
+
 const cursorStmt = (
   db: D1Database,
   divisionId: number,
@@ -297,6 +347,7 @@ const cursorStmt = (
   status: "partial" | "ok",
   startedAt: string,
   cycle: number | null,
+  lease: Lease,
 ): D1PreparedStatement =>
   db
     .prepare(
@@ -306,9 +357,10 @@ const cursorStmt = (
        ON CONFLICT (division_id, entity) DO UPDATE SET
          cursor = excluded.cursor, mode = excluded.mode, last_status = excluded.last_status,
          last_started_at = excluded.last_started_at,
-         pass_cycle = COALESCE(excluded.pass_cycle, sync_state.pass_cycle)`,
+         pass_cycle = COALESCE(excluded.pass_cycle, sync_state.pass_cycle)
+       WHERE ${leaseHeld("?8", "?9")}`,
     )
-    .bind(divisionId, entity, cursor, mode, startedAt, status, cycle);
+    .bind(divisionId, entity, cursor, mode, startedAt, status, cycle, lease.holder, lease.runSeq);
 
 /** Saves a resumable open-item pass (same batch as the rows it covers). */
 const passStmt = (
@@ -320,6 +372,7 @@ const passStmt = (
   token: string | null,
   rows: number,
   total: number | null,
+  lease: Lease,
 ): D1PreparedStatement =>
   db
     .prepare(
@@ -328,9 +381,10 @@ const passStmt = (
        VALUES (?1, ?2, 'full', ?3, 'partial', ?4, ?5, ?6, ?7)
        ON CONFLICT (division_id, entity) DO UPDATE SET
          pass_cycle = excluded.pass_cycle, pass_token = excluded.pass_token,
-         pass_rows = excluded.pass_rows, pass_total = excluded.pass_total`,
+         pass_rows = excluded.pass_rows, pass_total = excluded.pass_total
+       WHERE ${leaseHeld("?8", "?9")}`,
     )
-    .bind(divisionId, entity, startedAt, cycle, token, rows, total);
+    .bind(divisionId, entity, startedAt, cycle, token, rows, total, lease.holder, lease.runSeq);
 
 function relationStmt(
   db: D1Database,
@@ -413,7 +467,7 @@ function openItemStmt(
          closed_at = CASE WHEN excluded.status = 'closed'
                           THEN COALESCE(open_items.closed_at, excluded.closed_at) ELSE NULL END,
          synced_at = excluded.synced_at, entry_number = excluded.entry_number,
-         last_seen_sync_id = excluded.last_seen_sync_id
+         last_seen_sync_id = excluded.last_seen_sync_id, missed_cycles = 0
        WHERE excluded.last_seen_sync_id >= COALESCE(open_items.last_seen_sync_id, 0)`,
     )
     .bind(
@@ -554,7 +608,10 @@ export async function syncDivision(
   >;
   const meter = opts.meter ?? newMeter();
   const holder = crypto.randomUUID();
-  const early = (status: "partial" | "locked", runSeq: number | null): SyncSummary => ({
+  const early = (
+    status: "partial" | "locked" | "cooldown",
+    runSeq: number | null,
+  ): SyncSummary => ({
     status,
     mode: opts.mode,
     divisionId: division.id,
@@ -604,21 +661,29 @@ export async function syncDivision(
       divisionCurrency: division.currency ?? "EUR",
     });
 
-    meter.used += 2; // the 'running' state row and the state read below
-    await stateStmt(db, division.id, "run", opts.mode, startedAt, startedAt, "running", null, 0, 0)
-      .run()
-      .catch(() => undefined);
-
+    // State first (the previous run as it ended), then the 'running' marker.
+    meter.used += 1;
     const stateRows = await db
       .prepare(
-        `SELECT entity, cursor, mode, last_status, last_completed_at, rows_seen, cycle_seq,
-                cycle_started_at, pass_cycle, pass_token, pass_rows, pass_total, done_cycle,
-                retry_count, retry_day
+        `SELECT entity, cursor, mode, last_status, last_error, last_started_at, last_completed_at,
+                rows_seen, cycle_seq, cycle_started_at, pass_cycle, pass_token, pass_rows,
+                pass_total, done_cycle, retry_count, retry_day
          FROM sync_state WHERE division_id = ?1`,
       )
       .bind(division.id)
       .all<StateRow>();
     const state = new Map(stateRows.results.map((r) => [r.entity, r]));
+
+    if (opts.admit !== undefined) {
+      // Under the lease: runs of this division are serialised, so this check cannot race.
+      const wait = opts.admit(state.get("run") ?? null);
+      if (wait > 0) return { ...early("cooldown", runSeq), retryAfterSeconds: wait };
+    }
+
+    meter.used += 1;
+    await stateStmt(db, division.id, "run", opts.mode, startedAt, startedAt, "running", null, 0, 0)
+      .run()
+      .catch(() => undefined);
 
     // FULL cycle: continue the open one (younger than CYCLE_MAX_AGE_MS, not restarted), else
     // this run starts a new one. Its id is this run's sequence number.
@@ -655,6 +720,7 @@ export async function syncDivision(
         division,
         mode: opts.mode,
         runSeq,
+        lease: { holder, runSeq },
         cycle,
         startedAt,
         nowIso: () => iso(now()),
@@ -725,34 +791,46 @@ export async function syncDivision(
     ] as const) {
       const r = entities[entity];
       if (cycle === null || r.status !== "ok" || r.completeRead !== true) continue;
-      if (opts.allowLargeClose === true) continue;
+      // `stale`: open items this read did not see; `due`: those that close now (two-strike rule,
+      // see the close statements below). Counted under the lease, so they match what the final
+      // batch does and the audit row can record them.
+      const need = strikesToClose(r, opts);
       meter.used += 1;
       const counts = await db
         .prepare(
           `SELECT COUNT(*) AS open,
                   COALESCE(SUM(CASE WHEN COALESCE(last_seen_sync_id, 0) < ?3 THEN 1 ELSE 0 END), 0)
-                    AS stale
+                    AS stale,
+                  COALESCE(SUM(CASE WHEN COALESCE(last_seen_sync_id, 0) < ?3
+                                     AND missed_cycles + 1 >= ?4 THEN 1 ELSE 0 END), 0) AS due
            FROM open_items WHERE division_id = ?1 AND kind = ?2 AND status = 'open'`,
         )
-        .bind(division.id, kind, cycle)
-        .first<{ open: number; stale: number }>();
-      if (!closeAllowed(counts?.stale ?? 0, counts?.open ?? 0)) {
+        .bind(division.id, kind, cycle, need)
+        .first<{ open: number; stale: number; due: number }>();
+      entities[entity] = { ...r, missed: counts?.stale ?? 0, closed: counts?.due ?? 0 };
+      if (opts.allowLargeClose !== true && !closeAllowed(counts?.stale ?? 0, counts?.open ?? 0)) {
         entities[entity] = {
-          ...r,
           status: "error",
+          rows: r.rows,
+          calls: r.calls,
           error: "close_guard",
           completeRead: false,
           cycleDone: false,
+          ...(r.progress !== undefined ? { progress: r.progress } : {}),
         };
       }
     }
 
-    // Transient failures are retried by the next run, but only MAX_TRANSIENT_RETRIES times per
-    // Amsterdam day; after that they count as errors (and scheduledMode stops retrying a full).
+    // FULL runs: transient failures are retried by the next run, but only MAX_TRANSIENT_RETRIES
+    // times per Amsterdam day; after that they count as errors. retry_count / retry_day count the
+    // failed full attempts of the day and are what scheduledMode reads, so they survive the
+    // incremental runs in between (a full that failed is not retried every other tick).
+    // Incremental runs do not touch the counter: they run hourly anyway and a transient failure
+    // simply ends them `partial`.
     const today = amsterdamParts(now()).date;
     let retryCount = prevRun?.retry_count ?? 0;
     let retryDay = prevRun?.retry_day ?? null;
-    if (fatal?.transient === true || transientEntities.size > 0) {
+    if (opts.mode === "full" && (fatal?.transient === true || transientEntities.size > 0)) {
       retryCount = (retryDay === today ? retryCount : 0) + 1;
       retryDay = today;
       if (retryCount > MAX_TRANSIENT_RETRIES) {
@@ -783,32 +861,52 @@ export async function syncDivision(
     const cycleComplete =
       cycle !== null && status === "ok" && required.every((e) => entities[e].cycleDone === true);
 
+    // A full run that ended in error (a permanent API error, the close guard, an internal error,
+    // or transient failures past the bound) is not started again by the scheduler that day.
+    if (opts.mode === "full" && status === "error") {
+      retryCount = Math.max(retryDay === today ? retryCount : 0, MAX_TRANSIENT_RETRIES + 1);
+      retryDay = today;
+    }
+
     const finishedAt = iso(now());
     const rowsTotal = results.reduce((n, r) => n + r.rows, 0);
     const statements: D1PreparedStatement[] = [];
-    const closing: EntityName[] = [];
+    // [entity, index of its strike statement]; the close statement follows it.
+    const closing: [EntityName, number][] = [];
     for (const [entity, kind] of [
       ["receivables", "invoice"],
       ["payables", "bill"],
     ] as const) {
       const r = entities[entity];
       if (cycle !== null && r.status === "ok" && r.completeRead === true) {
-        closing.push(entity);
-        // Only items last seen BEFORE this cycle began (a newer run's rows are never touched),
-        // only of this division and kind, and only while this run still holds the lease: if the
-        // lease expired and another run took over, run_seq moved on and nothing is closed.
+        closing.push([entity, statements.length]);
+        // Two-strike rule (ADR 0017): every open item this complete read did not see (last seen
+        // BEFORE the cycle began) gets a strike; it is closed once it has missed two complete
+        // reads in a row, or one that was read in a single run (no $skiptoken carried across
+        // runs, so no risk from a list order that moved between runs), or one an admin confirmed
+        // with allowLargeClose. Seeing the item again resets the count (openItemStmt). Both
+        // statements touch only this division and kind, and only while this run still holds
+        // the lease: if it expired and another run took over, run_seq moved on and nothing
+        // changes.
+        const need = strikesToClose(r, opts);
         statements.push(
+          db
+            .prepare(
+              `UPDATE open_items SET missed_cycles = missed_cycles + 1
+               WHERE division_id = ?1 AND kind = ?2 AND status = 'open'
+                 AND COALESCE(last_seen_sync_id, 0) < ?3 AND ${leaseHeld("?4", "?5")}`,
+            )
+            .bind(division.id, kind, cycle, holder, runSeq),
           db
             .prepare(
               `UPDATE open_items SET status = 'closed', open_minor = 0,
                  open_dc_minor = CASE WHEN open_dc_minor IS NULL THEN NULL ELSE 0 END,
                  closed_at = ?4
                WHERE division_id = ?1 AND kind = ?2 AND status = 'open'
-                 AND COALESCE(last_seen_sync_id, 0) < ?3
-                 AND EXISTS (SELECT 1 FROM sync_locks
-                             WHERE division_id = ?1 AND holder = ?5 AND run_seq = ?6)`,
+                 AND COALESCE(last_seen_sync_id, 0) < ?3 AND missed_cycles >= ?7
+                 AND ${leaseHeld("?5", "?6")}`,
             )
-            .bind(division.id, kind, cycle, finishedAt, holder, runSeq),
+            .bind(division.id, kind, cycle, finishedAt, holder, runSeq, need),
         );
       }
     }
@@ -834,9 +932,9 @@ export async function syncDivision(
           db
             .prepare(
               `UPDATE sync_state SET done_cycle = ?3, pass_token = NULL
-               WHERE division_id = ?1 AND entity = ?2`,
+               WHERE division_id = ?1 AND entity = ?2 AND ${leaseHeld("?4", "?5")}`,
             )
-            .bind(division.id, entity, cycle),
+            .bind(division.id, entity, cycle, holder, runSeq),
         );
       } else if (
         cycle !== null &&
@@ -849,9 +947,9 @@ export async function syncDivision(
           db
             .prepare(
               `UPDATE sync_state SET pass_token = NULL, pass_rows = 0
-               WHERE division_id = ?1 AND entity = ?2`,
+               WHERE division_id = ?1 AND entity = ?2 AND ${leaseHeld("?3", "?4")}`,
             )
-            .bind(division.id, entity),
+            .bind(division.id, entity, holder, runSeq),
         );
       }
     }
@@ -875,7 +973,7 @@ export async function syncDivision(
              cycle_seq = CASE WHEN ?2 = 1 THEN ?3 ELSE cycle_seq END,
              cycle_started_at = CASE WHEN ?2 = 1 THEN ?4 ELSE cycle_started_at END,
              retry_count = ?5, retry_day = ?6
-           WHERE division_id = ?1 AND entity = 'run'`,
+           WHERE division_id = ?1 AND entity = 'run' AND ${leaseHeld("?7", "?8")}`,
         )
         .bind(
           division.id,
@@ -884,6 +982,8 @@ export async function syncDivision(
           cycle === null || cycleComplete ? null : cycleStartedAt,
           retryCount,
           retryDay,
+          holder,
+          runSeq,
         ),
       auditStatement(db, {
         actorEmail: actor,
@@ -905,6 +1005,9 @@ export async function syncDivision(
                 rows: entities[e].rows,
                 calls: entities[e].calls,
                 ...(entities[e].error !== undefined ? { error: entities[e].error } : {}),
+                ...(entities[e].closed !== undefined
+                  ? { missed: entities[e].missed ?? 0, closed: entities[e].closed }
+                  : {}),
               },
             ]),
           ),
@@ -913,10 +1016,13 @@ export async function syncDivision(
     );
     meter.used += 1;
     const results2 = await db.batch(statements);
-    // The close statements come first; report how many items each one closed.
-    closing.forEach((entity, i) => {
-      entities[entity].closed = results2[i]?.meta.changes ?? 0;
-    });
+    // The strike and close statements come first; report what each kind missed and closed.
+    // (The audit row in the same batch cannot carry these counts; the sync_state row and the
+    // response do, and every closed row has closed_at.)
+    for (const [entity, i] of closing) {
+      entities[entity].missed = results2[i]?.meta.changes ?? 0;
+      entities[entity].closed = results2[i + 1]?.meta.changes ?? 0;
+    }
     return {
       status,
       mode: opts.mode,
@@ -944,6 +1050,8 @@ interface Ctx {
   division: DivisionRef;
   mode: SyncMode;
   runSeq: number;
+  /** This run's lease (holder + run_seq): progress is only saved while it is held. */
+  lease: Lease;
   /** Full mode: the cycle this run belongs to (its first run's sequence number). */
   cycle: number | null;
   startedAt: string;
@@ -1046,6 +1154,7 @@ async function cursorLoop<T>(
         page.complete ? "ok" : "partial",
         ctx.startedAt,
         ctx.mode === "full" ? ctx.cycle : null,
+        ctx.lease,
       ),
     ]);
     await runBatches(ctx.db, ctx.meter, units);
@@ -1146,6 +1255,7 @@ async function syncOpenItemsFull(
         page.nextToken,
         readTotal,
         total,
+        ctx.lease,
       ),
     ]);
     await runBatches(ctx.db, ctx.meter, units);
@@ -1160,6 +1270,7 @@ async function syncOpenItemsFull(
         calls: 0,
         completeRead: true,
         cycleDone: true,
+        singleRunRead: !resuming,
         progress: ctx.pass,
       };
     }

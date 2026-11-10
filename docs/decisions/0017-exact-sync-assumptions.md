@@ -22,16 +22,45 @@ is local to `apps/worker/src/exact/sync.ts` or to the client field lists.
   batch is safe: saved tokens carry the cycle they belong to (`pass_cycle`) and are ignored by
   any other cycle.
 - **Resumable bulk reads.** Receivables and payables are read from `ReceivablesList` /
-  `PayablesList` in chunks of `chunkPages` (5) pages. Each chunk is written in ONE batch together
+  `PayablesList` in chunks of `chunkPages` (5) pages. Each chunk's rows are written together
   with the `$skiptoken` to continue from and the pass progress (`pass_token`, `pass_rows`,
-  `pass_total`); if a page after the first fails, the client hands back the pages it did read
-  (`ListChunk.error`) and the sync writes them before rethrowing, so a stop anywhere loses nothing.
-  The read is COMPLETE only when Exact returns a last page. Then, in the final batch, open items
-  of that kind last seen BEFORE the cycle began (`last_seen_sync_id < cycle_seq`) are closed
-  (still only while this run holds the lease). Items the cycle's reads, or an hourly incremental
-  run in between, have seen carry a newer `run_seq` and stay open. A partial, failed,
-  rate-limited, time-boxed or subrequest-stopped run never closes anything. A permanent API error
-  while resuming drops the saved token so it is not retried until the cycle expires.
+  `pass_total`). A chunk can be more than one D1 batch (100 statements each: 5 pages of 60 rows
+  are 4 batches); the progress statement is always the LAST statement of the last batch, so the
+  saved token never runs ahead of the rows: if a batch fails, the next run re-reads (upserts are
+  idempotent) instead of skipping. If a page after the first fails, the client hands back the
+  pages it did read (`ListChunk.error`) and the sync writes them before rethrowing, so a stop
+  anywhere loses nothing. Pass and cursor progress is only saved while the run still holds its
+  lease (the upsert's `DO UPDATE ... WHERE` checks `sync_locks`), and so are `done_cycle`, the
+  cycle columns on the `run` row and the token reset after an error: a run that outlived its
+  lease cannot move another run's pass, finish its cycle or leave a half-open one behind (tested).
+  The read is COMPLETE only when Exact returns a last page. Then, in the final batch, the open
+  items of that kind last seen BEFORE the cycle began (`last_seen_sync_id < cycle_seq`) get a
+  strike and close under the **two-strike rule** below (only while this run holds the lease).
+  Items the cycle's reads, or an hourly incremental run in between, have seen carry a newer
+  `run_seq` and stay open. A partial, failed, rate-limited, time-boxed or subrequest-stopped run
+  never strikes or closes anything. A permanent API error while resuming drops the saved token so
+  it is not retried until the cycle expires.
+- **Two-strike rule (review G1).** A pass that resumes from a `$skiptoken` saved minutes or hours
+  earlier relies on Exact keeping the list order between runs (Verify item 10). If the token is
+  an offset and an earlier row is paid in between, every later row moves up one place and the
+  row at the page boundary is never served: without a guard that still-open item would be
+  closed, and the 20 % close guard only catches mass errors. So `open_items.missed_cycles`
+  (migration 0006) counts the complete reads in a row that did not see an open item; any read
+  that sees it (full or incremental) resets it to 0. An item is closed when it has been missed
+  by **two complete reads in a row**, or by **one complete read done in a single run** (the
+  whole list from its first to its last page in one run, no token carried over: the pre-G1
+  behaviour; the nightly full read of a normal division is one), or by one confirmed with
+  `allowLargeClose` (the admin accepts the closes). The chance that the same item sits at a
+  shifting page boundary in two consecutive passes is negligible; a genuinely paid item closes
+  one cycle later at most (the hourly incremental read usually closes it first, from its zero
+  open amount). An item paid AFTER a pass read it counts as seen in that cycle and is struck
+  by the next one, so it is never left open for good. The close guard counts the strikes
+  (`stale`), so a mass problem is refused on its first pass, before anything is struck; a
+  refused read adds no strike. The `exact.sync` audit row records per kind `missed` (struck) and
+  `closed`, counted under the lease just before the final batch. Rejected alternatives:
+  `$orderby=ID` on the list reads (not verified that `read/financial/*List` accepts it; a 400
+  would break every full read; keep as the fix once Verify item 10 is checked) and re-reading
+  candidates by ID (an unverified filter, and up to one call per candidate).
 - **INCREMENTAL** continues every cursor-based entity from its saved Timestamp and never closes by
   absence. A row whose open amount is zero updates a row we know to closed; a closed row we have
   never seen is NOT inserted (G1: the first pass from cursor 0 would import the whole paid
@@ -39,8 +68,12 @@ is local to `apps/worker/src/exact/sync.ts` or to the client field lists.
   full sync the open-item incremental cursors still start at 0 and walk the sync endpoint once,
   history included, inside the hourly budget (`ceil(rows / page size)` calls over as many hourly
   ticks as it takes; the volume test shows 9 calls at 1,000 per page for the reference
-  division). Seeding the cursor with the latest Timestamp (`$orderby=Timestamp desc&$top=1`
-  taken before a full pass) would remove it, but needs that query verified on real Exact.
+  division). The cursors cannot be seeded from the completed full cycle: the bulk list rows
+  carry no `Timestamp` (`OPEN_ITEM_LIST_FIELDS`; `mapOpenItem(..., sync = false)` leaves
+  `timestamp` null). Seeding with the latest Timestamp of the sync endpoint itself
+  (`$orderby=Timestamp desc&$top=1`, one call, taken BEFORE a full pass so nothing changed during
+  the pass is skipped) would remove the walk, but needs that query verified on real Exact; it is
+  a one-time cost per division, so it waits for the first live connection.
 - **IBANs are read in scheduled FULL runs only** (`readIbans`; B1a). Manual runs skip them. Of the
   two options (full only, or per-relation reads for relations whose Timestamp changed) the full
   read is cheaper: `ceil(4,000 / 60) = 67` calls once a night against one call per changed
@@ -56,8 +89,15 @@ is local to `apps/worker/src/exact/sync.ts` or to the client field lists.
   total is the number of open items of that kind we held before the pass, null when unknown) and
   the next call continues the cycle. One new run per division per 60 s (`MANUAL_COOLDOWN_MS`):
   429 `cooldown` with `retryAfterSeconds` and a `Retry-After` header, except continuing a
-  partial run of the same mode (not after a rate limit). `GET /api/divisions` returns the
-  remaining cooldown per mode. A manual full run covers everything but IBANs and does not count
+  partial run of the same mode (not after a rate limit, and not with `restart`, which is a new
+  run). The route checks the cooldown for a fast answer, and `syncDivision` checks it again
+  UNDER the lease (`admit`), before writing anything: runs of a division are serialised by the
+  lease, so two requests that both pass the route's check cannot both start a new run (the second
+  gets 409 while the first runs, or 429 once it has finished). `GET /api/divisions` returns the
+  remaining cooldown per mode. There is no separate daily cap on manual slices: each is at most
+  60 calls, the gate's 60/minute limit bounds them in time, and the gate never lets `job`
+  calls into the last 10 % of the day (the user reserve). A user who keeps clicking can use
+  daytime budget that later Phase 3 jobs would want; revisit with the jobs table (Phase 3). A manual full run covers everything but IBANs and does not count
   as the night's full sync (`last_full_completed_at`).
 - **Budgets (S2).** Scheduled full runs get 240 Exact calls, hourly incremental runs 40
   (`SCHEDULED_FULL_BUDGET`, `SCHEDULED_INCREMENTAL_BUDGET`). A day has at most 25 ticks (the
@@ -79,12 +119,23 @@ is local to `apps/worker/src/exact/sync.ts` or to the client field lists.
   stops it as `needs_reauth` (recorded in `sync_state`, no retry; the scheduler also skips the
   other divisions of that connection). **Transient failures (S3)** (HTTP 502/503/504, the gate's
   `network` and `gate_unavailable`, a rate limit, a gate that cannot start the job) also stop the
-  run as `partial`: the next entities would fail the same way and the next run resumes. They are
-  counted per Amsterdam day (`retry_count`, `retry_day` on the `run` row, never reset by a
-  success); after `MAX_TRANSIENT_RETRIES` (3) the failure is recorded as `error`, and
-  `scheduledMode` stops starting full syncs for that day (so retries are bounded, not
-  infinite). Other `ExactApiError`s are permanent: recorded with a short code (`http_400`, ...)
-  as `error`, and the next entities still run, so one bad endpoint does not hide the rest.
+  run as `partial`: the next entities would fail the same way and the next run resumes. The
+  gate's retryable token errors (`token_refresh_retry`, a refused or failed refresh, HTTP 503)
+  are transient too, never `needs_reauth`. FULL runs count them per Amsterdam day (`retry_count`,
+  `retry_day` on the `run` row, never reset by a success); after `MAX_TRANSIENT_RETRIES` (3) the
+  failure is recorded as `error`. A full run that ends `error` for any reason (permanent API
+  error, close guard, internal error, too many transient failures) sets the counter past the
+  bound, so `scheduledMode` starts no other full sync that Amsterdam day, even after
+  incremental ticks in between (before G1 review the check only looked at the last run, so an
+  incremental tick re-enabled the failing full sync every other hour). Incremental runs do not
+  touch the counter; they run hourly anyway. Other `ExactApiError`s are permanent: recorded
+  with a short code (`http_400`, ...) as `error`, and the next entities still run, so one bad
+  endpoint does not hide the rest.
+  While the gate has marked the connection `token_endpoint_rejected_credentials`
+  (`connections.last_error`, ADR 0016; the fix is the client secret, not a re-authorisation) the
+  scheduler skips the sync instead of failing every hour, except one incremental run of one
+  division at 03:00 Amsterdam (`CREDENTIALS_PROBE_HOUR`) that lets a fixed secret clear the flag.
+  A manual sync is still allowed and works as the same probe.
   Unknown exceptions stop the run as `error` / `internal_error`; only the error name is logged.
   `endJob` is always called in a `finally`.
 - **Lock.** `sync_locks` holds a 15-minute lease per division. Taking it is one
@@ -157,10 +208,12 @@ is local to `apps/worker/src/exact/sync.ts` or to the client field lists.
 10. **`$skiptoken` is stateless and the list order is stable between runs.** Resuming a bulk read
     in a later run (minutes or hours later) assumes the token from `__next` keeps working and
     that rows do not move to earlier pages when others are added or paid. If Exact rejects an old
-    token (HTTP 400) the pass restarts from the top; if the order is not stable an item can be
-    missed and wrongly look paid, which the close guard (S5) catches when many are affected but
-    not a single one: verify on a test division by reading a list across two runs. A stable sort
-    (`$orderby=ID`) would be the fix.
+    token (HTTP 400) the pass restarts from the top. If the order is not stable, an item can be
+    skipped once; the two-strike rule keeps it open (it is only closed when two complete reads
+    in a row miss it, or a single-run read does), and the close guard (S5) catches mass errors.
+    Verify on a test division by reading a list across two runs with a payment in between, and
+    check whether `$orderby=ID` is accepted on `read/financial/ReceivablesList`; if it is, add it
+    to the list reads (`listChunk` in `packages/exact/src/client.ts`).
 11. **Page sizes.** 60 on list endpoints and 1,000 on sync endpoints are assumptions (tested at
     both and at 60 everywhere); real sizes change only the call counts above.
 

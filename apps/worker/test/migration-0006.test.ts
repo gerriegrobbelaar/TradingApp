@@ -2,7 +2,7 @@ import { applyD1Migrations, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
 /**
- * Migration 0006 only adds columns to sync_state. This runs it on a database that already holds
+ * Migration 0006 only adds columns (sync_state, open_items.missed_cycles). This runs it on a database that already holds
  * sync state, locks and open items (as a deployed Phase 2 database would) and checks that nothing
  * is lost, the defaults are right and the foreign keys still hold.
  */
@@ -94,10 +94,12 @@ describe("migration 0006 on a database with existing sync state", () => {
       ],
     ).toBe(4);
     expect(
-      (await mdb.prepare("SELECT last_seen_sync_id FROM open_items WHERE id = 1").first())?.[
-        "last_seen_sync_id"
-      ],
-    ).toBe(4);
+      await mdb
+        .prepare(
+          "SELECT last_seen_sync_id, missed_cycles, status, open_minor FROM open_items WHERE id = 1",
+        )
+        .first(),
+    ).toEqual({ last_seen_sync_id: 4, missed_cycles: 0, status: "open", open_minor: 12345 });
     expect((await mdb.prepare("PRAGMA foreign_key_check").all()).results).toEqual([]);
 
     // The new columns are writable.
@@ -108,5 +110,10 @@ describe("migration 0006 on a database with existing sync state", () => {
          WHERE division_id = 9 AND entity = 'run'`,
       )
       .run();
+    await mdb.prepare("UPDATE open_items SET missed_cycles = 1 WHERE id = 1").run();
+    // The open/closed triggers of 0005 still apply to the altered table.
+    await expect(
+      mdb.prepare("UPDATE open_items SET status = 'paid' WHERE id = 1").run(),
+    ).rejects.toThrow();
   });
 });

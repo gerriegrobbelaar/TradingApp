@@ -261,6 +261,8 @@ export interface SyncResponse {
       rows: number;
       calls: number;
       closed?: number;
+      /** Open items the complete read did not see (closed now or waiting for a second miss). */
+      missed?: number;
       error?: string;
       progress?: SyncProgress;
     }

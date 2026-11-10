@@ -20,7 +20,7 @@
  */
 import { auditStatement } from "../db/audit";
 import { json, type Ctx, type Router } from "../router";
-import { syncDivision, type SyncMode } from "./sync";
+import { syncDivision, type PrevRun, type SyncMode } from "./sync";
 
 const ANY_ROLE = { roles: ["admin", "finance", "approver", "viewer"] } as const;
 const SYNC_ROLES = { roles: ["admin", "finance"] } as const;
@@ -66,12 +66,24 @@ interface RunRow {
 
 /**
  * Seconds until a manual run of `mode` may start (0 = now). Continuing a partial run of the same
- * mode is always allowed, except after a rate limit (then the cooldown applies); a run that is
- * still marked running is left to the lease (409).
+ * mode is allowed at once, except after a rate limit (then the cooldown applies) or when the
+ * caller restarts the cycle (`restart`, a new run); a run that is still marked running is left to
+ * the lease (409). The route checks this for a fast answer and syncDivision checks it again under
+ * the lease (`admit`), so two racing requests cannot both start a new run.
  */
-export function cooldownSeconds(run: RunRow | undefined, mode: SyncMode, nowMs: number): number {
+export function cooldownSeconds(
+  run: PrevRun | undefined | null,
+  mode: SyncMode,
+  nowMs: number,
+  restart = false,
+): number {
   if (!run || run.last_started_at === null || run.last_status === "running") return 0;
-  if (run.last_status === "partial" && run.mode === mode && run.last_error !== "rate_limited") {
+  if (
+    !restart &&
+    run.last_status === "partial" &&
+    run.mode === mode &&
+    run.last_error !== "rate_limited"
+  ) {
     return 0;
   }
   const left = Date.parse(run.last_started_at) + MANUAL_COOLDOWN_MS - nowMs;
@@ -228,12 +240,10 @@ export function registerSyncRoutes(router: Router): void {
         .bind(division.id)
         .all<RunRow>()
     ).results[0];
-    const wait = cooldownSeconds(run, mode, ctx.nowMs);
-    if (wait > 0) {
-      return json({ error: "cooldown", retryAfterSeconds: wait }, 429, {
-        "Retry-After": String(wait),
-      });
-    }
+    const cooldown = (wait: number): Response =>
+      json({ error: "cooldown", retryAfterSeconds: wait }, 429, { "Retry-After": String(wait) });
+    const wait = cooldownSeconds(run, mode, ctx.nowMs, rawRestart);
+    if (wait > 0) return cooldown(wait);
     const summary = await syncDivision(
       ctx.env,
       {
@@ -252,9 +262,11 @@ export function registerSyncRoutes(router: Router): void {
         restart: rawRestart,
         readIbans: false,
         guaranteeProgress: true,
+        admit: (prev) => cooldownSeconds(prev, mode, ctx.nowMs, rawRestart),
       },
     );
     if (summary.status === "locked") return json({ error: "sync_running" }, 409);
+    if (summary.status === "cooldown") return cooldown(summary.retryAfterSeconds ?? 1);
     return json({
       status: summary.status,
       mode: summary.mode,
@@ -269,6 +281,7 @@ export function registerSyncRoutes(router: Router): void {
             rows: r.rows,
             calls: r.calls,
             ...(r.closed !== undefined ? { closed: r.closed } : {}),
+            ...(r.missed !== undefined ? { missed: r.missed } : {}),
             ...(r.progress !== undefined ? { progress: r.progress } : {}),
             ...(r.error !== undefined ? { error: r.error } : {}),
           },

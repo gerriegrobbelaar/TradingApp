@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import { Button, Card, Chip, Skeleton, Stamp, type ChipTone } from "@camelthorn/ui";
 import { ApiError, runSync, type DivisionInfo, type SyncResponse } from "../api";
 import { useDivision } from "../division";
-import { useToast } from "../toasts";
 
 const LABEL: Record<string, { text: string; tone: ChipTone }> = {
   ok: { text: "Up to date", tone: "ok" },
@@ -44,10 +43,13 @@ function progressLine(r: SyncResponse): string | null {
   return null;
 }
 
+/** Codes of failures that pass by themselves (the server retries them, see ADR 0017). */
+const TRANSIENT = new Set(["rate_limited", "gate_unavailable", "network", "token_refresh_retry"]);
+
 /** Why a partial run stopped, in words. */
 function pauseReason(r: SyncResponse): string {
   const codes = Object.values(r.entities).map((e) => e.error ?? "");
-  if (codes.some((c) => c === "rate_limited" || c === "gate_unavailable" || /^http_5/.test(c))) {
+  if (codes.some((c) => TRANSIENT.has(c) || /^http_5/.test(c))) {
     return "Exact was busy or did not answer.";
   }
   return "The sync paused at its time or call limit.";
@@ -92,7 +94,7 @@ function describeFailure(name: string, e: unknown): string {
       const s = e.retryAfterSeconds;
       return s === undefined
         ? `Wait a moment before starting another sync of ${name}.`
-        : `Wait ${s} ${s === 1 ? "second" : "seconds"} before starting another sync of ${name}.`;
+        : `${s} ${s === 1 ? "second" : "seconds"} before another sync of ${name} can start.`;
     }
     if (e.code === "needs_reauth")
       return "Exact Online needs to be re-authorised before it can sync.";
@@ -104,7 +106,6 @@ function describeFailure(name: string, e: unknown): string {
 
 export function SyncPanel({ canSync }: { canSync: boolean }) {
   const { status, divisions, reload } = useDivision();
-  const toast = useToast();
   const [busy, setBusy] = useState<number | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   // When each (administration, mode) may start a new run; continuing a partial run is exempt.
@@ -143,9 +144,9 @@ export function SyncPanel({ canSync }: { canSync: boolean }) {
     setMessage(`Syncing ${d.name}. This can take a minute.`);
     try {
       const r = await runSync(d.id, mode);
-      const text = describeSync(d.name, r);
-      setMessage(text);
-      toast.show(text);
+      // Shown and announced once, in the card's live region (a toast as well would make screen
+      // readers read every result twice).
+      setMessage(describeSync(d.name, r));
     } catch (e) {
       if (e instanceof ApiError && e.code === "cooldown" && e.retryAfterSeconds !== undefined) {
         setUntil((u) => ({
@@ -153,9 +154,7 @@ export function SyncPanel({ canSync }: { canSync: boolean }) {
           [`${d.id}:${mode}`]: Date.now() + (e.retryAfterSeconds ?? 0) * 1000,
         }));
       }
-      const text = describeFailure(d.name, e);
-      setMessage(text);
-      toast.show(text);
+      setMessage(describeFailure(d.name, e));
     } finally {
       setBusy(null);
       await reload();
@@ -200,6 +199,29 @@ export function SyncPanel({ canSync }: { canSync: boolean }) {
               {divisions.map((d) => {
                 const s = LABEL[statusOf(d)] ?? LABEL["none"];
                 const active = d.connectionStatus === "active";
+                // The countdown is plain text (not a live region: it would announce every
+                // second); each disabled button points at its line with aria-describedby.
+                // Both modes waiting the same time (the usual case) share one line.
+                const waitInc = waitSeconds(d.id, "incremental");
+                const waitFull = waitSeconds(d.id, "full");
+                const shared = waitInc > 0 && waitInc === waitFull;
+                const waitId = (m: "full" | "incremental") =>
+                  shared ? `sync-wait-${d.id}` : `sync-wait-${d.id}-${m}`;
+                const describedBy = (m: "full" | "incremental") =>
+                  waitSeconds(d.id, m) > 0 ? waitId(m) : undefined;
+                const waitLines: { id: string; text: string }[] = shared
+                  ? [
+                      {
+                        id: waitId("incremental"),
+                        text: `${waitInc} s until the next sync can start`,
+                      },
+                    ]
+                  : (["incremental", "full"] as const)
+                      .filter((m) => waitSeconds(d.id, m) > 0)
+                      .map((m) => ({
+                        id: waitId(m),
+                        text: `${waitSeconds(d.id, m)} s until ${m === "full" ? "Full sync" : "Sync now"} is available`,
+                      }));
                 return (
                   <tr key={d.id}>
                     <td>{d.name}</td>
@@ -213,40 +235,44 @@ export function SyncPanel({ canSync }: { canSync: boolean }) {
                     </td>
                     {canSync && (
                       <td>
-                        <div className="chips">
-                          <Button
-                            size="sm"
-                            variant="primary"
-                            disabled={
-                              busy !== null ||
-                              d.syncing ||
-                              !active ||
-                              waitSeconds(d.id, "incremental") > 0
-                            }
-                            aria-label={`Sync ${d.name} now`}
-                            onClick={() => void start(d, "incremental")}
-                          >
-                            {busy === d.id ? "Syncing" : "Sync now"}
-                          </Button>
-                          <Button
-                            size="sm"
-                            disabled={
-                              busy !== null || d.syncing || !active || waitSeconds(d.id, "full") > 0
-                            }
-                            aria-label={`Run a full sync of ${d.name}`}
-                            onClick={() => void start(d, "full")}
-                          >
-                            Full sync
-                          </Button>
-                        </div>
-                        {(["incremental", "full"] as const)
-                          .filter((m) => waitSeconds(d.id, m) > 0)
-                          .map((m) => (
-                            <p className="stamp" key={m}>
-                              {m === "full" ? "Full sync" : "Sync now"} again in{" "}
-                              {waitSeconds(d.id, m)} s
+                        <div className="stack">
+                          <div className="chips">
+                            <Button
+                              size="sm"
+                              variant="primary"
+                              disabled={
+                                busy !== null ||
+                                d.syncing ||
+                                !active ||
+                                waitSeconds(d.id, "incremental") > 0
+                              }
+                              aria-label={`Sync ${d.name} now`}
+                              aria-describedby={describedBy("incremental")}
+                              onClick={() => void start(d, "incremental")}
+                            >
+                              {busy === d.id ? "Syncing" : "Sync now"}
+                            </Button>
+                            <Button
+                              size="sm"
+                              disabled={
+                                busy !== null ||
+                                d.syncing ||
+                                !active ||
+                                waitSeconds(d.id, "full") > 0
+                              }
+                              aria-label={`Run a full sync of ${d.name}`}
+                              aria-describedby={describedBy("full")}
+                              onClick={() => void start(d, "full")}
+                            >
+                              Full sync
+                            </Button>
+                          </div>
+                          {waitLines.map((l) => (
+                            <p className="stamp" key={l.id} id={l.id}>
+                              {l.text}
                             </p>
                           ))}
+                        </div>
                       </td>
                     )}
                   </tr>

@@ -1,6 +1,11 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ExactApiError, ExactBudgetExhaustedError, ExactRateLimitedError } from "@camelthorn/exact";
+import {
+  ExactApiError,
+  ExactBudgetExhaustedError,
+  ExactRateLimitedError,
+  type ExactTransport,
+} from "@camelthorn/exact";
 import {
   CLOSE_GUARD_FRACTION,
   CLOSE_GUARD_MIN,
@@ -126,6 +131,13 @@ describe.each([
     let runs = 0;
     let finished: SyncSummary | null = null;
     let lastRead = 0;
+    const missedCycles = async (): Promise<number | undefined> =>
+      (
+        await db
+          .prepare("SELECT missed_cycles FROM open_items WHERE division_id = ?1 AND exact_id = ?2")
+          .bind(div.id, guid(gone.n))
+          .first<{ missed_cycles: number }>()
+      )?.missed_cycles;
     while (finished === null && runs < 30) {
       runs++;
       budgeted(perRun); // divisions + (perRun - 1) pages of this entity per run
@@ -147,11 +159,24 @@ describe.each([
     }
     expect(finished).not.toBeNull();
     expect(runs).toBeGreaterThanOrEqual(3); // forced to resume at least twice
-    expect(finished?.entities.receivables.closed).toBe(1);
+    // Two-strike rule: a read carried across runs is one strike; the item stays open for now.
+    expect(finished?.entities.receivables).toMatchObject({ missed: 1, closed: 0 });
+    expect((await status())[guid(gone.n)]).toBe("open");
+    expect(await missedCycles()).toBe(1);
+    expect(state("receivables")).resolves.toMatchObject({ pass_token: null });
+
+    // Let the rest of the cycle finish, then read the list across runs once more: second strike.
+    fx.beforeCall = () => undefined;
+    expect((await run("full", { chunkPages: chunk })).cycleComplete).toBe(true);
+    let second: SyncSummary | null = null;
+    for (let i = 0; i < 30 && second === null; i++) {
+      budgeted(perRun);
+      const s = await run("full", { chunkPages: chunk });
+      if (s.entities.receivables.status === "ok") second = s;
+    }
+    expect(second?.entities.receivables).toMatchObject({ missed: 1, closed: 1 });
     expect((await status())[guid(gone.n)]).toBe("closed");
     expect(await count("status = 'open'")).toBe(total - 1);
-    // Every later run resumed from the saved token instead of the start of the list.
-    expect(state("receivables")).resolves.toMatchObject({ pass_token: null });
   });
 
   it("resumes with the saved $skiptoken and does not re-read what it already has", async () => {
@@ -263,7 +288,14 @@ describe("full cycles", () => {
     const rest = await run("full");
     expect(rest.entities.receivables.status).toBe("ok");
     expect(rest.entities.receivables.progress?.read).toBe(110);
-    expect(rest.entities.receivables.closed).toBe(20);
+    // Read across runs: the first strike only.
+    expect(rest.entities.receivables).toMatchObject({ missed: 20, closed: 0 });
+    expect(await count("status = 'closed'")).toBe(0);
+    // The next cycle reads the list in one run: the 20 are missed again and close.
+    fx.beforeCall = () => undefined;
+    const next = await run("full");
+    expect(next.entities.receivables).toMatchObject({ missed: 20, closed: 20 });
+    expect(await count("status = 'closed'")).toBe(20);
   });
 
   it("incremental runs and runs with readIbans false never read crm/BankAccounts", async () => {
@@ -371,6 +403,12 @@ describe("transient failures (S3)", () => {
     ["network", () => new ExactApiError(502, "x", "network")],
     ["gate_unavailable", () => new ExactApiError(503, "x", "gate_unavailable")],
     ["rate limit", () => new ExactRateLimitedError(1000)],
+    // The gate's retryable token trouble (review G2) is never needs_reauth.
+    ["token_refresh_retry", () => new ExactApiError(503, "x", "token_refresh_retry")],
+    [
+      "credentials rejected (retryable)",
+      () => new ExactApiError(503, "x", "token_endpoint_rejected_credentials"),
+    ],
   ])(
     "%s ends the run as partial and stops, without touching the other entities",
     async (_n, err) => {
@@ -386,12 +424,36 @@ describe("transient failures (S3)", () => {
     },
   );
 
-  it("a permanent error stays an error, counts no retry and lets the next entities run", async () => {
+  it("a permanent error stays an error, lets the next entities run and ends the day's full runs", async () => {
     fx.receivables = many(3);
     failFirstEntityCall(() => new ExactApiError(400, "x"));
     const s = await run("full");
     expect(s.status).toBe("error");
+    expect(s.entities.receivables.status).toBe("error");
     expect(s.entities.payables.status).toBe("ok");
+    // Marked so that scheduledMode does not start another full run today, even after an
+    // incremental run in between (which does not touch the counter).
+    expect((await state("run"))?.retry_count).toBe(MAX_TRANSIENT_RETRIES + 1);
+    fx.beforeCall = () => undefined;
+    await run("incremental");
+    expect(await state("run")).toMatchObject({
+      retry_count: MAX_TRANSIENT_RETRIES + 1,
+      retry_day: "2026-07-15",
+      mode: "incremental",
+    });
+  });
+
+  it("incremental runs do not count transient failures against the day's full retries", async () => {
+    fx.receivables = many(3);
+    fx.calls = [];
+    fx.beforeCall = (_c, req) => {
+      if (req.path === "/sync/Cashflow/Receivables") throw new ExactApiError(503, "x");
+    };
+    for (let i = 0; i < MAX_TRANSIENT_RETRIES + 2; i++) {
+      const s = await run("incremental");
+      expect(s.status).toBe("partial");
+      expect(s.entities.receivables).toMatchObject({ status: "partial", error: "http_503" });
+    }
     expect((await state("run"))?.retry_count).toBe(0);
   });
 
@@ -510,5 +572,194 @@ describe("stale saved token", () => {
     fx.calls = [];
     await run("full");
     expect(skiptokens("/read/financial/ReceivablesList")[0]).toBeUndefined();
+  });
+});
+
+describe("two-strike closing (review G1)", () => {
+  const missed = async (i: number): Promise<number | undefined> =>
+    (
+      await db
+        .prepare("SELECT missed_cycles FROM open_items WHERE division_id = ?1 AND exact_id = ?2")
+        .bind(div.id, guid(i))
+        .first<{ missed_cycles: number }>()
+    )?.missed_cycles;
+
+  /** Reads the receivables list one page per run until it completes; returns the last run. */
+  const sliceThrough = async (between?: (slice: number) => void): Promise<SyncSummary> => {
+    for (let i = 0; i < 20; i++) {
+      budgeted(2); // divisions + one list page
+      const s = await run("full", { chunkPages: 1, readIbans: false });
+      if (s.entities.receivables.status === "ok") return s;
+      between?.(i);
+    }
+    throw new Error("list never completed");
+  };
+
+  beforeEach(() => {
+    fx.listPageSize = 60;
+    fx.syncPageSize = 1000;
+  });
+
+  it("an item skipped by a page shift between runs is not closed; seeing it again resets it", async () => {
+    fx.receivables = many(180);
+    expect((await run("full")).status).toBe("ok");
+
+    // The fake's $skiptoken is an offset, the unstable case: an item on page 1 is paid after
+    // page 1 was read, so every later row moves up one place and the first row of page 2
+    // (item 1060, still open in Exact) is never served in this pass.
+    const shifted = await sliceThrough((slice) => {
+      if (slice === 0) fx.receivables.splice(5, 1); // item 1005 paid
+    });
+    // 1005 was read before it was paid, so this cycle saw it; 1060 was skipped: one strike only.
+    expect(shifted.entities.receivables).toMatchObject({ status: "ok", missed: 1, closed: 0 });
+    expect(await missed(1005)).toBe(0);
+    expect(await missed(1060)).toBe(1);
+    expect((await status())[guid(1060)]).toBe("open"); // not wrongly closed
+
+    // Finish the cycle (payables, relations), then a second pass across runs, order stable now.
+    fx.beforeCall = () => undefined;
+    expect((await run("full", { readIbans: false })).cycleComplete).toBe(true);
+    const second = await sliceThrough();
+    expect(second.entities.receivables).toMatchObject({ missed: 1, closed: 0 });
+    expect(await missed(1060)).toBe(0); // seen again: the strike is forgiven
+    expect(await missed(1005)).toBe(1); // genuinely gone: first strike
+
+    // Third cycle: 1005 is missed a second time in a row and closes; 1060 stays open.
+    fx.beforeCall = () => undefined;
+    expect((await run("full", { readIbans: false })).cycleComplete).toBe(true);
+    const third = await sliceThrough();
+    expect(third.entities.receivables).toMatchObject({ missed: 1, closed: 1 });
+    const after = await status();
+    expect(after[guid(1005)]).toBe("closed");
+    expect(after[guid(1060)]).toBe("open");
+  });
+
+  it("a whole list read in one run closes on the first miss (as before G1)", async () => {
+    fx.receivables = many(180);
+    await run("full");
+    fx.receivables.splice(5, 1);
+    const s = await run("full");
+    expect(s.entities.receivables).toMatchObject({ missed: 1, closed: 1 });
+    expect((await status())[guid(1005)]).toBe("closed");
+  });
+
+  it("an incremental run that sees the item clears its strike", async () => {
+    fx.receivables = many(120);
+    await run("full");
+    const parked = fx.receivables.splice(70, 1)[0] as FakeItem;
+    await sliceThrough();
+    expect(await missed(1070)).toBe(1);
+    // It changes in Exact and the hourly sync reads it: still open, strike gone.
+    fx.receivables.push({ ...parked, ts: 99_999 });
+    fx.beforeCall = () => undefined;
+    expect((await run("incremental")).status).toBe("ok");
+    expect(await missed(1070)).toBe(0);
+    expect((await status())[guid(1070)]).toBe("open");
+  });
+
+  it("allowLargeClose (admin-confirmed) closes on the first miss even across runs", async () => {
+    fx.receivables = many(180);
+    await run("full");
+    fx.receivables.splice(0, 60); // a third gone: over the guard
+    budgeted(2);
+    await run("full", { chunkPages: 1, readIbans: false });
+    fx.beforeCall = () => undefined;
+    const guarded = await run("full", { chunkPages: 1, readIbans: false });
+    expect(guarded.entities.receivables.error).toBe("close_guard");
+    expect(await missed(1000)).toBe(0); // a refused close adds no strike
+
+    let forced: SyncSummary | null = null;
+    for (let i = 0; i < 10 && forced === null; i++) {
+      budgeted(2);
+      const s = await run("full", { chunkPages: 1, readIbans: false, allowLargeClose: true });
+      if (s.entities.receivables.status === "ok") forced = s;
+    }
+    expect(forced?.entities.receivables).toMatchObject({ missed: 60, closed: 60 });
+    expect(await count("status = 'closed'")).toBe(60);
+    const audit = await db
+      .prepare(
+        "SELECT after_json FROM audit_log WHERE action = 'exact.sync' AND entity_id = ?1 ORDER BY id DESC LIMIT 1",
+      )
+      .bind(String(div.id))
+      .first<{ after_json: string }>();
+    const after = JSON.parse(audit?.after_json ?? "{}") as {
+      allowLargeClose?: boolean;
+      entities: { receivables: { missed: number; closed: number } };
+    };
+    expect(after.allowLargeClose).toBe(true);
+    expect(after.entities.receivables).toMatchObject({ missed: 60, closed: 60 });
+  });
+});
+
+describe("a run that lost its lease (review G1)", () => {
+  it("saves no pass progress, marks nothing done, strikes and closes nothing", async () => {
+    fx.listPageSize = 60;
+    fx.receivables = many(120);
+    await run("full");
+    fx.receivables.splice(0, 3);
+    // Mid-run, another run takes the division over (the lease expired): run_seq moves on.
+    const takeover: ExactTransport = async (req) => {
+      if (req.path === "/read/financial/ReceivablesList") {
+        await db
+          .prepare(
+            "UPDATE sync_locks SET holder = 'other', run_seq = run_seq + 100 WHERE division_id = ?1",
+          )
+          .bind(div.id)
+          .run();
+      }
+      return fx.transport(req);
+    };
+    const before = await state("receivables");
+    const s = await syncDivision(
+      env,
+      div,
+      { jobId: `resume-${++n}`, mode: "full", actor: "system", readIbans: false },
+      { transport: takeover, gate, now: () => clock },
+    );
+    expect(s.entities.receivables.status).toBe("ok");
+    expect(s.entities.receivables.closed).toBe(0);
+    expect(await count("status = 'closed'")).toBe(0);
+    expect(await count("missed_cycles > 0")).toBe(0);
+    const after = await state("receivables");
+    expect(after?.done_cycle).toBe(before?.done_cycle);
+    expect(after?.pass_cycle).toBe(before?.pass_cycle);
+    // The run row keeps no half-open cycle from the stale run.
+    expect((await state("run"))?.cycle_seq).toBeNull();
+  });
+});
+
+describe("admit (cooldown re-checked under the lease)", () => {
+  it("refuses before writing anything and frees the lock", async () => {
+    fx.receivables = many(3);
+    await run("full");
+    const auditsBefore = (
+      await db.prepare("SELECT COUNT(*) AS n FROM audit_log").first<{ n: number }>()
+    )?.n;
+    const runBefore = await state("run");
+    fx.calls = [];
+    const s = await run("full", { admit: () => 42 });
+    expect(s.status).toBe("cooldown");
+    expect(s.retryAfterSeconds).toBe(42);
+    expect(fx.calls).toEqual([]);
+    expect(gate.started.length).toBe(1); // only the first run started a job
+    expect(await state("run")).toEqual(runBefore);
+    expect(
+      (await db.prepare("SELECT COUNT(*) AS n FROM audit_log").first<{ n: number }>())?.n,
+    ).toBe(auditsBefore);
+    // The lock was released: the next run goes ahead.
+    expect((await run("full", { admit: () => 0 })).status).toBe("ok");
+  });
+
+  it("sees the previous run as it ended, not this run's 'running' marker", async () => {
+    fx.receivables = many(3);
+    await run("full");
+    let seen: unknown = null;
+    await run("incremental", {
+      admit: (prev) => {
+        seen = prev;
+        return 0;
+      },
+    });
+    expect(seen).toMatchObject({ mode: "full", last_status: "ok" });
   });
 });

@@ -1,5 +1,6 @@
 import { env } from "cloudflare:test";
-import { ExactAuthError } from "@camelthorn/exact";
+import { ExactApiError, ExactAuthError } from "@camelthorn/exact";
+import { CREDENTIALS_REJECTED } from "../src/exact/gate";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   MAX_FULL_WINDOW_TICKS,
@@ -236,5 +237,60 @@ describe("budgets and fairness (review G1)", () => {
       order.push(...r.ran.map((x) => x.divisionId));
     }
     expect(order).toEqual([a.id, b, a.id, b]);
+  });
+});
+
+describe("no endless retries (review G1)", () => {
+  beforeEach(resetSync);
+
+  it("a full sync that failed permanently is not retried later in the window, even after an incremental tick", async () => {
+    const div = await addDivision();
+    const fx = new FakeExact(div.exactDivision);
+    fx.divisions = [{ code: div.exactDivision, description: "BV" }];
+    fx.beforeCall = (_n, req) => {
+      if (req.path === "/read/financial/PayablesList") throw new ExactApiError(400, "x");
+    };
+    const gate = fakeGate();
+    let clock = Date.parse("2026-07-15T00:00:00Z"); // 02:00 CEST
+    const deps = { transport: fx.transport, gate, now: () => clock };
+    const modes: string[] = [];
+    for (let h = 0; h < 4; h++) {
+      clock = Date.parse("2026-07-15T00:00:00Z") + h * 3_600_000; // 02:00 .. 05:00
+      const r = await runScheduledExactSync(env, clock, deps);
+      modes.push(`${r.ran[0]?.mode}:${r.ran[0]?.status}`);
+    }
+    expect(modes).toEqual(["full:error", "incremental:ok", "incremental:ok", "incremental:ok"]);
+    // The next night tries again.
+    clock = Date.parse("2026-07-16T00:00:00Z");
+    expect((await runScheduledExactSync(env, clock, deps)).ran[0]?.mode).toBe("full");
+  });
+
+  it("skips while Exact rejects the client credentials, with one daily probe at 03:00", async () => {
+    const div = await addDivision();
+    await db
+      .prepare("UPDATE connections SET last_error = ?2 WHERE id = ?1")
+      .bind(div.connectionId, CREDENTIALS_REJECTED)
+      .run();
+    await db
+      .prepare("INSERT INTO divisions (connection_id, exact_division, name) VALUES (?1, ?2, 'B')")
+      .bind(div.connectionId, div.exactDivision + 1)
+      .run();
+    const fx = new FakeExact(div.exactDivision);
+    fx.divisions = [];
+    const gate = fakeGate();
+    const deps = { transport: fx.transport, gate, now: () => Date.parse("2026-07-15T00:00:00Z") };
+    for (const iso of ["2026-07-15T00:00:00Z", "2026-07-15T10:00:00Z", "2026-07-15T02:00:00Z"]) {
+      expect(await runScheduledExactSync(env, Date.parse(iso), deps)).toEqual({
+        ran: [],
+        skipped: "credentials_rejected",
+      });
+    }
+    expect(fx.calls).toHaveLength(0);
+    // 01:00 UTC = 03:00 CEST: one incremental run of one division.
+    const probe = await runScheduledExactSync(env, Date.parse("2026-07-15T01:00:00Z"), deps);
+    expect(probe.skipped).toBeNull();
+    expect(probe.ran).toHaveLength(1);
+    expect(probe.ran[0]?.mode).toBe("incremental");
+    expect(gate.started[0]?.budget).toBe(SCHEDULED_INCREMENTAL_BUDGET);
   });
 });

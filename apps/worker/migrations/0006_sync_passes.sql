@@ -27,3 +27,8 @@ ALTER TABLE sync_state ADD COLUMN pass_total INTEGER;
 ALTER TABLE sync_state ADD COLUMN done_cycle INTEGER;
 ALTER TABLE sync_state ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE sync_state ADD COLUMN retry_day TEXT;
+
+-- Two-strike closing (review G1, ADR 0017): an open item is closed by absence only when it was
+-- missing from complete full reads of TWO cycles in a row, or from one complete read that was
+-- done in a single run (no $skiptoken carried between runs). Reset to 0 whenever a read sees it.
+ALTER TABLE open_items ADD COLUMN missed_cycles INTEGER NOT NULL DEFAULT 0;

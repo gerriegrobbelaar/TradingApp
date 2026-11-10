@@ -423,6 +423,53 @@ describe("manual slices (review G1)", () => {
     }
   }, 30_000);
 
+  it("of two concurrent requests exactly one runs; the other is refused before any Exact call", async () => {
+    const fin = tokens["finance"] as string;
+    const fx = new FakeExact(divA.exact);
+    fx.divisions = [{ code: divA.exact, description: "Alpha" }];
+    serve(fx);
+    const [a, b] = await Promise.all([
+      post(fin, { mode: "incremental" }),
+      post(tokens["admin"] as string, { mode: "incremental" }),
+    ]);
+    const codes = [a.status, b.status].sort();
+    expect(codes[0]).toBe(200);
+    // 409 while the first holds the lease, or 429 when the lease check found it finished.
+    expect([409, 429]).toContain(codes[1]);
+    expect(await auditRows("exact.sync", divA.id)).toHaveLength(1);
+  });
+
+  it("a restart is a new run: not exempt from the cooldown even after a partial run", async () => {
+    const fin = tokens["finance"] as string;
+    const fx = new FakeExact(divA.exact);
+    fx.divisions = [{ code: divA.exact, description: "Alpha" }];
+    fx.pageSize = 1;
+    fx.receivables = Array.from({ length: 30 }, (_, i) => ({
+      n: 100 + i,
+      account: 1,
+      name: "Acme",
+      amount: 10,
+      currency: "EUR",
+      invoiceNumber: i,
+      ts: 10 + i,
+    }));
+    serve(fx);
+    let t = Date.now();
+    const spy = vi.spyOn(Date, "now").mockImplementation(() => (t += 2000));
+    try {
+      const first = (await (await post(fin, { mode: "full" })).json()) as Body;
+      expect(first.status).toBe("partial");
+      t += 1000;
+      const restart = await post(fin, { mode: "full", restart: true });
+      expect(restart.status).toBe(429);
+      expect(Number(restart.headers.get("Retry-After"))).toBeGreaterThan(0);
+      // Continuing (no restart) is exempt.
+      expect((await post(fin, { mode: "full" })).status).toBe(200);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("validates restart (full mode only)", async () => {
     const fin = tokens["finance"] as string;
     expect((await post(fin, { mode: "incremental", restart: true })).status).toBe(400);

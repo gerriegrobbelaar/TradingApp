@@ -1296,8 +1296,6 @@ describe("review G2/S6: EU jurisdiction for every Durable Object stub", () => {
       if (path.endsWith("/exact/gate-transport.ts")) continue;
       if (/setGateNamespaceResolverForTests|DO_JURISDICTION_DISABLED/.test(text))
         offenders.push(path);
-      // KNOWN EXCEPTION until task G1 lands: sync.ts defaultGate still uses idFromName directly.
-      if (path.endsWith("/exact/sync.ts")) continue;
       if (/EXACT_GATE\s*\.\s*(idFromName|get|newUniqueId|idFromString)\b/.test(text)) {
         offenders.push(path);
       }

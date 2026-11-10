@@ -19,9 +19,15 @@
  * once either runs out the remaining divisions wait for the next tick. Divisions are taken
  * least recently completed first, so a slow division cannot starve the ones after it.
  * Skips silently when there is no Exact connection or it is not active (for example needs_reauth).
+ * While Exact rejects the app's client credentials (connections.last_error = CREDENTIALS_REJECTED,
+ * set by the gate; an admin must fix EXACT_CLIENT_ID / EXACT_CLIENT_SECRET) the hourly ticks skip
+ * the sync instead of failing every hour; once a day, at CREDENTIALS_PROBE_HOUR, one incremental
+ * run of one division probes whether the fix is in (a successful refresh clears last_error).
+ * A manual "Sync now" also works as a probe.
  * Never throws: every failure is caught and logged by name only.
  */
 import type { Env } from "../env";
+import { CREDENTIALS_REJECTED } from "./gate";
 import { amsterdamParts } from "./local-time";
 import {
   MAX_TRANSIENT_RETRIES,
@@ -53,6 +59,8 @@ export const SCHEDULED_WORST_CASE_CALLS_PER_DAY =
  * the 15-minute Cron Trigger limit and the 15-minute sync lease.
  */
 export const SCHEDULED_MAX_MS = 12 * 60 * 1000;
+/** Amsterdam hour of the daily probe while the client credentials are rejected (exists every day). */
+export const CREDENTIALS_PROBE_HOUR = 3;
 
 /** The last run of a division (sync_state entity 'run'). */
 export interface LastRun {
@@ -103,7 +111,7 @@ export function scheduledMode(
 
 export interface ScheduledResult {
   ran: { divisionId: number; mode: SyncMode; status: string }[];
-  skipped: "no_connection" | "not_active" | null;
+  skipped: "no_connection" | "not_active" | "credentials_rejected" | null;
 }
 
 export async function runScheduledExactSync(
@@ -116,10 +124,14 @@ export async function runScheduledExactSync(
   const deadlineMs = clock() + SCHEDULED_MAX_MS;
   meter.used += 2;
   const conn = await env.DB.prepare(
-    "SELECT id, status FROM connections WHERE kind = 'exact' ORDER BY id LIMIT 1",
-  ).first<{ id: number; status: string }>();
+    "SELECT id, status, last_error FROM connections WHERE kind = 'exact' ORDER BY id LIMIT 1",
+  ).first<{ id: number; status: string; last_error: string | null }>();
   if (!conn) return { ran: [], skipped: "no_connection" };
   if (conn.status !== "active") return { ran: [], skipped: "not_active" };
+  const probe = conn.last_error === CREDENTIALS_REJECTED;
+  if (probe && amsterdamParts(nowMs).hour !== CREDENTIALS_PROBE_HOUR) {
+    return { ran: [], skipped: "credentials_rejected" };
+  }
 
   const divisions = await env.DB.prepare(
     `SELECT d.id, d.connection_id, d.exact_division, d.base_currency, s.last_full_completed_at,
@@ -148,13 +160,15 @@ export async function runScheduledExactSync(
   for (const d of divisions.results) {
     // Out of time or subrequests: the remaining divisions wait for the next tick.
     if (clock() >= deadlineMs || meter.used + SUBREQUEST_RESERVE * 2 > meter.limit) break;
-    const mode = scheduledMode(nowMs, d.last_full_completed_at, {
-      mode: d.mode,
-      status: d.last_status,
-      startedAt: d.last_started_at,
-      retryCount: d.retry_count ?? 0,
-      retryDay: d.retry_day,
-    });
+    const mode: SyncMode = probe
+      ? "incremental"
+      : scheduledMode(nowMs, d.last_full_completed_at, {
+          mode: d.mode,
+          status: d.last_status,
+          startedAt: d.last_started_at,
+          retryCount: d.retry_count ?? 0,
+          retryDay: d.retry_day,
+        });
     try {
       const summary = await syncDivision(
         env,
@@ -175,11 +189,13 @@ export async function runScheduledExactSync(
         deps,
       );
       ran.push({ divisionId: d.id, mode, status: summary.status });
-      // No point trying the other divisions of a connection that needs a person.
-      if (summary.status === "needs_reauth") break;
+      // No point trying the other divisions of a connection that needs a person; a probe is
+      // one division only.
+      if (summary.status === "needs_reauth" || probe) break;
     } catch (e) {
       console.error("scheduled exact sync failed", e instanceof Error ? e.name : "unknown");
       ran.push({ divisionId: d.id, mode, status: "error" });
+      if (probe) break;
     }
   }
   return { ran, skipped: null };

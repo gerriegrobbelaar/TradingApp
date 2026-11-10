@@ -406,6 +406,11 @@ describe("describeSync", () => {
       receivables: { status: "partial", rows: 0, calls: 1, error: "rate_limited" },
     });
     expect(busy).toContain("Exact was busy or did not answer.");
+    for (const error of ["network", "token_refresh_retry", "http_503"]) {
+      expect(partial({ receivables: { status: "partial", rows: 0, calls: 1, error } })).toContain(
+        "Exact was busy or did not answer.",
+      );
+    }
   });
 });
 
@@ -424,14 +429,36 @@ describe("manual sync cooldown", () => {
     renderApp("/settings/connections");
     await user.click(await screen.findByRole("button", { name: "Sync Alpha BV now" }));
     expect(
-      (await screen.findAllByText("Wait 45 seconds before starting another sync of Alpha BV."))[0],
+      (await screen.findAllByText("45 seconds before another sync of Alpha BV can start."))[0],
     ).toBeTruthy();
     await waitFor(() =>
       expect(
         (screen.getByRole("button", { name: "Sync Alpha BV now" }) as HTMLButtonElement).disabled,
       ).toBe(true),
     );
-    expect(screen.getByText(/Sync now again in \d+ s/)).toBeTruthy();
+    const line = screen.getByText(/^\d+ s until Sync now is available$/);
+    expect(line.id).not.toBe("");
+    expect(
+      screen.getByRole("button", { name: "Sync Alpha BV now" }).getAttribute("aria-describedby"),
+    ).toBe(line.id);
+  });
+
+  it("shows one countdown line when both modes wait equally, described by both buttons", async () => {
+    mockFetch({
+      ...ME_OK(FINANCE),
+      ...CONNECTIONS,
+      ...divisions({
+        selectedId: 1,
+        divisions: [div(1, "Alpha BV", { cooldown: { full: 30, incremental: 30 } })],
+      }),
+    });
+    renderApp("/settings/connections");
+    const line = await screen.findByText(/^\d+ s until the next sync can start$/);
+    for (const name of ["Sync Alpha BV now", "Run a full sync of Alpha BV"]) {
+      expect(screen.getByRole("button", { name }).getAttribute("aria-describedby")).toBe(line.id);
+    }
+    // Plain text, not a live region: it must not be announced every second.
+    expect(line.closest("[aria-live]")).toBeNull();
   });
 
   it("starts with the server's cooldown, but leaves a mode that continues a partial run open", async () => {
