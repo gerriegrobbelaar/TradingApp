@@ -1,0 +1,22 @@
+name = "camelthorn-finance"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "../web/dist"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+binding = "ASSETS"
+
+[vars]
+# Seeded as the initial admin by the first migration (CLAUDE.md 4.0). Set per environment.
+INITIAL_ADMIN_EMAIL = ""
+ALLOWED_HD = "camelthorncapital.com"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "camelthorn-finance"
+# Placeholder. Create the database with EU jurisdiction (wrangler d1 create --jurisdiction eu)
+# and paste the real id here.
+database_id = "00000000-0000-0000-0000-000000000000"

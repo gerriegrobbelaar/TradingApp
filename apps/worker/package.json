@@ -1,0 +1,21 @@
+{
+  "name": "@camelthorn/worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "test": "vitest run",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@camelthorn/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.23.0",
+    "@cloudflare/workers-types": "^4.0.0",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.0.0"
+  }
+}
