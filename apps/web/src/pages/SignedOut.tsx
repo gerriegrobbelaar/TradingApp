@@ -5,9 +5,13 @@ import { loginUrl } from "../api";
 export const DENIED_MESSAGE =
   "That Google account has no access. Ask an admin to invite your @camelthorncapital.com email.";
 
-export function SignedOut() {
-  const { search } = useLocation();
+export const EXPIRED_MESSAGE = "Your session ended. Sign in again to continue.";
+
+export function SignedOut({ expired = false }: { expired?: boolean }) {
+  const { pathname, search } = useLocation();
   const denied = new URLSearchParams(search).get("auth") === "denied";
+  // Back to the page the user was on (the Worker re-validates return_to).
+  const returnTo = pathname === "/" && !search ? "/" : `${pathname}${search}`;
   return (
     <main id="main" tabIndex={-1} className="signin">
       <Card className="signin-card">
@@ -19,7 +23,12 @@ export function SignedOut() {
             {DENIED_MESSAGE}
           </p>
         )}
-        <a className="btn primary" href={loginUrl("/")}>
+        {expired && !denied && (
+          <p role="alert" className="notice warn">
+            {EXPIRED_MESSAGE}
+          </p>
+        )}
+        <a className="btn primary" href={loginUrl(returnTo)}>
           Sign in with Google
         </a>
       </Card>
@@ -31,6 +40,7 @@ export function Checking() {
   return (
     <main id="main" tabIndex={-1} className="signin" aria-busy="true">
       <Card className="signin-card">
+        <h1 className="sr-only">Camelthorn Finance</h1>
         <p role="status" className="lede">
           Checking your session
         </p>

@@ -30,15 +30,50 @@ describe("api client", () => {
     expect(assign).not.toHaveBeenCalled();
   });
 
-  it("redirects to login with return_to on a plain 401", async () => {
+  it("reports a plain 401 as session ended and never redirects by itself", async () => {
     const assign = vi.spyOn(api.nav, "assign").mockImplementation(() => undefined);
+    const ended = vi.fn();
+    const off = api.onSessionEnded(ended);
     mockFetch({ "GET /api/users": () => ({ status: 401, body: { error: "unauthenticated" } }) });
-    window.history.pushState({}, "", "/settings/users?x=1");
+    await expect(api.listUsers()).rejects.toMatchObject({ status: 401, code: "unauthenticated" });
+    expect(ended).toHaveBeenCalledTimes(1);
+    expect(assign).not.toHaveBeenCalled();
+    off();
     await expect(api.listUsers()).rejects.toBeInstanceOf(api.ApiError);
-    expect(assign).toHaveBeenCalledWith(
-      `/api/auth/login?return_to=${encodeURIComponent("/settings/users?x=1")}`,
+    expect(ended).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not report session ended for the session check or sign-out", async () => {
+    const ended = vi.fn();
+    const off = api.onSessionEnded(ended);
+    mockFetch({
+      "GET /api/auth/me": () => ({ status: 401, body: { error: "unauthenticated" } }),
+      "POST /api/auth/logout": () => ({ status: 401, body: { error: "unauthenticated" } }),
+    });
+    expect(await api.me()).toBeNull();
+    await expect(api.logout()).rejects.toBeInstanceOf(api.ApiError);
+    expect(ended).not.toHaveBeenCalled();
+    off();
+  });
+
+  it("sends the CSRF header on any method that is not GET, HEAD or OPTIONS", async () => {
+    const calls = mockFetch({
+      "PUT /x": () => ({ body: {} }),
+      "HEAD /x": () => ({ body: {} }),
+    });
+    await api.request("/x", { method: "put" });
+    await api.request("/x", { method: "HEAD" });
+    expect(calls[0]?.method).toBe("PUT");
+    expect(calls[0]?.headers["X-Requested-With"]).toBe("camelthorn");
+    expect(calls[1]?.headers["X-Requested-With"]).toBeUndefined();
+  });
+
+  it("propagates network failures as errors from me()", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Promise.reject(new TypeError("offline"))),
     );
-    window.history.pushState({}, "", "/");
+    await expect(api.me()).rejects.toBeInstanceOf(TypeError);
   });
 
   it("throws StepUpRequired without redirecting on step_up_required", async () => {
@@ -56,6 +91,26 @@ describe("api client", () => {
     expect(assign).toHaveBeenCalledWith(
       `/api/auth/login?step_up=1&return_to=${encodeURIComponent("/settings/users")}`,
     );
+  });
+
+  it.each([
+    ["/settings/users?x=1", "/settings/users?x=1"],
+    ["/?auth=denied", "/"],
+    ["/today?auth=denied&a=1", "/today?a=1"],
+    ["//evil.example/x", "/"],
+    ["/\\evil.example", "/"],
+    ["https://evil.example/", "/"],
+    ["javascript:alert(1)", "/"],
+    ["/a\nb", "/"],
+    ["", "/"],
+    ["/" + "a".repeat(3000), "/"],
+  ])("safeReturnTo(%j) is %j", (input, out) => {
+    expect(api.safeReturnTo(input)).toBe(out);
+  });
+
+  it("loginUrl never carries an unsafe return_to", () => {
+    const u = new URL(api.loginUrl("//evil.example"), "http://x");
+    expect(u.searchParams.get("return_to")).toBe("/");
   });
 
   it("maps other failures to ApiError with the server code", async () => {

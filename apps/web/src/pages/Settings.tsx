@@ -42,7 +42,7 @@ export function Appearance() {
       </div>
       {!saved && (
         <p role="status" className="notice warn">
-          Your browser blocked saving this choice. It applies until you close the tab.
+          Your browser blocked saving this choice. It applies until you reload the page.
         </p>
       )}
     </Card>
@@ -80,12 +80,14 @@ export function Settings() {
         title="Settings"
         lede="Appearance, people, connections and schedules."
       />
-      <Segmented
-        label="Settings section"
-        options={options}
-        value={current}
-        onChange={(t) => navigate(`/settings/${t}`)}
-      />
+      <div className="settings-seg">
+        <Segmented
+          label="Settings section"
+          options={options}
+          value={current}
+          onChange={(t) => navigate(`/settings/${t}`)}
+        />
+      </div>
       {current === "appearance" && <Appearance />}
       {current === "users" && <Users />}
       {current === "connections" && <Soon what="Connections" />}

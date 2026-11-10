@@ -140,7 +140,9 @@ export function TopNav() {
   return (
     <nav className="topnav card" aria-label="Main">
       <div className="brand">
-        <b>Camelthorn Finance</b>
+        <span className="wordmark">
+          Camelthorn <span>Finance</span>
+        </span>
       </div>
       <div className="track">
         {NAV.map((item) =>

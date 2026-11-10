@@ -1,11 +1,18 @@
-import { useState } from "react";
-import { BrowserRouter, Navigate, Route, Routes } from "react-router";
+import { useEffect, useRef, useState } from "react";
+import {
+  BrowserRouter,
+  Navigate,
+  Route,
+  Routes,
+  useLocation,
+  useNavigationType,
+} from "react-router";
 import { Button } from "@camelthorn/ui";
 import { logout, nav } from "./api";
 import { AuthProvider, useMe } from "./auth";
 import { TopNav } from "./components/TopNav";
 import { PLACEHOLDERS } from "./routes";
-import { ToastProvider } from "./toasts";
+import { ToastProvider, useToast } from "./toasts";
 import { ComingSoon, NotFound } from "./pages/Placeholder";
 import { Settings } from "./pages/Settings";
 import { Checking, SessionError, SignedOut } from "./pages/SignedOut";
@@ -23,9 +30,10 @@ function Footer({ email }: { email: string }) {
           setBusy(true);
           try {
             await logout();
-          } finally {
-            nav.assign("/");
+          } catch {
+            // Already signed out, or offline: the reload below shows the real state.
           }
+          nav.assign("/");
         }}
       >
         Sign out
@@ -34,13 +42,38 @@ function Footer({ email }: { email: string }) {
   );
 }
 
+export const STEP_UP_DENIED_MESSAGE =
+  "The sign-in check did not go through, so nothing was changed. Try again.";
+
 function SignedInShell() {
   const auth = useMe();
+  const toast = useToast();
+  const { pathname, search } = useLocation();
+  // A failed step-up lands on /?auth=denied while the session is still valid. Read it once,
+  // before the / to /today redirect drops the query, and tell the user.
+  const [denied] = useState(() => new URLSearchParams(search).get("auth") === "denied");
+  useEffect(() => {
+    if (denied) toast.show(STEP_UP_DENIED_MESSAGE);
+  }, [denied, toast]);
+  // After a menu navigation, move focus to the new page so keyboard and screen reader users
+  // start at its content (the focused menu link has just been hidden). Redirects and in-page
+  // controls such as the Settings tabs keep their focus.
+  const mainRef = useRef<HTMLElement>(null);
+  const navType = useNavigationType();
+  const lastPath = useRef(pathname);
+  useEffect(() => {
+    if (pathname === lastPath.current) return;
+    lastPath.current = pathname;
+    if (navType === "REPLACE") return;
+    const active = document.activeElement;
+    if (active && active !== document.body && !active.closest("nav")) return;
+    mainRef.current?.focus();
+  }, [pathname, navType]);
   if (auth.status !== "ready") return null;
   return (
     <div className="wrap">
       <TopNav />
-      <main id="main" tabIndex={-1} className="main">
+      <main ref={mainRef} id="main" tabIndex={-1} className="main">
         <Routes>
           <Route path="/" element={<Navigate to="/today" replace />} />
           {PLACEHOLDERS.map((p) => (
@@ -61,7 +94,7 @@ function Gate() {
     case "loading":
       return <Checking />;
     case "signedOut":
-      return <SignedOut />;
+      return <SignedOut expired={auth.expired} />;
     case "error":
       return <SessionError />;
     case "ready":

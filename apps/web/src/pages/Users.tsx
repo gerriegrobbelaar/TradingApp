@@ -13,6 +13,7 @@ import {
   type Role,
   type UserRow,
 } from "../api";
+import { useSignedIn } from "../auth";
 import { useToast } from "../toasts";
 
 export const ALLOWED_DOMAIN = "camelthorncapital.com";
@@ -42,6 +43,13 @@ function describe(e: unknown): string {
   return "Could not reach the server. Try again.";
 }
 
+export const ROLE_LABEL: Record<Role, string> = {
+  admin: "Admin",
+  approver: "Approver",
+  finance: "Finance",
+  viewer: "Viewer",
+};
+
 function RolePicker({
   value,
   onChange,
@@ -55,15 +63,16 @@ function RolePicker({
     <fieldset className="roles">
       <legend>{legend}</legend>
       {ROLES.map((r) => (
-        <label key={r} className="check">
+        <label key={r} className="check-row">
           <input
+            className="check"
             type="checkbox"
             checked={value.includes(r)}
             onChange={(e) =>
               onChange(e.target.checked ? [...value, r] : value.filter((x) => x !== r))
             }
           />
-          <span>{r}</span>
+          <span>{ROLE_LABEL[r]}</span>
         </label>
       ))}
     </fieldset>
@@ -73,8 +82,14 @@ function RolePicker({
 type Dialog =
   null | { kind: "stepup" } | { kind: "roles"; user: UserRow } | { kind: "remove"; user: UserRow };
 
+function countLine(users: number, invites: number): string {
+  const people = `${users} ${users === 1 ? "person" : "people"} with access`;
+  return invites === 0 ? people : `${people}, ${invites} invite${invites === 1 ? "" : "s"} pending`;
+}
+
 export function Users() {
   const toast = useToast();
+  const me = useSignedIn();
   const [data, setData] = useState<{ users: UserRow[]; invites: InviteRow[]; at: number } | null>(
     null,
   );
@@ -188,6 +203,11 @@ export function Users() {
           <h2 className="h2">People</h2>
           {data && <Stamp at={data.at} />}
         </div>
+        {data && (
+          <p className="lede">
+            {countLine(data.users.filter((u) => !u.disabled).length, data.invites.length)}
+          </p>
+        )}
         {loadError && (
           <p role="alert" className="notice warn">
             {loadError}
@@ -202,7 +222,7 @@ export function Users() {
         )}
         {data && (
           <div className="scroll">
-            <table className="tbl">
+            <table className="tbl stacked">
               <caption className="sr-only">Users</caption>
               <thead>
                 <tr>
@@ -225,7 +245,7 @@ export function Users() {
                           {u.roles.length === 0 && <Chip>No roles</Chip>}
                           {u.roles.map((r) => (
                             <Chip key={r} tone={r === "admin" ? "ok" : undefined}>
-                              {r}
+                              {ROLE_LABEL[r]}
                             </Chip>
                           ))}
                         </span>
@@ -252,7 +272,7 @@ export function Users() {
                       <span className="chips">
                         <Chip tone="gold">Invited</Chip>
                         {i.roles.map((r) => (
-                          <Chip key={r}>{r}</Chip>
+                          <Chip key={r}>{ROLE_LABEL[r]}</Chip>
                         ))}
                       </span>
                     </td>
@@ -290,6 +310,13 @@ export function Users() {
             {sheetRoles.length === 0 && (
               <p className="lede">Without any role this person can sign in but see nothing.</p>
             )}
+            {dialog.user.email === me.email &&
+              dialog.user.roles.includes("admin") &&
+              !sheetRoles.includes("admin") && (
+                <p className="notice warn">
+                  This removes your own admin role. You can no longer manage users.
+                </p>
+              )}
             {sheetError && (
               <p role="alert" className="notice warn">
                 {sheetError}
@@ -324,6 +351,9 @@ export function Users() {
             <p className="lede">
               {dialog.user.email} will be signed out now and can no longer sign in.
             </p>
+            {dialog.user.email === me.email && (
+              <p className="notice warn">This is your own account. You are signed out at once.</p>
+            )}
             {sheetError && (
               <p role="alert" className="notice warn">
                 {sheetError}

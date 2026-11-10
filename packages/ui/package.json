@@ -9,7 +9,8 @@
     ".": "./src/index.ts",
     "./styles.css": "./src/styles/styles.css",
     "./tokens.css": "./src/styles/tokens.css",
-    "./components.css": "./src/styles/components.css"
+    "./components.css": "./src/styles/components.css",
+    "./helpers.css": "./src/styles/helpers.css"
   },
   "sideEffects": [
     "*.css"

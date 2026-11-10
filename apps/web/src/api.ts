@@ -56,14 +56,35 @@ export const nav = {
   },
 };
 
-function currentPath(): string {
-  return `${window.location.pathname}${window.location.search}`;
+/**
+ * A same-origin relative path for return_to, or "/". Mirrors the Worker's safeReturnTo (which
+ * re-checks it): must start with a single "/", no backslashes or control characters, and drop
+ * the one-shot `auth` flag so a denied notice is not replayed after sign-in.
+ */
+export function safeReturnTo(value: string): string {
+  if (!value.startsWith("/") || value.startsWith("//") || value.includes("\\")) return "/";
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(value) || value.length > 2048) return "/";
+  let u: URL;
+  try {
+    u = new URL(value, "https://app.invalid");
+  } catch {
+    return "/";
+  }
+  if (u.origin !== "https://app.invalid") return "/";
+  u.searchParams.delete("auth");
+  const out = `${u.pathname}${u.search}`;
+  return out.startsWith("/") && !out.startsWith("//") ? out : "/";
+}
+
+export function currentPath(): string {
+  return safeReturnTo(`${window.location.pathname}${window.location.search}`);
 }
 
 export function loginUrl(returnTo: string, stepUp = false): string {
   const q = new URLSearchParams();
   if (stepUp) q.set("step_up", "1");
-  q.set("return_to", returnTo);
+  q.set("return_to", safeReturnTo(returnTo));
   return `/api/auth/login?${q.toString()}`;
 }
 
@@ -72,13 +93,24 @@ export function stepUp(returnTo: string = currentPath()): void {
   nav.assign(loginUrl(returnTo, true));
 }
 
-const UNSAFE = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+/**
+ * Listeners told when the server says the session is gone (401 other than step-up). The app
+ * shows the signed-out screen instead of redirecting to Google on its own, so a 401 can never
+ * start a redirect loop: leaving the app always needs a click.
+ */
+const sessionEndedListeners = new Set<() => void>();
+export function onSessionEnded(fn: () => void): () => void {
+  sessionEndedListeners.add(fn);
+  return () => sessionEndedListeners.delete(fn);
+}
+
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 interface RequestOptions {
   method?: string;
   body?: unknown;
-  /** Redirect to sign-in on 401. The session check turns this off to show the signed-out screen. */
-  redirectOn401?: boolean;
+  /** Report a 401 as "session ended". Off for the session check and sign-out themselves. */
+  notifyOn401?: boolean;
 }
 
 async function errorCode(res: Response): Promise<string> {
@@ -94,7 +126,7 @@ async function errorCode(res: Response): Promise<string> {
 export async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   const method = (opts.method ?? "GET").toUpperCase();
   const headers: Record<string, string> = { accept: "application/json" };
-  if (UNSAFE.has(method)) headers["X-Requested-With"] = "camelthorn";
+  if (!SAFE_METHODS.has(method)) headers["X-Requested-With"] = "camelthorn";
   let body: string | undefined;
   if (opts.body !== undefined) {
     headers["content-type"] = "application/json";
@@ -104,7 +136,7 @@ export async function request<T>(path: string, opts: RequestOptions = {}): Promi
   if (res.status === 401) {
     const code = await errorCode(res);
     if (code === "step_up_required") throw new StepUpRequired();
-    if (opts.redirectOn401 ?? true) nav.assign(loginUrl(currentPath()));
+    if (opts.notifyOn401 ?? true) for (const fn of sessionEndedListeners) fn();
     throw new ApiError(401, code);
   }
   if (!res.ok) throw new ApiError(res.status, await errorCode(res));
@@ -114,7 +146,7 @@ export async function request<T>(path: string, opts: RequestOptions = {}): Promi
 /** Resolves to null when nobody is signed in. */
 export async function me(): Promise<Me | null> {
   try {
-    return await request<Me>("/api/auth/me", { redirectOn401: false });
+    return await request<Me>("/api/auth/me", { notifyOn401: false });
   } catch (e) {
     if (e instanceof ApiError && e.status === 401) return null;
     throw e;
@@ -122,7 +154,7 @@ export async function me(): Promise<Me | null> {
 }
 
 export async function logout(): Promise<void> {
-  await request<unknown>("/api/auth/logout", { method: "POST", redirectOn401: false });
+  await request<unknown>("/api/auth/logout", { method: "POST", notifyOn401: false });
 }
 
 export const listUsers = () => request<UsersResponse>("/api/users");
