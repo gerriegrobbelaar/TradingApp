@@ -37,6 +37,7 @@ import {
   markNeedsReauth,
   type ExactConnectionRow,
 } from "./store";
+import { auditStatement } from "../db/audit";
 import { toWire, type GateResult } from "./wire";
 
 export interface GateLimits {
@@ -73,9 +74,13 @@ export const DEFAULT_LIMITS: GateLimits = {
  *     refreshed by the next call that needs it. A call that arrives with 20-30 s left (age
  *     570-580 s) refreshes inside the intended window; one arriving later refreshes late but
  *     still legally. 20 s is the least time a call in flight needs on a token.
- *   - If a token has less than the margin left but is younger than the minimum age (the real
- *     lifetime is shorter than assumed), the refresh waits (bounded by MAX_AGE_WAIT_MS) rather
- *     than going early; if the wait would be longer, the still-valid token is used instead.
+ *   - The minimum age scales with the lifetime Exact actually gave: the earliest refresh is
+ *     min(issued + 570 s, expires - 30 s). With expires_in 600 both are the same; with a shorter
+ *     lifetime (say 300 s) a fixed 570 s rule would leave us with no valid token for minutes, and
+ *     once a token has expired it can always be refreshed.
+ *   - If a refresh is still needed before that point (for example a stored row without an access
+ *     token), it waits (bounded by MAX_AGE_WAIT_MS) rather than going early; if the wait would be
+ *     longer, the still-valid token is used instead.
  */
 export const TOKEN_LIFETIME_MS = 600_000;
 export const MIN_REFRESH_AGE_MS = 570_000;
@@ -89,6 +94,15 @@ const REFRESH_COOLDOWN_MS = 10_000;
 const YOUNG_401_WAIT_MS = 2_000;
 /** Retry persisting a stashed token pair this often (alarm). */
 const PENDING_RETRY_MS = 30_000;
+/**
+ * The token endpoint rejecting our client credentials (invalid_client) this many times in a row,
+ * over at least this long, marks the connection with CREDENTIALS_REJECTED (ADR 0016 item 20).
+ */
+const CLIENT_REJECT_ATTEMPTS = 3;
+const CLIENT_REJECT_SPAN_MS = 60_000;
+/** After that, no new attempt for this long (a wrong secret does not fix itself in seconds). */
+const CLIENT_REJECT_COOLDOWN_MS = 60_000;
+export const CREDENTIALS_REJECTED = "token_endpoint_rejected_credentials";
 const MAX_BLOCK_MS = 24 * 3600 * 1000;
 const JOB_ID_RE = /^[A-Za-z0-9_.:-]{1,100}$/;
 const JOB_TTL_MS = 24 * 3600 * 1000;
@@ -157,6 +171,13 @@ interface PendingTokens {
 }
 const pendingKey = (connectionId: number): string => `pending:${connectionId}`;
 const issuedKey = (connectionId: number): string => `issued:${connectionId}`;
+const clientRejectsKey = (connectionId: number): string => `client-rejects:${connectionId}`;
+
+interface ClientRejects {
+  /** Consecutive client_rejected answers from the token endpoint. */
+  count: number;
+  firstAt: number;
+}
 
 const dayOf = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
 
@@ -182,17 +203,22 @@ export class ExactGate extends DurableObject<Env> {
   private userStreak = 0;
   /** No refresh attempt before this time after a failed one that left a usable token. */
   private refreshCooldownUntil = 0;
+  /** No refresh attempt at all before this time once our client credentials were rejected. */
+  private clientRejectedUntil = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    void ctx.blockConcurrencyWhile(async () => {
-      const saved = await ctx.storage.get<LimiterState>("rl");
-      this.st = saved ?? this.freshState(Date.now());
-      // State saved by an older build (token bucket) has no window.
-      if (!Array.isArray(this.st.window)) this.st.window = [];
-      if (this.st.remoteMinute === undefined) this.st.remoteMinute = null;
-      this.role = (await ctx.storage.get<GateRole>("role")) ?? null;
-    });
+    void ctx.blockConcurrencyWhile(() => this.load());
+  }
+
+  /** Loads the persisted limiter state (the sliding window included) and role. */
+  private async load(): Promise<void> {
+    const saved = await this.ctx.storage.get<LimiterState>("rl");
+    this.st = saved ?? this.freshState(Date.now());
+    // State saved by an older build (token bucket) has no window.
+    if (!Array.isArray(this.st.window)) this.st.window = [];
+    if (this.st.remoteMinute === undefined) this.st.remoteMinute = null;
+    this.role = (await this.ctx.storage.get<GateRole>("role")) ?? null;
   }
 
   /**
@@ -332,10 +358,20 @@ export class ExactGate extends DurableObject<Env> {
       .run();
   }
 
+  /**
+   * A Durable Object has ONE alarm, shared by the usage flush (division gates) and the stash retry
+   * (token authorities). Both arm it through here, which only ever moves it earlier, so neither
+   * use can push the other's back or cancel it; `alarm()` does both jobs whenever it fires.
+   */
+  private async armAlarm(at: number): Promise<void> {
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || current > at) await this.ctx.storage.setAlarm(at);
+  }
+
   async alarm(): Promise<void> {
     this.alarmScheduled = false;
-    if (this.dirty) await this.flushUsage();
     // A token authority with a stashed token pair keeps trying to write it to D1 (review N2).
+    // Done first and never throws, so a failing usage flush cannot starve it.
     if (this.role?.startsWith("authority:")) {
       const id = Number(this.role.slice("authority:".length));
       try {
@@ -344,9 +380,10 @@ export class ExactGate extends DurableObject<Env> {
         /* D1 still down: the check below re-arms the alarm */
       }
       if ((await this.ctx.storage.get(pendingKey(id))) !== undefined) {
-        await this.ctx.storage.setAlarm(this.now() + PENDING_RETRY_MS);
+        await this.armAlarm(this.now() + PENDING_RETRY_MS);
       }
     }
+    if (this.dirty) await this.flushUsage();
   }
 
   // ---------------------------------------------------------------------------------------
@@ -354,7 +391,7 @@ export class ExactGate extends DurableObject<Env> {
   // ---------------------------------------------------------------------------------------
 
   /**
-   * Returns a usable access token, refreshing if it expires within 60 s. Concurrent callers
+   * Returns a usable access token, refreshing if it expires within 30 s. Concurrent callers
    * share one refresh. `staleExpiresAt` is the `expires_at` of a token Exact just rejected: a
    * refresh is forced only if the stored token is still that one.
    */
@@ -423,16 +460,79 @@ export class ExactGate extends DurableObject<Env> {
     return null;
   }
 
-  private async issuedAtOf(connectionId: number, expiresAtIso: string | null): Promise<number> {
-    const exp = expiresAtIso ? Date.parse(expiresAtIso) : 0;
-    const saved = await this.ctx.storage.get<{ expiresAt: string; issuedAt: number }>(
-      issuedKey(connectionId),
-    );
-    if (saved && saved.expiresAt === expiresAtIso) return saved.issuedAt;
-    // No record (tokens from the connect callback or an older build): assume a 600 s lifetime. A
-    // token with more than that left is older than we can know; treat it as old enough.
-    const derived = exp - TOKEN_LIFETIME_MS;
-    return derived > this.now() ? this.now() - MIN_REFRESH_AGE_MS : derived;
+  /**
+   * Earliest time this token may be refreshed: min(issued + MIN_REFRESH_AGE_MS, expires -
+   * REFRESH_MARGIN_MS). The issue time comes from the record written on every refresh; without one
+   * (tokens from the connect callback or an older build) a 600 s lifetime is assumed, and a token
+   * with more than that left is older than we can know, so it counts as old enough.
+   */
+  private async earliestRefreshAt(
+    connectionId: number,
+    expiresAtIso: string | null,
+  ): Promise<number> {
+    const now = this.now();
+    const parsed = expiresAtIso ? Date.parse(expiresAtIso) : NaN;
+    if (!Number.isFinite(parsed)) return now; // no usable expiry: nothing to protect
+    let issuedAt: number;
+    let saved: { expiresAt: string; issuedAt: number } | undefined;
+    try {
+      saved = await this.ctx.storage.get(issuedKey(connectionId));
+    } catch {
+      saved = undefined;
+    }
+    if (saved && saved.expiresAt === expiresAtIso && Number.isFinite(saved.issuedAt)) {
+      issuedAt = saved.issuedAt;
+    } else {
+      const derived = parsed - TOKEN_LIFETIME_MS;
+      issuedAt = derived > now ? now - MIN_REFRESH_AGE_MS : derived;
+    }
+    return Math.min(issuedAt + MIN_REFRESH_AGE_MS, parsed - REFRESH_MARGIN_MS);
+  }
+
+  /** Counts a client_rejected answer; true once it has repeated long enough to report. */
+  private async noteClientRejected(connectionId: number): Promise<boolean> {
+    const now = this.now();
+    const key = clientRejectsKey(connectionId);
+    const prev = await this.ctx.storage.get<ClientRejects>(key);
+    const next: ClientRejects = prev
+      ? { count: prev.count + 1, firstAt: prev.firstAt }
+      : { count: 1, firstAt: now };
+    await this.ctx.storage.put(key, next);
+    return next.count >= CLIENT_REJECT_ATTEMPTS && now - next.firstAt >= CLIENT_REJECT_SPAN_MS;
+  }
+
+  /**
+   * Records that Exact rejects the app's client credentials: `last_error` on the still-active
+   * connection plus one audit row, both only if not already recorded. Tokens are not touched: the
+   * grant is fine, the fix is EXACT_CLIENT_ID / EXACT_CLIENT_SECRET (an admin's job, not a
+   * re-authorisation). A successful refresh clears `last_error` again (persistTokens).
+   */
+  private async markCredentialsRejected(connectionId: number): Promise<void> {
+    const guard = `status = 'active' AND (last_error IS NULL OR last_error <> '${CREDENTIALS_REJECTED}')`;
+    const db = this.env.DB;
+    await db.batch([
+      auditStatement(
+        db,
+        {
+          actorEmail: "system",
+          action: "connection.exact_credentials_rejected",
+          entity: "connection",
+          entityId: connectionId,
+          after: { status: "active", reason: CREDENTIALS_REJECTED },
+        },
+        {
+          sql: `EXISTS (SELECT 1 FROM connections WHERE id = ?7 AND ${guard})`,
+          binds: [connectionId],
+        },
+      ),
+      db
+        .prepare(
+          `UPDATE connections SET last_error = ?2,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+           WHERE id = ?1 AND ${guard}`,
+        )
+        .bind(connectionId, CREDENTIALS_REJECTED),
+    ]);
   }
 
   private async doRefresh(connectionId: number, staleExpiresAt?: string): Promise<TokenResult> {
@@ -487,7 +587,7 @@ export class ExactGate extends DurableObject<Env> {
       }
 
       // Never refresh a token younger than the minimum age (B2).
-      const earliest = (await this.issuedAtOf(row.id, row.expires_at)) + MIN_REFRESH_AGE_MS;
+      const earliest = await this.earliestRefreshAt(row.id, row.expires_at);
       if (now < earliest) {
         if (forced) {
           // Exact rejected a token we may not refresh yet: the caller waits and retries once.
@@ -502,6 +602,10 @@ export class ExactGate extends DurableObject<Env> {
         const t = await usableOld();
         if (t) return t;
       }
+      if (this.clientRejectedUntil > this.now()) {
+        // Exact keeps rejecting our client credentials: do not hammer the token endpoint.
+        return (await usableOld()) ?? { ok: false, code: CREDENTIALS_REJECTED, retryable: true };
+      }
 
       const refreshToken = await decryptToken(keys, row.refresh_token_enc, aad(row.id, "refresh"));
       let origin: string;
@@ -515,6 +619,7 @@ export class ExactGate extends DurableObject<Env> {
 
       let tokens;
       let lastFailure = "unavailable";
+      let credentialsRejected = false;
       for (let attempt = 0; ; attempt++) {
         try {
           tokens = await refreshTokens(
@@ -529,17 +634,20 @@ export class ExactGate extends DurableObject<Env> {
         } catch (e) {
           const failure = e instanceof TokenEndpointError ? e.failure : "unavailable";
           lastFailure = failure;
-          // Only a clear invalid_grant (or a success body we cannot read, after which the old
-          // refresh token may be spent) means the grant is gone. Everything else, including a
-          // premature-refresh rejection whose body we cannot classify, keeps the tokens.
-          if (failure === "invalid_grant" || failure === "malformed") {
-            await markNeedsReauth(
-              db,
-              row.id,
-              failure === "malformed" ? "malformed_response" : failure,
-            );
-            await this.ctx.storage.delete(pendingKey(connectionId));
+          // Only a clear invalid_grant means the grant is gone. Everything else, including a
+          // premature-refresh rejection whose body we cannot classify and a 2xx we cannot read,
+          // keeps the tokens (a spent refresh token answers invalid_grant on the next try).
+          if (failure === "invalid_grant") {
+            await markNeedsReauth(db, row.id, failure);
+            await this.ctx.storage.delete([
+              pendingKey(connectionId),
+              clientRejectsKey(connectionId),
+            ]);
             return { ok: false, code: "needs_reauth", retryable: false };
+          }
+          if (failure === "client_rejected" && (await this.noteClientRejected(row.id))) {
+            credentialsRejected = true;
+            break; // retrying with the same wrong credentials cannot help
           }
           const delay = REFRESH_RETRY_DELAYS_MS[attempt];
           if (failure === "bad_host" || delay === undefined) break;
@@ -548,14 +656,25 @@ export class ExactGate extends DurableObject<Env> {
       }
       if (!tokens) {
         this.refreshCooldownUntil = this.now() + REFRESH_COOLDOWN_MS;
+        if (credentialsRejected) {
+          this.clientRejectedUntil = this.now() + CLIENT_REJECT_COOLDOWN_MS;
+          try {
+            await this.markCredentialsRejected(row.id);
+          } catch {
+            /* D1 down: reported on the next attempt */
+          }
+        }
         if (!forced) {
           const t = await usableOld(); // the old token still works: keep using it
           if (t) return t;
         }
         return {
           ok: false,
-          code:
-            lastFailure === "unavailable" ? "token_endpoint_unavailable" : "token_refresh_retry",
+          code: credentialsRejected
+            ? CREDENTIALS_REJECTED
+            : lastFailure === "unavailable"
+              ? "token_endpoint_unavailable"
+              : "token_refresh_retry",
           retryable: true,
         };
       }
@@ -598,17 +717,8 @@ export class ExactGate extends DurableObject<Env> {
         } catch {
           const stash: PendingTokens = { baseRefreshEnc, accessEnc, refreshEnc, expiresAt };
           await this.ctx.storage.put(pendingKey(row.id), stash);
-          await this.ctx.storage.setAlarm(this.now() + PENDING_RETRY_MS);
           persisted = true;
           stashed = true;
-        }
-        if (persisted) {
-          await this.ctx.storage.put(issuedKey(row.id), {
-            expiresAt: new Date(expiresAt).toISOString(),
-            issuedAt,
-          });
-          // A direct write supersedes any older stash (same base refresh token in D1).
-          if (!stashed) await this.ctx.storage.delete(pendingKey(row.id));
         }
       } catch {
         try {
@@ -621,6 +731,21 @@ export class ExactGate extends DurableObject<Env> {
       if (!persisted) {
         // Row changed under us (disconnect or re-authorise). Do not use or keep these tokens.
         return { ok: false, code: "connection_changed", retryable: true };
+      }
+      // The new pair is safe (D1 or stash). Everything below is bookkeeping: a failure here must
+      // never turn into needs_reauth, which would wipe the tokens that were just saved.
+      this.clientRejectedUntil = 0;
+      try {
+        await this.ctx.storage.put(issuedKey(row.id), {
+          expiresAt: new Date(expiresAt).toISOString(),
+          issuedAt,
+        });
+        // A direct write supersedes any older stash (same base refresh token in D1).
+        if (!stashed) await this.ctx.storage.delete(pendingKey(row.id));
+        await this.ctx.storage.delete(clientRejectsKey(row.id));
+        if (stashed) await this.armAlarm(this.now() + PENDING_RETRY_MS);
+      } catch {
+        /* without the issued record the age falls back to expires_at - 600 s (same answer) */
       }
       return { ok: true, accessToken: tokens.accessToken, expiresAt };
     } catch (e) {
@@ -823,7 +948,7 @@ export class ExactGate extends DurableObject<Env> {
     this.dirty = true;
     if (this.limits.flushIntervalMs > 0 && !this.alarmScheduled) {
       this.alarmScheduled = true;
-      void this.ctx.storage.setAlarm(this.now() + this.limits.flushIntervalMs).catch(() => {
+      void this.armAlarm(this.now() + this.limits.flushIntervalMs).catch(() => {
         this.alarmScheduled = false;
       });
     }
@@ -948,6 +1073,11 @@ export class ExactGate extends DurableObject<Env> {
       }
       if (!forced.ok) throw this.tokenError(forced);
       item.retried = true;
+      // The authority handed back the same token (it joined a refresh that reused it, or a stash
+      // of the same pair): a second 401 then says nothing about the grant, so keep it retryable.
+      if (row.expires_at !== null && forced.expiresAt === Date.parse(row.expires_at)) {
+        item.youngRetry = true;
+      }
       this.queue.unshift(item);
       return null;
     }

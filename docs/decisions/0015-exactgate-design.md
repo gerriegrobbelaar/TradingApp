@@ -28,4 +28,7 @@ CLAUDE.md 3: Exact allows about 60 calls/minute and 5,000/day per division; acce
 ## Update (review G2)
 - Rotation: if the D1 write fails twice the encrypted pair is stashed in the authority's DO storage and written later instead of marking `needs_reauth` (ADR 0016 item 19).
 - Refresh timing and errors: ADR 0016 items 16-17. `token_rejected` is now the retryable 503 `token_refresh_retry`.
-- All stubs come from `getExactGate` (EU jurisdiction, ADR 0018).
+- All stubs come from `getExactGate` (EU jurisdiction, ADR 0018; `sync.ts` is the one remaining exception until task G1).
+- Earliest refresh is `min(issued + 570 s, expires - 30 s)` so a shorter `expires_in` cannot lock us out. A 2xx token answer we cannot parse is retryable (tokens kept) instead of `needs_reauth`. Repeated `invalid_client` sets `last_error = 'token_endpoint_rejected_credentials'` without touching the tokens (ADR 0016 item 20).
+- One alarm per object: the usage flush and the stash retry both arm it through `armAlarm`, which only moves it earlier; `alarm()` writes the stash first, then flushes usage.
+- The sliding-window log is part of the persisted limiter state (`rl`), so an eviction does not reset the minute limit.

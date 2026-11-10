@@ -380,6 +380,20 @@ describe("GET /api/connections", () => {
     });
   });
 
+  it("reports rejected app credentials on an active connection (configuration problem)", async () => {
+    await seedConnection();
+    await db
+      .prepare("UPDATE connections SET last_error = 'token_endpoint_rejected_credentials'")
+      .run();
+    const res = await authed("/api/connections", adminTok);
+    const text = await res.text();
+    expect(JSON.parse(text).connections[0]).toMatchObject({
+      status: "active",
+      lastError: "token_endpoint_rejected_credentials",
+    });
+    expect(text).not.toMatch(/acc-0|ref-0/);
+  });
+
   it("needs a session", async () => {
     expect((await call("/api/connections")).status).toBe(401);
   });

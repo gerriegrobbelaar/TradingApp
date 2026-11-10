@@ -39,11 +39,13 @@ Paste the `database_id` into `apps/worker/wrangler.toml`, replacing the all-zero
 
 **Durable Objects are EU-only too.** The code creates every `ExactGate` object through
 `env.EXACT_GATE.jurisdiction("eu")` (docs/decisions/0018). Object ids depend on the jurisdiction,
-so this is fixed from the first deploy: do not remove it later. Do not add
-`DO_JURISDICTION_DISABLED` to `wrangler.toml` or to the Workers variables (it is test-only, the
-deploy check refuses it). After the first deploy, confirm in the dashboard (Workers, Durable
-Objects) that the `ExactGate` objects are listed under the EU jurisdiction. `wrangler dev` does not
-implement jurisdictions: for local work put `DO_JURISDICTION_DISABLED=1` in `.dev.vars` only.
+so this is fixed from the first deploy: do not remove it later. There is no variable or binding
+that switches the jurisdiction off (only the vitest setup file can, in code); the deploy check also
+refuses a leftover `DO_JURISDICTION_DISABLED`. After the first deploy, confirm in the dashboard
+(Workers, Durable Objects) that the `ExactGate` objects are listed under the EU jurisdiction.
+Local `wrangler dev` (workerd) does not implement jurisdictions, so Exact calls fail there with
+"Jurisdiction restrictions are not implemented in workerd"; use `wrangler dev --remote` to try the
+Exact connection before deploying.
 
 ## 2. Create the Google OAuth client
 

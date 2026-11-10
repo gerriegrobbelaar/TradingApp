@@ -40,7 +40,7 @@ describe("deploy config guard", () => {
   it("refuses a config that disables the Durable Object jurisdiction (test-only switch)", () => {
     const t = ready.replace("[vars]", '[vars]\nDO_JURISDICTION_DISABLED = "1"');
     expect(deployConfigProblems(t)).toEqual([
-      "DO_JURISDICTION_DISABLED is test-only and must not be set (EU Durable Objects)",
+      "DO_JURISDICTION_DISABLED has no effect and must not be set: Durable Objects are always EU (ADR 0018)",
     ]);
   });
 

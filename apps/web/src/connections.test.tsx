@@ -68,6 +68,29 @@ describe("Settings, Connections", () => {
     expect(screen.getByRole("button", { name: "Re-authorise" })).toBeTruthy();
   });
 
+  it("shows rejected app credentials as a configuration problem without a re-authorise button", async () => {
+    const body: api.ConnectionsResponse = {
+      exactConfigured: true,
+      connections: [
+        {
+          ...(EXACT_ACTIVE.connections[0] as api.ConnectionRow),
+          lastError: "token_endpoint_rejected_credentials",
+        },
+      ],
+    };
+    mockFetch({ ...ME_OK(ADMIN), ...list(body) });
+    renderApp("/settings/connections");
+    expect(await screen.findByText("Configuration problem")).toBeTruthy();
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain(
+      "Exact rejected the app credentials. Check EXACT_CLIENT_ID and EXACT_CLIENT_SECRET.",
+    );
+    expect(alert.textContent).toContain("re-authorising does not help");
+    expect(screen.queryByRole("button", { name: "Re-authorise" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Disconnect" })).toBeTruthy();
+    expect(screen.queryByText("Connected")).toBeNull();
+  });
+
   it("hides the buttons from non-admins", async () => {
     mockFetch({ ...ME_OK(VIEWER), ...list(EXACT_ACTIVE) });
     renderApp("/settings/connections");
