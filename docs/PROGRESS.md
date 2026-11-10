@@ -21,6 +21,7 @@ Orchestrator log. Update after every merge and every direct (trivial) edit.
 ## Log
 - 2026-11-10: Scaffolded repo layout, agent definitions (`.claude/agents/`), project brief (`CLAUDE.md`). Direct edit, no pipeline (config/docs).
 - 2026-11-10: T1 monorepo tooling + CI merged (reviewer PASS).
+- 2026-11-10: T2 D1 schema, seed, audit, idempotency merged (reviewer PASS).
 - 2026-11-10: ADR 0001 (Workers only), ADR 0002 (camelthorncapital.com only, no external emails in v1). Direct edit (docs).
 
 ## Open decisions (CLAUDE.md §9)
