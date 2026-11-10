@@ -11,7 +11,24 @@ export interface TokenSet {
   expiresInS: number;
 }
 
-export type TokenFailure = "invalid_grant" | "rejected" | "unavailable" | "malformed";
+/**
+ * "rejected" is any 4xx other than a clear invalid_grant or client rejection, a redirect, or a
+ * body we cannot classify: it may be a premature refresh (ADR 0016), so callers treat it as
+ * retryable, never as a lost grant.
+ * "client_rejected" is `invalid_client` / `unauthorized_client`, or a 401 without invalid_grant:
+ * most likely a wrong EXACT_CLIENT_ID / EXACT_CLIENT_SECRET. Tokens are kept; the authority
+ * reports it as a configuration problem once it repeats (ADR 0016 item 20).
+ * "malformed" is a 2xx we cannot read. The old refresh token may or may not be spent; keeping it
+ * costs nothing (a spent one answers invalid_grant on the next try), so it is retryable too.
+ * "bad_host" is our own configuration (not an Exact host) and is not worth retrying.
+ */
+export type TokenFailure =
+  "invalid_grant" | "client_rejected" | "rejected" | "unavailable" | "malformed" | "bad_host";
+
+/** The OAuth `error` code, trimmed and lower-cased; "" if the body has none. */
+function errorCode(obj: Record<string, unknown>): string {
+  return typeof obj.error === "string" ? obj.error.trim().toLowerCase() : "";
+}
 
 export class TokenEndpointError extends Error {
   readonly failure: TokenFailure;
@@ -45,7 +62,7 @@ export function authorizeUrl(
 
 async function post(client: OAuthClient, form: Record<string, string>): Promise<TokenSet> {
   // The client secret and the refresh token go in the body: only ever to an Exact host.
-  if (!isExactHost(client.host)) throw new TokenEndpointError("rejected");
+  if (!isExactHost(client.host)) throw new TokenEndpointError("bad_host");
   let res: Response;
   try {
     res = await fetch(`https://${client.host}/api/oauth2/token`, {
@@ -71,9 +88,20 @@ async function post(client: OAuthClient, form: Record<string, string>): Promise<
     data = null;
   }
   const obj = data && typeof data === "object" ? (data as Record<string, unknown>) : {};
+  const code = errorCode(obj);
   if (!res.ok) {
     if (res.status >= 500 || res.status === 429) throw new TokenEndpointError("unavailable");
-    throw new TokenEndpointError(obj.error === "invalid_grant" ? "invalid_grant" : "rejected");
+    // Only the `error` member counts (RFC 6749 5.2), at 400 or 401 alike. A description that merely
+    // mentions a code is ambiguous, and an ambiguous answer must never wipe the tokens.
+    if (code === "invalid_grant") throw new TokenEndpointError("invalid_grant");
+    if (code === "invalid_client" || code === "unauthorized_client" || res.status === 401) {
+      throw new TokenEndpointError("client_rejected");
+    }
+    throw new TokenEndpointError("rejected");
+  }
+  // A 2xx that carries an OAuth error instead of tokens was not a successful refresh.
+  if (code !== "" && obj.access_token === undefined) {
+    throw new TokenEndpointError(code === "invalid_grant" ? "invalid_grant" : "rejected");
   }
   const { access_token, refresh_token } = obj;
   // Exact sends expires_in as a string ("600"); accept a number too.

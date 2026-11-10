@@ -26,6 +26,6 @@ export default defineConfig(async () => {
         },
       }),
     ],
-    test: { setupFiles: ["./test/apply-migrations.ts"] },
+    test: { setupFiles: ["./test/apply-migrations.ts", "./test/do-namespace.ts"] },
   };
 });

@@ -26,17 +26,24 @@ const RESULT_MESSAGE: Record<string, string> = {
   error: "Could not finish connecting to Exact Online. Try again.",
 };
 
-type ExactState = "connected" | "needs_reauth" | "not_connected";
+type ExactState = "connected" | "credentials_rejected" | "needs_reauth" | "not_connected";
+
+/** Set by the token authority when Exact keeps rejecting the app's client id or secret. */
+export const CREDENTIALS_REJECTED = "token_endpoint_rejected_credentials";
 
 export function exactState(row: ConnectionRow | undefined): ExactState {
   if (!row) return "not_connected";
-  if (row.status === "active") return "connected";
+  if (row.status === "active") {
+    // The grant is fine but Exact refuses the app itself: a server setting, not a re-authorisation.
+    return row.lastError === CREDENTIALS_REJECTED ? "credentials_rejected" : "connected";
+  }
   if (row.status === "needs_reauth" || row.status === "expired") return "needs_reauth";
   return "not_connected";
 }
 
 const STATE_LABEL: Record<ExactState, { text: string; tone: ChipTone }> = {
   connected: { text: "Connected", tone: "ok" },
+  credentials_rejected: { text: "Configuration problem", tone: "warn" },
   needs_reauth: { text: "Needs re-authorisation", tone: "warn" },
   not_connected: { text: "Not connected", tone: "neutral" },
 };
@@ -189,6 +196,14 @@ export function Connections() {
                 Exact client ID, secret and encryption key.
               </p>
             )}
+            {state === "credentials_rejected" && (
+              <p role="alert" className="notice warn">
+                Exact rejected the app credentials. Check EXACT_CLIENT_ID and EXACT_CLIENT_SECRET.{" "}
+                {isAdmin
+                  ? "These are Worker settings: fix them where the app is deployed. The saved sign-in is kept, so re-authorising does not help."
+                  : "Ask an admin to fix the app settings."}
+              </p>
+            )}
             {state === "needs_reauth" && (
               <p role="alert" className="notice warn">
                 {exact?.lastError && ERROR_LABEL[exact.lastError]
@@ -227,16 +242,18 @@ export function Connections() {
             )}
             {isAdmin ? (
               <div className="chips" ref={actions}>
-                <Button
-                  variant="primary"
-                  disabled={busy || !data.exactConfigured}
-                  onClick={(e) => {
-                    remember(e);
-                    void connect();
-                  }}
-                >
-                  {state === "not_connected" ? "Connect Exact Online" : "Re-authorise"}
-                </Button>
+                {state !== "credentials_rejected" && (
+                  <Button
+                    variant="primary"
+                    disabled={busy || !data.exactConfigured}
+                    onClick={(e) => {
+                      remember(e);
+                      void connect();
+                    }}
+                  >
+                    {state === "not_connected" ? "Connect Exact Online" : "Re-authorise"}
+                  </Button>
+                )}
                 {state !== "not_connected" && (
                   <Button
                     disabled={busy}

@@ -2,6 +2,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { vi } from "vitest";
 import { decryptToken, encryptToken } from "../src/crypto/token-crypto";
 import type { ExactGate } from "../src/exact/gate";
+import { getExactGate } from "../src/exact/gate-transport";
 import { aad } from "../src/exact/store";
 import type { ExactRequest } from "@camelthorn/exact";
 
@@ -141,8 +142,7 @@ export async function storedTokens(id: number): Promise<{
 let nextDivision = 700_000;
 export const freshDivision = (): number => ++nextDivision;
 
-export const gateStub = (name: string): DurableObjectStub<ExactGate> =>
-  env.EXACT_GATE.get(env.EXACT_GATE.idFromName(name));
+export const gateStub = (name: string): DurableObjectStub<ExactGate> => getExactGate(env, name);
 
 export interface FakeClock {
   t: number;

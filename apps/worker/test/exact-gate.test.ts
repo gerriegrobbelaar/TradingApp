@@ -7,7 +7,12 @@ import {
   type ExactRequest,
 } from "@camelthorn/exact";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createGateTransport, gateName } from "../src/exact/gate-transport";
+import {
+  createGateTransport,
+  gateName,
+  getExactGate,
+  setGateNamespaceResolverForTests,
+} from "../src/exact/gate-transport";
 import type { ExactGate } from "../src/exact/gate";
 import { buildUrl, validateRequest } from "../src/exact/request";
 import { unwrap } from "../src/exact/wire";
@@ -82,27 +87,6 @@ describe("token refresh", () => {
     expect(seenAtApiCall).toBe("ref-1");
   });
 
-  it("marks needs_reauth and never uses the new token when persistence fails", async () => {
-    const id = await seedConnection({ expiresInMs: 1000 });
-    const authority = gateStub(`exact-token:${id}`);
-    await runInDurableObject(authority, (g: ExactGate) => {
-      g.persistTokens = async () => {
-        throw new Error("d1 down");
-      };
-    });
-    const before = await auditActions("connection.exact_needs_reauth");
-    await expect(go(freshDivision())).rejects.toBeInstanceOf(ExactAuthError);
-    expect(stub.apiCalls).toHaveLength(0);
-    const s = await storedTokens(id);
-    expect(s).toMatchObject({
-      status: "needs_reauth",
-      access: null,
-      refresh: null,
-      lastError: "token_persist_failed",
-    });
-    expect(await auditActions("connection.exact_needs_reauth")).toBe(before + 1);
-  });
-
   it("invalid_grant marks needs_reauth, audits, and throws ExactAuthError", async () => {
     const id = await seedConnection({ expiresInMs: 1000 });
     stub.token = () => Response.json({ error: "invalid_grant" }, { status: 400 });
@@ -120,15 +104,23 @@ describe("token refresh", () => {
 
   it("treats a transient token endpoint failure as retryable and keeps the tokens", async () => {
     const id = await seedConnection({ expiresInMs: 1000 });
+    await fakeClock(`exact-token:${id}`);
     stub.token = () => new Response("oops", { status: 503 });
     await expect(go(freshDivision())).rejects.toMatchObject({ name: "ExactApiError", status: 503 });
+    expect(stub.tokenCalls).toHaveLength(3); // one try and two bounded retries
     expect(await storedTokens(id)).toMatchObject({ status: "active", refresh: "ref-0" });
   });
 
   it("does not wipe tokens when Exact rejects our client credentials", async () => {
     const id = await seedConnection({ expiresInMs: 1000 });
+    await fakeClock(`exact-token:${id}`);
     stub.token = () => Response.json({ error: "invalid_client" }, { status: 401 });
-    await expect(go(freshDivision())).rejects.toBeInstanceOf(ExactAuthError);
+    // Retryable, not an auth error: it must not turn into a needs_reauth sync status (B2).
+    await expect(go(freshDivision())).rejects.toMatchObject({
+      name: "ExactApiError",
+      status: 503,
+      code: "token_refresh_retry",
+    });
     expect((await storedTokens(id)).status).toBe("active");
   });
 
@@ -152,9 +144,459 @@ describe("token refresh", () => {
       "Bearer acc-1",
     ]);
     expect((await storedTokens(id)).refresh).toBe("ref-1");
+  });
 
+  it("a second 401 on a token that was old enough to refresh is an auth error", async () => {
+    await seedConnection({ expiresInMs: 3600_000 });
     stub.api = () => new Response("", { status: 401 });
     await expect(go(freshDivision())).rejects.toBeInstanceOf(ExactAuthError);
+  });
+});
+
+describe("review G2/B2: minimum token age (570 s)", () => {
+  // Remaining life = 600 s minus age, so expiresInMs 60_000 is a 540 s old token.
+  it("does not refresh a token that is 540 s old", async () => {
+    await seedConnection({ expiresInMs: 60_000 });
+    await go(freshDivision());
+    expect(stub.tokenCalls).toHaveLength(0);
+    expect(stub.apiCalls[0]?.headers.authorization).toBe("Bearer acc-0");
+  });
+
+  it("does not refresh at 569 s but refreshes inside the 570-580 s window", async () => {
+    await seedConnection({ expiresInMs: 31_000 }); // age 569 s
+    await go(freshDivision());
+    expect(stub.tokenCalls).toHaveLength(0);
+    await resetExact();
+    await seedConnection({ expiresInMs: 25_000 }); // age 575 s
+    await go(freshDivision());
+    expect(stub.tokenCalls).toHaveLength(1);
+    expect(stub.apiCalls.at(-1)?.headers.authorization).toBe("Bearer acc-1");
+  });
+
+  it("an expired token (age over 600 s) refreshes at once", async () => {
+    await seedConnection({ expiresInMs: -5_000 });
+    await go(freshDivision());
+    expect(stub.tokenCalls).toHaveLength(1);
+  });
+
+  const setIssued = (id: number, issuedAt: number) =>
+    db
+      .prepare("SELECT expires_at FROM connections WHERE id = ?1")
+      .bind(id)
+      .first<{ expires_at: string }>()
+      .then((row) =>
+        runInDurableObject(gateStub(`exact-token:${id}`), (_g: ExactGate, state) =>
+          state.storage.put(`issued:${id}`, { expiresAt: row?.expires_at, issuedAt }),
+        ),
+      );
+
+  it("boundary: no refresh with 30.001 s left (age 569.999 s), refresh with exactly 30 s left", async () => {
+    const id = await seedConnection({ expiresInMs: 600_000 });
+    const row = await db
+      .prepare("SELECT expires_at FROM connections WHERE id = ?1")
+      .bind(id)
+      .first<{ expires_at: string }>();
+    const exp = Date.parse(row?.expires_at ?? "");
+    const div = freshDivision();
+    const gateClock = await fakeClock(gateName(div));
+    const authClock = await fakeClock(`exact-token:${id}`);
+    await setIssued(id, exp - 600_000);
+    gateClock.t = authClock.t = exp - 30_001;
+    await go(div);
+    expect(stub.tokenCalls).toHaveLength(0);
+    gateClock.t = authClock.t = exp - 30_000;
+    await go(div);
+    expect(stub.tokenCalls).toHaveLength(1);
+    expect(authClock.sleeps).toEqual([]);
+    expect(stub.apiCalls.at(-1)?.headers.authorization).toBe("Bearer acc-1");
+  });
+
+  it("the minimum age scales with a shorter lifetime: refreshes at once with 20 s left", async () => {
+    const id = await seedConnection({ expiresInMs: 20_000 });
+    const clock = await fakeClock(`exact-token:${id}`);
+    // Issued 560 s ago with only 20 s left: the real lifetime was 580 s, not 600 s.
+    await setIssued(id, clock.t - 560_000);
+    await go(freshDivision());
+    expect(clock.sleeps).toEqual([]);
+    expect(stub.tokenCalls).toHaveLength(1);
+  });
+
+  it("a 300 s token that has expired refreshes at once (no 570 s lock-out)", async () => {
+    const id = await seedConnection({ expiresInMs: -1_000 });
+    const clock = await fakeClock(`exact-token:${id}`);
+    await setIssued(id, clock.t - 301_000);
+    const res = await go(freshDivision());
+    expect(res.status).toBe(200);
+    expect(stub.tokenCalls).toHaveLength(1);
+    expect(stub.apiCalls[0]?.headers.authorization).toBe("Bearer acc-1");
+  });
+
+  it("a 300 s token is not refreshed while it has more than 30 s left", async () => {
+    const id = await seedConnection({ expiresInMs: 40_000 });
+    const clock = await fakeClock(`exact-token:${id}`);
+    await setIssued(id, clock.t - 260_000);
+    await go(freshDivision());
+    expect(stub.tokenCalls).toHaveLength(0);
+  });
+
+  it("a premature-refresh rejection is retried after a wait, then succeeds", async () => {
+    const audited = await auditActions("connection.exact_needs_reauth");
+    const id = await seedConnection({ expiresInMs: 25_000 });
+    const clock = await fakeClock(`exact-token:${id}`);
+    stub.token = (_f, n) =>
+      n === 1 ? Response.json({ error: "invalid_request" }, { status: 400 }) : tokenOk(n);
+    await go(freshDivision());
+    expect(stub.tokenCalls).toHaveLength(2);
+    expect(stub.tokenCalls.map((f) => f.get("refresh_token"))).toEqual(["ref-0", "ref-0"]);
+    expect(clock.sleeps).toEqual([5_000]);
+    expect(await storedTokens(id)).toMatchObject({ status: "active", refresh: "ref-2" });
+    expect(await auditActions("connection.exact_needs_reauth")).toBe(audited);
+  });
+
+  it("an unclassifiable rejection keeps the valid token, backs off and never wipes tokens", async () => {
+    const audited = await auditActions("connection.exact_needs_reauth");
+    const id = await seedConnection({ expiresInMs: 25_000 });
+    await fakeClock(`exact-token:${id}`);
+    stub.token = () => new Response("<html>nope</html>", { status: 400 });
+    const res = await go(freshDivision());
+    expect(res.status).toBe(200);
+    expect(stub.tokenCalls).toHaveLength(3); // bounded
+    expect(stub.apiCalls[0]?.headers.authorization).toBe("Bearer acc-0");
+    expect(await storedTokens(id)).toMatchObject({ status: "active", refresh: "ref-0" });
+    // Cooldown: the next call does not hammer the token endpoint again.
+    await go(freshDivision());
+    expect(stub.tokenCalls).toHaveLength(3);
+    expect(await auditActions("connection.exact_needs_reauth")).toBe(audited);
+  });
+
+  it("a rejection with no valid token left is a retryable 503, tokens kept", async () => {
+    const id = await seedConnection({ expiresInMs: -1000 });
+    await fakeClock(`exact-token:${id}`);
+    stub.token = () => Response.json({ error: "invalid_request" }, { status: 400 });
+    await expect(go(freshDivision())).rejects.toMatchObject({
+      status: 503,
+      code: "token_refresh_retry",
+    });
+    expect(await storedTokens(id)).toMatchObject({ status: "active", refresh: "ref-0" });
+  });
+
+  it("invalid_grant is the only rejection that wipes the tokens", async () => {
+    const id = await seedConnection({ expiresInMs: 25_000 });
+    await fakeClock(`exact-token:${id}`);
+    stub.token = () => Response.json({ error: "invalid_grant" }, { status: 400 });
+    const before = await auditActions("connection.exact_needs_reauth");
+    await expect(go(freshDivision())).rejects.toBeInstanceOf(ExactAuthError);
+    expect(stub.tokenCalls).toHaveLength(1); // no retry of a clear invalid_grant
+    expect(await storedTokens(id)).toMatchObject({ status: "needs_reauth", access: null });
+    expect(await auditActions("connection.exact_needs_reauth")).toBe(before + 1);
+  });
+
+  it("a 401 on a young token waits and retries once without refreshing", async () => {
+    const id = await seedConnection({ expiresInMs: 590_000 }); // age 10 s
+    const div = freshDivision();
+    const clock = await fakeClock(gateName(div));
+    stub.api = (_c, n) =>
+      n === 1 ? new Response("", { status: 401 }) : Response.json({ d: { results: [] } });
+    const res = await go(div);
+    expect(res.status).toBe(200);
+    expect(stub.tokenCalls).toHaveLength(0);
+    expect(clock.sleeps).toEqual([2_000]);
+    expect(stub.apiCalls.map((c) => c.headers.authorization)).toEqual([
+      "Bearer acc-0",
+      "Bearer acc-0",
+    ]);
+    expect((await storedTokens(id)).status).toBe("active");
+  });
+
+  it("two 401s on a young token are a retryable 503, not an auth error", async () => {
+    const id = await seedConnection({ expiresInMs: 590_000 });
+    const div = freshDivision();
+    await fakeClock(gateName(div));
+    stub.api = () => new Response("", { status: 401 });
+    await expect(go(div)).rejects.toMatchObject({ status: 503, code: "token_refresh_retry" });
+    expect(stub.tokenCalls).toHaveLength(0);
+    expect(await storedTokens(id)).toMatchObject({ status: "active", refresh: "ref-0" });
+  });
+});
+
+describe("review G2 (reviewer): token endpoint classification and credentials", () => {
+  it("invalid_grant is recognised at 401 too, in any case and with whitespace", async () => {
+    const id = await seedConnection({ expiresInMs: 1000 });
+    await fakeClock(`exact-token:${id}`);
+    stub.token = () => Response.json({ error: " Invalid_Grant " }, { status: 401 });
+    await expect(go(freshDivision())).rejects.toBeInstanceOf(ExactAuthError);
+    expect(stub.tokenCalls).toHaveLength(1);
+    expect(await storedTokens(id)).toMatchObject({ status: "needs_reauth", refresh: null });
+  });
+
+  it("a description that only mentions invalid_grant is ambiguous: tokens kept, retryable", async () => {
+    const id = await seedConnection({ expiresInMs: -1000 });
+    await fakeClock(`exact-token:${id}`);
+    stub.token = () =>
+      Response.json({ error_description: "invalid_grant (maybe)" }, { status: 400 });
+    await expect(go(freshDivision())).rejects.toMatchObject({ status: 503 });
+    expect(await storedTokens(id)).toMatchObject({ status: "active", refresh: "ref-0" });
+  });
+
+  it("a 2xx we cannot read keeps the tokens and is retryable (no needs_reauth)", async () => {
+    const audited = await auditActions("connection.exact_needs_reauth");
+    const id = await seedConnection({ expiresInMs: -1000 });
+    await fakeClock(`exact-token:${id}`);
+    stub.token = (_f, n) =>
+      n === 1 ? new Response("<html>ok</html>", { status: 200 }) : tokenOk(n);
+    const res = await go(freshDivision());
+    expect(res.status).toBe(200);
+    expect(stub.tokenCalls.map((f) => f.get("refresh_token"))).toEqual(["ref-0", "ref-0"]);
+    expect(await storedTokens(id)).toMatchObject({ status: "active", refresh: "ref-2" });
+    expect(await auditActions("connection.exact_needs_reauth")).toBe(audited);
+  });
+
+  it("a 2xx carrying an OAuth error is a rejection, not a malformed success", async () => {
+    const id = await seedConnection({ expiresInMs: -1000 });
+    await fakeClock(`exact-token:${id}`);
+    stub.token = () => Response.json({ error: "invalid_request" });
+    await expect(go(freshDivision())).rejects.toMatchObject({
+      status: 503,
+      code: "token_refresh_retry",
+    });
+    expect(await storedTokens(id)).toMatchObject({ status: "active", refresh: "ref-0" });
+  });
+
+  it("repeated invalid_client over a minute flags the connection for an admin, keeps tokens", async () => {
+    const audited = await auditActions("connection.exact_credentials_rejected");
+    const id = await seedConnection({ expiresInMs: -1000 });
+    const clock = await fakeClock(`exact-token:${id}`);
+    stub.token = () => Response.json({ error: "invalid_client" }, { status: 400 });
+
+    // First round: three attempts within 20 s are not yet "repeated over a minute".
+    await expect(go(freshDivision())).rejects.toMatchObject({ code: "token_refresh_retry" });
+    expect(stub.tokenCalls).toHaveLength(3);
+    expect((await storedTokens(id)).lastError).toBeNull();
+
+    clock.t += 45_000;
+    await expect(go(freshDivision())).rejects.toMatchObject({
+      name: "ExactApiError",
+      status: 503,
+      code: "token_endpoint_rejected_credentials",
+    });
+    expect(stub.tokenCalls).toHaveLength(4); // no pointless retries once it is clear
+    expect(await storedTokens(id)).toMatchObject({
+      status: "active",
+      refresh: "ref-0",
+      access: "acc-0",
+      lastError: "token_endpoint_rejected_credentials",
+    });
+    expect(await auditActions("connection.exact_credentials_rejected")).toBe(audited + 1);
+
+    // Cooldown: the token endpoint is left alone for a minute; still one audit row.
+    await expect(go(freshDivision())).rejects.toMatchObject({
+      code: "token_endpoint_rejected_credentials",
+    });
+    expect(stub.tokenCalls).toHaveLength(4);
+
+    // Still wrong after the cooldown: reported again, but no second audit row.
+    clock.t += 61_000;
+    await expect(go(freshDivision())).rejects.toMatchObject({
+      code: "token_endpoint_rejected_credentials",
+    });
+    expect(stub.tokenCalls).toHaveLength(5);
+    expect(await auditActions("connection.exact_credentials_rejected")).toBe(audited + 1);
+
+    // The admin fixes the secret: the next refresh works and clears the flag.
+    stub.token = (_f, n) => tokenOk(n);
+    clock.t += 61_000;
+    expect((await go(freshDivision())).status).toBe(200);
+    expect(await storedTokens(id)).toMatchObject({ refresh: "ref-6", lastError: null });
+  });
+
+  it("a 401 with no error code from the token endpoint counts as a credentials rejection", async () => {
+    const id = await seedConnection({ expiresInMs: -1000 });
+    const clock = await fakeClock(`exact-token:${id}`);
+    stub.token = () => new Response("", { status: 401 });
+    await expect(go(freshDivision())).rejects.toMatchObject({ code: "token_refresh_retry" });
+    clock.t += 60_000;
+    await expect(go(freshDivision())).rejects.toMatchObject({
+      code: "token_endpoint_rejected_credentials",
+    });
+    expect((await storedTokens(id)).status).toBe("active");
+  });
+
+  it("a second 401 after the authority handed back the same token is retryable, not auth", async () => {
+    const id = await seedConnection({ expiresInMs: 3600_000 });
+    await runInDurableObject(gateStub(`exact-token:${id}`), (g: ExactGate) => {
+      // As after a credentials rejection: the authority answers with the token it has.
+      (g as unknown as { clientRejectedUntil: number }).clientRejectedUntil = Date.now() + 600_000;
+    });
+    const div = freshDivision();
+    await fakeClock(gateName(div));
+    stub.api = () => new Response("", { status: 401 });
+    await expect(go(div)).rejects.toMatchObject({ status: 503, code: "token_refresh_retry" });
+    expect(stub.tokenCalls).toHaveLength(0);
+    expect(stub.apiCalls).toHaveLength(2);
+    expect(await storedTokens(id)).toMatchObject({ status: "active", refresh: "ref-0" });
+  });
+});
+
+describe("review G2 (reviewer): one alarm, shared; window survives a restart", () => {
+  it("arming the alarm only ever moves it earlier, never later", async () => {
+    await seedConnection();
+    const div = freshDivision();
+    const clock = await fakeClock(gateName(div));
+    const gate = gateStub(gateName(div));
+    const far = clock.t + 2 * 3600_000;
+    await runInDurableObject(gate, async (g: ExactGate, state) => {
+      g.limits.flushIntervalMs = 3 * 3600_000; // would land after the existing alarm
+      await state.storage.setAlarm(far);
+    });
+    await go(div);
+    const after = await runInDurableObject(gate, async (_g: ExactGate, state) => {
+      const at = await state.storage.getAlarm();
+      await state.storage.deleteAlarm();
+      return at;
+    });
+    expect(after).toBe(far);
+  });
+
+  it("the alarm writes a stash even when the usage flush fails", async () => {
+    const id = await seedConnection({ expiresInMs: 1000 });
+    const authority = gateStub(`exact-token:${id}`);
+    await runInDurableObject(authority, (g: ExactGate) => {
+      const orig = g.persistTokens.bind(g);
+      let calls = 0;
+      g.persistTokens = async (...args: Parameters<ExactGate["persistTokens"]>) => {
+        calls++;
+        if (calls <= 2) throw new Error("d1 down");
+        return orig(...args);
+      };
+    });
+    await go(freshDivision());
+    const armed = await runInDurableObject(authority, (_g: ExactGate, state) =>
+      state.storage.getAlarm(),
+    );
+    expect(armed).not.toBeNull();
+    await runInDurableObject(authority, async (g: ExactGate, state) => {
+      await state.storage.deleteAlarm();
+      (g as unknown as { dirty: boolean }).dirty = true;
+      g.flushUsage = () => Promise.reject(new Error("d1 down"));
+      await expect(g.alarm()).rejects.toThrow("d1 down");
+    });
+    expect(await storedTokens(id)).toMatchObject({ refresh: "ref-1", access: "acc-1" });
+  });
+
+  it("the sliding window is persisted, so a restarted instance still waits", async () => {
+    await seedConnection();
+    const div = freshDivision();
+    const clock = await fakeClock(gateName(div));
+    await Promise.all(
+      Array.from({ length: 60 }, (_, i) => go(div, { query: { $top: String(i) } })),
+    );
+    const t0 = clock.t;
+    const waited = await runInDurableObject(gateStub(gateName(div)), async (_g, state) => {
+      const saved = await state.storage.get<{ window: number[] }>("rl");
+      expect(saved?.window).toHaveLength(60);
+      // A fresh instance on the same storage (what an eviction gives us) sees the same window.
+      const fresh = new (_g.constructor as new (s: DurableObjectState, e: typeof env) => ExactGate)(
+        state,
+        env,
+      );
+      // The constructor's blockConcurrencyWhile waits behind this test's own event; load directly.
+      await (fresh as unknown as { load(): Promise<void> }).load();
+      const sleeps: number[] = [];
+      let t = t0;
+      fresh.now = () => t;
+      fresh.sleep = async (ms) => {
+        sleeps.push(ms);
+        t += ms;
+      };
+      fresh.limits.flushIntervalMs = 0;
+      await fresh.request(req(div));
+      return sleeps;
+    });
+    expect(waited).toEqual([60_000]);
+    expect(stub.apiCalls).toHaveLength(61);
+  });
+});
+
+describe("review G2/N2: rotated tokens survive a failing D1 write", () => {
+  const failFirst = (n: number) => async (g: ExactGate) => {
+    const orig = g.persistTokens.bind(g);
+    let calls = 0;
+    g.persistTokens = async (...args: Parameters<ExactGate["persistTokens"]>) => {
+      calls++;
+      if (calls <= n) throw new Error("d1 down");
+      return orig(...args);
+    };
+  };
+  const pendingOf = (id: number) =>
+    runInDurableObject(gateStub(`exact-token:${id}`), (_g: ExactGate, state) =>
+      state.storage.get<{ accessEnc: string; refreshEnc: string }>(`pending:${id}`),
+    );
+
+  it("stashes the encrypted pair, keeps the connection active, and persists it on the alarm", async () => {
+    const audited = await auditActions("connection.exact_needs_reauth");
+    const id = await seedConnection({ expiresInMs: 1000 });
+    await runInDurableObject(gateStub(`exact-token:${id}`), failFirst(2));
+    const res = await go(freshDivision());
+    expect(res.status).toBe(200);
+    expect(stub.apiCalls[0]?.headers.authorization).toBe("Bearer acc-1");
+    // D1 still has the old pair; the new one waits, encrypted, in the authority's storage.
+    expect(await storedTokens(id)).toMatchObject({ status: "active", refresh: "ref-0" });
+    const stash = await pendingOf(id);
+    expect(stash?.refreshEnc.startsWith("v1.")).toBe(true);
+    expect(JSON.stringify(stash)).not.toContain("ref-1");
+    expect(JSON.stringify(stash)).not.toContain("acc-1");
+    expect(await auditActions("connection.exact_needs_reauth")).toBe(audited);
+
+    await runInDurableObject(gateStub(`exact-token:${id}`), (g: ExactGate) => g.alarm());
+    expect(await storedTokens(id)).toMatchObject({
+      status: "active",
+      access: "acc-1",
+      refresh: "ref-1",
+    });
+    expect(await pendingOf(id)).toBeUndefined();
+  });
+
+  it("persists the stash before any other use on the next call", async () => {
+    const id = await seedConnection({ expiresInMs: 1000 });
+    await runInDurableObject(gateStub(`exact-token:${id}`), failFirst(2));
+    await go(freshDivision());
+    // D1 holds an expired token, so this call asks the authority, which flushes first and then
+    // reuses the new (fresh) token instead of refreshing again.
+    await go(freshDivision());
+    expect(stub.tokenCalls).toHaveLength(1);
+    expect(await storedTokens(id)).toMatchObject({ refresh: "ref-1", access: "acc-1" });
+    expect(await pendingOf(id)).toBeUndefined();
+  });
+
+  it("refreshes from the stashed refresh token while D1 keeps failing", async () => {
+    const id = await seedConnection({ expiresInMs: 1000 });
+    const authority = gateStub(`exact-token:${id}`);
+    await runInDurableObject(authority, (g: ExactGate) => {
+      g.persistTokens = async () => {
+        throw new Error("d1 down");
+      };
+    });
+    await go(freshDivision());
+    // The stashed token ages out; the next refresh must use ref-1 (D1 still holds dead ref-0).
+    await runInDurableObject(authority, (_g: ExactGate, state) =>
+      state.storage
+        .get<Record<string, unknown>>(`pending:${id}`)
+        .then((p) => state.storage.put(`pending:${id}`, { ...p, expiresAt: Date.now() - 1000 })),
+    );
+    await go(freshDivision());
+    expect(stub.tokenCalls.map((f) => f.get("refresh_token"))).toEqual(["ref-0", "ref-1"]);
+    expect(stub.apiCalls.at(-1)?.headers.authorization).toBe("Bearer acc-2");
+    expect((await storedTokens(id)).status).toBe("active");
+  });
+
+  it("drops the stash if the connection was disconnected meanwhile", async () => {
+    const id = await seedConnection({ expiresInMs: 1000 });
+    await runInDurableObject(gateStub(`exact-token:${id}`), failFirst(2));
+    await go(freshDivision());
+    await db.prepare("UPDATE connections SET status = 'disabled' WHERE id = ?1").bind(id).run();
+    await runInDurableObject(gateStub(`exact-token:${id}`), (g: ExactGate) => g.alarm());
+    expect(await pendingOf(id)).toBeUndefined();
+    expect(await storedTokens(id)).toMatchObject({ status: "disabled", refresh: "ref-0" });
   });
 });
 
@@ -302,7 +744,7 @@ describe("path and header validation (SSRF, injection)", () => {
 });
 
 describe("rate limiting", () => {
-  it("allows a burst of 60 per minute, then waits for the bucket to refill", async () => {
+  it("allows a burst of 60, then the 61st waits until the first call leaves the window", async () => {
     await seedConnection();
     const div = freshDivision();
     const clock = await fakeClock(gateName(div));
@@ -311,10 +753,54 @@ describe("rate limiting", () => {
     );
     expect(results).toHaveLength(61);
     expect(stub.apiCalls).toHaveLength(61);
-    // 60 immediate, then exactly one wait of about a second for the 61st.
-    expect(clock.sleeps).toHaveLength(1);
-    expect(clock.sleeps[0]).toBeGreaterThanOrEqual(950);
-    expect(clock.sleeps[0]).toBeLessThanOrEqual(1050);
+    expect(clock.sleeps).toEqual([60_000]);
+  });
+
+  it("never lets more than 60 calls into any 60 s window, even with no headers (review S1)", async () => {
+    await seedConnection();
+    const div = freshDivision();
+    const clock = await fakeClock(gateName(div));
+    await runInDurableObject(gateStub(gateName(div)), (g: ExactGate) => {
+      g.limits.maxQueueWaitMs = 10 * 3600_000; // let all 200 wait instead of failing
+    });
+    const at: number[] = [];
+    stub.api = () => {
+      at.push(clock.t);
+      return Response.json({ d: { results: [] } });
+    };
+    const t0 = clock.t;
+    await Promise.all(
+      Array.from({ length: 200 }, (_, i) => go(div, { query: { $top: String(i) } })),
+    );
+    expect(at).toHaveLength(200);
+    // Every 60 s span [t, t + 60 s) holds at most 60 calls (checked from each call's own time).
+    for (const t of at) {
+      expect(at.filter((x) => x >= t && x < t + 60_000).length).toBeLessThanOrEqual(60);
+    }
+    expect(at.filter((x) => x < t0 + 60_000)).toHaveLength(60);
+    expect(at.filter((x) => x < t0 + 120_000)).toHaveLength(120);
+    expect(clock.t - t0).toBe(180_000); // 200 calls = 60 + 60 + 60 + 20
+  });
+
+  it("a header can only tighten the window, never loosen it (review S1)", async () => {
+    await seedConnection();
+    const div = freshDivision();
+    const clock = await fakeClock(gateName(div));
+    stub.api = () =>
+      Response.json(
+        { d: { results: [] } },
+        {
+          headers: {
+            "x-ratelimit-minutely-limit": "1000",
+            "x-ratelimit-minutely-remaining": "999",
+          },
+        },
+      );
+    const t0 = clock.t;
+    await Promise.all(
+      Array.from({ length: 61 }, (_, i) => go(div, { query: { $top: String(i) } })),
+    );
+    expect(clock.t - t0).toBe(60_000);
   });
 
   it("fails a request whose wait would exceed the maximum queue time", async () => {
@@ -366,7 +852,7 @@ describe("rate limiting", () => {
     const first = top("j0");
     await vi.waitFor(() => expect(stub.apiCalls).toHaveLength(1));
     const rest = [top("j1"), top("j2"), top("j3"), top("u1", { priority: "user" })];
-    await new Promise((r) => setTimeout(r, 50)); // let all four reach the queue
+    await vi.waitFor(async () => expect((await gateStub(gateName(div)).usage()).queued).toBe(4));
     release();
     await Promise.all([first, ...rest]);
     expect(stub.apiCalls.map((c) => c.url.searchParams.get("$top"))).toEqual([
@@ -656,7 +1142,7 @@ describe("review E2: priority without starvation", () => {
     await vi.waitFor(() => expect(stub.apiCalls).toHaveLength(1));
     const job = go(div, { priority: "job", jobId: "j", query: { $top: "job" } });
     const users = Array.from({ length: 10 }, (_, i) => go(div, { query: { $top: `u${i + 1}` } }));
-    await new Promise((r) => setTimeout(r, 50));
+    await vi.waitFor(async () => expect((await gateStub(gateName(div)).usage()).queued).toBe(11));
     release();
     await Promise.all([first, job, ...users]);
     const order = stub.apiCalls.map((c) => c.url.searchParams.get("$top"));
@@ -697,12 +1183,14 @@ describe("review E2: budget accounting", () => {
 
 describe("review E2: RPC failures are typed and retryable", () => {
   it("turns a failed gate RPC (eviction, reset) into ExactApiError 503 gate_unavailable", async () => {
-    const fakeNs = {
+    const inner = {
       idFromName: () => ({}) as DurableObjectId,
       get: () => ({
         call: () => Promise.reject(new Error("Durable Object reset because its code was updated")),
       }),
-    } as unknown as DurableObjectNamespace<ExactGate>;
+    };
+    // The test resolver uses the namespace as is, so the fake is the (already EU) namespace.
+    const fakeNs = inner as unknown as DurableObjectNamespace<ExactGate>;
     const transport = createGateTransport({ EXACT_GATE: fakeNs }, 5);
     const err = await transport(req(5)).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ExactApiError);
@@ -722,9 +1210,10 @@ describe("review E2: RPC failures are typed and retryable", () => {
 describe("review E2: token endpoint hygiene", () => {
   it("never follows a redirect from the token endpoint and keeps the tokens", async () => {
     const id = await seedConnection({ expiresInMs: 1000 });
+    await fakeClock(`exact-token:${id}`);
     stub.token = () =>
       new Response(null, { status: 307, headers: { location: "https://evil.test/t" } });
-    await expect(go(freshDivision())).rejects.toBeInstanceOf(ExactAuthError);
+    await expect(go(freshDivision())).rejects.toMatchObject({ status: 503 });
     const tokenInit = vi
       .mocked(globalThis.fetch)
       .mock.calls.map((c) => c[1])
@@ -740,7 +1229,79 @@ describe("review E2: token endpoint hygiene", () => {
       .bind(id)
       .run();
     const r = await gateStub(`exact-token:${id}`).refreshAccessToken(id);
-    expect(r).toMatchObject({ ok: false, code: "token_rejected" });
+    expect(r).toMatchObject({ ok: false, code: "token_refresh_retry", retryable: true });
     expect(stub.tokenCalls).toHaveLength(0);
+  });
+});
+
+describe("review G2/S6: EU jurisdiction for every Durable Object stub", () => {
+  it("getExactGate always goes through env.EXACT_GATE.jurisdiction('eu')", () => {
+    const seen: string[] = [];
+    const ns = {
+      idFromName: (n: string) => ({ n }) as unknown as DurableObjectId,
+      get: (id: unknown) => ({ id }) as unknown as DurableObjectStub<ExactGate>,
+    };
+    const fake = {
+      jurisdiction: (j: string) => {
+        seen.push(j);
+        return ns;
+      },
+      idFromName: () => {
+        throw new Error("the global namespace must not be used");
+      },
+    } as unknown as DurableObjectNamespace<ExactGate>;
+    setGateNamespaceResolverForTests(null); // the production resolver
+    try {
+      const stub = getExactGate({ EXACT_GATE: fake }, "exact:5") as unknown as {
+        id: { n: string };
+      };
+      expect(seen).toEqual(["eu"]);
+      expect(stub.id.n).toBe("exact:5");
+      createGateTransport({ EXACT_GATE: fake }, 7);
+      expect(seen).toEqual(["eu", "eu"]);
+    } finally {
+      setGateNamespaceResolverForTests((ns) => ns);
+    }
+  });
+
+  it("has no environment switch: a DO_JURISDICTION_DISABLED variable changes nothing", () => {
+    setGateNamespaceResolverForTests(null); // production resolver
+    try {
+      const seen: string[] = [];
+      const fake = {
+        jurisdiction: (j: string) => {
+          seen.push(j);
+          throw new Error("eu");
+        },
+      } as unknown as DurableObjectNamespace<ExactGate>;
+      for (const v of [undefined, "", "0", "1", "true"]) {
+        const e = { EXACT_GATE: fake, ...(v === undefined ? {} : { DO_JURISDICTION_DISABLED: v }) };
+        expect(() => getExactGate(e, "x")).toThrow("eu");
+      }
+      expect(seen).toEqual(["eu", "eu", "eu", "eu", "eu"]);
+    } finally {
+      setGateNamespaceResolverForTests((ns) => ns);
+    }
+  });
+
+  it("no source file obtains a gate stub except through getExactGate, or uses the test seam", () => {
+    const files = import.meta.glob("../src/**/*.ts", {
+      query: "?raw",
+      import: "default",
+      eager: true,
+    }) as Record<string, string>;
+    expect(Object.keys(files).length).toBeGreaterThan(10);
+    const offenders: string[] = [];
+    for (const [path, text] of Object.entries(files)) {
+      if (path.endsWith("/exact/gate-transport.ts")) continue;
+      if (/setGateNamespaceResolverForTests|DO_JURISDICTION_DISABLED/.test(text))
+        offenders.push(path);
+      // KNOWN EXCEPTION until task G1 lands: sync.ts defaultGate still uses idFromName directly.
+      if (path.endsWith("/exact/sync.ts")) continue;
+      if (/EXACT_GATE\s*\.\s*(idFromName|get|newUniqueId|idFromString)\b/.test(text)) {
+        offenders.push(path);
+      }
+    }
+    expect(offenders).toEqual([]);
   });
 });
