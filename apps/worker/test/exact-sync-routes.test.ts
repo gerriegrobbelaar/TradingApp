@@ -242,6 +242,18 @@ describe("POST /api/divisions/:id/sync", () => {
     expect(stub.apiCalls).toHaveLength(0);
   });
 
+  it("lets only an admin override the empty-list guard, and only in full mode", async () => {
+    const fin = tokens["finance"] as string;
+    const adm = tokens["admin"] as string;
+    expect((await post(fin, divA.id, { mode: "full", allowEmptyClose: true })).status).toBe(403);
+    expect((await post(adm, divA.id, { mode: "incremental", allowEmptyClose: true })).status).toBe(
+      403,
+    );
+    expect((await post(adm, divA.id, { mode: "full", allowEmptyClose: "yes" })).status).toBe(400);
+    expect(stub.apiCalls).toHaveLength(0);
+    expect(await auditRows("exact.sync", divA.id)).toHaveLength(0);
+  });
+
   it("runs a sync through the real client and gate for finance, and audits the actor", async () => {
     const fx = new FakeExact(divA.exact);
     fx.divisions = [{ code: divA.exact, description: "Alpha Advisory B.V." }];

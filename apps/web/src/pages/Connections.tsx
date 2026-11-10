@@ -65,7 +65,8 @@ export function Connections() {
   const isAdmin = me.roles.includes("admin");
   const canSync = isAdmin || me.roles.includes("finance");
   const { selected } = useDivision();
-  const lastSync = selected?.lastSync?.finishedAt;
+  // "Updated x ago" means the data is that fresh: only a sync that completed counts.
+  const lastSync = selected?.lastSync?.completedAt ?? null;
   const [params, setParams] = useSearchParams();
   const [data, setData] = useState<(ConnectionsResponse & { at: number }) | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);

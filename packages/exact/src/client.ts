@@ -45,6 +45,11 @@ export interface ExactClientOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Injected clock (epoch ms), used to turn X-RateLimit-*-Reset into a wait. */
   now?: () => number;
+  /**
+   * The division's own (default) currency, ISO 4217. Sets the minor-unit scale of `...DC`
+   * amounts (`OpenItem.amountDc`). Default EUR (a Dutch division).
+   */
+  divisionCurrency?: string;
 }
 
 export const DEFAULT_EXACT_HOST = "start.exactonline.nl";
@@ -110,8 +115,27 @@ export interface OpenItem {
   description: string | null;
   invoiceDate: string | null;
   dueDate: string | null;
-  /** Open amount in the item's own currency (integer minor units). Credit notes are negative. */
+  /**
+   * OPEN amount in the item's own currency (integer minor units). Credit notes are negative.
+   * Zero when Exact says the item is fully paid.
+   */
   amount: Money;
+  /**
+   * Original (invoice total) amount in the item's own currency, when the resource exposes it
+   * (sync reads: `TransactionAmountFC`). Null on the bulk list reads. VERIFY with credentials
+   * (ADR 0014 item 4, ADR 0017).
+   */
+  originalAmount: Money | null;
+  /**
+   * Open amount in the division currency (sync reads: `AmountDC`; zero when fully paid). Null on
+   * the bulk list reads. VERIFY with credentials.
+   */
+  amountDc: Money | null;
+  /**
+   * Booked exchange rate as a plain decimal string (sync reads: `RateFC`), never a float. Null
+   * when absent, not positive or not a plain decimal. Direction (FC -> DC) to VERIFY.
+   */
+  rate: string | null;
   /** Present on sync reads only. */
   timestamp: string | null;
 }
@@ -174,13 +198,21 @@ export const OPEN_ITEM_LIST_FIELDS = [
   "InvoiceDate",
   "InvoiceNumber",
 ] as const;
+/**
+ * Cashflow sync resources. Field names follow the Exact cashflow model (`AmountFC`/`AmountDC`,
+ * `TransactionAmountFC`, `RateFC`, `IsFullyPaid`): VERIFY with credentials (ADR 0014 item 4).
+ */
 export const OPEN_ITEM_SYNC_FIELDS = [
   "ID",
   "Account",
   "AccountCode",
   "AccountName",
-  "Amount",
+  "AmountDC",
+  "AmountFC",
   "Currency",
+  "IsFullyPaid",
+  "RateFC",
+  "TransactionAmountFC",
   "Description",
   "DueDate",
   "EntryNumber",
@@ -334,6 +366,9 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
   const maxPages = assertMaxPages(options.maxPages ?? DEFAULT_MAX_PAGES);
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const now = options.now ?? Date.now;
+  const divisionCurrency = (options.divisionCurrency ?? "EUR").toUpperCase();
+  if (!/^[A-Z]{3}$/.test(divisionCurrency))
+    throw new RangeError("divisionCurrency must be ISO 4217");
 
   /**
    * One transport call with the client's retry and error rules:
@@ -451,8 +486,34 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
     return money(minor, currency);
   }
 
+  function optionalMoney(r: Row, key: string, currency: string): Money | null {
+    const minor = minorField(r, key, currency);
+    return minor === null ? null : money(minor, currency);
+  }
+
+  /** Positive plain decimal rate kept as text (no float). Anything else is treated as unknown. */
+  function rateField(r: Row, key: string): string | null {
+    const v = strField(r, key);
+    if (v === null || !/^\d{1,12}(\.\d{1,20})?$/.test(v) || !/[1-9]/.test(v)) return null;
+    return v;
+  }
+
   function mapOpenItem(kind: OpenItemKind, r: Row, sync: boolean): OpenItem {
-    const amount = moneyField(r, "Amount", trimField(r, sync ? "Currency" : "CurrencyCode"));
+    let amount: Money;
+    let originalAmount: Money | null = null;
+    let amountDc: Money | null = null;
+    let rate: string | null = null;
+    if (sync) {
+      const open = moneyField(r, "AmountFC", trimField(r, "Currency"));
+      const paid = boolField(r, "IsFullyPaid");
+      amount = paid ? money(0, open.currency) : open;
+      originalAmount = optionalMoney(r, "TransactionAmountFC", open.currency);
+      const dc = optionalMoney(r, "AmountDC", divisionCurrency);
+      amountDc = dc === null ? null : paid ? money(0, divisionCurrency) : dc;
+      rate = rateField(r, "RateFC");
+    } else {
+      amount = moneyField(r, "Amount", trimField(r, "CurrencyCode"));
+    }
     return {
       kind,
       id: reqGuid(r, "ID"),
@@ -465,6 +526,9 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
       invoiceDate: dateField(r, "InvoiceDate"),
       dueDate: dateField(r, "DueDate"),
       amount,
+      originalAmount,
+      amountDc,
+      rate,
       timestamp: sync ? reqTimestamp(r) : null,
     };
   }

@@ -181,7 +181,10 @@ describe("GET /api/connections/exact/callback", () => {
       callback({ ...s, state: "" }),
       callback({ ...s, flowCookie: "" }),
       callback({ ...s, flowCookie: `${s.flowCookie}x` }),
-      callback({ ...s, flowCookie: s.flowCookie.replace(/.$/, (c) => (c === "A" ? "B" : "A")) }),
+      // Tamper with the FIRST character: every bit of it is significant. (The last base64url
+      // character carries padding bits, so changing it can decode to the same bytes; that made
+      // this test flaky about 1 run in 16.)
+      callback({ ...s, flowCookie: s.flowCookie.replace(/^./, (c) => (c === "A" ? "B" : "A")) }),
     ]) {
       const res = await bad;
       expect(res.headers.get("location")).toBe("/settings/connections?exact=denied");

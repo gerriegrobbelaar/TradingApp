@@ -10,13 +10,16 @@ const LABEL: Record<string, { text: string; tone: ChipTone }> = {
   error: { text: "Failed", tone: "warn" },
   needs_reauth: { text: "Needs re-authorisation", tone: "warn" },
   running: { text: "Syncing", tone: "neutral" },
+  interrupted: { text: "Interrupted", tone: "warn" },
   none: { text: "Not synced yet", tone: "neutral" },
 };
 
 function statusOf(d: DivisionInfo): string {
   if (d.syncing) return "running";
   const s = d.lastSync?.status;
-  return s && s !== "running" ? s : "none";
+  // 'running' without a live lease: the run stopped without finishing (for example a deploy).
+  if (s === "running") return "interrupted";
+  return s ?? "none";
 }
 
 const PLURAL: Record<string, [string, string]> = {
@@ -33,6 +36,12 @@ export function describeSync(name: string, r: SyncResponse): string {
       return `${rows} ${rows === 1 ? one : many}`;
     })
     .join(", ");
+  const guarded = Object.entries(r.entities)
+    .filter(([, e]) => e.error === "empty_list_guard")
+    .map(([key]) => key);
+  if (guarded.length > 0) {
+    return `Exact returned no open ${guarded.join(" or ")} for ${name}, while several are open here. Nothing was closed. Check the administration in Exact; an admin can confirm the close.`;
+  }
   switch (r.status) {
     case "ok":
       return `${name} is up to date: ${parts}.`;
@@ -106,7 +115,7 @@ export function SyncPanel({ canSync }: { canSync: boolean }) {
               <tr>
                 <th scope="col">Administration</th>
                 <th scope="col">Status</th>
-                <th scope="col">Last sync</th>
+                <th scope="col">Last complete sync</th>
                 {canSync && <th scope="col">Actions</th>}
               </tr>
             </thead>
@@ -119,10 +128,10 @@ export function SyncPanel({ canSync }: { canSync: boolean }) {
                     <td>{d.name}</td>
                     <td>{s && <Chip tone={s.tone}>{s.text}</Chip>}</td>
                     <td>
-                      {d.lastSync ? (
-                        <Stamp at={Date.parse(d.lastSync.finishedAt)} />
+                      {d.lastSync?.completedAt ? (
+                        <Stamp at={Date.parse(d.lastSync.completedAt)} />
                       ) : (
-                        <span>Never</span>
+                        <span className="stamp">Never</span>
                       )}
                     </td>
                     {canSync && (

@@ -400,6 +400,62 @@ describe("sync endpoints", () => {
     expect(page.items[0]?.accountId).toBe("c0000000-0000-0000-0000-000000000001");
   });
 
+  it("maps the open amount (FC), original amount, division-currency amount and rate of sync rows", async () => {
+    const usdRow = (extra: string) =>
+      `{"d":{"results":[{"ID":"a0000000-0000-0000-0000-000000000001","Account":"c0000000-0000-0000-0000-000000000001","Currency":"usd","AmountFC":400.10,"AmountDC":368.55,"TransactionAmountFC":1000,"RateFC":0.92112${extra},"Timestamp":5}]}}`;
+    const [part] = (
+      await createExactClient(
+        scripted([ok(usdRow(',"IsFullyPaid":false'))]).transport,
+        base,
+      ).syncReceivables("0")
+    ).items;
+    // Part payment: the remainder stays open; the original total is kept separately.
+    expect(part?.amount).toEqual({ minor: 40010, currency: "USD" });
+    expect(part?.originalAmount).toEqual({ minor: 100000, currency: "USD" });
+    expect(part?.amountDc).toEqual({ minor: 36855, currency: "EUR" });
+    expect(part?.rate).toBe("0.92112");
+
+    const [paid] = (
+      await createExactClient(
+        scripted([ok(usdRow(',"IsFullyPaid":true'))]).transport,
+        base,
+      ).syncReceivables("0")
+    ).items;
+    expect(paid?.amount).toEqual({ minor: 0, currency: "USD" });
+    expect(paid?.amountDc).toEqual({ minor: 0, currency: "EUR" });
+    expect(paid?.originalAmount).toEqual({ minor: 100000, currency: "USD" });
+
+    // Division currency sets the DC scale (JPY has no minor digits).
+    const [jpy] = (
+      await createExactClient(scripted([ok(usdRow(""))]).transport, {
+        ...base,
+        divisionCurrency: "JPY",
+      }).syncReceivables("0")
+    ).items;
+    expect(jpy?.amountDc).toEqual({ minor: 369, currency: "JPY" });
+  });
+
+  it("leaves unknown amounts and odd rates null instead of guessing", async () => {
+    const row = (rate: string) =>
+      `{"d":{"results":[{"ID":"a0000000-0000-0000-0000-000000000001","Account":"c0000000-0000-0000-0000-000000000001","Currency":"EUR","AmountFC":5,"RateFC":${rate},"Timestamp":5}]}}`;
+    for (const rate of ["0", "-1.2", "1e-7", "null"]) {
+      const [it0] = (
+        await createExactClient(scripted([ok(row(rate))]).transport, base).syncPayables("0")
+      ).items;
+      expect(it0?.rate).toBeNull();
+      expect(it0?.originalAmount).toBeNull();
+      expect(it0?.amountDc).toBeNull();
+    }
+    const [list] = await createExactClient(
+      scripted([ok(fx.PAYABLES)]).transport,
+      base,
+    ).listPayables();
+    expect(list).toMatchObject({ originalAmount: null, amountDc: null, rate: null });
+    expect(() =>
+      createExactClient(scripted([]).transport, { ...base, divisionCurrency: "eu" }),
+    ).toThrow(RangeError);
+  });
+
   it("stops at the page cap with a resumable cursor when maxPages is given", async () => {
     const { transport, calls } = scripted([ok(fx.SYNC_RECEIVABLES), ok(fx.SYNC_RECEIVABLES_2)]);
     // Client default cap is 200: the per-call maxPages must really be the cap.
@@ -425,7 +481,7 @@ describe("sync endpoints", () => {
 
   it("refuses a partial read whose rows are not in Timestamp order", async () => {
     const row = (id: string, ts: number) =>
-      `{"ID":"a0000000-0000-0000-0000-00000000000${id}","Account":"c0000000-0000-0000-0000-000000000001","Amount":1,"Currency":"EUR","Timestamp":${ts}}`;
+      `{"ID":"a0000000-0000-0000-0000-00000000000${id}","Account":"c0000000-0000-0000-0000-000000000001","AmountFC":1,"Currency":"EUR","Timestamp":${ts}}`;
     const unordered = `{"d":{"results":[${row("1", 500)},${row("2", 400)}],"__next":"https://${fx.HOST}/api/v1/${fx.DIV}/sync/Cashflow/Receivables?$skiptoken=1"}}`;
     const { transport } = scripted([ok(unordered)]);
     await expect(

@@ -3,7 +3,10 @@
  *
  *  GET  /api/divisions            any signed-in role: divisions, the user's selection, last sync
  *  PUT  /api/me/division          any signed-in role: remember the chosen division (validated)
- *  POST /api/divisions/:id/sync   admin or finance: run a sync now, inline (no step-up)
+ *  POST /api/divisions/:id/sync   admin or finance: run a sync now, inline (no step-up).
+ *                                 Body `{ mode?: "full" | "incremental", allowEmptyClose?: true }`;
+ *                                 allowEmptyClose (full mode, admin only) overrides the
+ *                                 empty-list guard (ADR 0017).
  *  GET  /api/sync/status          any signed-in role: per-division, per-entity sync state
  *
  * `:id` and `divisionId` are our divisions.id, never the raw Exact division number. A division
@@ -166,6 +169,11 @@ export function registerSyncRoutes(router: Router): void {
     const rawMode = body["mode"] ?? "incremental";
     if (rawMode !== "full" && rawMode !== "incremental") return json({ error: "bad_request" }, 400);
     const mode: SyncMode = rawMode;
+    const rawAllow = body["allowEmptyClose"] ?? false;
+    if (typeof rawAllow !== "boolean") return json({ error: "bad_request" }, 400);
+    if (rawAllow && (mode !== "full" || !session.roles.includes("admin"))) {
+      return json({ error: "forbidden" }, 403);
+    }
 
     const division = (await listDivisions(ctx.env.DB)).find((d) => d.id === id);
     if (!division) return json({ error: "not_found" }, 404);
@@ -183,6 +191,7 @@ export function registerSyncRoutes(router: Router): void {
         id: division.id,
         connectionId: division.connection_id,
         exactDivision: division.exact_division,
+        currency: division.base_currency,
       },
       {
         jobId: `sync:manual:${division.exact_division}:${ctx.nowMs}`,
@@ -190,6 +199,7 @@ export function registerSyncRoutes(router: Router): void {
         budget: MANUAL_SYNC_BUDGET,
         actor: session.email,
         deadlineMs: Date.now() + MANUAL_SYNC_MAX_MS,
+        allowEmptyClose: rawAllow,
       },
     );
     if (summary.status === "locked") return json({ error: "sync_running" }, 409);

@@ -139,5 +139,27 @@ describe("migration 0005 on a database with existing rows", () => {
     await expect(
       mdb.prepare("INSERT INTO sync_state (division_id, entity) VALUES (9, 'nonsense')").run(),
     ).rejects.toThrow();
+
+    // amount model columns: existing rows get NULL (unknown), the currency check holds
+    const amounts = await mdb
+      .prepare("SELECT original_minor, open_dc_minor, dc_currency FROM open_items WHERE id = 1")
+      .first();
+    expect(amounts).toEqual({ original_minor: null, open_dc_minor: null, dc_currency: null });
+    await expect(
+      mdb.prepare("UPDATE open_items SET dc_currency = 'eur' WHERE id = 1").run(),
+    ).rejects.toThrow();
+    await mdb
+      .prepare("UPDATE open_items SET dc_currency = 'EUR', open_dc_minor = 5 WHERE id = 1")
+      .run();
+
+    // user_prefs follows the user (cascade) and survives a division leaving (set null)
+    await mdb.prepare("INSERT INTO users (id, email) VALUES (77, 'p@camelthorncapital.com')").run();
+    await mdb
+      .prepare("INSERT INTO user_prefs (user_id, division_id, updated_at) VALUES (77, 9, 'x')")
+      .run();
+    await mdb.prepare("DELETE FROM users WHERE id = 77").run();
+    const prefs = await mdb.prepare("SELECT COUNT(*) AS n FROM user_prefs").first<{ n: number }>();
+    expect(prefs?.n).toBe(0);
+    expect((await mdb.prepare("PRAGMA foreign_key_check").all()).results).toEqual([]);
   });
 });

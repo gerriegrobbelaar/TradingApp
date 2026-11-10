@@ -8,8 +8,19 @@
 --   open_items.kind   'invoice' = open receivable (sales invoice), 'bill' = open payable
 --                     (existing CHECK in 0003)
 --   open_items.status 'open' | 'closed', enforced by the triggers below.
--- Money stays integer minor units (amount_minor, open_minor) with the item's own currency.
+-- Money stays integer minor units with the item's own currency (`currency`):
+--   open_minor      open balance in the item currency (part payments keep the remainder here)
+--   original_minor  invoice total in the item currency, NULL while Exact has not told us
+--   amount_minor    original_minor when known, else the open balance (best known figure; 0003
+--                   made it NOT NULL)
+--   open_dc_minor   open balance in the division currency `dc_currency`, NULL when unknown
+--   rate            booked rate as a decimal string (0003), NULL when unknown
+-- See ADR 0017 (amount model; field names to verify with credentials).
 
+ALTER TABLE open_items ADD COLUMN original_minor INTEGER;
+ALTER TABLE open_items ADD COLUMN open_dc_minor INTEGER;
+ALTER TABLE open_items ADD COLUMN dc_currency TEXT
+  CHECK (dc_currency IS NULL OR (length(dc_currency) = 3 AND dc_currency = upper(dc_currency)));
 ALTER TABLE open_items ADD COLUMN entry_number INTEGER;
 ALTER TABLE open_items ADD COLUMN closed_at TEXT;
 -- Sequence number of the sync run that last saw this item (sync_locks.run_seq of its division).

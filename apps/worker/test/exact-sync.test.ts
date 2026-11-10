@@ -7,7 +7,11 @@ import {
   ExactRateLimitedError,
 } from "@camelthorn/exact";
 import {
+  EMPTY_CLOSE_GUARD,
+  SUBREQUEST_LIMIT,
+  SUBREQUEST_RESERVE,
   acquireSyncLock,
+  newMeter,
   syncDivision,
   type DivisionRef,
   type SyncMode,
@@ -23,6 +27,7 @@ import {
   guid,
   resetSync,
   type FakeGate,
+  type FakeItem,
 } from "./sync-helpers";
 
 const ACTOR = "finance@camelthorncapital.com";
@@ -549,6 +554,11 @@ describe("IBAN changes", () => {
 
     await run("full"); // same IBAN again: no second row
     expect(await auditRows("relation.iban_changed", relId(2))).toHaveLength(1);
+
+    // Case and spacing differences are not a change.
+    fx.banks = [{ n: 1, account: 2, iban: "de89 3704 0044 0532 0130 00" }];
+    await run("incremental");
+    expect(await auditRows("relation.iban_changed", relId(2))).toHaveLength(1);
   });
 
   it("flags a first IBAN that appears on a relation we already knew", async () => {
@@ -608,5 +618,253 @@ describe("locking", () => {
     expect(await acquireSyncLock(db, other.id, "x", Date.now())).toBe(1);
     seedData();
     expect((await run("full")).status).toBe("ok");
+  });
+});
+
+describe("closing guards (review E3)", () => {
+  const manyOpen = (count: number): void => {
+    fx.receivables = Array.from({ length: count }, (_, i) => ({
+      n: 300 + i,
+      account: 1,
+      name: "Acme BV",
+      amount: 10 + i,
+      currency: "EUR",
+      invoiceNumber: 300 + i,
+      ts: 300 + i,
+    }));
+  };
+
+  it("refuses to close everything when a complete list is suddenly empty (more than the guard)", async () => {
+    seedData();
+    manyOpen(EMPTY_CLOSE_GUARD + 1);
+    await run("full");
+    fx.receivables = [];
+    const s = await run("full");
+    expect(s.status).toBe("error");
+    expect(s.entities.receivables).toMatchObject({ status: "error", error: "empty_list_guard" });
+    expect(s.entities.receivables.closed).toBeUndefined();
+    expect(Object.values(await itemStatus()).every((v) => v === "open")).toBe(true);
+    expect((await stateRow("receivables"))?.last_error).toBe("empty_list_guard");
+    expect((await stateRow("run"))?.last_full_completed_at).not.toBeNull(); // from the first run
+
+    // An admin override closes them, and is audited.
+    const forced = await run("full", { allowEmptyClose: true });
+    expect(forced.status).toBe("ok");
+    expect(forced.entities.receivables.closed).toBe(EMPTY_CLOSE_GUARD + 1);
+    const audit = await auditRows("exact.sync", div.id);
+    expect(JSON.parse(audit.at(-1)?.after_json ?? "{}")).toMatchObject({ allowEmptyClose: true });
+  });
+
+  it("closes a small set (at most the guard) when a complete list is empty", async () => {
+    seedData();
+    manyOpen(EMPTY_CLOSE_GUARD);
+    await run("full");
+    fx.receivables = [];
+    const s = await run("full");
+    expect(s.status).toBe("ok");
+    expect(s.entities.receivables.closed).toBe(EMPTY_CLOSE_GUARD);
+  });
+
+  it("never closes items of another division, nor of the other kind", async () => {
+    seedData();
+    await run("full");
+    const other = await addDivision();
+    const fx2 = new FakeExact(other.exactDivision);
+    fx2.divisions = [{ code: other.exactDivision, description: "Other" }];
+    const s = await syncDivision(
+      env,
+      other,
+      { jobId: `test-${++n}`, mode: "full" },
+      { transport: fx2.transport, gate },
+    );
+    expect(s.status).toBe("ok");
+    expect(Object.values(await itemStatus()).every((v) => v === "open")).toBe(true);
+
+    // Payables empty but receivables complete: only the bill closes.
+    fx.payables = [];
+    await run("full");
+    expect((await itemStatus())[guid(201)]).toBe("closed");
+    expect((await itemStatus())[guid(101)]).toBe("open");
+  });
+
+  it("closes nothing when the lease was taken over by another run before the close", async () => {
+    seedData();
+    await run("full");
+    fx.receivables = [];
+    fx.payables = [];
+    let stolen = false;
+    const transport = async (req: Parameters<typeof fx.transport>[0]) => {
+      if (req.path === "/read/financial/PayablesList" && !stolen) {
+        stolen = true;
+        // Simulate: our lease expired and a newer run took the division over.
+        await db
+          .prepare(
+            "UPDATE sync_locks SET holder = 'newer', run_seq = run_seq + 1 WHERE division_id = ?1",
+          )
+          .bind(div.id)
+          .run();
+      }
+      return fx.transport(req);
+    };
+    const s = await syncDivision(
+      env,
+      div,
+      { jobId: `test-${++n}`, mode: "full" },
+      { transport, gate },
+    );
+    expect(s.entities.receivables.status).toBe("ok");
+    expect(Object.values(await itemStatus()).every((v) => v === "open")).toBe(true);
+    expect(s.entities.receivables.closed).toBe(0);
+    // Our release did not free the newer run's lease.
+    expect(await acquireSyncLock(db, div.id, "third", Date.now())).toBeNull();
+  });
+
+  it("an older run never overwrites or un-sees a row a newer run wrote", async () => {
+    seedData();
+    await run("full");
+    await db
+      .prepare("UPDATE open_items SET last_seen_sync_id = 999, open_minor = 1 WHERE exact_id = ?1")
+      .bind(guid(101))
+      .run();
+    fx.receivables = fx.receivables.filter((i) => i.n !== 101);
+    const s = await run("full");
+    expect(s.status).toBe("ok");
+    const row = (await items()).find((i) => i.exact_id === guid(101));
+    expect(row).toMatchObject({ status: "open", open_minor: 1, last_seen_sync_id: 999 });
+  });
+
+  it("stops at the deadline in the middle of a bulk read, closes nothing", async () => {
+    seedData();
+    await run("full");
+    fx.receivables = fx.receivables.slice(0, 2); // 103 looks paid
+    fx.pageSize = 1; // two pages: the deadline passes after the first one
+    let clock = Date.now();
+    const deadline = clock + 1000;
+    fx.beforeCall = (_n, req) => {
+      if (req.path === "/read/financial/ReceivablesList") clock = deadline + 1;
+    };
+    const s = await run("full", { deadlineMs: deadline }, { now: () => clock });
+    expect(s.status).toBe("partial");
+    expect(s.entities.receivables).toMatchObject({ status: "partial", error: "time_limit" });
+    expect(Object.values(await itemStatus()).every((v) => v === "open")).toBe(true);
+    expect(gate.ended).toHaveLength(2);
+  });
+
+  it("stops before the invocation's subrequest limit as partial, closing nothing", async () => {
+    seedData();
+    await run("full");
+    fx.receivables = [];
+    const meter = newMeter(SUBREQUEST_RESERVE + 8);
+    const s = await run("full", { meter });
+    expect(s.status).toBe("partial");
+    expect(Object.values(s.entities).some((e) => e.error === "subrequest_limit")).toBe(true);
+    expect(meter.used).toBeLessThanOrEqual(meter.limit);
+    expect(Object.values(await itemStatus()).every((v) => v === "open")).toBe(true);
+    expect(gate.ended).toHaveLength(2); // the seeding run and this one
+    // A meter with nothing left does not even take the lock.
+    const empty = { used: SUBREQUEST_LIMIT, limit: SUBREQUEST_LIMIT };
+    const none = await run("full", { meter: empty });
+    expect(none).toMatchObject({ status: "partial", runSeq: null });
+    expect(await acquireSyncLock(db, div.id, "x", Date.now())).not.toBeNull();
+  });
+
+  it("releases the lock when the run throws in its final write", async () => {
+    seedData();
+    const failing = {
+      ...env,
+      DB: new Proxy(env.DB, {
+        get(target, prop, recv) {
+          if (prop === "batch") {
+            return async (stmts: D1PreparedStatement[]) => {
+              // The final batch carries the audit row: fail that one.
+              if (stmts.length > 0 && stmts.length === 7) throw new Error("d1 down");
+              return target.batch(stmts);
+            };
+          }
+          const v = Reflect.get(target, prop, recv) as unknown;
+          return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+        },
+      }),
+    };
+    await expect(
+      syncDivision(
+        failing,
+        div,
+        { jobId: `test-${++n}`, mode: "incremental" },
+        { transport: fx.transport, gate },
+      ),
+    ).rejects.toThrow("d1 down");
+    expect(gate.ended).toHaveLength(1);
+    expect(await acquireSyncLock(db, div.id, "x", Date.now())).not.toBeNull();
+  });
+});
+
+describe("amount model (review E3)", () => {
+  it("stores the open balance, the original total, the division-currency amount and the rate", async () => {
+    seedData();
+    const usd = await addDivision();
+    const fx2 = new FakeExact(usd.exactDivision);
+    fx2.divisions = [{ code: usd.exactDivision, description: "USD" }];
+    fx2.accounts = [{ n: 1, name: "Acme", ts: 1, customer: true }];
+    fx2.receivables = [
+      {
+        n: 1,
+        account: 1,
+        name: "Acme",
+        amount: 400.1, // open after a part payment
+        original: 1000,
+        amountDc: 368.55,
+        rate: 0.92112,
+        currency: "USD",
+        invoiceNumber: 1,
+        ts: 5,
+      },
+    ];
+    const sync = (mode: SyncMode) =>
+      syncDivision(
+        env,
+        { ...usd, currency: "EUR" },
+        { jobId: `test-${++n}`, mode },
+        { transport: fx2.transport, gate },
+      );
+    expect((await sync("incremental")).status).toBe("ok");
+    const read = () =>
+      db
+        .prepare(
+          `SELECT amount_minor, open_minor, original_minor, open_dc_minor, dc_currency, rate, status
+           FROM open_items WHERE division_id = ?1`,
+        )
+        .bind(usd.id)
+        .first();
+    expect(await read()).toEqual({
+      amount_minor: 100000,
+      open_minor: 40010,
+      original_minor: 100000,
+      open_dc_minor: 36855,
+      dc_currency: "EUR",
+      rate: "0.92112",
+      status: "open",
+    });
+
+    // The nightly bulk list has only the open amount: original and rate are kept, the
+    // division-currency snapshot is cleared rather than left stale.
+    fx2.receivables = [{ ...(fx2.receivables[0] as FakeItem), amount: 100 }];
+    expect((await sync("full")).status).toBe("ok");
+    expect(await read()).toEqual({
+      amount_minor: 100000,
+      open_minor: 10000,
+      original_minor: 100000,
+      open_dc_minor: null,
+      dc_currency: null,
+      rate: "0.92112",
+      status: "open",
+    });
+
+    // Fully paid per Exact: closed, open zero.
+    fx2.receivables = [
+      { ...(fx2.receivables[0] as FakeItem), amountDc: 92.11, fullyPaid: true, ts: 9 },
+    ];
+    await sync("incremental");
+    expect(await read()).toMatchObject({ open_minor: 0, open_dc_minor: 0, status: "closed" });
   });
 });

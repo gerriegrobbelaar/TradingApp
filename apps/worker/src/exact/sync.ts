@@ -51,7 +51,46 @@ export const DEFAULT_SYNC_BUDGET = 300;
 export const DEFAULT_CHUNK_PAGES = 5;
 const MAX_CHUNKS = 200;
 const BATCH_LIMIT = 100;
-const LEASE_MS = 15 * 60 * 1000;
+/**
+ * Lease length. Longer than any run may take: manual runs stop after 20 s and scheduled ones
+ * after SCHEDULED_MAX_MS (12 min) between Exact calls, and Cron Triggers end after 15 min wall
+ * time anyway. A crashed run frees the division after at most this long. Even if a run outlives
+ * its lease and another run takes over, the old run can no longer close items or overwrite rows
+ * the newer run has seen (lease-guarded close, run_seq-guarded upserts).
+ */
+export const LEASE_MS = 15 * 60 * 1000;
+
+/**
+ * Subrequests one Worker invocation may make (each gate RPC and each D1 call counts). 1,000 is
+ * the long-standing Workers Paid per-invocation limit; it is the conservative figure until the
+ * account's actual limit is checked (ADR 0017). The run stops as `partial` (`subrequest_limit`)
+ * while SUBREQUEST_RESERVE remain, which is enough for the final batch, endJob and the release.
+ */
+export const SUBREQUEST_LIMIT = 1000;
+export const SUBREQUEST_RESERVE = 25;
+
+/** Shared by all runs of one invocation (the scheduler syncs several divisions in one). */
+export interface SubrequestMeter {
+  used: number;
+  limit: number;
+}
+export const newMeter = (limit = SUBREQUEST_LIMIT): SubrequestMeter => ({ used: 0, limit });
+
+/**
+ * An empty but complete FULL list closes every open item of that kind. If more than this many
+ * were open, that is far more likely a fault (wrong division, filter, licence) than every item
+ * paid at once: nothing is closed and the entity ends as `error` / `empty_list_guard` until an
+ * admin runs a full sync with `allowEmptyClose`.
+ */
+export const EMPTY_CLOSE_GUARD = 5;
+
+/** A clean stop between Exact calls: deadline or subrequest limit. Ends the run as partial. */
+class SyncStop extends Error {
+  constructor(readonly code: "time_limit" | "subrequest_limit") {
+    super(code);
+    this.name = "SyncStop";
+  }
+}
 
 export interface DivisionRef {
   /** divisions.id */
@@ -59,6 +98,8 @@ export interface DivisionRef {
   connectionId: number;
   /** The Exact division number. */
   exactDivision: number;
+  /** divisions.base_currency (scale of division-currency amounts). Default EUR. */
+  currency?: string;
 }
 
 export interface SyncOptions {
@@ -69,8 +110,12 @@ export interface SyncOptions {
   /** Audit actor: the user's email for manual runs, `system` otherwise. */
   actor?: string;
   chunkPages?: number;
-  /** Epoch ms after which the run stops between steps and finishes as partial. */
+  /** Epoch ms after which the run stops before the next Exact call and finishes as partial. */
   deadlineMs?: number;
+  /** Subrequest meter of the invocation; a fresh one (SUBREQUEST_LIMIT) when omitted. */
+  meter?: SubrequestMeter;
+  /** Full mode only: close all open items of a kind even when a complete list is empty. */
+  allowEmptyClose?: boolean;
 }
 
 export interface JobGate {
@@ -124,6 +169,7 @@ const safeCode = (c: string | undefined, fallback: string): string =>
   c !== undefined && SAFE_CODE.test(c) ? c : fallback;
 
 function classify(e: unknown): Failure {
+  if (e instanceof SyncStop) return { kind: "stop", status: "partial", code: e.code };
   if (e instanceof ExactBudgetExhaustedError) {
     return { kind: "stop", status: "partial", code: "budget_exhausted" };
   }
@@ -143,17 +189,31 @@ function classify(e: unknown): Failure {
 
 const iso = (ms: number): string => new Date(ms).toISOString();
 
-async function runBatches(db: D1Database, units: D1PreparedStatement[][]): Promise<void> {
+/** Counts one subrequest, refusing it when only the reserve would be left. */
+function spend(meter: SubrequestMeter): void {
+  if (meter.used + 1 + SUBREQUEST_RESERVE > meter.limit) throw new SyncStop("subrequest_limit");
+  meter.used += 1;
+}
+
+async function runBatches(
+  db: D1Database,
+  meter: SubrequestMeter,
+  units: D1PreparedStatement[][],
+): Promise<void> {
   // Units (for example change + its audit row) are never split across batches.
   let cur: D1PreparedStatement[] = [];
   for (const unit of units) {
     if (cur.length > 0 && cur.length + unit.length > BATCH_LIMIT) {
+      spend(meter);
       await db.batch(cur);
       cur = [];
     }
     cur.push(...unit);
   }
-  if (cur.length > 0) await db.batch(cur);
+  if (cur.length > 0) {
+    spend(meter);
+    await db.batch(cur);
+  }
 }
 
 function defaultGate(env: Env, exactDivision: number): JobGate {
@@ -226,23 +286,46 @@ function openItemStmt(
   nowIso: string,
 ): D1PreparedStatement {
   const closed = item.amount.minor === 0;
+  // Amount model (migration 0005, ADR 0017): open_minor is the open balance in the item
+  // currency; original_minor the invoice total when known. Original amount and rate describe the
+  // booked invoice and are kept when a later read (the bulk list) does not carry them, unless the
+  // currency changed. open_dc_minor is a snapshot of the open balance and is never kept stale.
+  // The DO UPDATE only applies when this run is not older than the run that last saw the row, so
+  // a run that outlived its lease cannot overwrite (or un-see) what a newer run wrote.
+  const original =
+    item.originalAmount?.currency === item.amount.currency ? item.originalAmount : null;
+  const dc = item.amountDc;
   return db
     .prepare(
       `INSERT INTO open_items (division_id, exact_id, kind, relation_id, relation_name,
          invoice_number, reference, currency, amount_minor, open_minor, invoice_date, due_date,
-         status, closed_at, synced_at, entry_number, last_seen_sync_id)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+         status, closed_at, synced_at, entry_number, last_seen_sync_id, original_minor,
+         open_dc_minor, dc_currency, rate)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?17, ?9), ?9, ?10, ?11, ?12, ?13, ?14,
+         ?15, ?16, ?17, ?18, ?19, ?20)
        ON CONFLICT (division_id, exact_id) DO UPDATE SET
          kind = excluded.kind, relation_id = excluded.relation_id,
          relation_name = excluded.relation_name, invoice_number = excluded.invoice_number,
-         reference = excluded.reference, currency = excluded.currency,
-         amount_minor = excluded.amount_minor, open_minor = excluded.open_minor,
+         reference = excluded.reference,
+         original_minor = CASE WHEN excluded.original_minor IS NOT NULL THEN excluded.original_minor
+                               WHEN open_items.currency = excluded.currency
+                               THEN open_items.original_minor ELSE NULL END,
+         amount_minor = COALESCE(excluded.original_minor,
+                                 CASE WHEN open_items.currency = excluded.currency
+                                      THEN open_items.original_minor END,
+                                 excluded.open_minor),
+         rate = CASE WHEN excluded.rate IS NOT NULL THEN excluded.rate
+                     WHEN open_items.currency = excluded.currency THEN open_items.rate
+                     ELSE NULL END,
+         currency = excluded.currency, open_minor = excluded.open_minor,
+         open_dc_minor = excluded.open_dc_minor, dc_currency = excluded.dc_currency,
          invoice_date = excluded.invoice_date, due_date = excluded.due_date,
          status = excluded.status,
          closed_at = CASE WHEN excluded.status = 'closed'
                           THEN COALESCE(open_items.closed_at, excluded.closed_at) ELSE NULL END,
          synced_at = excluded.synced_at, entry_number = excluded.entry_number,
-         last_seen_sync_id = excluded.last_seen_sync_id`,
+         last_seen_sync_id = excluded.last_seen_sync_id
+       WHERE excluded.last_seen_sync_id >= COALESCE(open_items.last_seen_sync_id, 0)`,
     )
     .bind(
       divisionId,
@@ -261,6 +344,10 @@ function openItemStmt(
       nowIso,
       item.entryNumber,
       runSeq,
+      original === null ? null : original.minor,
+      dc === null ? null : dc.minor,
+      dc === null ? null : dc.currency,
+      item.rate,
     );
 }
 
@@ -358,7 +445,22 @@ export async function syncDivision(
     EntityName,
     EntityResult
   >;
+  const meter = opts.meter ?? newMeter();
   const holder = crypto.randomUUID();
+  if (meter.used + 1 + SUBREQUEST_RESERVE > meter.limit) {
+    // Nothing left in this invocation: do not even take the lock.
+    return {
+      status: "partial",
+      mode: opts.mode,
+      divisionId: division.id,
+      runSeq: null,
+      callsUsed: 0,
+      startedAt,
+      finishedAt: startedAt,
+      entities,
+    };
+  }
+  meter.used += 1;
   const runSeq = await acquireSyncLock(db, division.id, holder, now());
   if (runSeq === null) {
     return {
@@ -379,7 +481,17 @@ export async function syncDivision(
     const baseTransport = deps.transport ?? createGateTransport(env, division.exactDivision);
     let current: EntityName = "divisions";
     const tally = new Map<EntityName, number>();
+    // Every Exact call: stop cleanly at the deadline or before the invocation's subrequest limit
+    // (SyncStop -> partial). Checked per call, so a long bulk read cannot overrun either.
     const transport: ExactTransport = (req) => {
+      if (opts.deadlineMs !== undefined && now() >= opts.deadlineMs) {
+        return Promise.reject(new SyncStop("time_limit"));
+      }
+      try {
+        spend(meter);
+      } catch (e) {
+        return Promise.reject(e);
+      }
       tally.set(current, (tally.get(current) ?? 0) + 1);
       return baseTransport(req);
     };
@@ -387,8 +499,10 @@ export async function syncDivision(
       division: division.exactDivision,
       jobId: opts.jobId,
       priority: "job",
+      divisionCurrency: division.currency ?? "EUR",
     });
 
+    meter.used += 2; // the 'running' state row and the state read below
     await stateStmt(db, division.id, "run", opts.mode, startedAt, startedAt, "running", null, 0, 0)
       .run()
       .catch(() => undefined);
@@ -406,6 +520,7 @@ export async function syncDivision(
     let started = false;
     try {
       try {
+        meter.used += 1;
         await gate.startJob(opts.jobId, opts.budget ?? DEFAULT_SYNC_BUDGET);
         started = true;
       } catch {
@@ -426,6 +541,7 @@ export async function syncDivision(
         deadlineMs: opts.deadlineMs,
         now,
         progress: 0,
+        meter,
       };
 
       for (const entity of ENTITIES) {
@@ -459,10 +575,39 @@ export async function syncDivision(
     } finally {
       if (started) {
         try {
+          meter.used += 1;
           callsUsed = (await gate.endJob(opts.jobId)).used;
         } catch {
           // The job record is purged by the gate after 24 hours; nothing else to do.
         }
+      }
+    }
+
+    // Empty-list guard (see EMPTY_CLOSE_GUARD): checked before the status is computed, so a
+    // refused close shows as an error on the entity and the run.
+    for (const [entity, kind] of [
+      ["receivables", "invoice"],
+      ["payables", "bill"],
+    ] as const) {
+      const r = entities[entity];
+      if (opts.mode !== "full" || r.status !== "ok" || r.completeRead !== true || r.rows !== 0) {
+        continue;
+      }
+      if (opts.allowEmptyClose === true) continue;
+      meter.used += 1;
+      const open = await db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM open_items WHERE division_id = ?1 AND kind = ?2 AND status = 'open'",
+        )
+        .bind(division.id, kind)
+        .first<{ n: number }>();
+      if ((open?.n ?? 0) > EMPTY_CLOSE_GUARD) {
+        entities[entity] = {
+          ...r,
+          status: "error",
+          error: "empty_list_guard",
+          completeRead: false,
+        };
       }
     }
 
@@ -492,14 +637,21 @@ export async function syncDivision(
       const r = entities[entity];
       if (opts.mode === "full" && r.status === "ok" && r.completeRead === true) {
         closing.push(entity);
+        // Only items an OLDER run saw (a newer run's rows are never touched), only of this
+        // division and kind, and only while this run still holds the lease: if the lease expired
+        // and another run took over, run_seq moved on and nothing is closed.
         statements.push(
           db
             .prepare(
-              `UPDATE open_items SET status = 'closed', open_minor = 0, closed_at = ?4
+              `UPDATE open_items SET status = 'closed', open_minor = 0,
+                 open_dc_minor = CASE WHEN open_dc_minor IS NULL THEN NULL ELSE 0 END,
+                 closed_at = ?4
                WHERE division_id = ?1 AND kind = ?2 AND status = 'open'
-                 AND COALESCE(last_seen_sync_id, -1) <> ?3`,
+                 AND COALESCE(last_seen_sync_id, 0) < ?3
+                 AND EXISTS (SELECT 1 FROM sync_locks
+                             WHERE division_id = ?1 AND holder = ?5 AND run_seq = ?3)`,
             )
-            .bind(division.id, kind, runSeq, finishedAt),
+            .bind(division.id, kind, runSeq, finishedAt, holder),
         );
       }
     }
@@ -543,6 +695,7 @@ export async function syncDivision(
           mode: opts.mode,
           status,
           error: runError,
+          ...(opts.allowEmptyClose === true ? { allowEmptyClose: true } : {}),
           callsUsed,
           entities: Object.fromEntries(
             ENTITIES.map((e) => [
@@ -558,6 +711,7 @@ export async function syncDivision(
         },
       }),
     );
+    meter.used += 1;
     const results2 = await db.batch(statements);
     // The close statements come first; report how many items each one closed.
     closing.forEach((entity, i) => {
@@ -574,6 +728,7 @@ export async function syncDivision(
       entities,
     };
   } finally {
+    meter.used += 1;
     await releaseSyncLock(db, division.id, holder).catch(() => undefined);
   }
 }
@@ -597,6 +752,7 @@ interface Ctx {
   now: () => number;
   /** Rows written so far for the entity being synced (kept when a later chunk fails). */
   progress: number;
+  meter: SubrequestMeter;
 }
 
 function runEntity(ctx: Ctx, entity: EntityName): Promise<EntityResult> {
@@ -635,7 +791,7 @@ async function syncDivisions(ctx: Ctx): Promise<EntityResult> {
             .bind(division.connectionId, d.code, `Division ${d.code}`);
     return [stmt];
   });
-  await runBatches(db, units);
+  await runBatches(db, ctx.meter, units);
   return { status: "ok", rows: list.length, calls: 0 };
 }
 
@@ -679,7 +835,7 @@ async function cursorLoop<T>(
         ctx.startedAt,
       ),
     ]);
-    await runBatches(ctx.db, units);
+    await runBatches(ctx.db, ctx.meter, units);
     rows += page.items.length;
     ctx.progress = rows;
     cursor = page.nextCursor;
@@ -714,7 +870,7 @@ async function syncOpenItems(ctx: Ctx, entity: "receivables" | "payables"): Prom
       seen.add(it.id);
       units.push([openItemStmt(ctx.db, ctx.division.id, it, ctx.runSeq, nowIso)]);
     }
-    await runBatches(ctx.db, units);
+    await runBatches(ctx.db, ctx.meter, units);
     ctx.progress = units.length;
     return { status: "ok", rows: units.length, calls: 0, completeRead: true };
   }
@@ -750,6 +906,7 @@ async function syncIbans(ctx: Ctx): Promise<EntityResult> {
       best.set(key, { iban: b.iban, main: b.main });
     }
   }
+  ctx.meter.used += 1;
   const existing = await db
     .prepare("SELECT exact_id, iban FROM relations WHERE division_id = ?1")
     .bind(division.id)
@@ -796,6 +953,6 @@ async function syncIbans(ctx: Ctx): Promise<EntityResult> {
         .bind(division.id, rel.exact_id, next.iban, nowIso, rel.iban),
     ]);
   }
-  await runBatches(db, units);
+  await runBatches(db, ctx.meter, units);
   return { status: "ok", rows: accounts.length, calls: 0 };
 }

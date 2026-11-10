@@ -31,6 +31,11 @@ export interface FakeItem {
   currency: string;
   invoiceNumber: number | null;
   ts: number;
+  /** Sync rows only: invoice total (TransactionAmountFC), open in division currency, rate. */
+  original?: number;
+  amountDc?: number;
+  rate?: number;
+  fullyPaid?: boolean;
 }
 
 const date = (ms: number): string => `/Date(${ms})/`;
@@ -167,7 +172,11 @@ export class FakeExact {
       Account: guid(i.account),
       AccountCode: String(i.account),
       AccountName: i.name,
-      Amount: i.amount,
+      AmountFC: i.amount,
+      AmountDC: i.amountDc ?? null,
+      TransactionAmountFC: i.original ?? null,
+      RateFC: i.rate ?? null,
+      IsFullyPaid: i.fullyPaid ?? false,
       Currency: i.currency,
       Description: `Invoice ${i.invoiceNumber ?? ""}`,
       DueDate: date(1_700_000_000_000),

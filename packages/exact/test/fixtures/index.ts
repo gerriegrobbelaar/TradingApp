@@ -44,11 +44,11 @@ export const SYNC_ACCOUNTS = `{"d":{"results":[
 ]}}`;
 
 export const SYNC_RECEIVABLES = `{"d":{"results":[
- {"ID":"a0000000-0000-0000-0000-000000000009","Account":"c0000000-0000-0000-0000-000000000001","AccountCode":"1001","AccountName":"Acme BV","Amount":10,"Currency":"EUR","Description":"x","DueDate":"/Date(1700000000000)/","EntryNumber":9,"InvoiceDate":"/Date(1700000000000)/","InvoiceNumber":9,"Timestamp":500}
+ {"ID":"a0000000-0000-0000-0000-000000000009","Account":"c0000000-0000-0000-0000-000000000001","AccountCode":"1001","AccountName":"Acme BV","AmountFC":10,"AmountDC":10,"TransactionAmountFC":12.5,"RateFC":1,"IsFullyPaid":false,"Currency":"EUR","Description":"x","DueDate":"/Date(1700000000000)/","EntryNumber":9,"InvoiceDate":"/Date(1700000000000)/","InvoiceNumber":9,"Timestamp":500}
 ],"__next":"https://${HOST}/api/v1/${DIV}/sync/Cashflow/Receivables?$filter=Timestamp gt 0L&$orderby=Timestamp&$skiptoken=1"}}`;
 
 export const SYNC_RECEIVABLES_2 = `{"d":{"results":[
- {"ID":"a0000000-0000-0000-0000-00000000000a","Account":"c0000000-0000-0000-0000-000000000001","AccountCode":"1001","AccountName":"Acme BV","Amount":20.25,"Currency":"EUR","Description":"y","DueDate":null,"EntryNumber":10,"InvoiceDate":null,"InvoiceNumber":10,"Timestamp":700}
+ {"ID":"a0000000-0000-0000-0000-00000000000a","Account":"c0000000-0000-0000-0000-000000000001","AccountCode":"1001","AccountName":"Acme BV","AmountFC":20.25,"Currency":"EUR","Description":"y","DueDate":null,"EntryNumber":10,"InvoiceDate":null,"InvoiceNumber":10,"Timestamp":700}
 ]}}`;
 
 export const EMPTY = `{"d":{"results":[]}}`;

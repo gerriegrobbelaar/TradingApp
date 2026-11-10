@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { configureAxe } from "vitest-axe";
 import type { DivisionInfo, DivisionsResponse, Me, SyncResponse } from "./api";
 import { ADMIN, VIEWER, mockFetch, renderApp } from "./test-utils";
+import { describeSync } from "./pages/SyncPanel";
 
 const axe = configureAxe({ rules: { "color-contrast": { enabled: false } } });
 const ME_OK = (me: Me) => ({ "GET /api/auth/me": () => ({ body: me }) });
@@ -177,6 +178,47 @@ describe("Settings, Connections: data sync", () => {
     expect(screen.getAllByText("Updated 5 min ago").length).toBeGreaterThanOrEqual(2);
   });
 
+  it("stamps only completed syncs, and shows an interrupted run as such", async () => {
+    const tenMinAgo = new Date(Date.now() - 10 * 60_000).toISOString();
+    mockFetch({
+      ...ME_OK(ADMIN),
+      ...CONNECTIONS,
+      ...divisions({
+        selectedId: 1,
+        divisions: [
+          div(1, "Alpha BV", {
+            lastSync: {
+              status: "error",
+              mode: "full",
+              error: "http_400",
+              finishedAt: new Date().toISOString(),
+              completedAt: tenMinAgo,
+            },
+          }),
+          div(2, "Beta BV", {
+            lastSync: {
+              status: "running",
+              mode: "full",
+              error: null,
+              finishedAt: tenMinAgo,
+              completedAt: null,
+            },
+          }),
+        ],
+      }),
+    });
+    renderApp("/settings/connections");
+    const alpha = (await screen.findByRole("cell", { name: "Alpha BV" })).closest(
+      "tr",
+    ) as HTMLElement;
+    expect(within(alpha).getByText("Failed")).toBeTruthy();
+    // a failed attempt just now does not make the data "updated just now"
+    expect(within(alpha).getByText("Updated 10 min ago")).toBeTruthy();
+    const beta = screen.getByRole("cell", { name: "Beta BV" }).closest("tr") as HTMLElement;
+    expect(within(beta).getByText("Interrupted")).toBeTruthy();
+    expect(within(beta).getByText("Never")).toBeTruthy();
+  });
+
   it("hides the sync buttons from viewers", async () => {
     mockFetch({ ...ME_OK(VIEWER), ...CONNECTIONS, ...divisions(two) });
     renderApp("/settings/connections");
@@ -204,7 +246,7 @@ describe("Settings, Connections: data sync", () => {
                         mode: "incremental",
                         error: null,
                         finishedAt: new Date().toISOString(),
-                        completedAt: null,
+                        completedAt: new Date().toISOString(),
                       }
                     : null,
               }),
@@ -300,5 +342,23 @@ describe("Settings, Connections: data sync", () => {
     const { container } = renderApp("/settings/connections");
     await screen.findByRole("cell", { name: "Alpha BV" });
     expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
+describe("describeSync", () => {
+  it("explains a refused close instead of a generic failure", () => {
+    const text = describeSync("Alpha BV", {
+      status: "error",
+      mode: "full",
+      callsUsed: 3,
+      finishedAt: new Date().toISOString(),
+      entities: {
+        receivables: { status: "error", rows: 0, calls: 1, error: "empty_list_guard" },
+        payables: { status: "ok", rows: 2, calls: 1 },
+      },
+    });
+    expect(text).toContain("no open receivables");
+    expect(text).toContain("Nothing was closed");
+    expect(text).not.toMatch(/!/);
   });
 });

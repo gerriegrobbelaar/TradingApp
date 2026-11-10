@@ -1,7 +1,8 @@
 import { env } from "cloudflare:test";
 import { ExactAuthError } from "@camelthorn/exact";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { runScheduledExactSync, scheduledMode } from "../src/exact/scheduled";
+import { SUBREQUEST_RESERVE, newMeter } from "../src/exact/sync";
 import { FakeExact, addDivision, db, fakeGate, resetSync } from "./sync-helpers";
 
 describe("scheduledMode (02:00 Amsterdam, across daylight saving time)", () => {
@@ -36,6 +37,31 @@ describe("scheduledMode (02:00 Amsterdam, across daylight saving time)", () => {
     expect(scheduledMode(at("2026-07-15T01:00:00Z"), null)).toBe("full"); // 03:00
     expect(scheduledMode(at("2026-07-15T03:00:00Z"), null)).toBe("full"); // 05:00
     expect(scheduledMode(at("2026-07-15T04:00:00Z"), null)).toBe("incremental"); // 06:00
+  });
+
+  it("does not repeat a full sync that failed today, but retries a partial or interrupted one", () => {
+    const now = at("2026-07-15T02:00:00Z"); // 04:00 CEST
+    const today = "2026-07-15T00:00:05Z";
+    for (const status of ["error", "needs_reauth"]) {
+      expect(scheduledMode(now, null, { mode: "full", status, startedAt: today })).toBe(
+        "incremental",
+      );
+    }
+    for (const status of ["partial", "running"]) {
+      expect(scheduledMode(now, null, { mode: "full", status, startedAt: today })).toBe("full");
+    }
+    // A failed full sync yesterday does not block today's.
+    expect(
+      scheduledMode(now, null, {
+        mode: "full",
+        status: "error",
+        startedAt: "2026-07-14T00:00:05Z",
+      }),
+    ).toBe("full");
+    // An incremental error does not block the full sync.
+    expect(
+      scheduledMode(now, null, { mode: "incremental", status: "error", startedAt: today }),
+    ).toBe("full");
   });
 
   it("judges 'today' by the Amsterdam date, not the UTC date", () => {
@@ -108,5 +134,47 @@ describe("runScheduledExactSync", () => {
     });
     expect(r.ran).toEqual([{ divisionId: div.id, mode: "full", status: "needs_reauth" }]);
     expect(fx.calls).toHaveLength(1);
+  });
+
+  it("an error in one division does not stop the others", async () => {
+    const a = await addDivision();
+    const bExact = a.exactDivision + 1;
+    const b = await db
+      .prepare("INSERT INTO divisions (connection_id, exact_division, name) VALUES (?1, ?2, 'B')")
+      .bind(a.connectionId, bExact)
+      .run();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const fx = new FakeExact(a.exactDivision);
+    fx.divisions = [];
+    fx.beforeCall = (_n, req) => {
+      if (req.division === a.exactDivision) throw new TypeError("boom");
+    };
+    const r = await runScheduledExactSync(env, Date.parse("2026-07-15T12:00:00Z"), {
+      transport: fx.transport,
+      gate: fakeGate(),
+    });
+    expect(r.ran).toEqual([
+      { divisionId: a.id, mode: "incremental", status: "error" },
+      { divisionId: b.meta.last_row_id, mode: "incremental", status: "ok" },
+    ]);
+  });
+
+  it("leaves the remaining divisions for the next tick once the invocation's subrequests run low", async () => {
+    const a = await addDivision();
+    await db
+      .prepare("INSERT INTO divisions (connection_id, exact_division, name) VALUES (?1, ?2, 'B')")
+      .bind(a.connectionId, a.exactDivision + 1)
+      .run();
+    const fx = new FakeExact(a.exactDivision);
+    fx.divisions = [];
+    const meter = newMeter(SUBREQUEST_RESERVE * 2 + 15);
+    const r = await runScheduledExactSync(
+      env,
+      Date.parse("2026-07-15T12:00:00Z"),
+      { transport: fx.transport, gate: fakeGate() },
+      meter,
+    );
+    expect(r.ran).toHaveLength(1);
+    expect(meter.used).toBeLessThanOrEqual(meter.limit);
   });
 });
