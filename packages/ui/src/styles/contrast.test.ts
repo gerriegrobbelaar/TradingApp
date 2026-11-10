@@ -64,9 +64,12 @@ describe("text contrast >= 4.5:1", () => {
         });
       }
     }
-    it(`${name}: --subtle on --sheet surface`, () => {
-      expect(onSurface(tokens, "--subtle", "--sheet")).toBeGreaterThanOrEqual(4.5);
-    });
+    // --subtle is used for sidebar group labels (.grp) on the card, and on sheets.
+    for (const surface of ["--sheet", "--glass-1", "--glass-2"]) {
+      it(`${name}: --subtle on ${surface} surface`, () => {
+        expect(onSurface(tokens, "--subtle", surface)).toBeGreaterThanOrEqual(4.5);
+      });
+    }
   }
 
   it("auto light tokens equal the explicit light tokens", () => {
@@ -91,18 +94,51 @@ describe("non-text contrast >= 3:1 (WCAG 1.4.11)", () => {
     }
   }
 
-  // Interactive control borders (.input, .btn, .seg, .search, .switch, .check) use --control-line.
-  const CONTROL_SURFACES = ["--bg", "--sheet", "--glass-1"];
+  // Interactive control borders (.input, .btn, .seg, .search, .switch) use --control-line.
+  // Native .check keeps the browser's own checkbox border (accent-color control).
+  // Card = glass over bg; both ends of the card gradient are checked.
+  const CONTROL_SURFACES = ["--bg", "--sheet", "--glass-1", "--glass-2"];
   for (const [name, tokens] of SETS) {
     for (const surface of CONTROL_SURFACES) {
+      /** The surface the control sits on, made opaque over --bg. */
+      const surf = () => over(tok(tokens, surface), tok(tokens, "--bg"));
+
       it(`${name}: --control-line on ${surface}`, () => {
-        expect(onSurface(tokens, "--control-line", surface)).toBeGreaterThanOrEqual(3);
+        expect(contrastRatio(tok(tokens, "--control-line"), surf())).toBeGreaterThanOrEqual(3);
+      });
+      it(`${name}: switch off, --knob on --track-off over ${surface}`, () => {
+        const track = over(tok(tokens, "--track-off"), surf());
+        expect(contrastRatio(tok(tokens, "--knob"), track)).toBeGreaterThanOrEqual(3);
+      });
+      it(`${name}: switch on, knob (--accent-ink) on --accent over ${surface}`, () => {
+        const track = over(tok(tokens, "--accent"), surf());
+        expect(contrastRatio(tok(tokens, "--accent-ink"), track)).toBeGreaterThanOrEqual(3);
       });
     }
-    it(`${name}: switch knob on off-state track`, () => {
-      const track = over(tok(tokens, "--track-off"), tok(tokens, "--bg"));
-      expect(contrastRatio(tok(tokens, "--knob"), track)).toBeGreaterThanOrEqual(3);
-    });
   }
+
+  it("checked switch knob uses --accent-ink, off knob uses --knob", () => {
+    const components = readFileSync(join(__dirname, "components.css"), "utf8");
+    expect(components).toMatch(/\.switch::before\{[^}]*background:var\(--knob\)/);
+    expect(components).toMatch(/\.switch:checked::before\{[^}]*background:var\(--accent-ink\)/);
+    expect(components).toMatch(/\.switch\{[^}]*background:var\(--track-off\)/);
+    expect(components).toMatch(/\.switch\{[^}]*border:1px solid var\(--control-line\)/);
+  });
+
+  it(".search shows the focus ring when its inner input has keyboard focus", () => {
+    // `.search input:focus{outline:none}` outranks `.app :focus-visible`, so the wrapper carries it.
+    const components = readFileSync(join(__dirname, "components.css"), "utf8");
+    expect(components).toContain(
+      ".app .search:has(input:focus-visible){outline:2px solid var(--accent-text);outline-offset:2px}",
+    );
+  });
+
+  it("new control tokens are identical in the light and auto blocks and present in dark", () => {
+    for (const t of ["--control-line", "--track-off", "--knob"]) {
+      expect(themes.dark[t]).toBeDefined();
+      expect(themes.light[t]).toBeDefined();
+      expect(themes.auto[t]).toBe(themes.light[t]);
+    }
+  });
   // Decorative --line (table rules, dividers) is intentionally low contrast.
 });
