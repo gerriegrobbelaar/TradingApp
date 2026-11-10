@@ -3,6 +3,22 @@ main = "src/index.ts"
 compatibility_date = "2026-08-01"
 compatibility_flags = ["nodejs_compat"]
 
+# Only reachable through your own route / custom domain (see below). The *.workers.dev
+# hostname and per-version preview URLs would bypass the OAUTH_REDIRECT_URI origin and are off.
+workers_dev = false
+preview_urls = false
+
+# Production route. Uncomment and set your zone/hostname before the first deploy (docs/DEPLOY.md).
+# The hostname must match the origin of OAUTH_REDIRECT_URI below.
+# routes = [{ pattern = "app.example.com", custom_domain = true }]
+# or, on an existing proxied hostname:
+# routes = [{ pattern = "app.example.com/*", zone_name = "example.com" }]
+
+[observability]
+enabled = true
+# Sampling: 1 = keep every request log. Lower this (for example 0.1) if log volume or cost grows.
+head_sampling_rate = 1
+
 [assets]
 directory = "../web/dist"
 not_found_handling = "single-page-application"
@@ -10,19 +26,26 @@ run_worker_first = ["/api/*"]
 binding = "ASSETS"
 
 [vars]
-# Seeded (idempotently) as the initial admin by the first migration (CLAUDE.md 4.0).
+# Seeded as the initial admin when the Worker starts, at most once per database (a settings marker
+# makes re-runs no-ops; see apps/worker/src/db/seed.ts). It is not a SQL migration because D1
+# migrations cannot read Workers variables (CLAUDE.md 4.0).
 # Read from this variable only; never hard-code it in source.
 INITIAL_ADMIN_EMAIL = "gerrie.grobbelaar@camelthorncapital.com"
 ALLOWED_HD = "camelthorncapital.com"
-# Google OAuth client ID (public). Empty placeholder: set it to enable sign-in; until then every
-# non-public route answers 500 server_misconfigured. Secrets are not here, see README.md.
+# PLACEHOLDER. Google OAuth client ID (public). Empty until the Google Cloud project exists; while
+# empty, every route except /api/health answers 500 server_misconfigured. Secrets are not here,
+# see apps/worker/README.md and docs/DEPLOY.md.
 GOOGLE_CLIENT_ID = ""
-# Must equal the authorised redirect URI of the Google OAuth client; its origin is also the CSRF origin.
+# PLACEHOLDER (app.example.com). Must equal an authorised redirect URI of the Google OAuth client;
+# its origin is also the CSRF origin. For local dev override it in .dev.vars, see
+# .dev.vars.example (do not edit this value for local work).
 OAUTH_REDIRECT_URI = "https://app.example.com/api/auth/callback"
 
 [[d1_databases]]
 binding = "DB"
 database_name = "camelthorn-finance"
-# Placeholder. Create the database with EU jurisdiction (wrangler d1 create --jurisdiction eu)
-# and paste the real id here.
+# PLACEHOLDER (all zeros). Create the database with EU jurisdiction and paste the real id here:
+#   wrangler d1 create camelthorn-finance --jurisdiction eu
+# The jurisdiction cannot be changed later. See docs/DEPLOY.md.
 database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"

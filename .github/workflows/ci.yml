@@ -17,6 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      # TODO(N7): pin these actions by commit SHA (uses: owner/repo@<sha> # v4). The SHAs could not
+      # be verified from the build environment (GitHub API access was unavailable), so the major
+      # tags are kept for now rather than guessing hashes.
       - uses: actions/checkout@v4
       # Version comes from "packageManager" in package.json.
       - uses: pnpm/action-setup@v4
@@ -29,3 +32,5 @@ jobs:
       - run: pnpm lint
       - run: pnpm test
       - run: pnpm --filter @camelthorn/web build
+      # Validates config, assets and bundle without publishing or needing Cloudflare credentials.
+      - run: pnpm --filter @camelthorn/worker exec wrangler deploy --dry-run

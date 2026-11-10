@@ -1,0 +1,14 @@
+# Copy to .dev.vars (git-ignored) for local development: cp .dev.vars.example .dev.vars
+# wrangler dev loads .dev.vars; values here override [vars] in wrangler.toml, so local overrides
+# never touch committed config.
+
+# Secrets (placeholders; use a Google OAuth client with the local redirect URI registered)
+GOOGLE_CLIENT_SECRET=replace-with-google-oauth-client-secret
+# At least 32 random characters: openssl rand -base64 48
+SESSION_SECRET=replace-with-at-least-32-random-characters-xxxxxxxx
+
+# Local overrides of public vars. The browser talks to the Vite dev server on 5173, which proxies
+# /api to the Worker on 8787, so the redirect URI uses port 5173.
+OAUTH_REDIRECT_URI=http://localhost:5173/api/auth/callback
+# Needed locally until the committed placeholder is filled:
+# GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com

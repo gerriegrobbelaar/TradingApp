@@ -5,14 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
     <title>Camelthorn Finance</title>
-    <script>
-      // Apply the stored theme before first paint. Same key as @camelthorn/ui THEME_STORAGE_KEY.
-      // Auto (or anything unknown, or blocked storage) leaves data-theme unset.
-      try {
-        var t = localStorage.getItem("camelthorn.theme");
-        if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
-      } catch (e) {}
-    </script>
+    <script src="/theme-boot.js"></script>
   </head>
   <body>
     <div id="root"></div>
