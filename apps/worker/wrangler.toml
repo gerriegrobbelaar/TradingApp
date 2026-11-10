@@ -10,8 +10,9 @@ run_worker_first = ["/api/*"]
 binding = "ASSETS"
 
 [vars]
-# Seeded as the initial admin by the first migration (CLAUDE.md 4.0). Set per environment.
-INITIAL_ADMIN_EMAIL = ""
+# Seeded (idempotently) as the initial admin by the first migration (CLAUDE.md 4.0).
+# Read from this variable only; never hard-code it in source.
+INITIAL_ADMIN_EMAIL = "gerrie.grobbelaar@camelthorncapital.com"
 ALLOWED_HD = "camelthorncapital.com"
 
 [[d1_databases]]
