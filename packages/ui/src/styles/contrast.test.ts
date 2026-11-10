@@ -90,6 +90,19 @@ describe("non-text contrast >= 3:1 (WCAG 1.4.11)", () => {
       });
     }
   }
-  // Control borders (--line) and the light-theme off switch (white knob on --fill-2) are below
-  // 3:1 in the design; see docs/design/NOTES.md "Open contrast items".
+
+  // Interactive control borders (.input, .btn, .seg, .search, .switch, .check) use --control-line.
+  const CONTROL_SURFACES = ["--bg", "--sheet", "--glass-1"];
+  for (const [name, tokens] of SETS) {
+    for (const surface of CONTROL_SURFACES) {
+      it(`${name}: --control-line on ${surface}`, () => {
+        expect(onSurface(tokens, "--control-line", surface)).toBeGreaterThanOrEqual(3);
+      });
+    }
+    it(`${name}: switch knob on off-state track`, () => {
+      const track = over(tok(tokens, "--track-off"), tok(tokens, "--bg"));
+      expect(contrastRatio(tok(tokens, "--knob"), track)).toBeGreaterThanOrEqual(3);
+    });
+  }
+  // Decorative --line (table rules, dividers) is intentionally low contrast.
 });

@@ -38,14 +38,25 @@ the auto media block, here and in `packages/ui`:
 | `--warn-text` | `#b4442f` | `#a63d29` | warn chip text on `--warn-soft` | 4.30 |
 | `--gold` | `#8c6a1f` | `#7a5a15` | gold chip text on `--gold-soft` | 3.93 |
 
-## Open contrast items (design decision needed)
+## Control borders and switch (resolved)
 
-Not changed, because fixing them alters the look of every screen:
+New tokens, defined in dark, light and the auto block, and used by `.btn`, `.input`, `.search`,
+`.seg` and `.switch` (decorative `--line` for table rules and dividers is unchanged):
+
+| Token | Dark | Light | Use |
+|---|---|---|---|
+| `--control-line` | `#7f8ca1` | `#738096` | Border of interactive controls, at least 3:1 on bg, sheet and card |
+| `--track-off` | `rgba(255,255,255,.15)` | `#738096` | Off-state switch track |
+| `--knob` | `#ffffff` | `#ffffff` | Switch knob, at least 3:1 on the off track |
+
+`.seg` gained a 1px border (padding 4px to 3px, same size). Native `.check` keeps the browser
+checkbox border (an `accent-color` control cannot take `--control-line`). Screenshots:
+`docs/design/screens/controls-{light,dark}.png`.
+
+## Open contrast items
 
 | Item | Dark | Light | Note |
 |---|---|---|---|
-| Control border `--line` on bg / card | 1.30 / 1.37 | 1.22 / 1.22 | Buttons and inputs also have a fill and a visible label, but the boundary itself is below 3:1 |
-| Switch off state: white knob on `--fill-2` | 12.1 | 1.37 | Light theme off switch is hard to see; knob colour is hard-coded `#fff` |
 | `--subtle` text on the card surface | 3.70 | 5.27 | Used for sidebar group labels (`.grp`); passes on bg and sheet |
 
 Orbs behind the glass are ignored (they are blurred decoration), so card ratios are approximate.
