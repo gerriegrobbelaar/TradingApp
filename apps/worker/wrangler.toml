@@ -1,3 +1,6 @@
+# PLACEHOLDERS below (database_id, GOOGLE_CLIENT_ID, OAUTH_REDIRECT_URI, routes) must be filled in
+# before the first deploy. Deploy with `pnpm --filter @camelthorn/worker run deploy`, which runs
+# scripts/check-deploy-config.mjs and refuses while any placeholder is left (docs/DEPLOY.md).
 name = "camelthorn-finance"
 main = "src/index.ts"
 compatibility_date = "2026-08-01"

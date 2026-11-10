@@ -30,7 +30,12 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm lint
-      - run: pnpm test
+      # Build before tests so apps/web/src/headers.test.ts also checks the built dist/_headers.
       - run: pnpm --filter @camelthorn/web build
+      - run: pnpm test
       # Validates config, assets and bundle without publishing or needing Cloudflare credentials.
+      # It does not run the placeholder guard (scripts/check-deploy-config.mjs); `pnpm run deploy`
+      # does, so committed placeholders cannot be deployed by that path.
       - run: pnpm --filter @camelthorn/worker exec wrangler deploy --dry-run
+        env:
+          WRANGLER_SEND_METRICS: "false"
