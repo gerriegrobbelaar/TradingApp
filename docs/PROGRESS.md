@@ -26,6 +26,7 @@ Orchestrator log. Update after every merge and every direct (trivial) edit.
   - Open for final review: control borders (--line) and off-switch knob below 3:1 non-text contrast; see docs/design/NOTES.md.
 - 2026-11-10: T4 Google sign-in, sessions, users/roles API merged (reviewer PASS; fixed step-up refresh and callback replay).
   - Go-live check: confirm Google returns auth_time with max_age (step-up fails closed otherwise); see apps/worker/README.md.
+- 2026-11-10: T5 app shell, sign-in UI, Settings/Users merged (reviewer PASS, browser-checked at 360/1280 in both themes; screenshots in docs/design/screens/).
 - 2026-11-10: ADR 0001 (Workers only), ADR 0002 (camelthorncapital.com only, no external emails in v1). Direct edit (docs).
 
 ## Open decisions (CLAUDE.md §9)
