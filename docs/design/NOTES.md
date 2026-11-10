@@ -50,3 +50,6 @@ Not changed, because fixing them alters the look of every screen:
 
 Orbs behind the glass are ignored (they are blurred decoration), so card ratios are approximate.
 Decorative colours (orbs, `--in`, `--out`, meter and pace bars) are not checked.
+
+## Orchestrator change: dark `--subtle`
+`--subtle` (dark) changed from `#7d8a9c` to `#97a3b4` so sidebar group labels reach 4.5:1 on the card surface. Applied to both `app.css` and `tokens.css`.
