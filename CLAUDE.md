@@ -110,9 +110,10 @@ Re-check each API's current docs before implementing; note any difference in an 
   `state`/`nonce`). No passwords are stored in the app.
 - Verify the Google ID token on the server: signature (Google's published keys), `iss`, `aud`
   (our client ID), `exp`, `nonce` and `email_verified = true`.
-- **Initial administrator: `gerrie.grobbelaar@camelthorncapital.com`.** Seed it in the first
-  migration from the `INITIAL_ADMIN_EMAIL` Workers variable (not hard-coded in source), with role
-  `admin`. Seeding is idempotent and never creates a second admin on re-run.
+- **Initial administrator: `gerrie.grobbelaar@camelthorncapital.com`.** Seed it at the first
+  Worker start from the `INITIAL_ADMIN_EMAIL` Workers variable (not hard-coded in source; D1
+  migrations cannot read variables), with role `admin`. Seeding is idempotent, marked once in
+  `settings`, and never creates a second admin on re-run (docs/decisions/0004).
 - Access is **invite-only**: a Google account can sign in only if an admin has added its email in
   Settings → Users. Additionally restrict to the `camelthorncapital.com` Google Workspace domain
   (`hd` claim checked server-side, not only as a login hint) unless the admin allows an external
