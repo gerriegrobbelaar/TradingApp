@@ -1,8 +1,9 @@
+import { DEFAULT_EXACT_HOST } from "@camelthorn/exact";
 import type { Env } from "../env";
 import { isValidEncKey } from "../crypto/token-crypto";
 
 export const EXACT_CALLBACK_PATH = "/api/connections/exact/callback";
-export const DEFAULT_EXACT_HOST = "start.exactonline.nl";
+export { DEFAULT_EXACT_HOST };
 
 /**
  * Exact serves each country from its own host. Only these may ever be called or stored, so a

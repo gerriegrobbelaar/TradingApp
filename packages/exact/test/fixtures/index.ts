@@ -7,11 +7,11 @@
 export const HOST = "start.exactonline.nl";
 export const DIV = 1234567;
 
-export const ME = `{"d":{"results":[{"__metadata":{"uri":"https://${HOST}/api/v1/current/Me(guid'x')","type":"Exact.Web.Api.Models.Me"},"UserID":"11111111-2222-3333-4444-555555555555","UserName":"gerrie","FullName":"Test User","Email":"test@example.com","CurrentDivision":${DIV}}]}}`;
+export const ME = `{"d":{"results":[{"__metadata":{"uri":"https://${HOST}/api/v1/current/Me(guid'x')","type":"Exact.Web.Api.Models.Me"},"UserID":"11111111-2222-3333-4444-555555555555","UserName":"gerrie","FullName":"Test User","Email":"test@example.com","CurrentDivision":${DIV},"DivisionCustomer":"AAAAAAAA-0000-0000-0000-00000000000C","DivisionCustomerName":" Camelthorn Advisory B.V. "}]}}`;
 
 export const DIVISIONS = `{"d":{"results":[
- {"__metadata":{"uri":"x"},"Code":${DIV},"Description":"Camelthorn Advisory B.V.","Country":"NL","Status":1,"Main":true},
- {"__metadata":{"uri":"x"},"Code":7654321,"Description":"  Second BV ","Country":"NL","Status":1,"Main":false}
+ {"__metadata":{"uri":"x"},"Code":${DIV},"Description":"Camelthorn Advisory B.V.","Country":"NL","Currency":"EUR","Status":1,"Main":true},
+ {"__metadata":{"uri":"x"},"Code":7654321,"Description":"  Second BV ","Country":"GB","Currency":"gbp","Status":1,"Main":false}
 ]}}`;
 
 export function receivablesPage1(): string {

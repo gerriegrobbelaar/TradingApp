@@ -6,6 +6,7 @@ import {
   ExactRateLimitedError,
   OPEN_ITEM_LIST_FIELDS,
   createExactClient,
+  fetchCurrentMe,
   odataGuid,
   odataString,
   resolveNextLink,
@@ -71,7 +72,29 @@ describe("currentMe and divisions", () => {
       fullName: "Test User",
       email: "test@example.com",
       currentDivision: fx.DIV,
+      divisionCustomerId: "aaaaaaaa-0000-0000-0000-00000000000c",
+      divisionCustomerName: "Camelthorn Advisory B.V.",
     });
+  });
+
+  it("maps Me without the customer fields to nulls", async () => {
+    const body = `{"d":{"results":[{"UserID":"11111111-2222-3333-4444-555555555555","CurrentDivision":5,"DivisionCustomer":"not-a-guid"}]}}`;
+    const me = await createExactClient(scripted([ok(body)]).transport, base).currentMe();
+    expect(me).toMatchObject({ divisionCustomerId: null, divisionCustomerName: null });
+  });
+
+  it("fetchCurrentMe sends division 0 / path /Me through any transport", async () => {
+    const { transport, calls } = scripted([ok(fx.ME)]);
+    const me = await fetchCurrentMe(transport, { jobId: "exact-connect" });
+    expect(me.currentDivision).toBe(fx.DIV);
+    expect(calls[0]).toMatchObject({
+      division: 0,
+      path: "/Me",
+      jobId: "exact-connect",
+      priority: "user",
+      api: "rest",
+    });
+    expect(calls[0]?.query?.["$select"]).toContain("DivisionCustomerName");
   });
 
   it("rejects an empty or incomplete Me", async () => {
@@ -93,11 +116,25 @@ describe("currentMe and divisions", () => {
         code: fx.DIV,
         description: "Camelthorn Advisory B.V.",
         country: "NL",
+        currency: "EUR",
         status: 1,
         main: true,
       },
-      { code: 7654321, description: "Second BV", country: "NL", status: 1, main: false },
+      {
+        code: 7654321,
+        description: "Second BV",
+        country: "GB",
+        currency: "GBP",
+        status: 1,
+        main: false,
+      },
     ]);
+  });
+
+  it("maps an unreadable division currency to null", async () => {
+    const body = `{"d":{"results":[{"Code":5,"Description":"x","Currency":"EURO"},{"Code":6,"Description":"y"}]}}`;
+    const d = await createExactClient(scripted([ok(body)]).transport, base).listDivisions();
+    expect(d.map((x) => x.currency)).toEqual([null, null]);
   });
 
   it("rejects a division without Code", async () => {

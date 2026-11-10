@@ -7,6 +7,9 @@ name = "camelthorn-finance"
 workers_dev = false
 routes = [{ pattern = "finance.camelthorncapital.com", custom_domain = true }]
 
+[triggers]
+crons = ["0 * * * *"]
+
 [vars]
 GOOGLE_CLIENT_ID = "123-abc.apps.googleusercontent.com"
 OAUTH_REDIRECT_URI = "https://finance.camelthorncapital.com/api/auth/callback"
@@ -78,6 +81,36 @@ describe("deploy config guard", () => {
     }
     const empty = ready.replace(/EXACT_CLIENT_ID = .*/, 'EXACT_CLIENT_ID = ""');
     expect(deployConfigProblems(empty)).toEqual(["EXACT_CLIENT_ID is empty"]);
+  });
+});
+
+describe("review G3: cron trigger check", () => {
+  const NO_CRON = "no cron trigger";
+  it("keeps the committed wrangler.toml's cron trigger", () => {
+    expect(deployConfigProblems(committed).join("\n")).not.toContain(NO_CRON);
+  });
+
+  it("blocks a config without [triggers] crons", () => {
+    const none = ready.replace(/\[triggers\]\ncrons = .*\n/, "");
+    expect(deployConfigProblems(none).join("\n")).toContain(NO_CRON);
+    const empty = ready.replace('crons = ["0 * * * *"]', "crons = []");
+    expect(deployConfigProblems(empty).join("\n")).toContain(NO_CRON);
+    const tableOnly = ready.replace('crons = ["0 * * * *"]', "");
+    expect(deployConfigProblems(tableOnly).join("\n")).toContain(NO_CRON);
+  });
+
+  it("ignores a commented-out cron and a crons key under another table", () => {
+    const commented = ready.replace('crons = ["0 * * * *"]', '# crons = ["0 * * * *"]');
+    expect(deployConfigProblems(commented).join("\n")).toContain(NO_CRON);
+    const elsewhere = ready
+      .replace('crons = ["0 * * * *"]', "")
+      .replace("[vars]", '[vars]\ncrons = ["0 * * * *"]');
+    expect(deployConfigProblems(elsewhere).join("\n")).toContain(NO_CRON);
+  });
+
+  it("accepts the cron anywhere inside [triggers], with other keys around it", () => {
+    const t = ready.replace('crons = ["0 * * * *"]', '# a comment\ncrons = [\n  "0 * * * *",\n]');
+    expect(deployConfigProblems(t)).toEqual([]);
   });
 });
 

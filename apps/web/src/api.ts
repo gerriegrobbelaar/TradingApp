@@ -199,7 +199,15 @@ export interface ConnectionRow {
   lastError: string | null;
   connectedBy: string | null;
   connectedAt: string | null;
-  divisions: { division: number; name: string; currency: string }[];
+  divisions: {
+    /** Our id (divisions.id), used by the sync switch. */
+    id: number;
+    division: number;
+    name: string;
+    currency: string;
+    /** Only enabled administrations are synced; the one Exact reports as current starts enabled. */
+    syncEnabled: boolean;
+  }[];
 }
 
 export interface ConnectionsResponse {
@@ -213,6 +221,20 @@ export const disconnectExact = () =>
   request<{ ok: true; changed: boolean }>("/api/connections/exact/disconnect", { method: "POST" });
 /** Full-page navigation: the Worker redirects to Exact and back to /settings/connections. */
 export const EXACT_START_URL = "/api/connections/exact/start";
+/** Same, but confirms replacing the connection with a different Exact account. */
+export const EXACT_REPLACE_URL = "/api/connections/exact/start?confirm_replace=1";
+export const setDivisionSync = (divisionId: number, enabled: boolean) =>
+  request<{ id: number; syncEnabled: boolean }>(`/api/divisions/${divisionId}/sync-enabled`, {
+    method: "PUT",
+    body: { enabled },
+  });
+export interface SyncSettings {
+  /** Hourly syncs also read open receivables and payables (off until verified, ADR 0017). */
+  incrementalOpenItems: boolean;
+}
+export const getSyncSettings = () => request<SyncSettings>("/api/sync/settings");
+export const putSyncSettings = (s: SyncSettings) =>
+  request<SyncSettings>("/api/sync/settings", { method: "PUT", body: s });
 
 export type SyncStatus = "running" | "ok" | "partial" | "error" | "needs_reauth";
 
@@ -222,6 +244,8 @@ export interface DivisionInfo {
   division: number;
   name: string;
   currency: string;
+  /** False: listed, but not synced until an admin turns it on (Settings, Connections). */
+  syncEnabled: boolean;
   connectionStatus: ConnectionStatus;
   syncing: boolean;
   lastSync: {

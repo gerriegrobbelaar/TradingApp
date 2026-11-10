@@ -8,6 +8,7 @@ import {
 } from "@camelthorn/exact";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  createCurrentGateTransport,
   createGateTransport,
   gateName,
   getExactGate,
@@ -658,6 +659,30 @@ describe("request building", () => {
   it("transport rejects a request for another division than its gate", async () => {
     const t = createGateTransport(env, 5);
     await expect(t(req(6))).rejects.toMatchObject({ code: "division_mismatch" });
+  });
+
+  it("the normal transport cannot be built for the current division (0)", () => {
+    expect(() => createGateTransport(env, 0)).toThrow("invalid division");
+    expect(() => createGateTransport(env, -1)).toThrow("invalid division");
+  });
+
+  it("the current-division transport serves GET /Me and nothing else", async () => {
+    await seedConnection();
+    const t = createCurrentGateTransport(env);
+    await expect(t(req(0, { path: "/Me" }))).resolves.toMatchObject({ status: 200 });
+    for (const over of [
+      { path: "/crm/Accounts" },
+      { path: "/Me", method: "POST" as const },
+      { path: "/Me", api: "xml" as const },
+    ]) {
+      await expect(t(req(0, over))).rejects.toMatchObject({ code: "division_mismatch" });
+    }
+    await expect(t(req(5, { path: "/Me" }))).rejects.toMatchObject({ code: "division_mismatch" });
+  });
+
+  it("the gate itself still refuses division 0 for anything but /Me", () => {
+    expect(() => validateRequest(req(0, { path: "/crm/Accounts" }))).toThrow(ExactApiError);
+    expect(() => validateRequest(req(0, { path: "/Me", api: "xml" }))).toThrow(ExactApiError);
   });
 });
 

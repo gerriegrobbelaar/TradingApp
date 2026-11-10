@@ -67,6 +67,13 @@ export interface CurrentMe {
   email: string | null;
   /** The division the user last used; the default for `createExactClient`. */
   currentDivision: number;
+  /**
+   * The Exact customer (subscription owner) that owns the current division: a stable id and a
+   * name, used to notice a reconnect to a DIFFERENT Exact account (docs/decisions/0016). Null
+   * when Exact does not return the field. Field names to verify with credentials (ADR 0014).
+   */
+  divisionCustomerId: string | null;
+  divisionCustomerName: string | null;
 }
 
 export interface Division {
@@ -75,6 +82,12 @@ export interface Division {
   country: string | null;
   status: number | null;
   main: boolean;
+  /**
+   * The division's own currency (ISO 4217, upper case), null if Exact did not send a readable
+   * one. Sets the scale of division-currency amounts. Field `Currency` on system/Divisions:
+   * verify with credentials (ADR 0014).
+   */
+  currency: string | null;
 }
 
 export interface ExactAccount {
@@ -180,8 +193,23 @@ export interface ListChunk<T> {
 // Typed field lists ($select is sent on every REST call)
 // ---------------------------------------------------------------------------------------------
 
-export const ME_FIELDS = ["UserID", "UserName", "FullName", "Email", "CurrentDivision"] as const;
-export const DIVISION_FIELDS = ["Code", "Description", "Country", "Status", "Main"] as const;
+export const ME_FIELDS = [
+  "UserID",
+  "UserName",
+  "FullName",
+  "Email",
+  "CurrentDivision",
+  "DivisionCustomer",
+  "DivisionCustomerName",
+] as const;
+export const DIVISION_FIELDS = [
+  "Code",
+  "Description",
+  "Country",
+  "Currency",
+  "Status",
+  "Main",
+] as const;
 export const ACCOUNT_FIELDS = [
   "ID",
   "Code",
@@ -365,6 +393,17 @@ export function odataString(v: string): string {
 function maxTimestamp(a: string, b: string | null): string {
   if (b === null) return a;
   return BigInt(b) > BigInt(a) ? b : a;
+}
+
+function guidOrNull(r: Row, field: string): string | null {
+  const v = trimField(r, field);
+  return v !== null && isGuid(v) ? v.toLowerCase() : null;
+}
+
+function currencyOrNull(r: Row, field: string): string | null {
+  const v = trimField(r, field);
+  const code = v === null ? null : v.toUpperCase();
+  return code !== null && /^[A-Z]{3}$/.test(code) ? code : null;
 }
 
 function assertMaxPages(v: number): number {
@@ -680,6 +719,8 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
         fullName: trimField(r, "FullName"),
         email: trimField(r, "Email"),
         currentDivision,
+        divisionCustomerId: guidOrNull(r, "DivisionCustomer"),
+        divisionCustomerName: trimField(r, "DivisionCustomerName"),
       };
     },
 
@@ -694,6 +735,7 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
           country: trimField(r, "Country"),
           status: intField(r, "Status"),
           main: boolField(r, "Main"),
+          currency: currencyOrNull(r, "Currency"),
         };
       });
     },
@@ -868,3 +910,22 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
 }
 
 export type ExactClient = ReturnType<typeof createExactClient>;
+
+/**
+ * `/current/Me` through any transport, with no division of its own (division 0 is the "current
+ * division" and exists only for this call; the gate accepts it for `/Me` only). Used by the OAuth
+ * callback, so the call takes the same path as every other (gate, rate limit, token refresh).
+ */
+export function fetchCurrentMe(
+  transport: ExactTransport,
+  opts: { jobId: string; priority?: ExactPriority; sleep?: (ms: number) => Promise<void> },
+): Promise<CurrentMe> {
+  // The client needs a division number to be constructed; currentMe() never uses it (it sends 0).
+  const client = createExactClient(transport, {
+    division: 1,
+    jobId: opts.jobId,
+    priority: opts.priority ?? "user",
+    ...(opts.sleep !== undefined ? { sleep: opts.sleep } : {}),
+  });
+  return client.currentMe();
+}

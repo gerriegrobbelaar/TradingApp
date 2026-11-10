@@ -1,6 +1,7 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { maskDeep, maskIban, writeAudit } from "../src/db/audit";
+import { maskIban } from "@camelthorn/core";
+import { maskDeep, writeAudit } from "../src/db/audit";
 import {
   claimIdempotencyKey,
   claimOnceAndPurge,

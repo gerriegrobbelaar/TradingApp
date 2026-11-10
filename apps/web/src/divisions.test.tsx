@@ -15,6 +15,7 @@ const div = (id: number, name: string, over: Partial<DivisionInfo> = {}): Divisi
   division: 1000 + id,
   name,
   currency: "EUR",
+  syncEnabled: true,
   connectionStatus: "active",
   syncing: false,
   lastSync: null,

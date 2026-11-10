@@ -2,7 +2,7 @@ import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cookieFrom, addSession, addUser, authed, call, db, resetDb, setCookies } from "./helpers";
 import worker from "../src/index";
-import { parseMe } from "../src/exact/routes";
+import { exactIdentity, isDifferentAccount } from "../src/exact/routes";
 import {
   auditActions,
   resetExact,
@@ -14,9 +14,21 @@ import {
 
 const ADMIN = "gerrie.grobbelaar@camelthorncapital.com";
 const FLOW = "__Host-exact-oauth";
-const ME = {
-  d: { results: [{ CurrentDivision: 123456, DivisionCustomerName: "Camelthorn Advisory B.V." }] },
-};
+const CUSTOMER = "aaaaaaaa-1111-2222-3333-444444444444";
+const meBody = (over: Record<string, unknown> = {}) => ({
+  d: {
+    results: [
+      {
+        UserID: "11111111-2222-3333-4444-555555555555",
+        CurrentDivision: 123456,
+        DivisionCustomer: CUSTOMER,
+        DivisionCustomerName: "Camelthorn Advisory B.V.",
+        ...over,
+      },
+    ],
+  },
+});
+const ME = meBody();
 
 let adminTok: string;
 let adminId: number;
@@ -45,8 +57,8 @@ interface Started {
   location: URL;
 }
 
-async function start(token = adminTok): Promise<Started> {
-  const res = await authed("/api/connections/exact/start", token);
+async function start(token = adminTok, query = ""): Promise<Started> {
+  const res = await authed(`/api/connections/exact/start${query}`, token);
   expect(res.status).toBe(302);
   const location = new URL(res.headers.get("location") ?? "");
   return {
@@ -363,7 +375,14 @@ describe("GET /api/connections", () => {
           kind: "exact",
           status: "active",
           connectedBy: "gerrie@camelthorncapital.com",
-          divisions: [{ division: 42, name: "BV", currency: "EUR" }],
+          divisions: [
+            expect.objectContaining({
+              division: 42,
+              name: "BV",
+              currency: "EUR",
+              syncEnabled: false,
+            }),
+          ],
         }),
       ]);
     }
@@ -436,25 +455,173 @@ describe("misconfiguration", () => {
   });
 });
 
-describe("parseMe", () => {
-  it("reads the current division and falls back to a generic name", () => {
-    expect(parseMe(JSON.stringify(ME))).toEqual({
-      division: 123456,
-      name: "Camelthorn Advisory B.V.",
+describe("reconnecting to another Exact account", () => {
+  const rows = () =>
+    db
+      .prepare("SELECT exact_division, sync_enabled FROM divisions ORDER BY exact_division")
+      .all<{ exact_division: number; sync_enabled: number }>();
+  const conn = () =>
+    db
+      .prepare("SELECT status, last_error, exact_identity, access_token_enc FROM connections")
+      .first<{
+        status: string;
+        last_error: string | null;
+        exact_identity: string | null;
+        access_token_enc: string | null;
+      }>();
+
+  it("stores the identity and enables only the /Me division on the first connection", async () => {
+    await callback(await start());
+    expect((await rows()).results).toEqual([{ exact_division: 123456, sync_enabled: 1 }]);
+    expect((await conn())?.exact_identity).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("lets the same account reconnect and never re-enables a division an admin switched off", async () => {
+    await callback(await start());
+    await db.batch([
+      db.prepare("UPDATE divisions SET sync_enabled = 0"),
+      db.prepare(
+        "INSERT INTO divisions (connection_id, exact_division, name, sync_enabled) SELECT id, 777, 'Other', 0 FROM connections",
+      ),
+    ]);
+    // Same customer, but Exact now says the current division is 777.
+    stub.api = () => Response.json(meBody({ CurrentDivision: 777 }));
+    const res = await callback(await start());
+    expect(res.headers.get("location")).toBe("/settings/connections?exact=connected");
+    // The admin had switched everything off and the reconnect did not turn anything back on.
+    const r = (await rows()).results;
+    expect(r.filter((d) => d.sync_enabled === 1).map((d) => d.exact_division)).toEqual([]);
+  });
+
+  it("refuses a different account without confirmation and removes the new sign-in", async () => {
+    await callback(await start());
+    const before = await conn();
+    stub.api = () =>
+      Response.json(
+        meBody({
+          CurrentDivision: 999001,
+          DivisionCustomer: "bbbbbbbb-1111-2222-3333-444444444444",
+          DivisionCustomerName: "Other Company B.V.",
+        }),
+      );
+    const res = await callback(await start());
+    expect(res.headers.get("location")).toBe("/settings/connections?exact=different_exact_account");
+    const after = await conn();
+    expect(after).toMatchObject({
+      status: "disabled",
+      last_error: "different_exact_account",
+      access_token_enc: null,
+      exact_identity: before?.exact_identity,
     });
-    expect(parseMe(JSON.stringify({ d: [{ CurrentDivision: "77" }] }))).toEqual({
-      division: 77,
-      name: "Division 77",
-    });
-    for (const bad of [
-      "",
-      "{}",
-      '{"d":{"results":[]}}',
-      '{"d":{"results":[{"CurrentDivision":0}]}}',
-      "[1]",
-    ]) {
-      expect(parseMe(bad)).toBeNull();
-    }
+    // Old divisions untouched, the new one not added.
+    expect((await rows()).results).toEqual([{ exact_division: 123456, sync_enabled: 1 }]);
+    expect(await auditActions("connection.exact_account_mismatch")).toBe(1);
+    expect(await auditActions("connection.exact_account_replaced")).toBe(0);
+  });
+
+  it("replaces the account with confirm_replace=1: old divisions off, new one on, audited", async () => {
+    await callback(await start());
+    stub.api = () =>
+      Response.json(
+        meBody({
+          CurrentDivision: 999001,
+          DivisionCustomer: "bbbbbbbb-1111-2222-3333-444444444444",
+          DivisionCustomerName: "Other Company B.V.",
+        }),
+      );
+    const res = await callback(await start(adminTok, "?confirm_replace=1"));
+    expect(res.headers.get("location")).toBe("/settings/connections?exact=connected");
+    expect((await rows()).results).toEqual([
+      { exact_division: 123456, sync_enabled: 0 },
+      { exact_division: 999001, sync_enabled: 1 },
+    ]);
+    expect(await conn()).toMatchObject({ status: "active", last_error: null });
+    expect(await auditActions("connection.exact_account_replaced")).toBe(1);
+    const audit = await db
+      .prepare(
+        "SELECT actor_email, after_json FROM audit_log WHERE action = 'connection.exact_account_replaced'",
+      )
+      .first<{ actor_email: string; after_json: string }>();
+    expect(audit?.actor_email).toBe(ADMIN);
+    expect(audit?.after_json).toContain("999001");
+  });
+
+  it("confirm_replace is only honoured for the flow that was started with it", async () => {
+    await callback(await start());
+    stub.api = () =>
+      Response.json(
+        meBody({
+          CurrentDivision: 999001,
+          DivisionCustomer: "cccccccc-1111-2222-3333-444444444444",
+        }),
+      );
+    // A plain start with the parameter only on the callback URL does not count.
+    const s = await start();
+    const res = await callback(s, adminTok, "code=the-code&confirm_replace=1");
+    expect(res.headers.get("location")).toBe("/settings/connections?exact=different_exact_account");
+  });
+
+  it("falls back to the division list when the identity is unknown on one side", async () => {
+    await callback(await start());
+    await db.prepare("UPDATE connections SET exact_identity = NULL").run();
+    // Same division as before: the same account, and the identity is filled in.
+    await callback(await start());
+    expect((await conn())?.exact_identity).toMatch(/^[0-9a-f]{64}$/);
+    await db.prepare("UPDATE connections SET exact_identity = NULL").run();
+    stub.api = () => Response.json(meBody({ CurrentDivision: 555 }));
+    const res = await callback(await start());
+    expect(res.headers.get("location")).toContain("different_exact_account");
+  });
+});
+
+describe("account identity", () => {
+  const me = (over: Partial<Parameters<typeof exactIdentity>[0]>) => ({
+    userId: "u",
+    userName: null,
+    fullName: null,
+    email: null,
+    currentDivision: 1,
+    divisionCustomerId: null,
+    divisionCustomerName: null,
+    ...over,
+  });
+
+  it("hashes the customer id, else the normalised name, else nothing", async () => {
+    const byId = await exactIdentity(
+      me({ divisionCustomerId: CUSTOMER, divisionCustomerName: "A" }),
+    );
+    expect(byId).toMatch(/^[0-9a-f]{64}$/);
+    expect(
+      await exactIdentity(me({ divisionCustomerId: CUSTOMER, divisionCustomerName: "B" })),
+    ).toBe(byId);
+    const byName = await exactIdentity(me({ divisionCustomerName: "  Camelthorn B.V. " }));
+    expect(byName).toBe(await exactIdentity(me({ divisionCustomerName: "camelthorn b.v." })));
+    expect(byName).not.toBe(byId);
+    expect(await exactIdentity(me({}))).toBeNull();
+    expect(await exactIdentity(me({ divisionCustomerName: "   " }))).toBeNull();
+  });
+
+  it("decides 'different' from identities, else from the known divisions", () => {
+    const none = { identity: null, divisions: [] as number[] };
+    expect(isDifferentAccount(none, { identity: "a", division: 1 })).toBe(false);
+    expect(
+      isDifferentAccount({ identity: "a", divisions: [1] }, { identity: "a", division: 9 }),
+    ).toBe(false);
+    expect(
+      isDifferentAccount({ identity: "a", divisions: [1] }, { identity: "b", division: 1 }),
+    ).toBe(true);
+    expect(
+      isDifferentAccount({ identity: null, divisions: [1] }, { identity: "b", division: 1 }),
+    ).toBe(false);
+    expect(
+      isDifferentAccount({ identity: null, divisions: [1] }, { identity: "b", division: 2 }),
+    ).toBe(true);
+    expect(
+      isDifferentAccount({ identity: "a", divisions: [1] }, { identity: null, division: 2 }),
+    ).toBe(true);
+    expect(
+      isDifferentAccount({ identity: "a", divisions: [] }, { identity: null, division: 2 }),
+    ).toBe(false);
   });
 });
 

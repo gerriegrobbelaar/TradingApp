@@ -19,7 +19,15 @@ const EXACT_ACTIVE: api.ConnectionsResponse = {
       lastError: null,
       connectedBy: "gerrie@camelthorncapital.com",
       connectedAt: null,
-      divisions: [{ division: 123456, name: "Camelthorn Advisory B.V.", currency: "EUR" }],
+      divisions: [
+        {
+          id: 1,
+          division: 123456,
+          name: "Camelthorn Advisory B.V.",
+          currency: "EUR",
+          syncEnabled: true,
+        },
+      ],
     },
   ],
 };
@@ -203,6 +211,85 @@ describe("Settings, Connections", () => {
     mockFetch({ ...ME_OK(ADMIN), "GET /api/connections": () => ({ status: 500, body: {} }) });
     renderApp("/settings/connections");
     expect((await screen.findByRole("alert")).textContent).toContain("Something went wrong");
+  });
+
+  it("lets an admin switch syncing per division and tells everyone else the state", async () => {
+    const body: api.ConnectionsResponse = {
+      exactConfigured: true,
+      connections: [
+        {
+          ...(EXACT_ACTIVE.connections[0] as api.ConnectionRow),
+          divisions: [
+            { id: 1, division: 123456, name: "Camelthorn", currency: "EUR", syncEnabled: true },
+            { id: 2, division: 123457, name: "Second BV", currency: "GBP", syncEnabled: false },
+          ],
+        },
+      ],
+    };
+    const calls = mockFetch({
+      ...ME_OK(ADMIN),
+      ...list(body),
+      "PUT /api/divisions/2/sync-enabled": () => ({ body: { id: 2, syncEnabled: true } }),
+    });
+    const user = userEvent.setup();
+    renderApp("/settings/connections");
+    const box = await screen.findByRole("checkbox", { name: /Sync Second BV/ });
+    expect((box as HTMLInputElement).checked).toBe(false);
+    expect(
+      (screen.getByRole("checkbox", { name: /Sync Camelthorn/ }) as HTMLInputElement).checked,
+    ).toBe(true);
+    await user.click(box);
+    const put = calls.find((c) => c.method === "PUT");
+    expect(put?.body).toEqual({ enabled: true });
+    expect(await screen.findByText("Sync switched on for Second BV.")).toBeTruthy();
+  });
+
+  it("shows sync as plain text to non-admins", async () => {
+    mockFetch({ ...ME_OK(VIEWER), ...list(EXACT_ACTIVE) });
+    renderApp("/settings/connections");
+    await screen.findByText("Connected");
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(screen.getByText("On")).toBeTruthy();
+  });
+
+  it("lets an admin turn the hourly open-items read on and off", async () => {
+    const calls = mockFetch({
+      ...ME_OK(ADMIN),
+      ...list(EXACT_ACTIVE),
+      "GET /api/sync/settings": () => ({ body: { incrementalOpenItems: false } }),
+      "PUT /api/sync/settings": (c) => ({ body: c.body }),
+    });
+    const user = userEvent.setup();
+    renderApp("/settings/connections");
+    const box = await screen.findByRole("checkbox", { name: /hourly sync as well/ });
+    expect((box as HTMLInputElement).checked).toBe(false);
+    await user.click(box);
+    expect(calls.find((c) => c.method === "PUT")?.body).toEqual({ incrementalOpenItems: true });
+    await vi.waitFor(() => expect((box as HTMLInputElement).checked).toBe(true));
+  });
+
+  it("explains a refused sign-in for another Exact account and offers an explicit replace", async () => {
+    const body: api.ConnectionsResponse = {
+      exactConfigured: true,
+      connections: [
+        {
+          ...(EXACT_ACTIVE.connections[0] as api.ConnectionRow),
+          status: "disabled",
+          lastError: "different_exact_account",
+        },
+      ],
+    };
+    mockFetch({ ...ME_OK(ADMIN), ...list(body) });
+    const assign = vi.spyOn(api.nav, "assign").mockImplementation(() => undefined);
+    const user = userEvent.setup();
+    renderApp("/settings/connections?exact=different_exact_account");
+    expect(await screen.findByText(/Nothing was replaced and the connection is off/)).toBeTruthy();
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Sign in with the original account");
+    await user.click(screen.getByRole("button", { name: "Replace with the other account" }));
+    await vi.waitFor(() =>
+      expect(assign).toHaveBeenCalledWith("/api/connections/exact/start?confirm_replace=1"),
+    );
   });
 
   it("has no accessibility violations", async () => {

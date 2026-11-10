@@ -1,5 +1,5 @@
 # 0018 Durable Objects use the EU jurisdiction
-Status: accepted 2026-11-10 (review S6)
+Status: accepted (review S6)
 
 ## Context
 CLAUDE.md 2 puts D1 and R2 in the EU. Durable Objects hold Exact limiter state, job budgets and (briefly, encrypted) a stashed token pair, so they should stay in the EU too. A Durable Object namespace can restrict objects to a jurisdiction with `env.EXACT_GATE.jurisdiction("eu")`. The jurisdiction is part of the object id: the same name under `eu` and under no jurisdiction are two different objects, and an object cannot be moved.

@@ -20,7 +20,9 @@ let divB: { id: number; exact: number };
 async function addDiv(connection: number, name: string): Promise<{ id: number; exact: number }> {
   const exact = freshDivision();
   const r = await db
-    .prepare("INSERT INTO divisions (connection_id, exact_division, name) VALUES (?1, ?2, ?3)")
+    .prepare(
+      "INSERT INTO divisions (connection_id, exact_division, name, sync_enabled) VALUES (?1, ?2, ?3, 1)",
+    )
     .bind(connection, exact, name)
     .run();
   return { id: r.meta.last_row_id, exact };

@@ -71,11 +71,13 @@ export async function resetExact(): Promise<void> {
     db.prepare("DELETE FROM sync_locks"),
     db.prepare("DELETE FROM sync_state"),
     db.prepare("DELETE FROM open_items"),
+    db.prepare("DELETE FROM relation_bank_accounts"),
     db.prepare("DELETE FROM relations"),
     db.prepare("DELETE FROM divisions"),
     db.prepare("DELETE FROM exact_usage"),
     db.prepare("DELETE FROM connections"),
     db.prepare("DELETE FROM jobs"),
+    db.prepare("DELETE FROM settings WHERE key = 'exact.incremental_open_items'"),
     db.prepare("DELETE FROM idempotency_keys WHERE scope = 'exact.flow'"),
   ]);
 }

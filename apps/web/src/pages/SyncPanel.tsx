@@ -11,9 +11,11 @@ const LABEL: Record<string, { text: string; tone: ChipTone }> = {
   running: { text: "Syncing", tone: "neutral" },
   interrupted: { text: "Interrupted", tone: "warn" },
   none: { text: "Not synced yet", tone: "neutral" },
+  off: { text: "Sync is off", tone: "neutral" },
 };
 
 function statusOf(d: DivisionInfo): string {
+  if (!d.syncEnabled) return "off";
   if (d.syncing) return "running";
   const s = d.lastSync?.status;
   // 'running' without a live lease: the run stopped without finishing (for example a deploy).
@@ -69,9 +71,16 @@ export function describeSync(name: string, r: SyncResponse): string {
   if (guarded.length > 0) {
     return `Exact no longer lists a large share of the open ${guarded.join(" and ")} of ${name}. Nothing was closed. Check the administration in Exact; an admin can confirm the close.`;
   }
+  // An hourly-style sync leaves open items to the nightly sync unless an admin turned them on.
+  const itemsSkipped =
+    r.mode === "incremental" &&
+    r.entities["receivables"]?.status === "skipped" &&
+    r.entities["payables"]?.status === "skipped";
   switch (r.status) {
     case "ok":
-      return `${name} is up to date: ${parts}.`;
+      return itemsSkipped
+        ? `${name}: ${r.entities["relations"]?.rows ?? 0} relations checked. Open receivables and payables are refreshed by the nightly sync or a full sync.`
+        : `${name} is up to date: ${parts}.`;
     case "partial": {
       const progress = progressLine(r);
       const lead =
@@ -166,8 +175,8 @@ export function SyncPanel({ canSync }: { canSync: boolean }) {
       <h2 className="h2">Data sync</h2>
       <p className="lede">
         Relations, open receivables and open payables are copied from Exact. A sync that does not
-        finish in one go continues where it stopped. Bank account numbers are refreshed by the
-        nightly sync.
+        finish in one go continues where it stopped. Open items and bank account numbers are
+        refreshed by the nightly sync. Only administrations with sync switched on are copied.
       </p>
       {status === "loading" && (
         <div className="stack" role="status" aria-label="Loading sync status">
@@ -198,7 +207,7 @@ export function SyncPanel({ canSync }: { canSync: boolean }) {
             <tbody>
               {divisions.map((d) => {
                 const s = LABEL[statusOf(d)] ?? LABEL["none"];
-                const active = d.connectionStatus === "active";
+                const active = d.connectionStatus === "active" && d.syncEnabled;
                 // The countdown is plain text (not a live region: it would announce every
                 // second); each disabled button points at its line with aria-describedby.
                 // Both modes waiting the same time (the usual case) share one line.

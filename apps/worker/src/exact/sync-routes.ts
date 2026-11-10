@@ -13,6 +13,15 @@
  *                                 with `retryAfterSeconds`), except continuing a partial one.
  *                                 allowLargeClose (full mode, admin only) overrides the close
  *                                 guard (ADR 0017).
+ *  PUT  /api/divisions/:id/sync-enabled
+ *                                 admin (no step-up): `{ enabled: boolean }` turns syncing of one
+ *                                 division on or off (audited). Only the division /current/Me
+ *                                 returned is enabled by default; the others are listed but off.
+ *                                 Sync (manual and scheduled) only handles enabled divisions.
+ *  GET  /api/sync/settings        any signed-in role: `{ incrementalOpenItems }`
+ *  PUT  /api/sync/settings        admin (no step-up): `{ incrementalOpenItems: boolean }`, the
+ *                                 `exact.incremental_open_items` setting (default OFF until the
+ *                                 same-ID assumption of ADR 0017 is verified), audited.
  *  GET  /api/sync/status          any signed-in role: per-division, per-entity sync state
  *
  * `:id` and `divisionId` are our divisions.id, never the raw Exact division number. A division
@@ -20,10 +29,17 @@
  */
 import { auditStatement } from "../db/audit";
 import { json, type Ctx, type Router } from "../router";
-import { syncDivision, type PrevRun, type SyncMode } from "./sync";
+import {
+  INCREMENTAL_OPEN_ITEMS_KEY,
+  readBoolSetting,
+  syncDivision,
+  type PrevRun,
+  type SyncMode,
+} from "./sync";
 
 const ANY_ROLE = { roles: ["admin", "finance", "approver", "viewer"] } as const;
 const SYNC_ROLES = { roles: ["admin", "finance"] } as const;
+const ADMIN = { roles: ["admin"] } as const;
 
 /** A manual sync stops between steps after this long and answers `partial`. */
 export const MANUAL_SYNC_MAX_MS = 20_000;
@@ -38,6 +54,7 @@ interface DivisionJoin {
   exact_division: number;
   name: string;
   base_currency: string;
+  sync_enabled: number;
   connection_status: string;
 }
 
@@ -45,7 +62,7 @@ const listDivisions = async (db: D1Database): Promise<DivisionJoin[]> =>
   (
     await db
       .prepare(
-        `SELECT d.id, d.connection_id, d.exact_division, d.name, d.base_currency,
+        `SELECT d.id, d.connection_id, d.exact_division, d.name, d.base_currency, d.sync_enabled,
                 c.status AS connection_status
          FROM divisions d JOIN connections c ON c.id = d.connection_id
          WHERE c.kind = 'exact' AND c.status <> 'disabled'
@@ -104,7 +121,10 @@ function positiveInt(v: unknown): number | null {
   return typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : null;
 }
 
-/** The user's stored selection if it is still valid, else the first division, else null. */
+/**
+ * The user's stored selection if it is still valid, else the first division that syncs, else the
+ * first division, else null.
+ */
 async function selectedId(
   db: D1Database,
   userId: number,
@@ -116,7 +136,7 @@ async function selectedId(
     .first<{ division_id: number | null }>();
   const saved = pref?.division_id ?? null;
   if (saved !== null && divisions.some((d) => d.id === saved)) return saved;
-  return divisions[0]?.id ?? null;
+  return (divisions.find((d) => d.sync_enabled === 1) ?? divisions[0])?.id ?? null;
 }
 
 export function registerSyncRoutes(router: Router): void {
@@ -150,6 +170,7 @@ export function registerSyncRoutes(router: Router): void {
           division: d.exact_division,
           name: d.name,
           currency: d.base_currency,
+          syncEnabled: d.sync_enabled === 1,
           connectionStatus: d.connection_status,
           syncing: locks.some((l) => l.division_id === d.id),
           lastSync:
@@ -202,6 +223,86 @@ export function registerSyncRoutes(router: Router): void {
     return json({ selectedId: id });
   });
 
+  router.add("GET", "/api/sync/settings", ANY_ROLE, async (ctx) => {
+    return json({
+      incrementalOpenItems: await readBoolSetting(ctx.env.DB, INCREMENTAL_OPEN_ITEMS_KEY, false),
+    });
+  });
+
+  router.add("PUT", "/api/sync/settings", ADMIN, async (ctx: Ctx) => {
+    const session = ctx.session;
+    if (!session) return json({ error: "unauthenticated" }, 401);
+    const body = await readJson(ctx.request);
+    const value = body?.["incrementalOpenItems"];
+    if (typeof value !== "boolean") return json({ error: "bad_request" }, 400);
+    const db = ctx.env.DB;
+    const before = await readBoolSetting(db, INCREMENTAL_OPEN_ITEMS_KEY, false);
+    // The audit row only exists when the stored value really changes.
+    await db.batch([
+      auditStatement(
+        db,
+        {
+          actorEmail: session.email,
+          action: "settings.exact_incremental_open_items",
+          entity: "settings",
+          entityId: INCREMENTAL_OPEN_ITEMS_KEY,
+          before: { value: before },
+          after: { value },
+        },
+        {
+          sql: `COALESCE((SELECT value_json FROM settings WHERE key = ?7), 'false') <> ?8`,
+          binds: [INCREMENTAL_OPEN_ITEMS_KEY, JSON.stringify(value)],
+        },
+      ),
+      db
+        .prepare(
+          `INSERT INTO settings (key, value_json, updated_by, updated_at)
+           VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+           ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json,
+             updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+        )
+        .bind(INCREMENTAL_OPEN_ITEMS_KEY, JSON.stringify(value), session.email),
+    ]);
+    return json({ incrementalOpenItems: value });
+  });
+
+  router.add("PUT", "/api/divisions/:id/sync-enabled", ADMIN, async (ctx: Ctx) => {
+    const session = ctx.session;
+    if (!session) return json({ error: "unauthenticated" }, 401);
+    const id = positiveInt(ctx.params["id"]);
+    if (id === null) return json({ error: "not_found" }, 404);
+    const body = await readJson(ctx.request);
+    const enabled = body?.["enabled"];
+    if (typeof enabled !== "boolean") return json({ error: "bad_request" }, 400);
+    const db = ctx.env.DB;
+    const division = (await listDivisions(db)).find((d) => d.id === id);
+    if (!division) return json({ error: "not_found" }, 404);
+    const want = enabled ? 1 : 0;
+    // Idempotent: setting what is already set changes nothing and audits nothing. The audit row
+    // carries the same condition, so it exists exactly when the change happened (ADR 0013).
+    await db.batch([
+      auditStatement(
+        db,
+        {
+          actorEmail: session.email,
+          action: "division.sync_enabled_changed",
+          entity: "division",
+          entityId: id,
+          before: { syncEnabled: !enabled },
+          after: { syncEnabled: enabled },
+        },
+        {
+          sql: "EXISTS (SELECT 1 FROM divisions WHERE id = ?7 AND sync_enabled <> ?8)",
+          binds: [id, want],
+        },
+      ),
+      db
+        .prepare("UPDATE divisions SET sync_enabled = ?2 WHERE id = ?1 AND sync_enabled <> ?2")
+        .bind(id, want),
+    ]);
+    return json({ id, syncEnabled: enabled });
+  });
+
   router.add("POST", "/api/divisions/:id/sync", SYNC_ROLES, async (ctx: Ctx) => {
     const session = ctx.session;
     if (!session) return json({ error: "unauthenticated" }, 401);
@@ -223,6 +324,7 @@ export function registerSyncRoutes(router: Router): void {
 
     const division = (await listDivisions(ctx.env.DB)).find((d) => d.id === id);
     if (!division) return json({ error: "not_found" }, 404);
+    if (division.sync_enabled !== 1) return json({ error: "sync_disabled" }, 409);
     if (division.connection_status !== "active") {
       return json(
         {
@@ -325,6 +427,7 @@ export function registerSyncRoutes(router: Router): void {
       divisions: divisions.map((d) => ({
         id: d.id,
         name: d.name,
+        syncEnabled: d.sync_enabled === 1,
         connectionStatus: d.connection_status,
         syncing: locks.some((l) => l.division_id === d.id),
         entities: states

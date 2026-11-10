@@ -1,5 +1,10 @@
-// Fixed interface shared by the Exact client (packages/exact, owned by task E1) and the
-// ExactGate Durable Object (apps/worker, task E2). Keep this file identical in both branches.
+// The interface between the Exact client (this package) and the ExactGate Durable Object
+// (apps/worker). There is a single copy, here; the worker imports it from `@camelthorn/exact`.
+// (E1 and E2 were built on separate branches against an identical copy; that is no longer true.)
+
+/** Job ids are short and plain: they key budgets in the gate and appear in logs. */
+export const JOB_ID_RE = /^[A-Za-z0-9_.:-]{1,100}$/;
+
 export type ExactPriority = "user" | "job";
 
 export interface ExactRequest {

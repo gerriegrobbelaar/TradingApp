@@ -3,12 +3,16 @@ import { useSearchParams } from "react-router";
 import { Button, Card, Chip, Sheet, Skeleton, Stamp, type ChipTone } from "@camelthorn/ui";
 import {
   ApiError,
+  EXACT_REPLACE_URL,
   EXACT_START_URL,
   StepUpRequired,
   disconnectExact,
+  getSyncSettings,
   listConnections,
   me as fetchMe,
   nav,
+  putSyncSettings,
+  setDivisionSync,
   stepUp,
   type ConnectionRow,
   type ConnectionsResponse,
@@ -24,7 +28,12 @@ const RESULT_MESSAGE: Record<string, string> = {
     "Exact Online is connected, but the division could not be read. Re-authorise to try again.",
   denied: "Exact Online access was not granted. Nothing changed.",
   error: "Could not finish connecting to Exact Online. Try again.",
+  different_exact_account:
+    "That sign-in belongs to a different Exact Online account. Nothing was replaced and the connection is off.",
 };
+
+/** Set on the connection by the server when a sign-in for another Exact account was refused. */
+export const DIFFERENT_ACCOUNT = "different_exact_account";
 
 type ExactState = "connected" | "credentials_rejected" | "needs_reauth" | "not_connected";
 
@@ -71,7 +80,7 @@ export function Connections() {
   const me = useSignedIn();
   const isAdmin = me.roles.includes("admin");
   const canSync = isAdmin || me.roles.includes("finance");
-  const { selected } = useDivision();
+  const { selected, reload: reloadDivisions } = useDivision();
   // "Updated x ago" means the data is that fresh: only a sync that completed counts.
   const lastSync = selected?.lastSync?.completedAt ?? null;
   const [params, setParams] = useSearchParams();
@@ -80,6 +89,7 @@ export function Connections() {
   const [dialog, setDialog] = useState<Dialog>(null);
   const [busy, setBusy] = useState(false);
   const [sheetError, setSheetError] = useState<string | null>(null);
+  const [incremental, setIncremental] = useState<boolean | null>(null);
   // The control that opened a sheet. `busy` disables it while the sheet opens, so the Sheet's own
   // focus restore would land on <body>; put focus back here instead (or on the first action).
   const trigger = useRef<HTMLElement | null>(null);
@@ -103,6 +113,11 @@ export function Connections() {
     } catch (e) {
       setLoadError(describeError(e));
     }
+    // The hourly open-items switch is an admin matter; others never need it.
+    getSyncSettings().then(
+      (s) => setIncremental(s.incrementalOpenItems),
+      () => setIncremental(null),
+    );
   }, []);
   useEffect(() => {
     void load();
@@ -129,13 +144,44 @@ export function Connections() {
   const state = exactState(exact);
   const label = STATE_LABEL[state];
 
-  async function connect() {
+  async function connect(replace = false) {
     // Ask the server how fresh the sign-in is right now; the page may have been open a while.
     setBusy(true);
     try {
       const current = await fetchMe();
       if (!current?.stepUpFresh) setDialog("stepup");
-      else nav.assign(EXACT_START_URL);
+      else nav.assign(replace ? EXACT_REPLACE_URL : EXACT_START_URL);
+    } catch (e) {
+      toast.show(describeError(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleSync(id: number, name: string, enabled: boolean) {
+    setBusy(true);
+    try {
+      await setDivisionSync(id, enabled);
+      toast.show(enabled ? `Sync switched on for ${name}.` : `Sync switched off for ${name}.`);
+      await load();
+      await reloadDivisions();
+    } catch (e) {
+      toast.show(describeError(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleIncremental(on: boolean) {
+    setBusy(true);
+    try {
+      const s = await putSyncSettings({ incrementalOpenItems: on });
+      setIncremental(s.incrementalOpenItems);
+      toast.show(
+        on
+          ? "Hourly syncs now also read open receivables and payables."
+          : "Open receivables and payables are refreshed by the nightly sync only.",
+      );
     } catch (e) {
       toast.show(describeError(e));
     } finally {
@@ -204,6 +250,32 @@ export function Connections() {
                   : "Ask an admin to fix the app settings."}
               </p>
             )}
+            {exact?.lastError === DIFFERENT_ACCOUNT && state === "not_connected" && (
+              <div role="alert" className="notice warn">
+                <p>
+                  The last sign-in belonged to a different Exact Online account than the one
+                  connected before, so it was not used. Sign in with the original account to keep
+                  the existing administrations.
+                </p>
+                {isAdmin && (
+                  <>
+                    <p>
+                      Replacing the account switches syncing off for the current administrations and
+                      starts again with the new one. Data already copied stays.
+                    </p>
+                    <Button
+                      disabled={busy || !data.exactConfigured}
+                      onClick={(e) => {
+                        remember(e);
+                        void connect(true);
+                      }}
+                    >
+                      Replace with the other account
+                    </Button>
+                  </>
+                )}
+              </div>
+            )}
             {state === "needs_reauth" && (
               <p role="alert" className="notice warn">
                 {exact?.lastError && ERROR_LABEL[exact.lastError]
@@ -226,6 +298,7 @@ export function Connections() {
                       <th scope="col">Division</th>
                       <th scope="col">Name</th>
                       <th scope="col">Currency</th>
+                      <th scope="col">Sync</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -234,11 +307,48 @@ export function Connections() {
                         <td>{d.division}</td>
                         <td>{d.name}</td>
                         <td>{d.currency}</td>
+                        <td>
+                          {isAdmin ? (
+                            <label className="check-row">
+                              <input
+                                className="check"
+                                type="checkbox"
+                                checked={d.syncEnabled}
+                                disabled={busy}
+                                onChange={(e) => void toggleSync(d.id, d.name, e.target.checked)}
+                              />
+                              <span>
+                                <span className="sr-only">Sync {d.name}: </span>
+                                {d.syncEnabled ? "On" : "Off"}
+                              </span>
+                            </label>
+                          ) : d.syncEnabled ? (
+                            "On"
+                          ) : (
+                            "Off"
+                          )}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
+            )}
+            {isAdmin && incremental !== null && state !== "not_connected" && (
+              <label className="check-row">
+                <input
+                  className="check"
+                  type="checkbox"
+                  checked={incremental}
+                  disabled={busy}
+                  onChange={(e) => void toggleIncremental(e.target.checked)}
+                />
+                <span>
+                  Read open receivables and payables in the hourly sync as well. Leave this off
+                  until the live check of Exact&apos;s change feed is done; the nightly sync always
+                  reads them.
+                </span>
+              </label>
             )}
             {isAdmin ? (
               <div className="chips" ref={actions}>

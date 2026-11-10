@@ -49,6 +49,7 @@ export class FakeExact {
   divisions = [{ code: 1000001, description: "Camelthorn Advisory B.V." }] as {
     code: number;
     description: string | null;
+    currency?: string | null;
   }[];
   accounts: FakeAccount[] = [];
   banks: FakeBank[] = [];
@@ -102,6 +103,7 @@ export class FakeExact {
           Code: d.code,
           Description: d.description,
           Country: "NL",
+          ...(d.currency === undefined ? {} : { Currency: d.currency }),
           Status: 1,
           Main: true,
         }));
@@ -223,11 +225,18 @@ export async function resetSync(): Promise<void> {
     db.prepare("DELETE FROM sync_locks"),
     db.prepare("DELETE FROM sync_state"),
     db.prepare("DELETE FROM open_items"),
+    db.prepare("DELETE FROM relation_bank_accounts"),
     db.prepare("DELETE FROM relations"),
     db.prepare("DELETE FROM exact_usage"),
     db.prepare("DELETE FROM divisions"),
     db.prepare("DELETE FROM connections"),
     db.prepare("DELETE FROM jobs"),
+    // Most sync tests exercise incremental open-item reads, which are OFF by default in
+    // production (ADR 0017); the default has its own tests, which delete this row.
+    db.prepare(
+      `INSERT INTO settings (key, value_json, updated_by) VALUES ('exact.incremental_open_items', 'true', 'test')
+       ON CONFLICT (key) DO UPDATE SET value_json = 'true'`,
+    ),
   ]);
 }
 
@@ -241,7 +250,9 @@ export async function addDivision(
     .run();
   const name = opts.name ?? `Division ${exact}`;
   const d = await db
-    .prepare("INSERT INTO divisions (connection_id, exact_division, name) VALUES (?1, ?2, ?3)")
+    .prepare(
+      "INSERT INTO divisions (connection_id, exact_division, name, sync_enabled) VALUES (?1, ?2, ?3, 1)",
+    )
     .bind(c.meta.last_row_id, exact, name)
     .run();
   return { id: d.meta.last_row_id, connectionId: c.meta.last_row_id, exactDivision: exact, name };

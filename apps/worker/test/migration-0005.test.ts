@@ -136,9 +136,8 @@ describe("migration 0005 on a database with existing rows", () => {
     await expect(
       mdb.prepare("INSERT INTO sync_state (division_id, entity) VALUES (9, 'run')").run(),
     ).rejects.toThrow();
-    await expect(
-      mdb.prepare("INSERT INTO sync_state (division_id, entity) VALUES (9, 'nonsense')").run(),
-    ).rejects.toThrow();
+    // (The CHECK on sync_state.entity was dropped by migration 0007: the allowed entities are
+    // validated in code, see test/migration-0007.test.ts and SYNC_ENTITIES.)
 
     // amount model columns: existing rows get NULL (unknown), the currency check holds
     const amounts = await mdb

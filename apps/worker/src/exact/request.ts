@@ -3,14 +3,13 @@
  * (it may be built from data that came from Exact), so it is checked against a strict allow-list
  * and the final URL is verified to stay on the Exact host under /api/v1 (or the two XML endpoints).
  */
-import { ExactApiError, type ExactRequest } from "@camelthorn/exact";
+import { ExactApiError, JOB_ID_RE, type ExactRequest } from "@camelthorn/exact";
 import { isExactHost } from "./config";
 
 const METHODS = new Set(["GET", "POST", "PUT", "DELETE"]);
 /** OData paths such as /crm/Accounts or /crm/Accounts(guid'...'): no %, ?, #, \, @, :, spaces. */
 const PATH_RE = /^\/[A-Za-z0-9_\-./()',]*$/;
 const QUERY_KEY_RE = /^[A-Za-z0-9_$.]{1,64}$/;
-const JOB_ID_RE = /^[A-Za-z0-9_.:-]{1,100}$/;
 const XML_PATHS: ReadonlySet<string> = new Set(["/docs/XMLUpload.aspx", "/docs/XMLDownload.aspx"]);
 /** Headers a caller may set; Authorization, Host, Cookie and friends are the gate's business. */
 const ALLOWED_HEADERS: ReadonlySet<string> = new Set([

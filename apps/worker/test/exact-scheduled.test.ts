@@ -130,7 +130,9 @@ describe("runScheduledExactSync", () => {
     const div = await addDivision();
     // second division on the same connection
     await db
-      .prepare("INSERT INTO divisions (connection_id, exact_division, name) VALUES (?1, ?2, 'B')")
+      .prepare(
+        "INSERT INTO divisions (connection_id, exact_division, name, sync_enabled) VALUES (?1, ?2, 'B', 1)",
+      )
       .bind(div.connectionId, div.exactDivision + 1)
       .run();
     const fx = new FakeExact(div.exactDivision);
@@ -149,7 +151,9 @@ describe("runScheduledExactSync", () => {
     const a = await addDivision();
     const bExact = a.exactDivision + 1;
     const b = await db
-      .prepare("INSERT INTO divisions (connection_id, exact_division, name) VALUES (?1, ?2, 'B')")
+      .prepare(
+        "INSERT INTO divisions (connection_id, exact_division, name, sync_enabled) VALUES (?1, ?2, 'B', 1)",
+      )
       .bind(a.connectionId, bExact)
       .run();
     vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -171,7 +175,9 @@ describe("runScheduledExactSync", () => {
   it("leaves the remaining divisions for the next tick once the invocation's subrequests run low", async () => {
     const a = await addDivision();
     await db
-      .prepare("INSERT INTO divisions (connection_id, exact_division, name) VALUES (?1, ?2, 'B')")
+      .prepare(
+        "INSERT INTO divisions (connection_id, exact_division, name, sync_enabled) VALUES (?1, ?2, 'B', 1)",
+      )
       .bind(a.connectionId, a.exactDivision + 1)
       .run();
     const fx = new FakeExact(a.exactDivision);
@@ -220,7 +226,9 @@ describe("budgets and fairness (review G1)", () => {
   it("takes the least recently completed division first, so a short invocation rotates", async () => {
     const a = await addDivision();
     const bRow = await db
-      .prepare("INSERT INTO divisions (connection_id, exact_division, name) VALUES (?1, ?2, 'B')")
+      .prepare(
+        "INSERT INTO divisions (connection_id, exact_division, name, sync_enabled) VALUES (?1, ?2, 'B', 1)",
+      )
       .bind(a.connectionId, a.exactDivision + 1)
       .run();
     const b = bRow.meta.last_row_id;
@@ -272,7 +280,9 @@ describe("no endless retries (review G1)", () => {
       .bind(div.connectionId, CREDENTIALS_REJECTED)
       .run();
     await db
-      .prepare("INSERT INTO divisions (connection_id, exact_division, name) VALUES (?1, ?2, 'B')")
+      .prepare(
+        "INSERT INTO divisions (connection_id, exact_division, name, sync_enabled) VALUES (?1, ?2, 'B', 1)",
+      )
       .bind(div.connectionId, div.exactDivision + 1)
       .run();
     const fx = new FakeExact(div.exactDivision);

@@ -211,7 +211,14 @@ describe("full sync", () => {
     expect(byId[guid(101)]?.due_date).toBe("2023-11-14");
     expect(rows.every((r) => r.last_seen_sync_id === s.runSeq)).toBe(true);
 
-    for (const e of ["divisions", "relations", "bank_accounts", "receivables", "payables", "run"]) {
+    for (const e of [
+      "divisions",
+      "relations",
+      "relation_ibans",
+      "receivables",
+      "payables",
+      "run",
+    ]) {
       expect((await stateRow(e))?.last_status).toBe("ok");
     }
     expect((await stateRow("relations"))?.cursor).toBe("30");
@@ -390,7 +397,7 @@ describe("resuming and cursors", () => {
       rows: 2,
       error: "budget_exhausted",
     });
-    expect(first.entities.bank_accounts.status).toBe("skipped");
+    expect(first.entities.relation_ibans.status).toBe("skipped");
     expect(await count("relations")).toBe(2);
     expect(await stateRow("relations")).toMatchObject({
       cursor: "20",
@@ -411,11 +418,25 @@ describe("resuming and cursors", () => {
     expect(await stateRow("relations")).toMatchObject({ cursor: "50", last_status: "ok" });
   });
 
-  it("a full run restarts relations from 0 when the last pass completed", async () => {
+  it("a nightly full run continues relations from the saved cursor (review N1)", async () => {
+    seedData();
+    await run("full");
+    expect(await stateRow("relations")).toMatchObject({ cursor: "30", last_status: "ok" });
+    fx.calls = [];
+    fx.accounts.push({ n: 4, name: "New one", ts: 40, supplier: true });
+    const s = await run("full");
+    expect(s.entities.relations.rows).toBe(1);
+    const q = fx.calls.find((c) => c.path === "/sync/CRM/Accounts");
+    expect(q?.query?.["$filter"]).toBe("Timestamp gt 30L");
+    expect(await count("relations")).toBe(4);
+  });
+
+  it("a full run with restart reads relations from 0 again", async () => {
     seedData();
     await run("full");
     fx.calls = [];
-    await run("full");
+    const s = await run("full", { restart: true });
+    expect(s.entities.relations.rows).toBe(3);
     const q = fx.calls.find((c) => c.path === "/sync/CRM/Accounts");
     expect(q?.query?.["$filter"]).toBe("Timestamp gt 0L");
   });

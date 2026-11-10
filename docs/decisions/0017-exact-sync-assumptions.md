@@ -1,7 +1,8 @@
 # 0017 Exact sync: design and unverified assumptions
 
-Status: accepted, provisional. Built (task E3, reworked in G1 after the Phase 2 review) with no
-Exact credentials; everything was tested
+Status: provisional — verify with credentials (the design is accepted; every figure and field name
+below is an unverified assumption). Built (task E3, reworked in G1 and G3 after the Phase 2
+review) with no Exact credentials; everything was tested
 against a scripted transport and a stubbed `fetch`. It builds on ADR 0014 (API shapes), 0015 (gate)
 and 0016 (OAuth). Items under "Verify" must be checked on the first real connection; a wrong guess
 is local to `apps/worker/src/exact/sync.ts` or to the client field lists.
@@ -9,7 +10,8 @@ is local to `apps/worker/src/exact/sync.ts` or to the client field lists.
 ## Design
 
 - **Entities, in order:** divisions, receivables, payables, relations (`/sync/CRM/Accounts`),
-  bank_accounts (IBANs from `/crm/BankAccounts`). Open items are what users look at, so they
+  relation_ibans (the bank accounts of customers and suppliers from `/crm/BankAccounts`; renamed
+  from `bank_accounts` in G3, ADR 0019). Open items are what users look at, so they
   refresh first (G1; before, 5,000+ bank accounts could eat the whole hourly budget). One
   `sync_state` row per division and entity plus an entity `run` row for the whole run (what the UI
   shows).
@@ -62,7 +64,11 @@ is local to `apps/worker/src/exact/sync.ts` or to the client field lists.
   would break every full read; keep as the fix once Verify item 10 is checked) and re-reading
   candidates by ID (an unverified filter, and up to one call per candidate).
 - **INCREMENTAL** continues every cursor-based entity from its saved Timestamp and never closes by
-  absence. A row whose open amount is zero updates a row we know to closed; a closed row we have
+  absence. **Since G3 it reads open items only when the admin setting
+  `exact.incremental_open_items` is on (default off, ADR 0019, verify 13)**; with it off the hourly
+  tick refreshes divisions and relations (about 2 calls) and the nightly full pass refreshes open
+  items. Relations continue from their saved cursor in every mode (nightly too); deletions in
+  Exact are not detected for them. A row whose open amount is zero updates a row we know to closed; a closed row we have
   never seen is NOT inserted (G1: the first pass from cursor 0 would import the whole paid
   history as closed rows). Incremental runs never read IBANs. Note the cost: after the first
   full sync the open-item incremental cursors still start at 0 and walk the sync endpoint once,
@@ -146,12 +152,14 @@ is local to `apps/worker/src/exact/sync.ts` or to the client field lists.
   second caller gets `locked` (HTTP 409 `sync_running`) and nothing is written or audited.
 - **Audit (ADR 0013).** One `exact.sync` audit row per run, in the same `db.batch` as the closes
   and the final `sync_state` rows; no per-row audit. IBAN changes get their own
-  `relation.iban_changed` row, in one batch with the update, guarded by the old value, with the IBAN
-  masked (`NL91****4300`). Actor is `system` for the scheduler and the user's email for manual runs.
-- **IBAN change rule.** A different IBAN on a relation that has one is a change. A first IBAN on a
-  relation sets `iban_changed_at` only if a previous IBAN pass already completed (so the very
-  first sync does not flag every supplier). A relation that loses all bank accounts keeps its last
-  IBAN. The main bank account wins, otherwise the lowest IBAN.
+  `relation.iban_changed` / `relation.iban_added` row, in one batch with the update, guarded by the
+  old value and the sync lease, with the IBAN masked (`NL91****4300`, the one `maskIban` in
+  `@camelthorn/core`). Actor is `system` for the scheduler and the user's email for manual runs.
+- **IBAN rules (G3, ADR 0019).** All bank accounts of a relation are kept in
+  `relation_bank_accounts`; `relations.iban` is the main account, else the lowest active IBAN. A new
+  IBAN in the active set sets `iban_added_at`; a changed main account (or a first IBAN) sets
+  `iban_changed_at`; neither fires on the very first pass, on a reordered answer or on case and
+  spacing. A relation that loses all bank accounts keeps its last IBAN in `relations.iban`.
 - **Migration 0005 does not rebuild `open_items`.** Dropping it would fire the `ON DELETE
   CASCADE` of `reminders` and `match_suggestions` and delete them, so the 0004 copy-aside pattern
   is unsafe here. Columns are added instead (`entry_number`, `closed_at`, `last_seen_sync_id`) and
@@ -189,17 +197,20 @@ is local to `apps/worker/src/exact/sync.ts` or to the client field lists.
    stale), `rate`. Original total and rate are kept when a later bulk read lacks them (same
    currency only).
 4. **`system/Divisions`** may list only the current division, or archived/test divisions as well.
-   All returned divisions are upserted by name and then synced hourly, so a long list costs budget.
-   There is no `currentMe` fallback in the sync (it would need the division 0 gate).
+   All returned divisions are upserted (name, currency) but, since G3, only those with
+   `sync_enabled = 1` are synced, so a long list costs no budget. The sync has no `currentMe`
+   fallback; the connect callback learns the current division through the division-0 gate.
 5. **Dates.** Stored as Amsterdam calendar dates (`YYYY-MM-DD`), assuming a Dutch division. A
    division in another timezone would need its own zone.
 6. **Account `IsSales`** is read as "customer". Exact has account statuses (customer, supplier,
    prospect) that may be more accurate.
 7. **Bank accounts per relation** come from one full `crm/BankAccounts` read in scheduled FULL
-   runs only (see above), `ceil(rows / page size)` calls once a night.
+   runs only (see above), `ceil(rows / page size)` calls once a night. Field names: ADR 0014 item 7.
 8. **Subrequest limit.** Each gate RPC and each D1 call in a Worker invocation counts toward the
    platform's per-invocation subrequest limit. We assume the conservative 1,000 (`SUBREQUEST_LIMIT`)
-   until the account's actual limit is checked. Every run counts its gate calls and D1 calls on a
+   until the account's actual limit is checked, and that one `db.batch` of up to 100 statements
+   counts as ONE call (it is one round trip to D1; the meter counts it once). If a batch counts per
+   statement, the limit would be reached about 100 times sooner: see verify 15. Every run counts its gate calls and D1 calls on a
    meter shared by the whole invocation (the scheduler syncs all divisions in one) and stops as
    `partial` / `subrequest_limit` while 25 remain for the final batch, `endJob` and the release.
    The scheduler leaves the remaining divisions for the next tick.
@@ -215,7 +226,33 @@ is local to `apps/worker/src/exact/sync.ts` or to the client field lists.
     check whether `$orderby=ID` is accepted on `read/financial/ReceivablesList`; if it is, add it
     to the list reads (`listChunk` in `packages/exact/src/client.ts`).
 11. **Page sizes.** 60 on list endpoints and 1,000 on sync endpoints are assumptions (tested at
-    both and at 60 everywhere); real sizes change only the call counts above.
+    both and at 60 everywhere); real sizes change only the call counts above. The IBAN read is
+    sized at about 50 rows per page (`IBAN_PAGE_GUESS`).
+12. **Minute-window semantics, and whether 429 answers count.** We enforce the stricter reading
+    (never more than 60 calls in any 60 s, ADR 0016 item 18) and count every request we send,
+    including those Exact answers with 429, against our own window. If Exact uses a clock minute
+    and does not count rejected calls we are merely conservative; if it counts them, a 429 burst
+    must not be retried at once (the gate blocks until `Retry-After` / the reset). Check with a
+    full minute under load; the daily window's reset time (midnight UTC assumed) too.
+13. **Same `ID` across the list and the sync endpoints (UNVERIFIED, blocks incremental open
+    items).** Open items are upserted on `(division_id, exact_id)` from both sources. If an
+    invoice has a different identifier in `ReceivablesList` and in `/sync/Cashflow/Receivables`
+    (the list key may be `HID`, ADR 0014 item 3), every changed invoice becomes a second row, the
+    original is never seen by the incremental read and the nightly full read closes the wrong one.
+    Therefore incremental open-item reads are OFF by default (`exact.incremental_open_items`,
+    ADR 0019) and `open_items.source` records `list` or `sync`. To switch it on: read one
+    invoice from both endpoints on a test division, compare the identifiers, and only then turn
+    the setting on in Settings, Connections. The payables sync resource may be `Payments` or
+    `PaymentTerms` instead of `Payables` (ADR 0014 item 4).
+14. **`sync/Deleted` is not used.** Rows deleted in Exact (a deleted invoice, a deleted account)
+    are not reported by the Timestamp reads. Open items are closed by absence from a complete full
+    read under the two-strike rule, so a deleted invoice is noticed after the next nightly pass at
+    the earliest (two passes if the read spans runs); a deleted relation is never removed from
+    `relations` (ADR 0019). If Exact offers `sync/Deleted`, it would give faster and exact
+    answers: a later task.
+15. **D1 batch versus subrequest counting.** See item 8. Check the subrequest count of a real
+    nightly invocation in the Worker logs; if batches count per statement, lower the batch size
+    or the budgets.
 
 ## Closing guards (review E3)
 
@@ -247,7 +284,8 @@ is local to `apps/worker/src/exact/sync.ts` or to the client field lists.
 ## Consequences
 
 - Later screens read `open_items` (`status = 'open'`) and `relations`; the four-eyes check reads
-  `relations.iban_changed_at` and the `relation.iban_changed` audit rows.
+  `relations.iban_changed_at`, `relations.iban_added_at` and the `relation.iban_changed` /
+  `relation.iban_added` audit rows (ADR 0019).
 - `sync_state.entity = 'run'` is the single place for "last sync" timestamps; the UI "Updated x ago"
   stamps use `last_completed_at` (last run that ended `ok`); `last_finished_at` is the last attempt.
 - Phase 3 should call `syncDivision` from a queue consumer and drop `scheduled.ts`.

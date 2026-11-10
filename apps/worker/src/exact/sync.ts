@@ -2,7 +2,8 @@
  * Exact -> D1 sync for one division (Phase 2, tasks E3 and G1). See ADR 0017.
  *
  * Entities, in this order (what users look at first refreshes first): divisions, receivables,
- * payables, relations (accounts via the Timestamp sync endpoint), bank_accounts (IBANs).
+ * payables, relations (accounts via the Timestamp sync endpoint), relation_ibans (the bank
+ * accounts of those relations, crm/BankAccounts; not our own bank accounts table).
  *
  *  - Everything goes through the division's ExactGate with priority 'job' and a call budget
  *    (startJob ... endJob in a finally).
@@ -16,9 +17,15 @@
  *    anything. A guard refuses more than max(5, 20 %) of the open items of a kind without
  *    `allowLargeClose`. Progress and cycle state are only saved while the run holds its lease.
  *  - IBANs (crm/BankAccounts) are read in scheduled FULL runs only (`readIbans`), never hourly.
+ *    Every bank account of a relation is kept in relation_bank_accounts (ADR 0019).
  *  - INCREMENTAL mode continues every cursor-based entity from its saved Timestamp and never
  *    closes by absence. A zero open amount closes an item we know; unknown closed items are not
- *    inserted (that would import the whole paid history).
+ *    inserted (that would import the whole paid history). Open items are only read in
+ *    incremental mode when the admin setting `exact.incremental_open_items` is on (default OFF
+ *    until the same-ID assumption across the list and sync endpoints is confirmed, ADR 0017);
+ *    otherwise the nightly full list pass is what refreshes them.
+ *  - Relations continue from their saved Timestamp cursor in every mode (a full run restarts them
+ *    from 0 only with `restart`). Deletions in Exact are not detected for relations.
  *  - Budget, rate limit, time limit, transient failures: save progress, finish as 'partial', the
  *    next run resumes. Transient failures are counted per Amsterdam day and become 'error' after
  *    MAX_TRANSIENT_RETRIES. Auth failure: record 'needs_reauth' and stop (no retry loop).
@@ -41,25 +48,37 @@ import {
 import { auditStatement } from "../db/audit";
 import type { Env } from "../env";
 import { createGateTransport, gateName, getExactGate } from "./gate-transport";
-import { amsterdamDate, amsterdamParts } from "./local-time";
+import { amsterdamDate, amsterdamParts, isPlausibleIban, normalizeIban } from "@camelthorn/core";
 
 export type SyncMode = "full" | "incremental";
 export type RunStatus = "ok" | "partial" | "error" | "needs_reauth";
-export type EntityName = "divisions" | "relations" | "bank_accounts" | "receivables" | "payables";
+export type EntityName = "divisions" | "relations" | "relation_ibans" | "receivables" | "payables";
 export const ENTITIES: readonly EntityName[] = [
   "divisions",
   "receivables",
   "payables",
   "relations",
-  "bank_accounts",
+  "relation_ibans",
 ];
+/**
+ * Every value sync_state.entity may hold: the entities plus 'run' for the whole run. The table has
+ * no CHECK for it (migration 0007); this is the one list, enforced before any write.
+ */
+export const SYNC_ENTITIES: readonly (EntityName | "run")[] = ["run", ...ENTITIES];
+export const isSyncEntity = (v: string): v is EntityName | "run" =>
+  (SYNC_ENTITIES as readonly string[]).includes(v);
+function assertSyncEntity(v: string): void {
+  if (!isSyncEntity(v)) throw new Error("unknown sync entity");
+}
+/** Admin setting (settings table): read open items in INCREMENTAL runs too. Default off. */
+export const INCREMENTAL_OPEN_ITEMS_KEY = "exact.incremental_open_items";
 
 export const DEFAULT_SYNC_BUDGET = 300;
 /** A full cycle that has not finished after this long is abandoned and started again. */
 export const CYCLE_MAX_AGE_MS = 36 * 60 * 60 * 1000;
 /** Transient failures (502/503/504, network, gate unavailable, rate limit) per Amsterdam day. */
 export const MAX_TRANSIENT_RETRIES = 3;
-/** Rough rows per page of crm/BankAccounts, used to skip an IBAN read the budget cannot finish. */
+/** Rough rows per page of crm/BankAccounts (unverified), used to skip an IBAN read the budget cannot finish. */
 const IBAN_PAGE_GUESS = 50;
 /** Pages read per chunk of a cursor-based read; progress is saved after every chunk. */
 export const DEFAULT_CHUNK_PAGES = 5;
@@ -149,6 +168,12 @@ export interface SyncOptions {
   allowLargeClose?: boolean;
   /** Full mode: read crm/BankAccounts (nightly scheduled runs). Default true; manual runs pass false. */
   readIbans?: boolean;
+  /**
+   * Incremental mode: also read the open receivables / payables from the Timestamp sync
+   * endpoints. Default: the `exact.incremental_open_items` setting, which is OFF unless an admin
+   * turned it on (ADR 0017: same-ID assumption not yet verified). Full mode is unaffected.
+   */
+  incrementalOpenItems?: boolean;
   /** Full mode: abandon the open cycle and start a new one. */
   restart?: boolean;
   /**
@@ -348,8 +373,9 @@ const cursorStmt = (
   startedAt: string,
   cycle: number | null,
   lease: Lease,
-): D1PreparedStatement =>
-  db
+): D1PreparedStatement => {
+  assertSyncEntity(entity);
+  return db
     .prepare(
       `INSERT INTO sync_state (division_id, entity, cursor, mode, last_started_at, last_status,
          pass_cycle)
@@ -361,6 +387,7 @@ const cursorStmt = (
        WHERE ${leaseHeld("?8", "?9")}`,
     )
     .bind(divisionId, entity, cursor, mode, startedAt, status, cycle, lease.holder, lease.runSeq);
+};
 
 /** Saves a resumable open-item pass (same batch as the rows it covers). */
 const passStmt = (
@@ -373,8 +400,9 @@ const passStmt = (
   rows: number,
   total: number | null,
   lease: Lease,
-): D1PreparedStatement =>
-  db
+): D1PreparedStatement => {
+  assertSyncEntity(entity);
+  return db
     .prepare(
       `INSERT INTO sync_state (division_id, entity, mode, last_started_at, last_status,
          pass_cycle, pass_token, pass_rows, pass_total)
@@ -385,6 +413,7 @@ const passStmt = (
        WHERE ${leaseHeld("?8", "?9")}`,
     )
     .bind(divisionId, entity, startedAt, cycle, token, rows, total, lease.holder, lease.runSeq);
+};
 
 function relationStmt(
   db: D1Database,
@@ -423,6 +452,7 @@ function openItemStmt(
   item: OpenItem,
   runSeq: number,
   nowIso: string,
+  source: "list" | "sync",
 ): D1PreparedStatement {
   const closed = item.amount.minor === 0;
   // Amount model (migration 0005, ADR 0017): open_minor is the open balance in the item
@@ -441,9 +471,9 @@ function openItemStmt(
       `INSERT INTO open_items (division_id, exact_id, kind, relation_id, relation_name,
          invoice_number, reference, currency, amount_minor, open_minor, invoice_date, due_date,
          status, closed_at, synced_at, entry_number, last_seen_sync_id, original_minor,
-         open_dc_minor, dc_currency, rate)
+         open_dc_minor, dc_currency, rate, source)
        SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?17, ?9), ?9, ?10, ?11, ?12, ?13, ?14,
-         ?15, ?16, ?17, ?18, ?19, ?20
+         ?15, ?16, ?17, ?18, ?19, ?20, ?21
        WHERE ?12 = 'open'
           OR EXISTS (SELECT 1 FROM open_items WHERE division_id = ?1 AND exact_id = ?2)
        ON CONFLICT (division_id, exact_id) DO UPDATE SET
@@ -467,7 +497,8 @@ function openItemStmt(
          closed_at = CASE WHEN excluded.status = 'closed'
                           THEN COALESCE(open_items.closed_at, excluded.closed_at) ELSE NULL END,
          synced_at = excluded.synced_at, entry_number = excluded.entry_number,
-         last_seen_sync_id = excluded.last_seen_sync_id, missed_cycles = 0
+         last_seen_sync_id = excluded.last_seen_sync_id, missed_cycles = 0,
+         source = excluded.source
        WHERE excluded.last_seen_sync_id >= COALESCE(open_items.last_seen_sync_id, 0)`,
     )
     .bind(
@@ -491,6 +522,7 @@ function openItemStmt(
       dc === null ? null : dc.minor,
       dc === null ? null : dc.currency,
       item.rate,
+      source,
     );
 }
 
@@ -511,6 +543,7 @@ function stateStmt(
    */
   fullOk = false,
 ): D1PreparedStatement {
+  assertSyncEntity(entity);
   return db
     .prepare(
       `INSERT INTO sync_state (division_id, entity, mode, last_started_at, last_finished_at,
@@ -654,12 +687,13 @@ export async function syncDivision(
       if (current !== "divisions") pageSeen = true;
       return res;
     };
-    const client = createExactClient(transport, {
-      division: division.exactDivision,
-      jobId: opts.jobId,
-      priority: "job",
-      divisionCurrency: division.currency ?? "EUR",
-    });
+    const makeClient = (currency: string): ExactClient =>
+      createExactClient(transport, {
+        division: division.exactDivision,
+        jobId: opts.jobId,
+        priority: "job",
+        divisionCurrency: currency,
+      });
 
     // State first (the previous run as it ended), then the 'running' marker.
     meter.used += 1;
@@ -678,6 +712,15 @@ export async function syncDivision(
       // Under the lease: runs of this division are serialised, so this check cannot race.
       const wait = opts.admit(state.get("run") ?? null);
       if (wait > 0) return { ...early("cooldown", runSeq), retryAfterSeconds: wait };
+    }
+
+    // Incremental open-item reads are off unless an admin turned them on (ADR 0017).
+    let incrementalOpenItems = opts.incrementalOpenItems ?? false;
+    if (opts.mode === "incremental" && opts.incrementalOpenItems === undefined) {
+      meter.used += 1;
+      incrementalOpenItems = await readBoolSetting(db, INCREMENTAL_OPEN_ITEMS_KEY, false).catch(
+        () => false,
+      );
     }
 
     meter.used += 1;
@@ -716,7 +759,11 @@ export async function syncDivision(
 
       const ctx: Ctx = {
         db,
-        client,
+        client: makeClient(division.currency ?? "EUR"),
+        setCurrency: (currency) => {
+          ctx.client = makeClient(currency);
+        },
+        restart: opts.restart === true,
         division,
         mode: opts.mode,
         runSeq,
@@ -740,7 +787,14 @@ export async function syncDivision(
         current = entity;
         ctx.progress = 0;
         ctx.pass = null;
-        if (entity === "bank_accounts" && !readIbans) continue;
+        if (entity === "relation_ibans" && !readIbans) continue;
+        if (
+          opts.mode === "incremental" &&
+          !incrementalOpenItems &&
+          (entity === "receivables" || entity === "payables")
+        ) {
+          continue; // left to the nightly full list pass
+        }
         if (cycle !== null && entity !== "divisions" && state.get(entity)?.done_cycle === cycle) {
           // Read completely earlier in this cycle: nothing to do.
           entities[entity] = { status: "skipped", rows: 0, calls: 0, cycleDone: true };
@@ -857,7 +911,7 @@ export async function syncDivision(
 
     // The cycle is finished when every entity it covers is. IBANs are only part of it for runs
     // that read them (a manual full run leaves them to the nightly one).
-    const required = ENTITIES.filter((e) => e !== "bank_accounts" || readIbans);
+    const required = ENTITIES.filter((e) => e !== "relation_ibans" || readIbans);
     const cycleComplete =
       cycle !== null && status === "ok" && required.every((e) => entities[e].cycleDone === true);
 
@@ -1046,7 +1100,12 @@ export async function syncDivision(
 
 interface Ctx {
   db: D1Database;
+  /** Replaced by setCurrency once the division's own currency has been read. */
   client: ExactClient;
+  /** Rebuilds the client with this division currency (scale of division-currency amounts). */
+  setCurrency: (currency: string) => void;
+  /** Full mode: start cursor-based reads from 0 instead of the saved cursor. */
+  restart: boolean;
   division: DivisionRef;
   mode: SyncMode;
   runSeq: number;
@@ -1076,7 +1135,7 @@ function runEntity(ctx: Ctx, entity: EntityName): Promise<EntityResult> {
       return syncDivisions(ctx);
     case "relations":
       return syncRelations(ctx);
-    case "bank_accounts":
+    case "relation_ibans":
       return syncIbans(ctx);
     case "receivables":
     case "payables":
@@ -1089,38 +1148,68 @@ function runEntity(ctx: Ctx, entity: EntityName): Promise<EntityResult> {
 async function syncDivisions(ctx: Ctx): Promise<EntityResult> {
   const { db, division } = ctx;
   const list = await ctx.client.listDivisions();
-  const units = list.map((d) => {
-    const name = d.description ?? "";
-    const stmt =
-      name !== ""
-        ? db
-            .prepare(
-              `INSERT INTO divisions (connection_id, exact_division, name) VALUES (?1, ?2, ?3)
-               ON CONFLICT (connection_id, exact_division) DO UPDATE SET name = excluded.name`,
-            )
-            .bind(division.connectionId, d.code, name.slice(0, 200))
-        : db
-            .prepare(
-              `INSERT INTO divisions (connection_id, exact_division, name) VALUES (?1, ?2, ?3)
-               ON CONFLICT (connection_id, exact_division) DO NOTHING`,
-            )
-            .bind(division.connectionId, d.code, `Division ${d.code}`);
-    return [stmt];
-  });
+  const nowIso = ctx.nowIso();
+  // New divisions arrive DISABLED (sync_enabled defaults to 0): an admin turns them on. Only the
+  // /current/Me division is enabled, by the connect callback. The currency is the division's own
+  // (scale of division-currency amounts); when Exact does not send one the stored value stays.
+  const units = list.map((d) => [
+    db
+      .prepare(
+        `INSERT INTO divisions (connection_id, exact_division, name, base_currency,
+           base_currency_read_at)
+         VALUES (?1, ?2, ?3, COALESCE(?4, 'EUR'), CASE WHEN ?4 IS NULL THEN NULL ELSE ?5 END)
+         ON CONFLICT (connection_id, exact_division) DO UPDATE SET
+           name = CASE WHEN ?6 = 1 THEN excluded.name ELSE divisions.name END,
+           base_currency = COALESCE(?4, divisions.base_currency),
+           base_currency_read_at = CASE WHEN ?4 IS NULL THEN divisions.base_currency_read_at
+                                        ELSE ?5 END`,
+      )
+      .bind(
+        division.connectionId,
+        d.code,
+        (d.description ?? "") !== "" ? (d.description ?? "").slice(0, 200) : `Division ${d.code}`,
+        d.currency,
+        nowIso,
+        (d.description ?? "") !== "" ? 1 : 0,
+      ),
+  ]);
   await runBatches(db, ctx.meter, units);
+  // The rest of this run reads amounts in the division's own currency.
+  const own = list.find((d) => d.code === division.exactDivision)?.currency ?? null;
+  if (own !== null && own !== (division.currency ?? "EUR")) ctx.setCurrency(own);
   return { status: "ok", rows: list.length, calls: 0, cycleDone: ctx.mode === "full" };
 }
 
+export async function readBoolSetting(
+  db: D1Database,
+  key: string,
+  fallback: boolean,
+): Promise<boolean> {
+  const row = await db
+    .prepare("SELECT value_json FROM settings WHERE key = ?1")
+    .bind(key)
+    .first<{ value_json: string }>();
+  if (!row) return fallback;
+  try {
+    const v: unknown = JSON.parse(row.value_json);
+    return typeof v === "boolean" ? v : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 /**
- * Where a cursor-based read starts. Incremental: the saved Timestamp. Full: from 0, unless this
- * entity's pass of the current cycle is under way (pass_cycle), in which case it continues from
- * the saved cursor. Hourly incremental runs between the slices only move the same cursor forward.
+ * Where a cursor-based read starts: the saved Timestamp, in every mode. The Timestamp endpoints
+ * return everything changed since the cursor, so continuing is complete for new and changed rows
+ * (a full nightly run used to start accounts over from 0, review N1). A full run with `restart`
+ * (an admin asked for a clean start) reads from 0. Rows deleted in Exact are NOT seen by a
+ * Timestamp read at all (sync/Deleted is not used, ADR 0017): relations never disappear here.
  */
 function startCursor(ctx: Ctx, entity: EntityName): string {
   const st = ctx.state.get(entity);
   if (!st) return "0";
-  if (ctx.mode === "incremental") return st.cursor;
-  return ctx.cycle !== null && st.pass_cycle === ctx.cycle ? st.cursor : "0";
+  if (ctx.mode === "full" && ctx.restart) return "0";
+  return st.cursor;
 }
 
 /**
@@ -1194,7 +1283,7 @@ async function syncOpenItemsIncremental(
       receivable
         ? ctx.client.syncReceivables(cursor, { maxPages })
         : ctx.client.syncPayables(cursor, { maxPages }),
-    (it) => openItemStmt(ctx.db, ctx.division.id, it, ctx.runSeq, nowIso),
+    (it) => openItemStmt(ctx.db, ctx.division.id, it, ctx.runSeq, nowIso, "sync"),
   );
   return r.complete
     ? { status: "ok", rows: r.rows, calls: 0 }
@@ -1243,7 +1332,7 @@ async function syncOpenItemsFull(
       : ctx.client.listPayablesChunk(token, { maxPages: ctx.chunkPages }));
     readTotal += page.items.length;
     const units: D1PreparedStatement[][] = page.items.map((it) => [
-      openItemStmt(ctx.db, ctx.division.id, it, ctx.runSeq, nowIso),
+      openItemStmt(ctx.db, ctx.division.id, it, ctx.runSeq, nowIso, "list"),
     ]);
     units.push([
       passStmt(
@@ -1280,77 +1369,265 @@ async function syncOpenItemsFull(
 }
 
 /**
- * IBANs per relation from crm/BankAccounts (full runs that read IBANs only). A relation can have several; the main one wins, else
- * the lowest IBAN (stable). A changed IBAN, or a first IBAN on a relation that existed before the
- * previous IBAN pass, sets iban_changed_at and writes `relation.iban_changed` (masked) in the
- * same batch as the update. A relation that loses all its bank accounts keeps its last IBAN.
+ * Bank accounts of the relations (crm/BankAccounts; full runs that read IBANs only). Every
+ * account of a relation is kept in relation_bank_accounts (ADR 0019); relations.iban stays the one
+ * IBAN to show and pay to: the main account, else the lowest active IBAN (stable). The read is
+ * COMPLETE or it throws, and only a complete read marks an account `removed_at`; an empty answer
+ * (no accounts at all) changes nothing.
+ *
+ * Two flags for payment safety (four-eyes, CLAUDE.md 4.4), both only after a first IBAN pass has
+ * completed (the first pass is the baseline) and never because Exact returned rows in another order:
+ *  - relations.iban_added_at   the set of active IBANs gained an IBAN it did not have (new, or one
+ *                              that was removed and came back). Audit `relation.iban_added`.
+ *  - relations.iban_changed_at the IBAN we would pay to changed because the MAIN account changed
+ *                              (or the first IBAN appeared). Audit `relation.iban_changed`. A
+ *                              display IBAN that moves only because a new lowest IBAN joined the
+ *                              set is an addition, not a change.
+ * Audit rows are masked and sit in the same batch as the change, guarded by the sync lease. A
+ * relation that loses all its accounts keeps its last IBAN in relations.iban.
  */
+interface IbanCandidate {
+  iban: string;
+  bic: string | null;
+  main: boolean;
+  exactId: string;
+}
+interface StoredIban {
+  relation_id: number;
+  iban: string;
+  is_main: number;
+  bic: string | null;
+  exact_id: string | null;
+  removed_at: string | null;
+}
+
+const lowest = (ibans: Iterable<string>): string | null => {
+  let best: string | null = null;
+  for (const i of ibans) if (best === null || i < best) best = i;
+  return best;
+};
+
 async function syncIbans(ctx: Ctx): Promise<EntityResult> {
-  const { db, division } = ctx;
+  const { db, division, lease } = ctx;
   // The read is one piece (about rows / 50 calls). When the budget left cannot cover what the
   // last read needed, do not start it: the next run begins with a fresh budget.
-  const prevRows = ctx.state.get("bank_accounts")?.rows_seen ?? 0;
+  const prevRows = ctx.state.get("relation_ibans")?.rows_seen ?? 0;
   const needed = Math.ceil(prevRows / IBAN_PAGE_GUESS);
   if (needed > 0 && ctx.budget - ctx.callsSoFar() < needed) {
     return { status: "partial", rows: 0, calls: 0, error: "budget_exhausted" };
   }
   const accounts = await ctx.client.listBankAccounts();
-  const best = new Map<string, { iban: string; main: boolean }>();
+
+  // Group by relation, normalise and de-duplicate (the same IBAN twice on a relation is one).
+  const returned = new Map<string, Map<string, IbanCandidate>>();
   for (const b of accounts) {
-    if (b.iban === null || b.iban === "") continue;
+    if (b.iban === null) continue;
+    const iban = normalizeIban(b.iban);
+    if (!isPlausibleIban(iban)) continue;
     const key = b.accountId.toLowerCase();
-    const cur = best.get(key);
-    if (cur === undefined || (b.main && !cur.main) || (b.main === cur.main && b.iban < cur.iban)) {
-      best.set(key, { iban: b.iban, main: b.main });
-    }
+    const perRelation = returned.get(key) ?? new Map<string, IbanCandidate>();
+    const cur = perRelation.get(iban);
+    perRelation.set(
+      iban,
+      cur === undefined
+        ? { iban, bic: b.bic, main: b.main, exactId: b.id.toLowerCase() }
+        : { ...cur, bic: cur.bic ?? b.bic, main: cur.main || b.main },
+    );
+    returned.set(key, perRelation);
   }
-  ctx.meter.used += 1;
-  const existing = await db
-    .prepare("SELECT exact_id, iban FROM relations WHERE division_id = ?1")
-    .bind(division.id)
-    .all<{ exact_id: string; iban: string | null }>();
-  const hadPass = (ctx.state.get("bank_accounts")?.last_completed_at ?? null) !== null;
+  // An answer with no usable account at all is far more likely a fault (wrong division, licence)
+  // than "every supplier lost every bank account": change nothing.
+  if (returned.size === 0) {
+    return { status: "ok", rows: accounts.length, calls: 0, cycleDone: true };
+  }
+
+  ctx.meter.used += 2;
+  const relations = (
+    await db
+      .prepare("SELECT id, exact_id, iban FROM relations WHERE division_id = ?1")
+      .bind(division.id)
+      .all<{ id: number; exact_id: string; iban: string | null }>()
+  ).results;
+  const stored = new Map<number, Map<string, StoredIban>>();
+  for (const r of (
+    await db
+      .prepare(
+        `SELECT relation_id, iban, is_main, bic, exact_id, removed_at
+         FROM relation_bank_accounts WHERE division_id = ?1`,
+      )
+      .bind(division.id)
+      .all<StoredIban>()
+  ).results) {
+    const m = stored.get(r.relation_id) ?? new Map<string, StoredIban>();
+    m.set(r.iban, r);
+    stored.set(r.relation_id, m);
+  }
+
+  const hadPass = (ctx.state.get("relation_ibans")?.last_completed_at ?? null) !== null;
   const nowIso = ctx.nowIso();
+  // ?{n}: division, holder, run_seq of the lease, appended to every statement below.
+  const lease3 = (a: string, b: string, c: string): string =>
+    `EXISTS (SELECT 1 FROM sync_locks WHERE division_id = ${a} AND holder = ${b} AND run_seq = ${c})`;
   const units: D1PreparedStatement[][] = [];
-  for (const rel of existing.results) {
-    const next = best.get(rel.exact_id);
-    if (next === undefined || next.iban === rel.iban) continue;
-    const flagged = rel.iban !== null || hadPass;
-    if (!flagged) {
-      units.push([
-        db
-          .prepare(
-            `UPDATE relations SET iban = ?3, updated_at = ?4
-             WHERE division_id = ?1 AND exact_id = ?2 AND iban IS NULL`,
-          )
-          .bind(division.id, rel.exact_id, next.iban, nowIso),
-      ]);
+
+  for (const rel of relations) {
+    const now = returned.get(rel.exact_id) ?? new Map<string, IbanCandidate>();
+    const before = stored.get(rel.id) ?? new Map<string, StoredIban>();
+    const activeBefore = [...before.values()].filter((r) => r.removed_at === null);
+    const added = [...now.keys()].filter((i) => {
+      const s = before.get(i);
+      return s === undefined || s.removed_at !== null;
+    });
+    const removed = activeBefore.filter((r) => !now.has(r.iban)).map((r) => r.iban);
+
+    const mainOf = (ibans: Iterable<IbanCandidate | StoredIban>): string | null =>
+      lowest([...ibans].filter((r) => ("main" in r ? r.main : r.is_main === 1)).map((r) => r.iban));
+    const prevMain = mainOf(activeBefore);
+    const newMain = mainOf(now.values());
+    const newDisplay = newMain ?? lowest(now.keys()) ?? rel.iban;
+    const displayChanged = newDisplay !== rel.iban;
+
+    // Relations from before migration 0007 have an IBAN but no rows: their rows are a baseline,
+    // not additions; only a different display IBAN counts (the old rule).
+    const legacy = before.size === 0 && rel.iban !== null;
+    const flagAdded = hadPass && !legacy && added.length > 0;
+    const flagChanged =
+      hadPass && displayChanged && (rel.iban === null || legacy || prevMain !== newMain);
+
+    // Rows that need writing: new, changed in a stored column, or no longer returned.
+    const upserts = [...now.values()].filter((c) => {
+      const s = before.get(c.iban);
+      return (
+        s === undefined ||
+        s.removed_at !== null ||
+        s.is_main !== (c.main ? 1 : 0) ||
+        s.bic !== c.bic ||
+        s.exact_id !== c.exactId
+      );
+    });
+    if (
+      upserts.length === 0 &&
+      removed.length === 0 &&
+      !displayChanged &&
+      !flagAdded &&
+      !flagChanged
+    ) {
       continue;
     }
-    units.push([
-      auditStatement(
-        db,
-        {
-          actorEmail: ctx.actor,
-          action: "relation.iban_changed",
-          entity: "relation",
-          entityId: `${division.id}:${rel.exact_id}`,
-          before: { iban: rel.iban },
-          after: { iban: next.iban },
-        },
-        {
-          sql: "EXISTS (SELECT 1 FROM relations WHERE division_id = ?7 AND exact_id = ?8 AND iban IS ?9)",
-          binds: [division.id, rel.exact_id, rel.iban],
-        },
-      ),
-      db
-        .prepare(
-          `UPDATE relations SET iban = ?3, iban_changed_at = ?4, updated_at = ?4
-           WHERE division_id = ?1 AND exact_id = ?2 AND iban IS ?5`,
-        )
-        .bind(division.id, rel.exact_id, next.iban, nowIso, rel.iban),
-    ]);
+
+    const unit: D1PreparedStatement[] = [];
+    const entityId = `${division.id}:${rel.exact_id}`;
+    if (flagAdded) {
+      for (const iban of added) {
+        unit.push(
+          auditStatement(
+            db,
+            {
+              actorEmail: ctx.actor,
+              action: "relation.iban_added",
+              entity: "relation",
+              entityId,
+              after: { iban },
+            },
+            {
+              sql: `${lease3("?7", "?8", "?9")} AND NOT EXISTS (SELECT 1 FROM relation_bank_accounts
+                      WHERE relation_id = ?10 AND iban = ?11 AND removed_at IS NULL)`,
+              binds: [division.id, lease.holder, lease.runSeq, rel.id, iban],
+            },
+          ),
+        );
+      }
+    }
+    if (flagChanged) {
+      unit.push(
+        auditStatement(
+          db,
+          {
+            actorEmail: ctx.actor,
+            action: "relation.iban_changed",
+            entity: "relation",
+            entityId,
+            before: { iban: rel.iban },
+            after: { iban: newDisplay },
+          },
+          {
+            sql: `${lease3("?7", "?8", "?9")} AND EXISTS (SELECT 1 FROM relations
+                    WHERE id = ?10 AND iban IS ?11)`,
+            binds: [division.id, lease.holder, lease.runSeq, rel.id, rel.iban],
+          },
+        ),
+      );
+    }
+    for (const c of upserts) {
+      unit.push(
+        db
+          .prepare(
+            `INSERT INTO relation_bank_accounts (division_id, relation_id, iban, bic, is_main,
+               exact_id, first_seen_at, last_seen_at, removed_at)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, NULL
+             WHERE ${lease3("?1", "?8", "?9")}
+             ON CONFLICT (relation_id, iban) DO UPDATE SET
+               bic = excluded.bic, is_main = excluded.is_main, exact_id = excluded.exact_id,
+               last_seen_at = excluded.last_seen_at, removed_at = NULL`,
+          )
+          .bind(
+            division.id,
+            rel.id,
+            c.iban,
+            c.bic,
+            c.main ? 1 : 0,
+            c.exactId,
+            nowIso,
+            lease.holder,
+            lease.runSeq,
+          ),
+      );
+    }
+    for (const iban of removed) {
+      unit.push(
+        db
+          .prepare(
+            `UPDATE relation_bank_accounts SET removed_at = ?3
+             WHERE relation_id = ?2 AND iban = ?4 AND removed_at IS NULL
+               AND ${lease3("?1", "?5", "?6")}`,
+          )
+          .bind(division.id, rel.id, nowIso, iban, lease.holder, lease.runSeq),
+      );
+    }
+    if (displayChanged || flagAdded || flagChanged) {
+      unit.push(
+        db
+          .prepare(
+            `UPDATE relations SET iban = ?3,
+               iban_added_at = CASE WHEN ?4 = 1 THEN ?6 ELSE iban_added_at END,
+               iban_changed_at = CASE WHEN ?5 = 1 THEN ?6 ELSE iban_changed_at END,
+               updated_at = ?6
+             WHERE id = ?2 AND iban IS ?7 AND ${lease3("?1", "?8", "?9")}`,
+          )
+          .bind(
+            division.id,
+            rel.id,
+            newDisplay,
+            flagAdded ? 1 : 0,
+            flagChanged ? 1 : 0,
+            nowIso,
+            rel.iban,
+            lease.holder,
+            lease.runSeq,
+          ),
+      );
+    }
+    units.push(unit);
   }
+  // Every account still active after the statements above was returned by this complete read.
+  units.push([
+    db
+      .prepare(
+        `UPDATE relation_bank_accounts SET last_seen_at = ?2
+         WHERE division_id = ?1 AND removed_at IS NULL AND ${lease3("?1", "?3", "?4")}`,
+      )
+      .bind(division.id, nowIso, lease.holder, lease.runSeq),
+  ]);
   await runBatches(db, ctx.meter, units);
   return { status: "ok", rows: accounts.length, calls: 0, cycleDone: true };
 }

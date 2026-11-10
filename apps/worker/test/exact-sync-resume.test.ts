@@ -305,13 +305,13 @@ describe("full cycles", () => {
     await run("full", { readIbans: false });
     expect(fx.calls.some((c) => c.path === "/crm/BankAccounts")).toBe(false);
     const manual = await run("full", { readIbans: false });
-    expect(manual.entities.bank_accounts.status).toBe("skipped");
+    expect(manual.entities.relation_ibans.status).toBe("skipped");
     // A manual full run that read everything else is not the night's complete full sync.
     expect((await state("run"))?.last_full_completed_at).toBeNull();
     expect(manual.cycleComplete).toBe(true);
     const nightly = await run("full");
     expect(fx.calls.some((c) => c.path === "/crm/BankAccounts")).toBe(true);
-    expect(nightly.entities.bank_accounts.status).toBe("ok");
+    expect(nightly.entities.relation_ibans.status).toBe("ok");
     expect((await state("run"))?.last_full_completed_at).not.toBeNull();
   });
 });

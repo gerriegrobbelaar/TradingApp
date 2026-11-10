@@ -9,7 +9,8 @@
  * the same condition on the audit statement via `guard`, then read the audit statement's
  * `meta.changes` (1 = it happened, 0 = the guard blocked everything).
  */
-import { normalizeEmail } from "@camelthorn/core";
+import { maskIban, normalizeEmail } from "@camelthorn/core";
+
 export const LAST_INSERT_ID = Symbol("last-insert-id");
 
 export interface AuditEntry {
@@ -42,13 +43,6 @@ const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
 /** Keys whose values are never stored. */
 const SECRET_KEY_RE =
   /(token|secret|password|passwd|private[_-]?key|api[_-]?key|authorization|cookie|signature|assertion|client[_-]?secret|code[_-]?verifier|^code$|body|html)/i;
-
-/** Keeps country, check digits and the last four characters, e.g. NL91****4300. */
-export function maskIban(iban: string): string {
-  const compact = iban.replace(/\s+/g, "").toUpperCase();
-  if (compact.length <= 8) return "****";
-  return `${compact.slice(0, 4)}****${compact.slice(-4)}`;
-}
 
 function maskString(value: string): string {
   return value

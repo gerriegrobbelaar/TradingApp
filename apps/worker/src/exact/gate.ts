@@ -21,6 +21,9 @@ import {
   ExactAuthError,
   ExactBudgetExhaustedError,
   ExactRateLimitedError,
+  JOB_ID_RE,
+  parseRateLimitHeaders,
+  retryAfterFromHeaders,
   type ExactRequest,
   type ExactResponse,
 } from "@camelthorn/exact";
@@ -104,7 +107,6 @@ const CLIENT_REJECT_SPAN_MS = 60_000;
 const CLIENT_REJECT_COOLDOWN_MS = 60_000;
 export const CREDENTIALS_REJECTED = "token_endpoint_rejected_credentials";
 const MAX_BLOCK_MS = 24 * 3600 * 1000;
-const JOB_ID_RE = /^[A-Za-z0-9_.:-]{1,100}$/;
 const JOB_TTL_MS = 24 * 3600 * 1000;
 /**
  * Fairness: after this many user calls in a row while a job call is waiting, the oldest job call
@@ -180,9 +182,6 @@ interface ClientRejects {
 }
 
 const dayOf = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
-
-/** Exact sends reset times as epoch milliseconds; tolerate seconds too. */
-const toEpochMs = (n: number): number => (n < 1e11 ? n * 1000 : n);
 
 export class ExactGate extends DurableObject<Env> {
   /** Mutable so tests can tighten them; production uses the defaults. */
@@ -1114,37 +1113,34 @@ export class ExactGate extends DurableObject<Env> {
     return r.accessToken;
   }
 
-  /** Trust Exact's numbers over our own counters. */
+  /**
+   * Trust Exact's numbers over our own counters, but only to TIGHTEN the limiter. How the headers
+   * are read (names, epoch seconds or milliseconds, decimals) is `parseRateLimitHeaders` in
+   * @camelthorn/exact, shared with the client.
+   */
   private readRateHeaders(h: Record<string, string>, now: number): void {
-    const num = (k: string): number | null => {
-      const v = h[k];
-      if (v === undefined || v.trim() === "") return null;
-      const n = Number(v);
-      return Number.isFinite(n) ? n : null;
-    };
+    const info = parseRateLimitHeaders(h, now);
     const s = this.st;
-    const dayRemaining = num("x-ratelimit-remaining");
+    const dayRemaining = info.daily.remaining;
     if (dayRemaining !== null) {
-      const reset = num("x-ratelimit-reset");
-      const resetMs = reset === null ? null : toEpochMs(reset);
+      const resetMs = info.daily.resetAtMs;
       s.remote = {
         dayLimit: Math.min(
-          num("x-ratelimit-limit") ?? s.remote?.dayLimit ?? this.limits.perDay,
+          info.daily.limit ?? s.remote?.dayLimit ?? this.limits.perDay,
           this.limits.perDay,
         ),
         dayRemaining: Math.max(0, dayRemaining),
         dayResetMs: resetMs !== null && resetMs > now ? resetMs : null,
       };
     }
-    const minuteLimit = num("x-ratelimit-minutely-limit");
+    const minuteLimit = info.minutely.limit;
     // Never above the configured per-minute cap: a header may only tighten the limiter.
     if (minuteLimit !== null && minuteLimit >= 1) {
       s.capacity = Math.min(Math.floor(minuteLimit), this.limits.perMinute);
     }
-    const minuteRemaining = num("x-ratelimit-minutely-remaining");
+    const minuteRemaining = info.minutely.remaining;
     if (minuteRemaining !== null) {
-      const reset = num("x-ratelimit-minutely-reset");
-      const resetMs = reset === null ? null : toEpochMs(reset);
+      const resetMs = info.minutely.resetAtMs;
       const until =
         resetMs !== null && resetMs > now ? Math.min(resetMs, now + 120_000) : now + 60_000;
       const left = Math.max(0, Math.floor(minuteRemaining));
@@ -1160,26 +1156,10 @@ export class ExactGate extends DurableObject<Env> {
 
   /** Blocks the gate per Retry-After / reset headers after a 429; returns the wait in ms. */
   private blockFor429(h: Record<string, string>, now: number): number {
-    let ms: number | null = null;
-    const ra = h["retry-after"];
-    if (ra !== undefined) {
-      const secs = Number(ra);
-      if (Number.isFinite(secs) && secs >= 0) ms = secs * 1000;
-      else {
-        const date = Date.parse(ra);
-        if (Number.isFinite(date)) ms = Math.max(0, date - now);
-      }
-    }
-    if (ms === null) {
-      const minReset = Number(h["x-ratelimit-minutely-reset"]);
-      const dayReset = Number(h["x-ratelimit-reset"]);
-      if (this.st.remote && this.st.remote.dayRemaining <= 0 && Number.isFinite(dayReset)) {
-        ms = Math.max(0, toEpochMs(dayReset) - now);
-      } else if (Number.isFinite(minReset) && h["x-ratelimit-minutely-reset"] !== undefined) {
-        ms = Math.max(0, toEpochMs(minReset) - now);
-      }
-    }
-    const wait = Math.min(MAX_BLOCK_MS, Math.max(1000, ms ?? 60_000));
+    const ms = retryAfterFromHeaders(h, now, {
+      dailyExhausted: this.st.remote !== null && this.st.remote.dayRemaining <= 0,
+    });
+    const wait = Math.min(MAX_BLOCK_MS, Math.max(1000, ms));
     this.st.blockedUntil = now + wait;
     this.st.limited++;
     this.markDirty();

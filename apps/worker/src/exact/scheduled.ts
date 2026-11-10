@@ -18,6 +18,9 @@
  * One invocation shares a deadline (SCHEDULED_MAX_MS) and a subrequest meter across divisions;
  * once either runs out the remaining divisions wait for the next tick. Divisions are taken
  * least recently completed first, so a slow division cannot starve the ones after it.
+ * Only divisions with sync_enabled = 1 are synced (the /current/Me division by default, review S7).
+ * Hourly (incremental) ticks refresh divisions and relations only; open items are read by the
+ * nightly full pass unless the admin setting `exact.incremental_open_items` is on (review S4).
  * Skips silently when there is no Exact connection or it is not active (for example needs_reauth).
  * While Exact rejects the app's client credentials (connections.last_error = CREDENTIALS_REJECTED,
  * set by the gate; an admin must fix EXACT_CLIENT_ID / EXACT_CLIENT_SECRET) the hourly ticks skip
@@ -28,7 +31,7 @@
  */
 import type { Env } from "../env";
 import { CREDENTIALS_REJECTED } from "./gate";
-import { amsterdamParts } from "./local-time";
+import { amsterdamParts } from "@camelthorn/core";
 import {
   MAX_TRANSIENT_RETRIES,
   newMeter,
@@ -138,7 +141,7 @@ export async function runScheduledExactSync(
             s.mode, s.last_status, s.last_started_at, s.retry_count, s.retry_day
      FROM divisions d
      LEFT JOIN sync_state s ON s.division_id = d.id AND s.entity = 'run'
-     WHERE d.connection_id = ?1
+     WHERE d.connection_id = ?1 AND d.sync_enabled = 1
      ORDER BY COALESCE(s.last_completed_at, '') ASC, d.id`,
   )
     .bind(conn.id)

@@ -6,7 +6,7 @@ Orchestrator log. Update after every merge and every direct (trivial) edit.
 | # | Phase | Status |
 |---|---|---|
 | 1 | Foundation | Done (open go-live gate: confirm Google returns auth_time, ADR 0007) |
-| 2 | Exact connection | In progress (E2 ExactGate + OAuth connect on build/E2; E1 typed client) |
+| 2 | Exact connection | Built and reviewed, not yet run against real Exact. Final review (docs/reviews/phase-2-review.md): B1, B2 fixed in G1/G2; S4, S7-S12 and N1 fixed in G3 (build/G3); S1-S3, S5, S6 fixed in G1/G2. Open: first live connection (docs/DEPLOY.md section 9), then the phase 2 re-review. |
 | 3 | Scheduler | Not started |
 | 4 | Read-only screens | Not started |
 | 5 | Revolut connection | Not started |
@@ -33,6 +33,8 @@ Orchestrator log. Update after every merge and every direct (trivial) edit.
 - 2026-11-10: ADR 0001 (Workers only), ADR 0002 (camelthorncapital.com only, no external emails in v1). Direct edit (docs).
 - 2026-11-10: F3 (branch build/F3): shared auth logic moved to packages/core (roles, email, safeReturnTo), `allowedDomain` on /api/auth/me and public /api/config, auth.flow claim via idempotency helper; ADRs 0003-0013 written; CLAUDE.md 4.0 now says the admin is seeded at first Worker start.
 - 2026-11-10: E2 (branch build/E2): ExactGate Durable Object (rate limit, priority, job budgets, single-flight refresh via token authority), AES-GCM token storage, Exact OAuth connect flow, Settings → Connections tab; ADR 0015 (gate design), 0016 (OAuth assumptions to verify with real credentials).
+
+- 2026-11-10: G3 (branch build/G3), Phase 2 review fixes S4, S7-S12, N1: sync entity `relation_ibans` (no CHECK on `sync_state.entity`), every relation bank account in `relation_bank_accounts` with distinct `iban_added_at` / `iban_changed_at` flags, per-division `sync_enabled` (admin toggle, only the `/Me` division on by default), division currency read from Exact, refusal of a reconnect to a different Exact account unless confirmed, incremental open-item sync off by default (`exact.incremental_open_items`), duplicated helpers removed (`fetchCurrentMe`, shared `maskIban`, rate-limit parser, `JOB_ID_RE`, Amsterdam time in core), relations continue from their cursor each night; ADR 0019, ADR status wording, DEPLOY.md live checklist, cron check in the deploy guard.
 
 ## Open decisions (CLAUDE.md §9)
 Answered: 7 (Workers only), 8 (domain only). Unanswered: 1-6 (needed from Phase 2 onward). Record answers as ADRs in `docs/decisions/`.

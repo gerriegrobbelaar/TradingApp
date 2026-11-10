@@ -1,5 +1,12 @@
-# PLACEHOLDERS below (database_id, GOOGLE_CLIENT_ID, OAUTH_REDIRECT_URI, routes) must be filled in
-# before the first deploy. Deploy with `pnpm --filter @camelthorn/worker run deploy`, which runs
+# PLACEHOLDERS below must be filled in before the first deploy:
+#   database_id (EU D1), routes, GOOGLE_CLIENT_ID, OAUTH_REDIRECT_URI,
+#   EXACT_CLIENT_ID, EXACT_REDIRECT_URI (same origin as OAUTH_REDIRECT_URI, fixed path).
+# Secrets are never in this file: GOOGLE_CLIENT_SECRET, SESSION_SECRET, EXACT_CLIENT_SECRET and
+# TOKEN_ENC_KEY (and TOKEN_ENC_KEY_PREVIOUS while rotating) go in with `wrangler secret put`.
+# Also required and checked: the [triggers] cron, and the ExactGate Durable Object binding with
+# its migration (tag v1, sqlite). Durable Objects are always created in the EU jurisdiction by
+# code (ADR 0018); D1 is created with --jurisdiction eu and that cannot be changed later.
+# Deploy with `pnpm --filter @camelthorn/worker run deploy`, which runs
 # scripts/check-deploy-config.mjs and refuses while any placeholder is left (docs/DEPLOY.md).
 name = "camelthorn-finance"
 main = "src/index.ts"

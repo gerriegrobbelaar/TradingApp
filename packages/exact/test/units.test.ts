@@ -13,7 +13,7 @@ import {
   xmlTextElement,
   xmlUnescape,
 } from "../src";
-import { retryAfterFromHeaders } from "../src/rate-limit";
+import { retryAfterFromHeaders, toEpochMs } from "../src/rate-limit";
 import { XML_ERR, XML_OK } from "./fixtures";
 
 describe("parseJsonRawNumbers", () => {
@@ -125,18 +125,59 @@ describe("parseRateLimitHeaders", () => {
     const info = parseRateLimitHeaders({
       "X-RateLimit-Limit": "abc",
       "X-RateLimit-Remaining": "99999999999999999999",
+      "X-RateLimit-Reset": "Infinity",
+      "X-RateLimit-Minutely-Limit": "0x10",
+      "X-RateLimit-Minutely-Remaining": "1e3",
+      "X-RateLimit-Minutely-Reset": "  ",
     });
     expect(info.daily).toEqual({ limit: null, remaining: null, resetAtMs: null });
-    expect(info.minutely.limit).toBeNull();
+    expect(info.minutely).toEqual({ limit: null, remaining: null, resetAtMs: null });
     expect(info.retryAfterMs).toBeNull();
+  });
+
+  it("tolerates whitespace and decimals in numbers", () => {
+    const info = parseRateLimitHeaders({
+      "X-RateLimit-Remaining": " 12 ",
+      "X-RateLimit-Minutely-Limit": "59.5",
+    });
+    expect(info.daily.remaining).toBe(12);
+    expect(info.minutely.limit).toBe(59.5);
+  });
+
+  it("treats a reset below 1e11 as epoch seconds and anything else as milliseconds", () => {
+    const info = parseRateLimitHeaders({
+      "X-RateLimit-Reset": "1700086400",
+      "X-RateLimit-Minutely-Reset": "1700000060000",
+    });
+    expect(info.daily.resetAtMs).toBe(1700086400000);
+    expect(info.minutely.resetAtMs).toBe(1700000060000);
+    expect(toEpochMs(99_999_999_999)).toBe(99_999_999_999_000);
+    expect(toEpochMs(100_000_000_000)).toBe(100_000_000_000);
+  });
+
+  it("reads Retry-After as seconds or as an HTTP date, never negative", () => {
+    const now = Date.parse("2026-01-01T00:00:00Z");
+    expect(parseRateLimitHeaders({ "Retry-After": "2.5" }, now).retryAfterMs).toBe(2500);
+    expect(parseRateLimitHeaders({ "Retry-After": "0" }, now).retryAfterMs).toBe(0);
+    expect(parseRateLimitHeaders({ "Retry-After": "-3" }, now).retryAfterMs).toBeNull();
+    expect(
+      parseRateLimitHeaders({ "Retry-After": "Thu, 01 Jan 2026 00:00:30 GMT" }, now).retryAfterMs,
+    ).toBe(30_000);
+    expect(
+      parseRateLimitHeaders({ "Retry-After": "Wed, 31 Dec 2025 23:00:00 GMT" }, now).retryAfterMs,
+    ).toBe(0);
+    expect(parseRateLimitHeaders({ "Retry-After": "soon" }, now).retryAfterMs).toBeNull();
   });
 });
 
 describe("retryAfterFromHeaders", () => {
-  const now = 1_000_000;
+  const now = 1_700_000_000_000;
   it("prefers Retry-After", () => {
     expect(
-      retryAfterFromHeaders({ "retry-after": "3", "x-ratelimit-minutely-reset": "2000000" }, now),
+      retryAfterFromHeaders(
+        { "retry-after": "3", "x-ratelimit-minutely-reset": String(now + 20_000) },
+        now,
+      ),
     ).toBe(3000);
   });
   it("uses the daily reset when the daily budget is gone", () => {
@@ -144,25 +185,45 @@ describe("retryAfterFromHeaders", () => {
       retryAfterFromHeaders(
         {
           "x-ratelimit-remaining": "0",
-          "x-ratelimit-reset": "1500000",
-          "x-ratelimit-minutely-reset": "1010000",
+          "x-ratelimit-reset": String(now + 500_000),
+          "x-ratelimit-minutely-reset": String(now + 10_000),
         },
         now,
       ),
     ).toBe(500_000);
   });
+  it("lets the caller say the daily budget is gone (state from an earlier response)", () => {
+    const h = {
+      "x-ratelimit-reset": String(now + 500_000),
+      "x-ratelimit-minutely-reset": String(now + 10_000),
+    };
+    expect(retryAfterFromHeaders(h, now)).toBe(10_000);
+    expect(retryAfterFromHeaders(h, now, { dailyExhausted: true })).toBe(500_000);
+    expect(
+      retryAfterFromHeaders({ "x-ratelimit-remaining": "0", ...h }, now, { dailyExhausted: false }),
+    ).toBe(10_000);
+  });
   it("falls back to minutely reset, clamps at 0, then 60 s", () => {
-    expect(retryAfterFromHeaders({ "x-ratelimit-minutely-reset": "1010000" }, now)).toBe(10_000);
-    expect(retryAfterFromHeaders({ "x-ratelimit-minutely-reset": "900000" }, now)).toBe(0);
+    expect(retryAfterFromHeaders({ "x-ratelimit-minutely-reset": String(now + 10_000) }, now)).toBe(
+      10_000,
+    );
+    expect(
+      retryAfterFromHeaders({ "x-ratelimit-minutely-reset": String(now - 100_000) }, now),
+    ).toBe(0);
     expect(retryAfterFromHeaders({ "x-ratelimit-remaining": "0" }, now)).toBe(60_000);
     expect(retryAfterFromHeaders({}, now)).toBe(60_000);
+  });
+  it("accepts epoch seconds for the minute reset", () => {
+    expect(
+      retryAfterFromHeaders({ "x-ratelimit-minutely-reset": String((now + 15_000) / 1000) }, now),
+    ).toBe(15_000);
   });
 });
 
 describe("redaction", () => {
-  it("masks IBANs, keeping country, check digits and last two", () => {
-    expect(maskIban("NL91 ABNA 0417 1643 00")).toBe("NL91************00");
-    expect(maskIban("NL9100")).toBe("******");
+  it("masks IBANs, keeping country, check digits and last four (the audit format)", () => {
+    expect(maskIban("NL91 ABNA 0417 1643 00")).toBe("NL91****4300");
+    expect(maskIban("NL9100")).toBe("****");
   });
 
   it("sanitises messages", () => {

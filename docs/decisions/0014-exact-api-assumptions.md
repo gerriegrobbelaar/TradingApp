@@ -1,6 +1,6 @@
 # 0014 Exact Online API assumptions (verify with real credentials)
 
-Status: accepted, provisional. Written from memory of Exact's API with no network access and no
+Status: provisional — verify with credentials. Written from memory of Exact's API with no network access and no
 credentials. Every item below must be checked against a real division and the current docs
 (https://start.exactonline.nl/docs/HlpRestAPIResources.aspx) before relying on it. Fixtures in
 `packages/exact/test/fixtures` encode these guesses, so fix both together.
@@ -11,8 +11,9 @@ weaker than the builder's guess; they are blockers for the feature that depends 
 
 ## Transport conventions (ours, not Exact's)
 
-- The transport interface (`packages/exact/src/transport.ts`) is the fixed file shared with the
-  `ExactGate` task (E2); keep it identical in both places.
+- The transport interface (`packages/exact/src/transport.ts`) is the contract between the client
+  and the `ExactGate`. There is one copy; the worker imports it from `@camelthorn/exact` (the two
+  tasks were first built against identical copies on separate branches, which is no longer so).
 - REST path excludes host, `/api/v1` and division. `division: 0` means the literal `current`
   segment and is allowed only for path `/Me`, i.e. `/api/v1/current/Me`.
 - XML path is host-relative (`/docs/XMLUpload.aspx`, query `Topic`); the transport must add
@@ -28,8 +29,12 @@ weaker than the builder's guess; they are blockers for the feature that depends 
 
 ## Endpoints and fields to verify
 
-1. `GET /current/Me` fields: `UserID, UserName, FullName, Email, CurrentDivision`.
-2. `GET /{div}/system/Divisions` fields: `Code, Description, Country, Status, Main` (the
+1. `GET /current/Me` fields: `UserID, UserName, FullName, Email, CurrentDivision`, plus
+   `DivisionCustomer` (id) and `DivisionCustomerName` for the account identity (ADR 0019).
+   Read by `fetchCurrentMe` through the gate's division-0 transport. A 400 on `$select` means one
+   of the names is wrong.
+2. `GET /{div}/system/Divisions` fields: `Code, Description, Country, Currency, Status, Main`
+   (`Currency` is the division's own currency and sets the scale of `AmountDC`; ADR 0019) (the
    `hrm/Divisions` resource is the older alternative). `system/Divisions` may list only the
    divisions of the current licence/company; `system/AllDivisions` may be the one the
    administration switcher needs. Verify.
@@ -43,10 +48,15 @@ weaker than the builder's guess; they are blockers for the feature that depends 
    the first real call means this guess is wrong.
 4. Sync endpoints `/sync/Cashflow/Receivables` and `/sync/Cashflow/Payables`: endpoint names,
    field names (`Account`, `Currency`, ...) and whether they expose open amount and invoice
-   number at all are guesses. **DOUBTFUL:** the payables side is more likely
-   `/sync/Cashflow/Payments`, and the amount fields are more likely `AmountDC` / `AmountFC`
-   (division vs foreign currency) than a single `Amount`. If not, fall back to the Receivables/PayablesList plus a nightly
-   full read. `/sync/CRM/Accounts` is believed correct.
+   number at all are guesses. **DOUBTFUL:** the payables side may be `/sync/Cashflow/Payments`
+   (or `PaymentTerms`) rather than `Payables`. The code already reads the amounts as `AmountFC`
+   (open amount in the item currency), `AmountDC` (open amount in the division currency),
+   `TransactionAmountFC` (invoice total), `RateFC` and `IsFullyPaid` (ADR 0017 verify 3); the
+   single `Amount` belongs to the bulk lists only (item 3). **Also unverified: that an invoice
+   has the same `ID` in these endpoints as in `ReceivablesList` / `PayablesList`** (ADR 0017
+   verify 13), which is why incremental open-item reads are off by default (ADR 0019). If these
+   endpoints do not exist or do not fit, fall back to the Receivables/PayablesList plus a
+   nightly full read. `/sync/CRM/Accounts` is believed correct.
 5. Sync pattern: `$filter=Timestamp gt <n>L` and `$orderby=Timestamp`; `Timestamp` is a 64-bit
    integer (kept as a digit string). Page size and whether `$orderby` is honoured on sync
    endpoints: verify. Sync endpoints may also reject `$select` on some resources. A sync read
@@ -72,8 +82,11 @@ weaker than the builder's guess; they are blockers for the feature that depends 
     and `$orderby` are always re-sent from our own query, so a link cannot widen the read.
 11. Error body: `{"error":{"code":"","message":{"lang":"","value":"..."}}}`.
 12. Rate limit headers: `X-RateLimit-Limit/Remaining/Reset` (daily) and
-    `X-RateLimit-Minutely-*`. Reset is assumed to be epoch milliseconds; `Retry-After` in
-    seconds. 429 body and whether Exact sends `Retry-After` at all: verify.
+    `X-RateLimit-Minutely-*`. Reset is assumed to be epoch milliseconds (seconds are tolerated:
+    below 1e11 is multiplied by 1000); `Retry-After` in seconds or an HTTP date. 429 body and
+    whether Exact sends `Retry-After` at all: verify. One parser (`parseRateLimitHeaders` in
+    `packages/exact/src/rate-limit.ts`) serves the client and the gate; the gate only lets the
+    numbers tighten its limiter (ADR 0015).
 13. XML upload: `POST /docs/XMLUpload.aspx?Topic=<Topic>&_Division_=<n>`; envelope `eExact` with
     `xsi:noNamespaceSchemaLocation="eExact-XML.xsd"`; response messages
     `<Message type="n"><Description>`. **DOUBTFUL, blocks MatchSets:** the builder guessed

@@ -6,6 +6,13 @@
  *
  * Every change is one db.batch of the change plus its audit row (ADR 0013). Tokens are encrypted
  * before they are stored and never appear in a response, a log line or an audit row.
+ *
+ * Reconnecting to a DIFFERENT Exact account (review S7, ADR 0016 item 21): the callback compares
+ * the identity of the account /current/Me reports with the one stored on the connection. If it
+ * differs, nothing is replaced unless the flow was started with `confirm_replace=1`: the saved
+ * sign-in is removed again (the connection is disabled, its old identity and divisions are kept)
+ * and the callback answers `?exact=different_exact_account`. With the confirmation the old
+ * divisions are switched off for syncing and the new account's current division is enabled.
  */
 import { auditStatement } from "../db/audit";
 import { claimOnceAndPurge } from "../db/idempotency";
@@ -13,9 +20,10 @@ import { clearCookie, EXACT_FLOW_COOKIE, parseCookies, setCookie } from "../auth
 import { randomBase64Url, safeEqual, sha256Hex } from "../auth/crypto";
 import { FLOW_TTL_SECONDS, openFlow, sealFlow } from "../auth/flow-cookie";
 import { json, type Ctx, type Router } from "../router";
+import { fetchCurrentMe, type CurrentMe } from "@camelthorn/exact";
 import { encryptToken } from "../crypto/token-crypto";
 import { DEFAULT_EXACT_HOST, loadExactConfig, type ExactConfig } from "./config";
-import { createGateTransport } from "./gate-transport";
+import { createCurrentGateTransport } from "./gate-transport";
 import { authorizeUrl, exchangeCode, TokenEndpointError } from "./oauth";
 import { aad, EXACT_CONNECTION_NAME } from "./store";
 
@@ -47,30 +55,36 @@ function exactConfig(ctx: Ctx): { config: ExactConfig } | { response: Response }
   return { config: cfg.config };
 }
 
-/** What Exact's /current/Me answers, reduced to what we store. */
-export function parseMe(body: string): { division: number; name: string } | null {
-  try {
-    const v = JSON.parse(body) as { d?: unknown };
-    const d = v.d as { results?: unknown } | unknown[] | undefined;
-    const first = Array.isArray(d)
-      ? d[0]
-      : d && Array.isArray((d as { results?: unknown }).results)
-        ? ((d as { results: unknown[] }).results[0] as unknown)
-        : undefined;
-    if (!first || typeof first !== "object") return null;
-    const rec = first as Record<string, unknown>;
-    const division = Number(rec.CurrentDivision);
-    if (!Number.isSafeInteger(division) || division < 1) return null;
-    const rawName = rec.DivisionCustomerName;
-    const name =
-      typeof rawName === "string" && rawName.trim() !== ""
-        ? rawName.trim().slice(0, 200)
-        : `Division ${division}`;
-    return { division, name };
-  } catch {
-    return null;
-  }
+/**
+ * Stable identity of the Exact account (subscription owner) behind a /current/Me answer: a hash of
+ * the customer id, else of the customer name. Null when Exact sent neither. Only the hash is
+ * stored; audit rows carry its first 12 characters.
+ */
+export async function exactIdentity(me: CurrentMe): Promise<string | null> {
+  const key =
+    me.divisionCustomerId ?? (me.divisionCustomerName ?? "").trim().toLowerCase().slice(0, 200);
+  return key === "" ? null : sha256Hex(`exact-account:${key}`);
 }
+
+/**
+ * True when the account behind `me` is not the one this connection was used with. Identities are
+ * compared when both sides have one; otherwise (a connection made before identities were stored,
+ * or Exact without the customer fields) the division list decides: a current division we have
+ * never seen means a different account. A connection with no history is never "different".
+ */
+export function isDifferentAccount(
+  prior: { identity: string | null; divisions: readonly number[] },
+  next: { identity: string | null; division: number },
+): boolean {
+  if (prior.identity === null && prior.divisions.length === 0) return false;
+  if (prior.identity !== null && next.identity !== null) return prior.identity !== next.identity;
+  return prior.divisions.length > 0 && !prior.divisions.includes(next.division);
+}
+
+const divisionName = (me: CurrentMe): string =>
+  me.divisionCustomerName !== null && me.divisionCustomerName !== ""
+    ? me.divisionCustomerName.slice(0, 200)
+    : `Division ${me.currentDivision}`;
 
 export function registerExactRoutes(router: Router): void {
   // Status only: tokens are never selected.
@@ -93,13 +107,16 @@ export function registerExactRoutes(router: Router): void {
       }>();
     const divs = await db
       .prepare(
-        "SELECT connection_id, exact_division, name, base_currency FROM divisions ORDER BY exact_division",
+        `SELECT id, connection_id, exact_division, name, base_currency, sync_enabled
+         FROM divisions ORDER BY exact_division`,
       )
       .all<{
+        id: number;
         connection_id: number;
         exact_division: number;
         name: string;
         base_currency: string;
+        sync_enabled: number;
       }>();
     const configured = loadExactConfig(ctx.env, ctx.config.appOrigin).ok;
     return json({
@@ -114,7 +131,13 @@ export function registerExactRoutes(router: Router): void {
         connectedAt: c.connected_at,
         divisions: divs.results
           .filter((d) => d.connection_id === c.id)
-          .map((d) => ({ division: d.exact_division, name: d.name, currency: d.base_currency })),
+          .map((d) => ({
+            id: d.id,
+            division: d.exact_division,
+            name: d.name,
+            currency: d.base_currency,
+            syncEnabled: d.sync_enabled === 1,
+          })),
       })),
     });
   });
@@ -133,6 +156,7 @@ export function registerExactRoutes(router: Router): void {
       returnTo: RETURN_TO,
       bind: session.email,
       exp: ctx.nowMs + FLOW_TTL_SECONDS * 1000,
+      ...(ctx.url.searchParams.get("confirm_replace") === "1" ? { confirmReplace: true } : {}),
     });
     const headers = new Headers({
       location: authorizeUrl(
@@ -214,10 +238,18 @@ export function registerExactRoutes(router: Router): void {
       .bind(EXACT_CONNECTION_NAME)
       .run();
     const row = await db
-      .prepare("SELECT id, status FROM connections WHERE kind = 'exact' AND name = ?1")
+      .prepare(
+        "SELECT id, status, exact_identity FROM connections WHERE kind = 'exact' AND name = ?1",
+      )
       .bind(EXACT_CONNECTION_NAME)
-      .first<{ id: number; status: string }>();
+      .first<{ id: number; status: string; exact_identity: string | null }>();
     if (!row) return back("error");
+    const knownDivisions = (
+      await db
+        .prepare("SELECT exact_division FROM divisions WHERE connection_id = ?1")
+        .bind(row.id)
+        .all<{ exact_division: number }>()
+    ).results.map((d) => d.exact_division);
 
     const key = ctx.env.TOKEN_ENC_KEY;
     const accessEnc = await encryptToken(key, tokens.accessToken, aad(row.id, "access"));
@@ -245,38 +277,93 @@ export function registerExactRoutes(router: Router): void {
     ]);
 
     // Learn the division through the gate (the same path every later call takes).
-    let me: { division: number; name: string } | null = null;
+    let me: CurrentMe | null = null;
     try {
-      const res = await createGateTransport(
-        ctx.env,
-        0,
-      )({
-        method: "GET",
-        path: "/Me",
-        division: 0,
-        priority: "user",
-        jobId: "exact-connect",
-        api: "rest",
-      });
-      me = res.status === 200 ? parseMe(res.body) : null;
+      me = await fetchCurrentMe(createCurrentGateTransport(ctx.env), { jobId: "exact-connect" });
     } catch (e) {
       console.warn("exact current/Me failed", e instanceof Error ? e.name : "error");
     }
     if (!me) return back("connected_no_division");
 
+    const identity = await exactIdentity(me);
+    const different = isDifferentAccount(
+      { identity: row.exact_identity, divisions: knownDivisions },
+      { identity, division: me.currentDivision },
+    );
+    const short = (v: string | null): string | null => (v === null ? null : v.slice(0, 12));
+    // New divisions start disabled, except the first one of a connection with none enabled.
+    const upsertDivision = db
+      .prepare(
+        `INSERT INTO divisions (connection_id, exact_division, name, sync_enabled)
+         VALUES (?1, ?2, ?3, CASE WHEN EXISTS
+           (SELECT 1 FROM divisions WHERE connection_id = ?1 AND sync_enabled = 1) THEN 0 ELSE 1 END)
+         ON CONFLICT (connection_id, exact_division) DO UPDATE SET name = excluded.name`,
+      )
+      .bind(row.id, me.currentDivision, divisionName(me));
+
+    if (different && flow.confirmReplace !== true) {
+      // Refuse: take the new sign-in out again; the old identity and divisions stay as they were.
+      await db.batch([
+        auditStatement(db, {
+          actorEmail: session.email,
+          action: "connection.exact_account_mismatch",
+          entity: "connection",
+          entityId: row.id,
+          before: { identity: short(row.exact_identity) },
+          after: { identity: short(identity), division: me.currentDivision, refused: true },
+        }),
+        db
+          .prepare(
+            `UPDATE connections
+             SET status = 'disabled', last_error = 'different_exact_account',
+                 access_token_enc = NULL, refresh_token_enc = NULL, token_ref = NULL,
+                 expires_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id = ?1`,
+          )
+          .bind(row.id),
+      ]);
+      console.warn("exact connect refused", "different_exact_account");
+      return back("different_exact_account");
+    }
+
+    if (different) {
+      await db.batch([
+        auditStatement(db, {
+          actorEmail: session.email,
+          action: "connection.exact_account_replaced",
+          entity: "connection",
+          entityId: row.id,
+          before: { identity: short(row.exact_identity), divisions: knownDivisions },
+          after: { identity: short(identity), division: me.currentDivision, confirmed: true },
+        }),
+        db.prepare("UPDATE divisions SET sync_enabled = 0 WHERE connection_id = ?1").bind(row.id),
+        upsertDivision,
+        db
+          .prepare(
+            "UPDATE divisions SET sync_enabled = 1 WHERE connection_id = ?1 AND exact_division = ?2",
+          )
+          .bind(row.id, me.currentDivision),
+        db
+          .prepare("UPDATE connections SET exact_identity = ?2 WHERE id = ?1")
+          .bind(row.id, identity),
+      ]);
+      return back("connected");
+    }
+
     await db.batch([
+      upsertDivision,
+      // Remember who this is (fills in connections made before identities were stored).
       db
         .prepare(
-          `INSERT INTO divisions (connection_id, exact_division, name) VALUES (?1, ?2, ?3)
-           ON CONFLICT (connection_id, exact_division) DO UPDATE SET name = excluded.name`,
+          "UPDATE connections SET exact_identity = COALESCE(?2, exact_identity) WHERE id = ?1",
         )
-        .bind(row.id, me.division, me.name),
+        .bind(row.id, identity),
       auditStatement(db, {
         actorEmail: session.email,
         action: "connection.exact_divisions_synced",
         entity: "connection",
         entityId: row.id,
-        after: { divisions: [me.division] },
+        after: { divisions: [me.currentDivision] },
       }),
     ]);
     return back("connected");

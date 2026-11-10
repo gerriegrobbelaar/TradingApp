@@ -47,6 +47,14 @@ export function deployConfigProblems(toml) {
       "DO_JURISDICTION_DISABLED has no effect and must not be set: Durable Objects are always EU (ADR 0018)",
     );
   }
+  // The cron trigger drives the Exact sync (hourly tick, nightly full pass); without it nothing
+  // is ever refreshed. Looked for inside the [triggers] table only.
+  const triggers = /^\[triggers\][ \t]*\n((?:(?!\[).*\n?)*)/m.exec(text);
+  if (!triggers || !/^\s*crons\s*=\s*\[\s*"[^"]+"/m.test(triggers[1] ?? "")) {
+    problems.push(
+      'no cron trigger: [triggers] crons = ["0 * * * *"] is missing (the Exact sync would never run)',
+    );
+  }
   if (!/^\s*(routes?\s*=|\[\[routes\]\])/m.test(text)) {
     problems.push("no routes set (workers_dev is off, so the Worker would be unreachable)");
   }

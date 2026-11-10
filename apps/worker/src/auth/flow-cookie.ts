@@ -16,6 +16,8 @@ export interface FlowState {
   returnTo: string;
   /** Optional: email of the signed-in user the flow belongs to (used by the Exact connect flow). */
   bind?: string;
+  /** Exact connect flow: the admin confirmed replacing the connection with a different account. */
+  confirmReplace?: boolean;
   /** Expiry, epoch milliseconds. */
   exp: number;
 }
@@ -46,6 +48,7 @@ export async function openFlow(
       typeof f.stepUp !== "boolean" ||
       typeof f.returnTo !== "string" ||
       (f.bind !== undefined && typeof f.bind !== "string") ||
+      (f.confirmReplace !== undefined && typeof f.confirmReplace !== "boolean") ||
       typeof f.exp !== "number" ||
       f.exp < nowMs
     ) {
