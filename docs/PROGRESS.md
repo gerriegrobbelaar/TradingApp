@@ -24,6 +24,8 @@ Orchestrator log. Update after every merge and every direct (trivial) edit.
 - 2026-11-10: T2 D1 schema, seed, audit, idempotency merged (reviewer PASS).
 - 2026-11-10: T3 design tokens + base components merged (reviewer PASS). Direct edit: dark --subtle lightened for 4.5:1.
   - Open for final review: control borders (--line) and off-switch knob below 3:1 non-text contrast; see docs/design/NOTES.md.
+- 2026-11-10: T4 Google sign-in, sessions, users/roles API merged (reviewer PASS; fixed step-up refresh and callback replay).
+  - Go-live check: confirm Google returns auth_time with max_age (step-up fails closed otherwise); see apps/worker/README.md.
 - 2026-11-10: ADR 0001 (Workers only), ADR 0002 (camelthorncapital.com only, no external emails in v1). Direct edit (docs).
 
 ## Open decisions (CLAUDE.md §9)
