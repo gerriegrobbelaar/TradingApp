@@ -212,6 +212,30 @@ export interface BudgetRow {
   dimension: string;
 }
 
+/**
+ * One purchase entry (`purchaseentry/PurchaseEntries`) with its approval/processing status.
+ * Every field name is a recollection to VERIFY with credentials (ADR 0025). Dates are instants
+ * (ISO, UTC) as for the other entities. `statusCode` is Exact's raw `Status`; the mapping to an
+ * approval status lives in @camelthorn/core (approvals.ts), not here. `hasDocument` is null when
+ * the row carries no `Document` field at all (we cannot tell), false when it is null in Exact.
+ */
+export interface PurchaseEntry {
+  id: string;
+  entryNumber: string | null;
+  supplierId: string | null;
+  supplierName: string | null;
+  /** Entry total in the entry currency (AmountFC). */
+  amount: Money;
+  /** Entry total in the division currency (AmountDC), when present. */
+  amountDc: Money | null;
+  entryDate: string | null;
+  dueDate: string | null;
+  statusCode: number | null;
+  created: string | null;
+  modified: string | null;
+  hasDocument: boolean | null;
+}
+
 export interface SyncPage<T> {
   items: T[];
   /** Resume point: pass as `cursor` next time. Equals the input cursor when nothing changed. */
@@ -361,6 +385,26 @@ export const BUDGET_FIELDS = [
   "Costcenter",
   "Costunit",
 ] as const;
+/**
+ * Purchase entries (ADR 0025). ALL names are recollections: VERIFY with credentials. A 400 on
+ * `$select` or `$filter` means one of them is wrong (the sync then reports purchase entries as
+ * unavailable instead of failing the run).
+ */
+export const PURCHASE_ENTRY_FIELDS = [
+  "EntryID",
+  "EntryNumber",
+  "Supplier",
+  "SupplierName",
+  "Currency",
+  "AmountFC",
+  "AmountDC",
+  "EntryDate",
+  "DueDate",
+  "Status",
+  "Created",
+  "Modified",
+  "Document",
+] as const;
 export const SYNC_ACCOUNT_FIELDS = [...ACCOUNT_FIELDS, "Timestamp"] as const;
 
 // ---------------------------------------------------------------------------------------------
@@ -475,6 +519,36 @@ export function odataString(v: string): string {
   // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u001F]/.test(v)) throw new RangeError("control characters in OData string");
   return `'${v.replace(/'/g, "''")}'`;
+}
+
+/**
+ * Which purchase entries to read (ADR 0025).
+ *  - window:   entry date or last change on/after `fromIso`, or still waiting for approval (the
+ *              listed Status codes, whatever their age). The full read.
+ *  - modified: changed on/after `sinceIso`. The hourly read; `ge`, not `gt`, so the row that set
+ *              the cursor and rows with the same timestamp are read again (upserts are idempotent).
+ * Both are ordered by Modified ascending, so a saved cursor can be the last Modified read.
+ */
+export type PurchaseEntryFilter =
+  | { kind: "window"; fromIso: string; pendingStatusCodes: readonly number[] }
+  | { kind: "modified"; sinceIso: string };
+
+/** OData v2 datetime literal, second precision, from an ISO instant (UTC). */
+export function odataDateTime(iso: string): string {
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) throw new RangeError("invalid date");
+  return `datetime'${new Date(ms).toISOString().slice(0, 19)}'`;
+}
+
+export function purchaseEntryFilterExpr(f: PurchaseEntryFilter): string {
+  if (f.kind === "modified") return `Modified ge ${odataDateTime(f.sinceIso)}`;
+  const dt = odataDateTime(f.fromIso);
+  const parts = [`EntryDate ge ${dt}`, `Modified ge ${dt}`];
+  for (const code of f.pendingStatusCodes) {
+    if (!Number.isSafeInteger(code) || code < 0) throw new RangeError("invalid status code");
+    parts.push(`Status eq ${code}`);
+  }
+  return parts.join(" or ");
 }
 
 function maxTimestamp(a: string, b: string | null): string {
@@ -867,6 +941,28 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
     };
   }
 
+  function mapPurchaseEntry(r: Row): PurchaseEntry {
+    const currency = currencyOrNull(r, "Currency") ?? divisionCurrency;
+    // `Document` present: a GUID means a document is attached, null means none. Absent: unknown.
+    const hasDocField = Object.prototype.hasOwnProperty.call(r, "Document");
+    const doc = hasDocField ? guidOrNull(r, "Document") : null;
+    const number = lenientInt(r, "EntryNumber");
+    return {
+      id: reqGuid(r, "EntryID"),
+      entryNumber: number === null ? null : String(number),
+      supplierId: guidOrNull(r, "Supplier"),
+      supplierName: trimField(r, "SupplierName"),
+      amount: moneyField(r, "AmountFC", currency),
+      amountDc: optionalMoney(r, "AmountDC", divisionCurrency),
+      entryDate: dateField(r, "EntryDate"),
+      dueDate: dateField(r, "DueDate"),
+      statusCode: lenientInt(r, "Status"),
+      created: dateField(r, "Created"),
+      modified: dateField(r, "Modified"),
+      hasDocument: hasDocField ? doc !== null : null,
+    };
+  }
+
   async function ledgerChunk<T>(
     path: string,
     select: readonly string[],
@@ -1116,6 +1212,26 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
         BUDGET_FIELDS,
         { $filter: `ReportingYear eq ${assertYear(opts.year)}` },
         mapBudget,
+        token,
+        opts,
+      );
+    },
+
+    /**
+     * Purchase entries with their approval status (ADR 0025), a resumable chunk of up to
+     * `maxPages` pages from `token` (null = start), ordered by Modified ascending. ASSUMPTIONS to
+     * verify: the resource and field names, `$orderby=Modified`, and the same stateless
+     * `$skiptoken` as the other lists.
+     */
+    async listPurchaseEntriesChunk(
+      token: string | null,
+      opts: { filter: PurchaseEntryFilter; maxPages?: number },
+    ): Promise<ListChunk<PurchaseEntry>> {
+      return ledgerChunk(
+        "/purchaseentry/PurchaseEntries",
+        PURCHASE_ENTRY_FIELDS,
+        { $filter: purchaseEntryFilterExpr(opts.filter), $orderby: "Modified" },
+        mapPurchaseEntry,
         token,
         opts,
       );

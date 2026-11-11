@@ -66,7 +66,7 @@ export const BUDGETS_UNAVAILABLE_STATUSES: readonly number[] = [400, 403, 404];
  * Codes of 400s that our own gate raises (request validation, a wrong gate): they say nothing about
  * Exact's budget module, so they never mark budgets unavailable.
  */
-const GATE_REJECT_CODES: ReadonlySet<string> = new Set([
+export const GATE_REJECT_CODES: ReadonlySet<string> = new Set([
   "division_mismatch",
   "method",
   "division",

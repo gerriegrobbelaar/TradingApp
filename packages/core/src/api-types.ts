@@ -172,7 +172,7 @@ export interface AgeingReportResponse {
 }
 
 /** The sync_state entities whose complete reads freshness is based on. */
-export type FreshnessEntity = "receivables" | "payables";
+export type FreshnessEntity = "receivables" | "payables" | "purchase_entries";
 
 export interface Freshness {
   /**
@@ -356,4 +356,60 @@ export interface LedgerAccountBalancesResponse {
   /** Sum of the period amounts shown. */
   totalMinor: number;
   freshness: LedgerFreshness;
+}
+
+// ---- approvals (task K4, ADR 0025) ----------------------------------------------------------
+
+export type ApprovalStatus = "pending_approval" | "approved" | "rejected" | "unknown";
+
+/**
+ * One purchase entry as the Approvals screen shows it. No IBANs or emails. `amountMinor` is the
+ * entry total in `currency` (credit notes negative). `status` comes from the one mapping table in
+ * approvals.ts (unverified, ADR 0025; unknown codes are 'unknown'). `ageDays` is set for pending
+ * items only. `hasPdf` is null when we could not tell.
+ */
+export interface ApprovalItemDto {
+  id: number;
+  exactId: string;
+  entryNumber: string | null;
+  relation: { id: number | null; name: string } | null;
+  currency: string;
+  amountMinor: number;
+  dueDate: string | null;
+  entryDate: string | null;
+  status: ApprovalStatus;
+  submittedAt: string | null;
+  ageDays: number | null;
+  hasPdf: boolean | null;
+}
+
+/**
+ * GET /api/approvals?division=&status=pending_approval|approved|rejected|all&q=&limit=&cursor=
+ * `available` is false until the purchase entries have been read completely once (or when Exact
+ * refuses the resource); items are then empty. `countsByStatus` ignores the status filter but
+ * follows `q`.
+ */
+export interface ApprovalsResponse {
+  division: { id: number; name: string };
+  items: ApprovalItemDto[];
+  nextCursor: string | null;
+  total: number;
+  countsByStatus: Record<ApprovalStatus, number>;
+  freshness: Freshness;
+  available: boolean;
+}
+
+/** GET /api/approvals/:id */
+export interface ApprovalDetail {
+  division: { id: number; name: string };
+  item: ApprovalItemDto;
+  statusCode: number | null;
+  amountDcMinor: number | null;
+  dcCurrency: string | null;
+  modifiedAt: string | null;
+  provenance: {
+    lastSeenAt: string;
+    lastSeenSyncId: number | null;
+    missedCycles: number;
+  };
 }

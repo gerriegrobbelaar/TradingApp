@@ -161,7 +161,8 @@ describe.each([
     expect(calls("/financial/ReportingBalance")).toBe(2 * p.balanceCalls);
     expect(calls("/budget/Budgets")).toBe(p.budgetCalls);
     expect(fx.calls.length).toBeLessThanOrEqual(240);
-    expect(fx.calls.length).toBe(PRE + p.accountCalls + 2 * p.balanceCalls + p.budgetCalls);
+    // + 1: the (empty) purchase-entry read that closes a full cycle (K4)
+    expect(fx.calls.length).toBe(PRE + p.accountCalls + 2 * p.balanceCalls + p.budgetCalls + 1);
     expect(await count("gl_accounts")).toBe(300);
     expect(await count("gl_balances")).toBe(7200);
     expect(await count("gl_balances", "year = 2025")).toBe(3600);

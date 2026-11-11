@@ -219,6 +219,7 @@ describe("full cycles", () => {
       "/financial/GLAccounts",
       "/financial/ReportingBalance",
       "/budget/Budgets",
+      "/purchaseentry/PurchaseEntries",
     ]);
   });
 

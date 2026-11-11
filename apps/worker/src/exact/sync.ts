@@ -56,6 +56,7 @@ import {
   syncGlBudgets,
   type LedgerEntityName,
 } from "./ledger-sync";
+import { PURCHASE_ENTITY, syncPurchaseEntries } from "./purchase-sync";
 import {
   CLOSE_GUARD_FRACTION,
   CLOSE_GUARD_MIN,
@@ -90,7 +91,13 @@ import {
 export type SyncMode = "full" | "incremental";
 export type RunStatus = "ok" | "partial" | "error" | "needs_reauth";
 export type EntityName =
-  "divisions" | "relations" | "relation_ibans" | "receivables" | "payables" | LedgerEntityName;
+  | "divisions"
+  | "relations"
+  | "relation_ibans"
+  | "receivables"
+  | "payables"
+  | LedgerEntityName
+  | typeof PURCHASE_ENTITY;
 export const ENTITIES: readonly EntityName[] = [
   "divisions",
   "receivables",
@@ -99,6 +106,18 @@ export const ENTITIES: readonly EntityName[] = [
   "relation_ibans",
   // Ledger data for the reports (ledger-sync.ts, ADR 0024): FULL runs only, after everything else.
   ...LEDGER_ENTITIES,
+  // Approval status of purchase entries (purchase-sync.ts, ADR 0025). In FULL runs it comes last;
+  // the hourly run reads it right after the divisions (INCREMENTAL_ORDER).
+  PURCHASE_ENTITY,
+];
+/**
+ * Order of an INCREMENTAL run: the cheap approval-status read (usually one call) goes before the
+ * relations, whose first walk after a reset can use the whole hourly budget.
+ */
+export const INCREMENTAL_ORDER: readonly EntityName[] = [
+  "divisions",
+  PURCHASE_ENTITY,
+  ...ENTITIES.filter((e) => e !== "divisions" && e !== PURCHASE_ENTITY),
 ];
 /**
  * Every value sync_state.entity may hold: the entities plus 'run' for the whole run. The table has
@@ -174,6 +193,11 @@ export interface SyncOptions {
    * after everything else. Default true; the hourly incremental run never reads it (ADR 0024).
    */
   readLedger?: boolean;
+  /**
+   * Read the approval status of purchase entries (ADR 0025): in full runs (a pass) and in hourly
+   * incremental runs (entries modified since the cursor). Default true.
+   */
+  readPurchaseEntries?: boolean;
   /**
    * Incremental mode: also read the open receivables / payables from the Timestamp sync
    * endpoints. Default: the `exact.incremental_open_items` setting, which is OFF unless an admin
@@ -617,6 +641,7 @@ export async function syncDivision(
   const budget = opts.budget ?? DEFAULT_SYNC_BUDGET;
   const readIbans = opts.mode === "full" && (opts.readIbans ?? true);
   const readLedger = opts.mode === "full" && (opts.readLedger ?? true);
+  const readPurchase = opts.readPurchaseEntries ?? true;
   const entities = Object.fromEntries(ENTITIES.map((e) => [e, emptyResult()])) as Record<
     EntityName,
     EntityResult
@@ -767,13 +792,14 @@ export async function syncDivision(
         callsSoFar: () => [...tally.values()].reduce((a, b) => a + b, 0),
       };
 
-      for (const entity of ENTITIES) {
+      for (const entity of opts.mode === "full" ? ENTITIES : INCREMENTAL_ORDER) {
         if (fatal !== null) break;
         current = entity;
         ctx.progress = 0;
         ctx.pass = null;
         if (entity === "relation_ibans" && !readIbans) continue;
         if (isLedgerEntity(entity) && !readLedger) continue;
+        if (entity === PURCHASE_ENTITY && !readPurchase) continue;
         if (
           opts.mode === "incremental" &&
           !incrementalOpenItems &&
@@ -898,7 +924,10 @@ export async function syncDivision(
     // The cycle is finished when every entity it covers is. IBANs are only part of it for runs
     // that read them (a manual full run leaves them to the nightly one).
     const required = ENTITIES.filter(
-      (e) => (e !== "relation_ibans" || readIbans) && (!isLedgerEntity(e) || readLedger),
+      (e) =>
+        (e !== "relation_ibans" || readIbans) &&
+        (!isLedgerEntity(e) || readLedger) &&
+        (e !== PURCHASE_ENTITY || readPurchase),
     );
     const cycleComplete =
       cycle !== null && status === "ok" && required.every((e) => entities[e].cycleDone === true);
@@ -981,7 +1010,10 @@ export async function syncDivision(
       } else if (
         cycle !== null &&
         r.status === "error" &&
-        (entity === "receivables" || entity === "payables" || isLedgerEntity(entity)) &&
+        (entity === "receivables" ||
+          entity === "payables" ||
+          isLedgerEntity(entity) ||
+          entity === PURCHASE_ENTITY) &&
         r.error !== "close_guard"
       ) {
         // A saved $skiptoken that keeps failing must not be retried until the cycle expires.
@@ -1139,6 +1171,8 @@ function runEntity(ctx: Ctx, entity: EntityName): Promise<EntityResult> {
       return syncGlBalances(ctx);
     case "gl_budgets":
       return syncGlBudgets(ctx);
+    case "purchase_entries":
+      return syncPurchaseEntries(ctx);
   }
 }
 
