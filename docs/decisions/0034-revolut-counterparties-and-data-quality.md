@@ -1,8 +1,8 @@
 # 0034 Revolut counterparties for matching, quarantine, frozen rows (Phase 5 review Q1)
 
 Status: accepted (task Q1, review items S1, S2, S6, S7, S8, S9, N3, N4). Items marked **verify with sandbox** are
-assumptions about Revolut payloads that no real call has confirmed (ADR 0030). The number 0034 may need to change at merge
-if another task took it.
+assumptions about Revolut payloads that no real call has confirmed (ADR 0030). Migration 0015 runs before 0016 (Q2,
+webhook health) and 0017 (Q3, `open_items.stored_minor`); nothing here touches `open_items`.
 
 ## Revolut counterparties for matching (S6)
 **Problem.** Matching rule 2 (CLAUDE.md 4.2) needs the counterparty's IBAN. A leg of a Revolut transaction carries
@@ -97,6 +97,10 @@ API) after 30 s, 2 min and 10 min, chosen by the delivery number (`msg.attempts`
 errors: whatever mix of 404s and rate limits happens, the 4th delivery always settles the row (`processed` for a 404,
 `error` with the code otherwise), so it never reaches the DLQ as `queued`. If the handler itself throws on the last
 delivery (D1 down), the consumer marks the row `error` / `internal` (best effort) before the message goes to the DLQ.
+Interplay with the webhook housekeeping (Q2): the sweep re-enqueues a row still `queued` 15 minutes after it was received;
+the three 404 delays add up to 12.5 minutes, so a plain 404 sequence settles first. A sequence stretched by long
+rate-limit waits can be re-enqueued by the sweep: the duplicate message is harmless (the handler and the upsert are
+idempotent, and the sweep's re-enqueues are bounded by `MAX_REQUEUES`).
 
 ## Frozen rows (S9)
 `isFrozen(row)` = the row is FINAL and (has a live `matches` row, or `match_status != 'unmatched'`). For a frozen row the

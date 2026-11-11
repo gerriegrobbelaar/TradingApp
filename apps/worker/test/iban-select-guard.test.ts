@@ -32,11 +32,15 @@ const ALLOWED_COLUMN_NAMES: Record<string, string> = {
   "../src/revolut/ingest.ts":
     "stores the counterparty IBAN of a transaction and compares it on update",
   "../src/read/bank-routes.ts": "reads it only to mask it (counterpartyIbanMasked)",
+  "../src/revolut/counterparties.ts":
+    "copies a looked-up counterparty IBAN to UNMATCHED bank_transactions rows for matching rule 2 (never returned or logged, ADR 0034)",
 };
 const ALLOWED_SELECT_IBAN: Record<string, string> = {
   "../src/exact/sync.ts":
     "reconciles relation and relation_bank_accounts rows (never returned to a client)",
   "../src/read/bank-routes.ts": "reads bank_accounts.iban only to mask it (ibanMasked)",
+  "../src/revolut/counterparties.ts":
+    "reads revolut_counterparties.iban (the lookup cache) to fill unmatched transactions; never returned or logged (ADR 0034)",
 };
 
 /** A column that holds a full IBAN: `iban` or `<prefix>_iban` (not `iban_changed_at`). */
