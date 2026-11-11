@@ -9,7 +9,11 @@ import { DataTable, KeyboardHint, LoadMore, type Column } from "../components/Da
 import { DrillSheet } from "../components/DrillSheet";
 import { EmptyState } from "../components/EmptyState";
 import { FilterBar } from "../components/FilterBar";
-import { MAPPING_NOTICE, MappingVerifySheet } from "../components/MappingVerifySheet";
+import {
+  MAPPING_CHANGED_NOTICE,
+  MAPPING_NOTICE,
+  MappingVerifySheet,
+} from "../components/MappingVerifySheet";
 import { FreshnessStamp } from "../components/FreshnessStamp";
 import { Money } from "../components/Money";
 import { PageHeader } from "../components/PageHeader";
@@ -178,7 +182,7 @@ export function Approvals() {
       />
       {notVerified && (
         <div role="status" className="notice warn">
-          <p>{MAPPING_NOTICE}</p>
+          <p>{list.first?.mappingChanged ? MAPPING_CHANGED_NOTICE : MAPPING_NOTICE}</p>
           {admin && (
             <Button size="sm" onClick={() => setVerifyOpen(true)}>
               Check and verify the mapping

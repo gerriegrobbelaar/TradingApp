@@ -11,10 +11,16 @@ const base = (me = VIEWER) => ({
 const LATE = approval({ id: 1, entryNumber: "2001", ageDays: 5 });
 const NOTICE =
   "Approval status mapping is not verified against Exact yet. Do not rely on these statuses for payments.";
+const CHANGED =
+  "The status mapping changed since it was verified. Do not rely on these statuses for payments until an admin verifies it again.";
+const SENTENCE = "I verified the approval status mapping against Exact";
 const CODES = {
   division: { id: 1, name: "Alpha BV" },
   table: [],
-  mappingVerified: null,
+  mappingVerified: false,
+  mappingChanged: false,
+  marker: null,
+  currentMappingHash: "ab".repeat(32),
   codes: [
     {
       statusCode: 5,
@@ -75,14 +81,22 @@ describe("mapping not verified (review S2)", () => {
     const dialog = await screen.findByRole("dialog");
     expect(await within(dialog).findByText("20")).toBeTruthy();
     expect(within(dialog).getByText("7")).toBeTruthy();
-    await user.click(
-      within(dialog).getByRole("button", { name: /Confirm the mapping is verified/ }),
-    );
+    const confirm = within(dialog).getByRole("button", { name: /Confirm the mapping is verified/ });
+    // the sentence must be typed; a near miss keeps the button disabled
+    expect((confirm as HTMLButtonElement).disabled).toBe(true);
+    const box = within(dialog).getByRole("textbox", { name: /to confirm/ });
+    await user.type(box, "I verified the approval status mapping");
+    expect((confirm as HTMLButtonElement).disabled).toBe(true);
+    expect(calls.some((c) => c.method === "PUT")).toBe(false);
+    await user.type(box, " against Exact");
+    expect((confirm as HTMLButtonElement).disabled).toBe(false);
+    await user.click(confirm);
     await waitFor(() => expect(screen.queryByText(NOTICE)).toBeNull());
     const put = calls.find((c) => c.method === "PUT");
     expect(put?.body).toEqual({
-      confirmation: "I verified the approval status mapping against Exact",
+      confirmation: SENTENCE,
       adrRef: "ADR 0025",
+      mappingHash: "ab".repeat(32),
     });
   });
 
@@ -101,8 +115,61 @@ describe("mapping not verified (review S2)", () => {
     await loaded();
     await user.click(screen.getByRole("button", { name: /Check and verify the mapping/ }));
     const dialog = await screen.findByRole("dialog");
-    await user.click(await within(dialog).findByRole("button", { name: /Confirm the mapping/ }));
+    await user.type(await within(dialog).findByRole("textbox", { name: /to confirm/ }), SENTENCE);
+    await user.click(within(dialog).getByRole("button", { name: /Confirm the mapping/ }));
     expect(await within(dialog).findByRole("button", { name: "Sign in again" })).toBeTruthy();
     expect(screen.getByText(NOTICE)).toBeTruthy();
+  });
+
+  it("says when the mapping changed since it was verified, and lets an admin verify again", async () => {
+    const marker = {
+      verifiedAt: "2026-10-01T10:00:00.000Z",
+      verifiedBy: "admin@camelthorncapital.com",
+      adrRef: "ADR 0025",
+      mappingHash: "cd".repeat(32),
+    };
+    const calls = mockFetch({
+      ...base(ADMIN),
+      "GET /api/approvals": () => ({
+        body: approvals([LATE], { mappingVerified: false, mappingChanged: true }),
+      }),
+      "GET /api/approvals/status-codes": () => ({
+        body: { ...CODES, mappingChanged: true, marker },
+      }),
+      "PUT /api/approvals/mapping-verified": () => ({
+        status: 409,
+        body: { error: "mapping_changed" },
+      }),
+    });
+    const user = userEvent.setup();
+    renderApp("/purchases/approvals");
+    await loaded();
+    expect(screen.getByText(CHANGED)).toBeTruthy();
+    expect(screen.queryByText(NOTICE)).toBeNull();
+    await user.click(screen.getByRole("button", { name: /Check and verify the mapping/ }));
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      await within(dialog).findByText(/The status mapping changed since it was verified/),
+    ).toBeTruthy();
+    // the old mark can still be removed, and a new one recorded
+    expect(within(dialog).getByRole("button", { name: /Remove the verified mark/ })).toBeTruthy();
+    await user.type(within(dialog).getByRole("textbox", { name: /to confirm/ }), SENTENCE);
+    await user.click(within(dialog).getByRole("button", { name: /Confirm the mapping/ }));
+    expect(await within(dialog).findByText(/changed while this sheet was open/)).toBeTruthy();
+    expect(calls.filter((c) => c.method === "PUT")).toHaveLength(1);
+    expect(screen.getByText(CHANGED)).toBeTruthy();
+  });
+
+  it("shows the changed notice to non-admins too, without an action", async () => {
+    mockFetch({
+      ...base(),
+      "GET /api/approvals": () => ({
+        body: approvals([LATE], { mappingVerified: false, mappingChanged: true }),
+      }),
+    });
+    renderApp("/purchases/approvals");
+    await loaded();
+    expect(screen.getByText(CHANGED)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /verify/i })).toBeNull();
   });
 });

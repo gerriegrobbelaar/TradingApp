@@ -54,7 +54,10 @@ database and checks `PRAGMA foreign_key_check`.
     both flags.
   - Phase 9 must treat either flag as "new or changed bank details" for the second-approver rule
     (CLAUDE.md 4.4) and must re-read the supplier's accounts (`listBankAccounts({ accountId })`)
-    when it prepares a payment, because the nightly read can be a day old.
+    when it prepares a payment, because the nightly read can be a day old (since M2 up to 3 days:
+    the IBAN read runs after the ledger and is only forced ahead of it once the last complete read
+    is older than 3 days, ADR 0024 addendum S10). This is a hard requirement of the payment
+    pre-check, also noted at `hasValidIbanChecksum` in `packages/core/src/iban.ts`.
 - The baseline is the first COMPLETED pass of a division, even one that found nothing: a division
   that really had no IBANs must flag its first one. The price: a faulty empty first answer makes
   the next real one flag every relation once (the cautious direction).

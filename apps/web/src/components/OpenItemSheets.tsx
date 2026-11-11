@@ -4,13 +4,13 @@ import { Chip } from "@camelthorn/ui";
 import { listOpenItems } from "../api";
 import { BUCKET_LABEL, BUCKET_TONE } from "../lib/ageing";
 import { describeLoadError } from "../lib/errors";
-import { describeDue, formatCount, formatDate, formatMoney } from "../lib/format";
+import { NO_VALUE, describeDue, formatCount, formatDate, formatMoney } from "../lib/format";
 import { useCursorList } from "../lib/useCursorList";
 import { LoadMore } from "./DataTable";
 import { DrillSheet } from "./DrillSheet";
 import { EmptyState, ErrorNotice } from "./EmptyState";
 import { Money } from "./Money";
-import { OpenItemDetailBody, itemTitle } from "./OpenItemDetailBody";
+import { OpenItemDetailBody, POSSIBLY_PAID_LABEL, itemTitle } from "./OpenItemDetailBody";
 import { Skeleton } from "@camelthorn/ui";
 
 /** Sheet with one open item's full detail (Invoices and Payables lists). */
@@ -64,7 +64,12 @@ function DrillRow({
           </span>
         </span>
         <span className="e">
-          <Money minor={item.openMinor} currency={item.currency} />
+          {item.status === "open" ? (
+            <Money minor={item.openMinor} currency={item.currency} />
+          ) : (
+            <span className="muted">{NO_VALUE}</span>
+          )}
+          {item.possiblyPaid && <Chip tone="warn">{POSSIBLY_PAID_LABEL}</Chip>}
           {item.bucket && (
             <Chip tone={BUCKET_TONE[item.bucket]}>
               {item.daysOverdue !== null && item.daysOverdue > 0

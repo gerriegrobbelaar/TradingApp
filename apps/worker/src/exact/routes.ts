@@ -255,9 +255,12 @@ export function registerExactRoutes(router: Router): void {
 
     // The ciphertext is bound to the connection id, so make sure the (single) row exists first.
     // An empty 'pending' placeholder carries no data and needs no audit row of its own.
+    // creates_bank_entries is explicit (migration 0012, review S11): the Exact connection never
+    // creates bank entries itself; the per-connection decision belongs to Revolut (Phase 5).
     await db
       .prepare(
-        `INSERT INTO connections (kind, name, status) VALUES ('exact', ?1, 'pending')
+        `INSERT INTO connections (kind, name, status, creates_bank_entries)
+         VALUES ('exact', ?1, 'pending', 0)
          ON CONFLICT (kind, name) DO NOTHING`,
       )
       .bind(EXACT_CONNECTION_NAME)

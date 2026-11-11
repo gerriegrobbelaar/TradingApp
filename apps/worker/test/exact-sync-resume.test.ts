@@ -10,8 +10,11 @@ import {
   CLOSE_GUARD_FRACTION,
   CLOSE_GUARD_MIN,
   CYCLE_MAX_AGE_MS,
+  ENTITIES,
+  IBAN_OVERDUE_MS,
   MAX_TRANSIENT_RETRIES,
   closeAllowed,
+  fullSyncOrder,
   syncDivision,
   type DivisionRef,
   type SyncMode,
@@ -205,22 +208,91 @@ describe("full cycles", () => {
     fx.payables = many(70, 5000);
   };
 
+  const pathsOf = (): string[] =>
+    fx.calls.map((c) => c.path).filter((p, i, a) => a.indexOf(p) === i);
+  const LAST = [
+    "/system/Divisions",
+    "/read/financial/ReceivablesList",
+    "/read/financial/PayablesList",
+    "/sync/CRM/Accounts",
+    "/purchaseentry/PurchaseEntries",
+    "/financial/GLAccounts",
+    "/financial/ReportingBalance",
+    "/budget/Budgets",
+    "/crm/BankAccounts",
+  ];
+  const EARLY = [
+    "/system/Divisions",
+    "/read/financial/ReceivablesList",
+    "/read/financial/PayablesList",
+    "/sync/CRM/Accounts",
+    "/crm/BankAccounts",
+    "/purchaseentry/PurchaseEntries",
+    "/financial/GLAccounts",
+    "/financial/ReportingBalance",
+    "/budget/Budgets",
+  ];
+
   it("runs the entities in order: divisions, receivables, payables, relations, purchase entries, ledger, ibans last (review S10)", async () => {
     seedTwoKinds();
     fx.banks = [{ n: 1, account: 1, iban: "NL91ABNA0417164300" }];
+    // The very first full run has never read the IBANs: they are overdue and come right after
+    // the relations (the baseline for "changed IBAN" flags must not wait for a large ledger).
     await run("full");
-    const firstPaths = fx.calls.map((c) => c.path).filter((p, i, a) => a.indexOf(p) === i);
-    expect(firstPaths).toEqual([
-      "/system/Divisions",
-      "/read/financial/ReceivablesList",
-      "/read/financial/PayablesList",
-      "/sync/CRM/Accounts",
-      "/purchaseentry/PurchaseEntries",
-      "/financial/GLAccounts",
-      "/financial/ReportingBalance",
-      "/budget/Budgets",
-      "/crm/BankAccounts",
-    ]);
+    expect(pathsOf()).toEqual(EARLY);
+    // The next night they were read a day ago: last (budgets are weekly, so not read again).
+    clock += 24 * 3_600_000;
+    fx.calls = [];
+    await run("full");
+    expect(pathsOf()).toEqual(LAST.filter((p) => p !== "/budget/Budgets"));
+  });
+
+  it("orders the IBANs by age of the last complete read (starvation bound, IBAN_OVERDUE_MS)", () => {
+    const now = Date.parse("2026-07-15T10:00:00Z");
+    const ago = (ms: number): string => new Date(now - ms).toISOString();
+    expect(fullSyncOrder(ago(IBAN_OVERDUE_MS - 1), now)).toBe(ENTITIES);
+    expect(fullSyncOrder(ago(0), now).at(-1)).toBe("relation_ibans");
+    for (const last of [ago(IBAN_OVERDUE_MS), ago(30 * IBAN_OVERDUE_MS), null, undefined, "x"]) {
+      const order = fullSyncOrder(last, now);
+      expect(order.indexOf("relation_ibans"), String(last)).toBe(order.indexOf("relations") + 1);
+      expect([...order].sort()).toEqual([...ENTITIES].sort());
+    }
+    expect(IBAN_OVERDUE_MS).toBe(3 * 24 * 3_600_000);
+  });
+
+  it("a ledger that takes the whole budget every night cannot starve the IBANs past 3 days", async () => {
+    seedTwoKinds();
+    fx.banks = [{ n: 1, account: 1, iban: "NL91ABNA0417164300" }];
+    await run("full"); // baseline: everything read, IBANs complete now
+    const ibanDone = async (): Promise<string | null> =>
+      (
+        await db
+          .prepare(
+            "SELECT last_completed_at FROM sync_state WHERE division_id = ?1 AND entity = 'relation_ibans'",
+          )
+          .bind(div.id)
+          .first<{ last_completed_at: string | null }>()
+      )?.last_completed_at ?? null;
+    const baseline = await ibanDone();
+    expect(baseline).not.toBeNull();
+    // From now on the ledger never finishes: every balance page fails with the budget error, as a
+    // huge ledger that uses the whole budget of every attempt would.
+    fx.beforeCall = (_call, req) => {
+      if (req.path === "/financial/ReportingBalance") throw new ExactBudgetExhaustedError("x");
+    };
+    const nights: { day: number; banks: boolean }[] = [];
+    for (let day = 1; day <= 7; day++) {
+      clock = Date.parse("2026-07-15T10:00:00Z") + day * 24 * 3_600_000;
+      fx.calls = [];
+      await run("full");
+      nights.push({ day, banks: fx.calls.some((c) => c.path === "/crm/BankAccounts") });
+    }
+    // Days 1 and 2: the IBANs wait behind the ledger. Day 3 (3 days after the last read): read
+    // before the ledger. Then again 3 days later.
+    expect(nights.filter((x) => x.banks).map((x) => x.day)).toEqual([3, 6]);
+    expect(Date.parse((await ibanDone()) as string)).toBeGreaterThan(
+      Date.parse(baseline as string),
+    );
   });
 
   it("does not repeat finished entities in later runs of the same cycle", async () => {

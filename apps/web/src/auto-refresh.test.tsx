@@ -83,6 +83,43 @@ describe("useAutoRefresh (review N5)", () => {
     expect(slow).toHaveBeenCalledTimes(2);
   });
 
+  it("aborts a refresh in flight when unmounted", async () => {
+    let seen: AbortSignal | null = null;
+    const slow = vi.fn((signal: AbortSignal) => {
+      seen = signal;
+      return new Promise<void>(() => undefined);
+    });
+    const h = renderHook(() => useAutoRefresh(slow, true, 60_000, 1_000));
+    await act(async () => {
+      vi.advanceTimersByTime(61_000);
+    });
+    expect(slow).toHaveBeenCalledTimes(1);
+    expect((seen as AbortSignal | null)?.aborted).toBe(false);
+    h.unmount();
+    expect((seen as AbortSignal | null)?.aborted).toBe(true);
+  });
+
+  it("many hooks on one page each refresh once per focus burst, not once per event", async () => {
+    const fns = Array.from({ length: 5 }, () => vi.fn(async () => undefined));
+    for (const f of fns) renderHook(() => useAutoRefresh(f, true));
+    await act(async () => {
+      vi.advanceTimersByTime(31_000);
+    });
+    act(() => {
+      for (let i = 0; i < 10; i++) {
+        window.dispatchEvent(new Event("focus"));
+        document.dispatchEvent(new Event("visibilitychange"));
+      }
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(10_000);
+    });
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    for (const f of fns) expect(f).toHaveBeenCalledTimes(1);
+  });
+
   it("stops listening when unmounted", async () => {
     const refresh = vi.fn(async () => undefined);
     const h = renderHook(() => useAutoRefresh(refresh, true));

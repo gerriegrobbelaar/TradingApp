@@ -1,7 +1,12 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { ExactApiError, ExactBudgetExhaustedError } from "@camelthorn/exact";
-import { isInvoiceApprovedForPayment, type ApprovalStatus } from "@camelthorn/core";
+import {
+  approvalMappingHash,
+  checkApprovalMapping,
+  isInvoiceApprovedForPayment,
+  type ApprovalStatus,
+} from "@camelthorn/core";
 import {
   CURSOR_FUTURE_LIMIT_MS,
   CURSOR_MARGIN_MS,
@@ -722,7 +727,17 @@ describe("status changes reach the cache (review K4)", () => {
           lastSeenAt: r.synced_at,
           missedCycles: r.missed_cycles,
         },
-        { nowMs, mappingVerified: true },
+        {
+          nowMs,
+          mapping: checkApprovalMapping(
+            JSON.stringify({
+              verifiedAt: "2026-01-01T00:00:00.000Z",
+              verifiedBy: "admin@camelthorncapital.com",
+              adrRef: "test",
+              mappingHash: approvalMappingHash(),
+            }),
+          ),
+        },
       );
     };
     expect(await asPayment(clock)).toBe(true);

@@ -459,8 +459,11 @@ export const getApprovalStatusCodes = (division: number, signal?: AbortSignal) =
     ...(signal ? { signal } : {}),
   });
 /** Admin + recent sign-in: records that the status mapping was checked against Exact. */
-export const verifyApprovalMapping = (body: { confirmation: string; adrRef: string }) =>
-  request<unknown>("/api/approvals/mapping-verified", { method: "PUT", body });
+export const verifyApprovalMapping = (body: {
+  confirmation: string;
+  adrRef: string;
+  mappingHash: string;
+}) => request<unknown>("/api/approvals/mapping-verified", { method: "PUT", body });
 export const revokeApprovalMapping = () =>
   request<unknown>("/api/approvals/mapping-verified", { method: "DELETE" });
 

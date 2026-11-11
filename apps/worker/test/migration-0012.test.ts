@@ -30,7 +30,34 @@ describe("migration 0012 on a populated database", () => {
       mdb.prepare(
         "INSERT INTO divisions (id, connection_id, exact_division, name) VALUES (10, 5, 124, 'Second')",
       ),
+      mdb.prepare(
+        `INSERT INTO bank_accounts (id, connection_id, division_id, external_id, name, currency)
+         VALUES (3, 6, 9, 'acc-1', 'Main', 'EUR')`,
+      ),
+      mdb.prepare(
+        `INSERT INTO bank_transactions (connection_id, bank_account_id, external_id, state,
+           amount_minor, currency, booked_at)
+         VALUES (6, 3, 'tx-1', 'completed', -1250, 'EUR', '2026-01-01T00:00:00.000Z')`,
+      ),
     ]);
+    const columns = async () =>
+      (
+        await mdb
+          .prepare(
+            "SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info('connections')",
+          )
+          .all<{
+            name: string;
+            type: string;
+            notnull: number;
+            dflt_value: string | null;
+            pk: number;
+          }>()
+      ).results;
+    const colsBefore = await columns();
+    const seqBefore = await mdb
+      .prepare("SELECT seq FROM sqlite_sequence WHERE name = 'connections'")
+      .first<{ seq: number }>();
     const snapshot = async (): Promise<unknown> =>
       (
         await mdb
@@ -50,6 +77,44 @@ describe("migration 0012 on a populated database", () => {
     expect(
       (await mdb.prepare("SELECT COUNT(*) AS n FROM divisions").first<{ n: number }>())?.n,
     ).toBe(2);
+    // every child of connections keeps its rows (no cascade fired on the drop)
+    for (const t of ["bank_accounts", "bank_transactions"]) {
+      expect(
+        (await mdb.prepare(`SELECT COUNT(*) AS n FROM ${t}`).first<{ n: number }>())?.n,
+        t,
+      ).toBe(1);
+    }
+    // same columns in the same order with the same types and keys; only the one default moved
+    const colsAfter = await columns();
+    expect(colsAfter.map((c) => c.name)).toEqual(colsBefore.map((c) => c.name));
+    expect(colsAfter.map((c) => c.name)).toContain("exact_identity");
+    for (const [i, c] of colsAfter.entries()) {
+      const b = colsBefore[i];
+      expect({ ...c, dflt_value: null }, c.name).toEqual({ ...b, dflt_value: null });
+      if (c.name === "creates_bank_entries") {
+        expect(b?.dflt_value).toBe("1");
+        expect(c.dflt_value).toBe("0");
+      } else {
+        expect(c.dflt_value, c.name).toBe(b?.dflt_value ?? null);
+      }
+    }
+    // no copy table left behind; no index or trigger was lost (there were none but the unique key)
+    expect(
+      await mdb
+        .prepare("SELECT name FROM sqlite_master WHERE name LIKE 'connections_0012%'")
+        .first(),
+    ).toBeNull();
+    expect(
+      (
+        await mdb
+          .prepare(
+            "SELECT type, name FROM sqlite_master WHERE tbl_name = 'connections' AND type IN ('index', 'trigger') ORDER BY name",
+          )
+          .all<{ type: string; name: string }>()
+      ).results.map((r) => r.type),
+    ).toEqual(["index"]);
+    // AUTOINCREMENT carries on from the highest kept id
+    expect(seqBefore?.seq).toBe(6);
 
     // A new row without the column gets 0; the CHECK still holds.
     await mdb.prepare("INSERT INTO connections (kind, name) VALUES ('revolut', 'rev2')").run();

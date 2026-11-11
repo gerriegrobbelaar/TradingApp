@@ -327,7 +327,7 @@ interface DetailRow extends ListRow {
 const DETAIL_SQL = `SELECT oi.id, oi.exact_id, oi.kind, oi.status, oi.invoice_number, oi.entry_number,
     oi.reference, oi.relation_id AS relation_exact_id, oi.relation_name, r.id AS relation_row_id,
     r.name AS relation_row_name, oi.invoice_date, oi.due_date, oi.currency, oi.original_minor,
-    oi.open_minor, oi.open_dc_minor, oi.dc_currency, oi.source, oi.synced_at, oi.missed_cycles,
+    oi.open_minor, oi.open_dc_minor, oi.dc_currency, oi.source, oi.synced_at,
     oi.division_id, oi.amount_minor, oi.rate, oi.closed_at, oi.last_seen_sync_id, oi.missed_cycles
   FROM open_items oi
   LEFT JOIN relations r ON r.division_id = oi.division_id AND r.exact_id = oi.relation_id

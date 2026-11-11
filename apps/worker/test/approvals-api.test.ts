@@ -8,6 +8,8 @@ import {
   type ApprovalStatus,
   APPROVAL_MAPPING_CONFIRMATION,
   APPROVAL_MAPPING_VERIFIED_SETTING,
+  approvalMappingHash,
+  PURCHASE_ENTRY_STATUS_TABLE,
   type ApprovalStatusCodesResponse,
   type ApprovalsResponse,
   type Freshness,
@@ -512,6 +514,7 @@ describe("response shapes", () => {
     "freshness",
     "available",
     "mappingVerified",
+    "mappingChanged",
   ]);
   const DETAIL = keysOf<ApprovalDetail>()([
     "division",
@@ -625,7 +628,11 @@ describe("status codes for verifying the mapping (review K4)", () => {
 describe("mapping verified gate (review S2)", () => {
   const put = (who: string, json: unknown, method = "PUT"): Promise<Response> =>
     authed("/api/approvals/mapping-verified", tokens[who] as string, { method, json });
-  const ok = { confirmation: APPROVAL_MAPPING_CONFIRMATION, adrRef: "ADR 0025 live check" };
+  const ok = {
+    confirmation: APPROVAL_MAPPING_CONFIRMATION,
+    adrRef: "ADR 0025 live check",
+    mappingHash: approvalMappingHash(),
+  };
   const stored = async (): Promise<string | null> =>
     (
       await db
@@ -658,7 +665,10 @@ describe("mapping verified gate (review S2)", () => {
     const sc = await get<ApprovalStatusCodesResponse>(
       `/api/approvals/status-codes?division=${divA}`,
     );
-    expect(sc.body.mappingVerified).toBeNull();
+    expect(sc.body.mappingVerified).toBe(false);
+    expect(sc.body.mappingChanged).toBe(false);
+    expect(sc.body.marker).toBeNull();
+    expect(sc.body.currentMappingHash).toBe(approvalMappingHash());
   });
 
   it("is admin only and needs a fresh sign-in", async () => {
@@ -691,6 +701,9 @@ describe("mapping verified gate (review S2)", () => {
       { confirmation: APPROVAL_MAPPING_CONFIRMATION, adrRef: "  " },
       { confirmation: APPROVAL_MAPPING_CONFIRMATION, adrRef: "x".repeat(101) },
       { confirmation: APPROVAL_MAPPING_CONFIRMATION, adrRef: 5 },
+      { confirmation: APPROVAL_MAPPING_CONFIRMATION, adrRef: "x" },
+      { ...ok, mappingHash: 5 },
+      { ...ok, confirmation: APPROVAL_MAPPING_CONFIRMATION.toLowerCase() },
     ]) {
       expect((await put("admin", body)).status, JSON.stringify(body)).toBe(400);
     }
@@ -710,7 +723,58 @@ describe("mapping verified gate (review S2)", () => {
     const sc = await get<ApprovalStatusCodesResponse>(
       `/api/approvals/status-codes?division=${divA}`,
     );
-    expect(sc.body.mappingVerified?.verifiedBy).toBe("gerrie.grobbelaar@camelthorncapital.com");
+    expect(sc.body.mappingVerified).toBe(true);
+    expect(sc.body.marker?.verifiedBy).toBe("gerrie.grobbelaar@camelthorncapital.com");
+    expect(marker["mappingHash"]).toBe(approvalMappingHash());
+  });
+
+  it("refuses a hash that is not the current table's (stale sheet or replayed request)", async () => {
+    const res = await put("admin", { ...ok, mappingHash: "0".repeat(64) });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "mapping_changed" });
+    expect(await stored()).toBeNull();
+    expect(await audits()).toEqual([]);
+  });
+
+  it("a change to the status table voids the mark at once (it stores the table's hash)", async () => {
+    await markSynced(divA);
+    expect((await put("admin", ok)).status).toBe(200);
+    expect(await listVerified(divA)).toBe(true);
+    const table = PURCHASE_ENTRY_STATUS_TABLE as Record<number, ApprovalStatus>;
+    table[20] = "approved";
+    try {
+      const list = await get<ApprovalsResponse>(`/api/approvals?division=${divA}`);
+      expect(list.body.mappingVerified).toBe(false);
+      expect(list.body.mappingChanged).toBe(true);
+      const sc = await get<ApprovalStatusCodesResponse>(
+        `/api/approvals/status-codes?division=${divA}`,
+      );
+      expect(sc.body.mappingVerified).toBe(false);
+      expect(sc.body.mappingChanged).toBe(true);
+      expect(sc.body.marker?.mappingHash).not.toBe(sc.body.currentMappingHash);
+      // replaying the old request is refused; verifying the new table works
+      expect((await put("admin", ok)).status).toBe(409);
+      expect((await put("admin", { ...ok, mappingHash: sc.body.currentMappingHash })).status).toBe(
+        200,
+      );
+      expect(await listVerified(divA)).toBe(true);
+    } finally {
+      delete table[20];
+    }
+    // back to the original table: the mark made for the changed one no longer counts
+    const list = await get<ApprovalsResponse>(`/api/approvals?division=${divA}`);
+    expect(list.body.mappingVerified).toBe(false);
+    expect(list.body.mappingChanged).toBe(true);
+  });
+
+  it("refuses a request without the CSRF header and does not store anything", async () => {
+    const res = await authed("/api/approvals/mapping-verified", tokens["admin"] as string, {
+      method: "PUT",
+      json: ok,
+      headers: { "x-requested-with": "" },
+    });
+    expect(res.status).toBe(403);
+    expect(await stored()).toBeNull();
   });
 
   it("a malformed marker counts as not verified; revoking is audited once and idempotent", async () => {
@@ -720,6 +784,19 @@ describe("mapping verified gate (review S2)", () => {
         "INSERT INTO settings (key, value_json, updated_by) VALUES (?1, '{\"verifiedAt\":1}', 'x')",
       )
       .bind(APPROVAL_MAPPING_VERIFIED_SETTING)
+      .run();
+    expect(await listVerified(divA)).toBe(false);
+    // a complete mark without the hash (made before hashing existed) does not count either
+    await db
+      .prepare("UPDATE settings SET value_json = ?2 WHERE key = ?1")
+      .bind(
+        APPROVAL_MAPPING_VERIFIED_SETTING,
+        JSON.stringify({
+          verifiedAt: "2026-11-01T00:00:00.000Z",
+          verifiedBy: "a@b.c",
+          adrRef: "x",
+        }),
+      )
       .run();
     expect(await listVerified(divA)).toBe(false);
     expect((await put("admin", {}, "DELETE")).status).toBe(200);

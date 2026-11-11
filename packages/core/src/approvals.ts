@@ -15,6 +15,7 @@
 import { addDays, dayNumber } from "./ageing";
 import type { ApprovalStatus } from "./api-types";
 import { amsterdamDate } from "./local-time";
+import { sha256Hex } from "./sha256";
 
 export const APPROVAL_STATUSES: readonly ApprovalStatus[] = [
   "pending_approval",
@@ -72,21 +73,58 @@ export const APPROVAL_MAX_AGE_MS = 36 * 60 * 60 * 1000;
 const APPROVAL_FUTURE_TOLERANCE_MS = 5 * 60 * 1000;
 
 /**
+ * Version of the rule that joins a payable (open_items) to its purchase entry
+ * (`purchaseEntryJoinKey` + `findPurchaseEntryForPayable`). It is part of the mapping fingerprint:
+ * bump it whenever the join rule changes, and the "verified" mark stops counting until an admin
+ * verifies again.
+ */
+export const PAYABLE_PURCHASE_JOIN_RULE_VERSION = 1;
+
+/**
  * `settings.key` of the "mapping verified" gate (review S2, ADR 0025). Value JSON:
- * `{ verifiedAt, verifiedBy, adrRef }`. Absent (the default) means NOT verified, and then no
- * entry counts as approved for payment, whatever the table says.
+ * `{ verifiedAt, verifiedBy, adrRef, mappingHash }`. Absent (the default) means NOT verified, and
+ * then no entry counts as approved for payment, whatever the table says.
  */
 export const APPROVAL_MAPPING_VERIFIED_SETTING = "exact.approval_mapping_verified";
 
-/** The exact text an admin must send to record the verification (a deliberate, typed act). */
+/** The exact text an admin must type to record the verification (a deliberate act). */
 export const APPROVAL_MAPPING_CONFIRMATION = "I verified the approval status mapping against Exact";
 
-/** What the stored "verified" marker looks like (all three are required). */
+/**
+ * Stable canonical text of what was verified: the status table (code -> status, sorted by code,
+ * keys as Exact codes) and the join rule version. Any change to either changes the text.
+ */
+export function approvalMappingCanonical(
+  table: Readonly<Record<number, ApprovalStatus>> = PURCHASE_ENTRY_STATUS_TABLE,
+  joinRuleVersion: number = PAYABLE_PURCHASE_JOIN_RULE_VERSION,
+): string {
+  const rows = Object.keys(table)
+    .sort((a, b) => {
+      const d = Number(a) - Number(b);
+      return Number.isNaN(d) || d === 0 ? (a < b ? -1 : a > b ? 1 : 0) : d;
+    })
+    .map((k) => [k, (table as Record<string, ApprovalStatus>)[k] ?? null]);
+  return JSON.stringify({ format: 1, joinRuleVersion, table: rows });
+}
+
+/** SHA-256 hex of `approvalMappingCanonical` (defaults: the CURRENT table and join rule). */
+export function approvalMappingHash(
+  table: Readonly<Record<number, ApprovalStatus>> = PURCHASE_ENTRY_STATUS_TABLE,
+  joinRuleVersion: number = PAYABLE_PURCHASE_JOIN_RULE_VERSION,
+): string {
+  return sha256Hex(approvalMappingCanonical(table, joinRuleVersion));
+}
+
+/** What the stored "verified" marker looks like (all four are required). */
 export interface ApprovalMappingVerified {
   verifiedAt: string;
   verifiedBy: string;
   adrRef: string;
+  /** approvalMappingHash() of the table and join rule at the moment of verification. */
+  mappingHash: string;
 }
+
+const HASH_RE = /^[0-9a-f]{64}$/;
 
 /** Parses the stored setting; null (= not verified) for anything that is not complete. */
 export function parseApprovalMappingVerified(
@@ -97,21 +135,128 @@ export function parseApprovalMappingVerified(
     const v: unknown = JSON.parse(valueJson);
     if (!v || typeof v !== "object" || Array.isArray(v)) return null;
     const o = v as Record<string, unknown>;
-    const { verifiedAt, verifiedBy, adrRef } = o;
+    const { verifiedAt, verifiedBy, adrRef, mappingHash } = o;
     if (
       typeof verifiedAt !== "string" ||
       Number.isNaN(Date.parse(verifiedAt)) ||
       typeof verifiedBy !== "string" ||
       verifiedBy === "" ||
       typeof adrRef !== "string" ||
-      adrRef === ""
+      adrRef === "" ||
+      typeof mappingHash !== "string" ||
+      !HASH_RE.test(mappingHash)
     ) {
       return null;
     }
-    return { verifiedAt, verifiedBy, adrRef };
+    return { verifiedAt, verifiedBy, adrRef, mappingHash };
   } catch {
     return null;
   }
+}
+
+/**
+ * Result of checking the stored marker against the CURRENT table. Only `checkApprovalMapping`
+ * creates one (registered in a module-private WeakSet), so `isInvoiceApprovedForPayment` cannot be
+ * satisfied by a hand-written `{ verified: true }` or a value that crossed JSON.
+ */
+export type ApprovalMappingCheck =
+  | Readonly<{ verified: false; reason: "not_verified"; marker: null; currentHash: string }>
+  | Readonly<{
+      verified: false;
+      reason: "mapping_changed";
+      marker: ApprovalMappingVerified;
+      currentHash: string;
+    }>
+  | Readonly<{
+      verified: true;
+      reason: null;
+      marker: ApprovalMappingVerified;
+      currentHash: string;
+    }>;
+
+const ISSUED = new WeakSet<object>();
+
+/**
+ * Verified only when the stored marker parses AND its `mappingHash` equals the hash of the table
+ * and join rule as they are now. A missing or malformed marker is `not_verified`; a marker for an
+ * older table (or join rule) is `mapping_changed`.
+ */
+export function checkApprovalMapping(
+  valueJson: string | null,
+  table: Readonly<Record<number, ApprovalStatus>> = PURCHASE_ENTRY_STATUS_TABLE,
+  joinRuleVersion: number = PAYABLE_PURCHASE_JOIN_RULE_VERSION,
+): ApprovalMappingCheck {
+  const currentHash = approvalMappingHash(table, joinRuleVersion);
+  const marker = parseApprovalMappingVerified(valueJson);
+  const check: ApprovalMappingCheck =
+    marker === null
+      ? { verified: false, reason: "not_verified", marker: null, currentHash }
+      : marker.mappingHash === currentHash
+        ? { verified: true, reason: null, marker, currentHash }
+        : { verified: false, reason: "mapping_changed", marker, currentHash };
+  Object.freeze(check);
+  ISSUED.add(check);
+  return check;
+}
+
+/**
+ * Join key of an entry number (ADR 0025 addendum, join rule version 1): trimmed text; a purely
+ * numeric value loses its leading zeros ("000123", " 123" and 123 are one key, "0" and "000" are
+ * "0"); anything else is kept as is, so "A001" and "A1" stay different. Null for missing, empty,
+ * negative, non-integer or unsafe numbers.
+ */
+export function purchaseEntryJoinKey(
+  entryNumber: string | number | null | undefined,
+): string | null {
+  if (entryNumber === null || entryNumber === undefined) return null;
+  if (typeof entryNumber === "number") {
+    if (!Number.isSafeInteger(entryNumber) || entryNumber < 0) return null;
+    return String(entryNumber);
+  }
+  const t = entryNumber.trim();
+  if (t === "") return null;
+  if (/^[0-9]+$/.test(t)) return t.replace(/^0+(?=[0-9])/, "");
+  return t;
+}
+
+/** The side of the join a payable brings (an open_items row of kind payable). */
+export interface PayableJoinSide {
+  divisionId: number;
+  entryNumber: number | string | null;
+  journalCode?: string | null;
+}
+/** The side of the join a cached purchase entry brings. */
+export interface PurchaseEntryJoinSide {
+  divisionId: number;
+  entryNumber: string | number | null;
+  journalCode?: string | null;
+}
+
+const journalKey = (j: string | null | undefined): string | null => {
+  if (j === null || j === undefined) return null;
+  const t = j.trim();
+  return t === "" ? null : t;
+};
+
+/**
+ * The ONE purchase entry of a payable, or null: same division, same join key and, when both sides
+ * carry a journal code, the same journal. No match or more than one match is null ("not
+ * approved", never a guess).
+ */
+export function findPurchaseEntryForPayable<T extends PurchaseEntryJoinSide>(
+  payable: PayableJoinSide,
+  entries: readonly T[],
+): T | null {
+  const key = purchaseEntryJoinKey(payable.entryNumber);
+  if (key === null || !Number.isSafeInteger(payable.divisionId)) return null;
+  const pj = journalKey(payable.journalCode);
+  const hits = entries.filter((e) => {
+    if (e.divisionId !== payable.divisionId) return false;
+    if (purchaseEntryJoinKey(e.entryNumber) !== key) return false;
+    const ej = journalKey(e.journalCode);
+    return pj === null || ej === null || pj === ej;
+  });
+  return hits.length === 1 ? (hits[0] as T) : null;
 }
 
 /** What the payment pre-check needs of a cached purchase entry (purchase_entries row). */
@@ -134,15 +279,22 @@ export interface ApprovalForPayment {
  *  - the row was seen by a read within `maxAgeMs` (default and upper bound APPROVAL_MAX_AGE_MS)
  *    and not in the future;
  *  - the last complete read saw it (`missedCycles` is 0);
- *  - the status mapping has been verified on a real division (`opts.mappingVerified === true`,
- *    from the `exact.approval_mapping_verified` setting; default false, review S2).
- * Phase 9 must also re-read the entry from Exact before it sends a payment.
+ *  - the status mapping has been verified for the CURRENT table and join rule: `opts.mapping` is a
+ *    check returned by `checkApprovalMapping` (from the `exact.approval_mapping_verified` setting)
+ *    with `verified === true`, and its hash still equals the table's hash now (review S2). A
+ *    missing setting, a malformed one, a mark for an older table or anything not produced by
+ *    `checkApprovalMapping` is false.
+ * Phase 9 must also join the payable to exactly one entry (`findPurchaseEntryForPayable`) and
+ * re-read the entry from Exact before it sends a payment.
  */
 export function isInvoiceApprovedForPayment(
   entry: ApprovalForPayment,
-  opts: { nowMs: number; maxAgeMs?: number; mappingVerified?: boolean },
+  opts: { nowMs: number; maxAgeMs?: number; mapping: ApprovalMappingCheck },
 ): boolean {
-  if (opts.mappingVerified !== true) return false;
+  const m: unknown = opts.mapping;
+  if (typeof m !== "object" || m === null || !ISSUED.has(m)) return false;
+  if (opts.mapping.verified !== true) return false;
+  if (opts.mapping.marker.mappingHash !== approvalMappingHash()) return false;
   if (entry.status !== "approved") return false;
   if (approvalStatusFromCode(entry.statusCode) !== "approved") return false;
   if (!Number.isSafeInteger(entry.missedCycles) || entry.missedCycles !== 0) return false;

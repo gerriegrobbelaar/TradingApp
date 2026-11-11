@@ -83,4 +83,34 @@ describe("closed and all views (review S9)", () => {
     const table = await loaded();
     expect(norm(table.textContent)).toContain("€ 125,00 invoiced");
   });
+
+  it("the closed view's totals row and a closed item's sheet show no 0,00 open balance", async () => {
+    const closed = row({
+      id: 5,
+      invoiceNumber: "INV-5",
+      status: "closed",
+      openMinor: 0,
+      dcMinor: 0,
+      originalMinor: 12_500,
+      bucket: null,
+      daysOverdue: null,
+    });
+    mockFetch({
+      ...base(),
+      "GET /api/invoices": () => ({ body: listResponse([closed]) }),
+      "GET /api/open-items/5": () => ({ body: detail(closed, { amountMinor: 12_500 }) }),
+    });
+    const user = userEvent.setup();
+    renderApp("/invoices?view=closed");
+    const table = await loaded();
+    const totals = table.querySelector(".totals-row") as HTMLElement;
+    expect(totals).toBeTruthy();
+    expect(norm(totals.textContent)).not.toContain("0,00");
+    expect(totals.textContent).toContain("—");
+    await user.click(within(table).getByRole("button", { name: "INV-5" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(await within(dialog).findByText("Closed since it was last open in Exact")).toBeTruthy();
+    expect(norm(dialog.textContent)).not.toContain("€ 0,00");
+    expect(norm(dialog.textContent)).toContain("€ 125,00");
+  });
 });

@@ -229,6 +229,7 @@ export function approvals(
     freshness: FRESH,
     available: true,
     mappingVerified: true,
+    mappingChanged: false,
     ...over,
   };
 }

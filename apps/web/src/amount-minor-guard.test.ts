@@ -17,6 +17,10 @@ const core = import.meta.glob("../../../packages/core/src/**/*.ts", {
   eager: true,
 }) as Record<string, string>;
 
+/** Code without block and line comments (a comment may name the field; `://` in URLs is kept). */
+const code = (t: string): string =>
+  t.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+
 const isTest = (n: string) => /\.test\.|test-fixtures|test-utils|test-setup/.test(n);
 const WEB_ALLOWED = new Set([
   "./components/OpenItemDetailBody.tsx", // the sheet row "Amount as stored"
@@ -37,7 +41,7 @@ describe("OpenItemDetail.amountMinor stays out of lists and totals (review S11)"
   it("web: only the item sheet uses amountMinor", () => {
     const offenders = Object.entries(web)
       .filter(([n]) => !isTest(n) && !WEB_ALLOWED.has(n))
-      .filter(([, t]) => /\bamountMinor\b/.test(t))
+      .filter(([, t]) => /\bamountMinor\b/.test(code(t)))
       .map(([n]) => n);
     expect(offenders).toEqual([]);
   });
@@ -45,9 +49,16 @@ describe("OpenItemDetail.amountMinor stays out of lists and totals (review S11)"
   it("core: only the type definitions and the ledger report use amountMinor", () => {
     const offenders = Object.entries(core)
       .filter(([n]) => !/\.test\./.test(n) && !CORE_ALLOWED.has(n))
-      .filter(([, t]) => /\bamountMinor\b/.test(t))
+      .filter(([, t]) => /\bamountMinor\b/.test(code(t)))
       .map(([n]) => n);
     expect(offenders).toEqual([]);
+  });
+
+  it("the comment filter keeps code and drops comments", () => {
+    expect(code("// amountMinor here\nconst a = 1;")).not.toMatch(/amountMinor/);
+    expect(code("/* amountMinor */ x")).not.toMatch(/amountMinor/);
+    expect(code("const v = d.amountMinor; // note")).toMatch(/amountMinor/);
+    expect(code("const u = 'https://x.y'; d.amountMinor")).toMatch(/amountMinor/);
   });
 
   it("the item sheet labels it as stored, not as the balance", () => {

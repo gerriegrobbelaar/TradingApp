@@ -6,6 +6,7 @@ import {
 } from "@camelthorn/core";
 import { Button, Sheet, Skeleton } from "@camelthorn/ui";
 import {
+  ApiError,
   StepUpRequired,
   getApprovalStatusCodes,
   revokeApprovalMapping,
@@ -23,6 +24,8 @@ const LABEL: Record<ApprovalStatus, string> = {
 
 export const MAPPING_NOTICE =
   "Approval status mapping is not verified against Exact yet. Do not rely on these statuses for payments.";
+export const MAPPING_CHANGED_NOTICE =
+  "The status mapping changed since it was verified. Do not rely on these statuses for payments until an admin verifies it again.";
 
 /**
  * Admin sheet (review S2, ADR 0025): lists the raw Exact status codes found in this administration
@@ -45,7 +48,8 @@ export function MappingVerifySheet({
   const [adrRef, setAdrRef] = useState("ADR 0025");
   const [busy, setBusy] = useState(false);
   const [needStepUp, setNeedStepUp] = useState(false);
-  const [saveError, setSaveError] = useState(false);
+  const [saveError, setSaveError] = useState<null | "failed" | "changed">(null);
+  const [typed, setTyped] = useState("");
 
   useEffect(() => {
     if (!open || divisionId === null) return;
@@ -53,7 +57,8 @@ export function MappingVerifySheet({
     setData(null);
     setLoadError(null);
     setNeedStepUp(false);
-    setSaveError(false);
+    setSaveError(null);
+    setTyped("");
     getApprovalStatusCodes(divisionId, ctl.signal).then(
       (r) => setData(r),
       (e: unknown) => {
@@ -64,11 +69,17 @@ export function MappingVerifySheet({
   }, [open, divisionId]);
 
   async function act(kind: "verify" | "revoke") {
+    if (data === null) return;
     setBusy(true);
-    setSaveError(false);
+    setSaveError(null);
     try {
       if (kind === "verify") {
-        await verifyApprovalMapping({ confirmation: APPROVAL_MAPPING_CONFIRMATION, adrRef });
+        // The typed text is sent as typed: the server compares it with the required sentence.
+        await verifyApprovalMapping({
+          confirmation: typed.trim(),
+          adrRef,
+          mappingHash: data.currentMappingHash,
+        });
       } else {
         await revokeApprovalMapping();
       }
@@ -76,13 +87,16 @@ export function MappingVerifySheet({
       onClose();
     } catch (e) {
       if (e instanceof StepUpRequired) setNeedStepUp(true);
-      else setSaveError(true);
+      else if (e instanceof ApiError && e.status === 409) setSaveError("changed");
+      else setSaveError("failed");
     } finally {
       setBusy(false);
     }
   }
 
-  const verified = data?.mappingVerified ?? null;
+  const marker = data?.marker ?? null;
+  const verified = data?.mappingVerified === true;
+  const typedOk = typed.trim() === APPROVAL_MAPPING_CONFIRMATION;
   return (
     <Sheet open={open} title="Verify approval status mapping" onClose={onClose}>
       <div className="drill">
@@ -127,10 +141,16 @@ export function MappingVerifySheet({
             </table>
           </div>
         )}
-        {verified && (
+        {marker && (
           <p className="lede">
-            Recorded as verified by {verified.verifiedBy} on {verified.verifiedAt.slice(0, 10)} (
-            {verified.adrRef}).
+            Recorded as verified by {marker.verifiedBy} on {marker.verifiedAt.slice(0, 10)} (
+            {marker.adrRef}).
+          </p>
+        )}
+        {data?.mappingChanged && (
+          <p role="status" className="notice warn">
+            The status mapping changed since it was verified. Check the codes again before you
+            confirm.
           </p>
         )}
         {needStepUp && (
@@ -141,9 +161,15 @@ export function MappingVerifySheet({
             </Button>
           </div>
         )}
-        {saveError && (
+        {saveError === "failed" && (
           <p role="alert" className="notice warn">
             Could not save. Try again.
+          </p>
+        )}
+        {saveError === "changed" && (
+          <p role="alert" className="notice warn">
+            The status mapping changed while this sheet was open. Close it, open it again and check
+            the codes again.
           </p>
         )}
         {data !== null && !verified && (
@@ -157,16 +183,26 @@ export function MappingVerifySheet({
                 onChange={(e) => setAdrRef(e.target.value)}
               />
             </label>
+            <label className="field">
+              Type “{APPROVAL_MAPPING_CONFIRMATION}” to confirm
+              <input
+                className="input"
+                value={typed}
+                autoComplete="off"
+                spellCheck={false}
+                onChange={(e) => setTyped(e.target.value)}
+              />
+            </label>
             <Button
               variant="primary"
-              disabled={busy || adrRef.trim() === ""}
+              disabled={busy || adrRef.trim() === "" || !typedOk}
               onClick={() => void act("verify")}
             >
               Confirm the mapping is verified
             </Button>
           </>
         )}
-        {verified && (
+        {marker && (
           <Button disabled={busy} onClick={() => void act("revoke")}>
             Remove the verified mark
           </Button>

@@ -35,7 +35,7 @@ let n = 0;
 /**
  * Exact calls before the ledger in a full run: divisions, receivables, payables, relations
  * and the (empty) purchase-entry read, which runs before the ledger (review K4, ADR 0025). The IBAN
- * read comes after the ledger (review S10).
+ * read is switched off in these runs (see `run`).
  */
 const PRE = 5;
 
@@ -53,7 +53,16 @@ const run = (over: Partial<SyncOptions> = {}): Promise<SyncSummary> =>
   syncDivision(
     env,
     div,
-    { jobId: `ledger-review-${++n}`, mode: "full", actor: "system", budget: 10_000, ...over },
+    // IBANs off: their place in the order depends on their own age (fullSyncOrder, tested in
+    // exact-sync-resume.test.ts) and would shift the call counts these ledger tests rely on.
+    {
+      jobId: `ledger-review-${++n}`,
+      mode: "full",
+      actor: "system",
+      budget: 10_000,
+      readIbans: false,
+      ...over,
+    },
     { transport: fx.transport, gate, now: () => clock },
   );
 
@@ -313,6 +322,68 @@ describe("the weekly night needs a second attempt, which resumes", () => {
     expect(balanceCalls(2026)).toEqual([]);
     expect(fx.calls.some((c) => c.path === "/financial/GLAccounts")).toBe(false);
     expect(balanceCalls(2025)).toEqual(["6", "8", "10"]);
+  });
+});
+
+describe("last year's balances nightly through April (review S4): resume and month boundary", () => {
+  beforeEach(() => {
+    fx.pageSize = 2;
+    fx.glAccounts = chart(4); // 2 pages
+    fx.glBalances = [...balances(4, 2027, 3), ...balances(4, 2026, 3)]; // 6 pages a year
+  });
+
+  it("a February night that does not fit one attempt resumes last year in the retry, not from the start", async () => {
+    clock = Date.parse("2027-02-09T01:00:00Z");
+    unlimited();
+    expect((await run({ chunkPages: 1 })).cycleComplete).toBe(true);
+    // Next night: chart, all of 2027, then 3 pages of 2026 before the budget ends.
+    clock = Date.parse("2027-02-10T01:00:00Z");
+    budgeted(PRE + 2 + 6 + 3);
+    const a = await run({ chunkPages: 1 });
+    expect(a.status).toBe("partial");
+    expect(balanceCalls(2026)).toEqual(["", "2", "4", "6"]);
+    expect((await state("gl_balances"))?.pass_token).toBe("2026:6");
+    // The scheduler's retry five minutes later continues 2026 and does not re-read 2027 or the chart.
+    clock += 5 * 60_000;
+    unlimited();
+    const b = await run({ chunkPages: 1 });
+    expect(b.cycleComplete).toBe(true);
+    expect(balanceCalls(2027)).toEqual([]);
+    expect(fx.calls.some((c) => c.path === "/financial/GLAccounts")).toBe(false);
+    expect(balanceCalls(2026)).toEqual(["6", "8", "10"]);
+    expect(await count("gl_balances", "year = 2026")).toBe(12);
+    expect(await count("gl_balances", "missed_cycles > 0")).toBe(0);
+  });
+
+  it("uses the Amsterdam month: 23:59 on 30 April still reads last year, 00:00 on 1 May does not", async () => {
+    clock = Date.parse("2027-04-29T22:30:00Z"); // 00:30 on 30 April (CEST)
+    unlimited();
+    await run({ chunkPages: 1 });
+    clock = Date.parse("2027-04-30T21:59:00Z"); // 23:59 on 30 April Amsterdam, 21:59 UTC
+    unlimited();
+    await run({ chunkPages: 1 });
+    expect(balanceCalls(2026)[0]).toBe("");
+    clock = Date.parse("2027-04-30T22:00:00Z"); // 00:00 on 1 May Amsterdam, still 30 April UTC
+    unlimited();
+    await run({ chunkPages: 1 });
+    expect(balanceCalls(2026)).toEqual([]);
+    expect(balanceCalls(2027)[0]).toBe("");
+  });
+
+  it("a pass of last year cut off at 23:59 on 30 April is finished after midnight, not left for a week", async () => {
+    clock = Date.parse("2027-04-29T22:30:00Z");
+    unlimited();
+    await run({ chunkPages: 1 });
+    clock = Date.parse("2027-04-30T21:50:00Z");
+    budgeted(PRE + 2 + 6 + 3);
+    expect((await run({ chunkPages: 1 })).status).toBe("partial");
+    expect((await state("gl_balances"))?.pass_token).toBe("2026:6");
+    clock = Date.parse("2027-04-30T22:05:00Z"); // 00:05 on 1 May: the nightly rule is over
+    unlimited();
+    const b = await run({ chunkPages: 1 });
+    expect(b.cycleComplete).toBe(true);
+    expect(balanceCalls(2026)).toEqual(["6", "8", "10"]);
+    expect((await state("gl_balances"))?.pass_token ?? null).toBeNull();
   });
 });
 

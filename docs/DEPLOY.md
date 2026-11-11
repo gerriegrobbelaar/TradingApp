@@ -454,7 +454,11 @@ sync panel on the test division.
       `PURCHASE_ENTRY_STATUS_TABLE` (`packages/core/src/approvals.ts`; today 5 = waiting and
       50 = approved, both guesses) and record the result in ADR 0025. **Until this is recorded,
       Phase 9 must not enable paying on the basis of `isInvoiceApprovedForPayment`.** After a
-      table change, run a full sync with "restart" so stored rows are re-derived.
+      table change, run a full sync with "restart" so stored rows are re-derived. Then, as admin
+      with a Google sign-in from the last 15 minutes, open Approvals → "Check and verify the
+      mapping", type the confirmation sentence and confirm. The mark stores a SHA-256 of the
+      table and join rule: any later change to either voids it automatically and the screen says
+      "The status mapping changed since it was verified" until it is verified again.
     - **Filters.** `EntryDate ge datetime'...'`, `Modified ge datetime'...'` and `Status eq 5`
       joined with `or` are accepted, and `$orderby=Modified` is honoured (rows come back in
       ascending Modified order; otherwise the hourly cursor never moves and the hourly read

@@ -5,9 +5,12 @@
  *  GET /api/approvals/:id
  *  GET /api/approvals/status-codes?division=   (admin only)
  *  PUT /api/approvals/mapping-verified         (admin + step-up, audited) body
- *      `{ confirmation: APPROVAL_MAPPING_CONFIRMATION, adrRef: string }`: records that the status
- *      mapping was verified against Exact (review S2). DELETE revokes it (same rules). Until set,
- *      `mappingVerified` is false everywhere and isInvoiceApprovedForPayment is always false.
+ *      `{ confirmation: APPROVAL_MAPPING_CONFIRMATION, adrRef: string, mappingHash: string }`:
+ *      records that the status mapping was verified against Exact (review S2). `mappingHash` must
+ *      be the current table's hash (as shown by status-codes; 409 `mapping_changed` otherwise) and
+ *      is stored in the mark, so any later change to the table or join rule voids the mark.
+ *      DELETE revokes it (same rules). Until set, `mappingVerified` is false everywhere and
+ *      isInvoiceApprovedForPayment is always false.
  *
  * Any signed-in role may read. Same division rules, error codes and `no-store` as the other read
  * routes (routes.ts): `?division=` is our divisions.id (400 bad, 404 unknown or disabled), default
@@ -25,7 +28,8 @@ import {
   APPROVAL_STATUSES,
   approvalAgeDays,
   approvalStatusFromCode,
-  parseApprovalMappingVerified,
+  checkApprovalMapping,
+  type ApprovalMappingCheck,
   type ApprovalMappingVerified,
   PURCHASE_ENTRY_STATUS_TABLE,
   type ApprovalDetail,
@@ -186,13 +190,24 @@ function mapRow(r: Row, todayDate: string): ApprovalItemDto {
   };
 }
 
-/** The stored "mapping verified" marker, null (= not verified) when absent or malformed. */
-export async function readMappingVerified(db: D1Database): Promise<ApprovalMappingVerified | null> {
+/**
+ * The stored "mapping verified" mark checked against the CURRENT table (global setting: the table
+ * is code, the same for every administration). Not verified when absent, malformed or made for
+ * another table or join rule. Phase 9 passes the result to isInvoiceApprovedForPayment.
+ */
+export async function readMappingCheck(db: D1Database): Promise<ApprovalMappingCheck> {
   const row = await db
     .prepare("SELECT value_json FROM settings WHERE key = ?1")
     .bind(APPROVAL_MAPPING_VERIFIED_SETTING)
     .first<{ value_json: string }>();
-  return parseApprovalMappingVerified(row?.value_json ?? null);
+  return checkApprovalMapping(row?.value_json ?? null);
+}
+
+async function mappingFlags(
+  db: D1Database,
+): Promise<{ mappingVerified: boolean; mappingChanged: boolean }> {
+  const check = await readMappingCheck(db);
+  return { mappingVerified: check.verified, mappingChanged: check.reason === "mapping_changed" };
 }
 
 const zeroCounts = (): Record<ApprovalStatus, number> => ({
@@ -229,7 +244,7 @@ async function listHandler(ctx: Ctx): Promise<Response> {
   const base = {
     division: { id: division.id, name: division.name },
     freshness: fresh,
-    mappingVerified: (await readMappingVerified(db)) !== null,
+    ...(await mappingFlags(db)),
   };
   if (!available) {
     const empty: ApprovalsResponse = {
@@ -341,9 +356,13 @@ async function statusCodesHandler(ctx: Ctx): Promise<Response> {
         last_seen_at: string;
       }>()
   ).results;
+  const check = await readMappingCheck(db);
   const body: ApprovalStatusCodesResponse = {
     division: { id: division.id, name: division.name },
-    mappingVerified: await readMappingVerified(db),
+    mappingVerified: check.verified,
+    mappingChanged: check.reason === "mapping_changed",
+    marker: check.marker,
+    currentMappingHash: check.currentHash,
     table: Object.entries(PURCHASE_ENTRY_STATUS_TABLE)
       .map(([code, status]) => ({ statusCode: Number(code), status }))
       .sort((a, b) => a.statusCode - b.statusCode),
@@ -378,7 +397,8 @@ async function setVerifiedHandler(ctx: Ctx): Promise<Response> {
   const session = ctx.session;
   if (!session) return json({ error: "unauthenticated" }, 401);
   const db = ctx.env.DB;
-  const before = await readMappingVerified(db);
+  const check = await readMappingCheck(db);
+  const before = check.marker ?? { verified: false };
   if (ctx.request.method === "DELETE") {
     await db.batch([
       auditStatement(
@@ -388,7 +408,7 @@ async function setVerifiedHandler(ctx: Ctx): Promise<Response> {
           action: "settings.approval_mapping_unverified",
           entity: "settings",
           entityId: APPROVAL_MAPPING_VERIFIED_SETTING,
-          before: before ?? { verified: false },
+          before,
           after: { verified: false },
         },
         {
@@ -398,7 +418,7 @@ async function setVerifiedHandler(ctx: Ctx): Promise<Response> {
       ),
       db.prepare("DELETE FROM settings WHERE key = ?1").bind(APPROVAL_MAPPING_VERIFIED_SETTING),
     ]);
-    return json({ mappingVerified: null });
+    return json({ mappingVerified: false, mappingChanged: false, marker: null });
   }
   const body = await readBody(ctx.request);
   const adrRef = body?.["adrRef"];
@@ -406,14 +426,21 @@ async function setVerifiedHandler(ctx: Ctx): Promise<Response> {
     body?.["confirmation"] !== APPROVAL_MAPPING_CONFIRMATION ||
     typeof adrRef !== "string" ||
     adrRef.trim() === "" ||
-    adrRef.length > 100
+    adrRef.length > 100 ||
+    typeof body["mappingHash"] !== "string"
   ) {
     return json({ error: "bad_request" }, 400);
+  }
+  // The admin verified the table they were shown. If the code changed since (a deploy between
+  // opening the sheet and confirming, or a replayed request), refuse: nothing is stored.
+  if (body["mappingHash"] !== check.currentHash) {
+    return json({ error: "mapping_changed" }, 409);
   }
   const marker: ApprovalMappingVerified = {
     verifiedAt: new Date(ctx.nowMs).toISOString(),
     verifiedBy: session.email,
     adrRef: adrRef.trim(),
+    mappingHash: check.currentHash,
   };
   await db.batch([
     auditStatement(db, {
@@ -421,7 +448,7 @@ async function setVerifiedHandler(ctx: Ctx): Promise<Response> {
       action: "settings.approval_mapping_verified",
       entity: "settings",
       entityId: APPROVAL_MAPPING_VERIFIED_SETTING,
-      before: before ?? { verified: false },
+      before,
       after: marker,
     }),
     db
@@ -437,7 +464,7 @@ async function setVerifiedHandler(ctx: Ctx): Promise<Response> {
         marker.verifiedAt,
       ),
   ]);
-  return json({ mappingVerified: marker });
+  return json({ mappingVerified: true, mappingChanged: false, marker });
 }
 
 export function registerApprovalsRoutes(router: Router): void {

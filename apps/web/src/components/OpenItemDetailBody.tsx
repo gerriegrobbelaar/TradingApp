@@ -9,6 +9,9 @@ import { useResource } from "../lib/useResource";
 import { ErrorNotice } from "./EmptyState";
 import { Money } from "./Money";
 
+/** Shown for an open item the last complete full read did not see (review S8). */
+export const POSSIBLY_PAID_LABEL = "Possibly paid — not seen in the last sync";
+
 /** `list` is the nightly full read of the open-item lists, `sync` the hourly incremental read. */
 const SOURCE_LABEL = { list: "Nightly full read", sync: "Hourly update" } as const;
 
@@ -65,19 +68,22 @@ export function OpenItemDetailView({
   const exactLink = safeExactLink(detail.exactLink);
   return (
     <div className="detail">
-      <p className="lede">
-        <Money minor={item.openMinor} currency={item.currency} className="detail-amount" />
-        {" open"}
-        {item.status === "open" && item.daysOverdue !== null && (
-          <> · {describeDue(item.daysOverdue)}</>
-        )}
-      </p>
+      {item.status === "open" ? (
+        <p className="lede">
+          <Money minor={item.openMinor} currency={item.currency} className="detail-amount" />
+          {" open"}
+          {item.daysOverdue !== null && <> · {describeDue(item.daysOverdue)}</>}
+        </p>
+      ) : (
+        // A closed item has no open balance we know of: never a misleading 0,00 (review S9).
+        <p className="lede">Closed since it was last open in Exact</p>
+      )}
       <div className="chips">
         <Chip tone={item.status === "open" ? "ok" : "neutral"}>
           {item.status === "open" ? "Open" : "Closed"}
         </Chip>
         {item.bucket && <Chip tone={BUCKET_TONE[item.bucket]}>{BUCKET_LABEL[item.bucket]}</Chip>}
-        {item.possiblyPaid && <Chip tone="warn">Possibly paid — not seen in the last sync</Chip>}
+        {item.possiblyPaid && <Chip tone="warn">{POSSIBLY_PAID_LABEL}</Chip>}
       </div>
       <dl className="dl">
         <Row label="Document">{item.invoiceNumber ?? NO_VALUE}</Row>
@@ -96,10 +102,16 @@ export function OpenItemDetailView({
           )}
         </Row>
         <Row label="Open balance">
-          <Money minor={item.openMinor} currency={item.currency} />
+          {item.status === "open" ? (
+            <Money minor={item.openMinor} currency={item.currency} />
+          ) : (
+            NO_VALUE
+          )}
         </Row>
         <Row label={`Open balance in ${dcCur}`}>
-          {item.dcMinor === null ? (
+          {item.status !== "open" ? (
+            NO_VALUE
+          ) : item.dcMinor === null ? (
             `No ${dcCur} amount yet`
           ) : (
             <Money minor={item.dcMinor} currency={dcCur} />

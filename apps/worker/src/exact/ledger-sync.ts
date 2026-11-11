@@ -745,10 +745,17 @@ export async function syncGlBalances(ctx: LedgerCtx): Promise<EntityResult> {
     ctx.meter.used += 1;
     nightly = reportingMonth(nowMs) <= (await readPriorYearNightlyUntilMonth(ctx.db));
   }
+  // A pass of the previous year that an earlier attempt left partway is always continued, even when
+  // the rule that started it no longer applies (an attempt cut off at 23:59 on the limit month's
+  // last day and retried after midnight): otherwise its token would sit unused for a week.
+  const prevResuming = passInfo(ctx, "gl_balances", `${thisYear - 1}:`).resuming;
   if (
     prev === undefined ||
     (prev.cycle !== cycle &&
-      (nightly || ageMs(prev.completed_at, nowMs) >= LEDGER_REFRESH_MS || readWhileCurrent(prev)))
+      (prevResuming ||
+        nightly ||
+        ageMs(prev.completed_at, nowMs) >= LEDGER_REFRESH_MS ||
+        readWhileCurrent(prev)))
   ) {
     due.push(thisYear - 1);
   }

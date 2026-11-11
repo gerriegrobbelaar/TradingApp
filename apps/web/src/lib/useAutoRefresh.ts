@@ -10,10 +10,12 @@ export const AUTO_REFRESH_MIN_GAP_MS = 30 * 1000;
  * while the tab is visible, so the "Updated x min ago" stamp and the stale flag do not stay fixed
  * at page load (review N5). Requests are de-duplicated: a trigger within 30 seconds of the last
  * one, or while a refresh is still running, does nothing. `refresh` should be quiet (no loading
- * state) and return a promise; `enabled: false` switches everything off.
+ * state) and return a promise; `enabled: false` switches everything off. `refresh` gets a signal
+ * that is aborted when the component unmounts or the hook is switched off, so a request in flight
+ * is cancelled instead of landing on a page that is gone.
  */
 export function useAutoRefresh(
-  refresh: () => Promise<void> | void,
+  refresh: (signal: AbortSignal) => Promise<void> | void,
   enabled: boolean,
   intervalMs: number = AUTO_REFRESH_MS,
   minGapMs: number = AUTO_REFRESH_MIN_GAP_MS,
@@ -24,13 +26,20 @@ export function useAutoRefresh(
     if (!enabled) return;
     let last = Date.now();
     let busy = false;
+    const ctl = new AbortController();
     const run = (): void => {
-      if (busy || document.visibilityState === "hidden") return;
+      if (busy || ctl.signal.aborted || document.visibilityState === "hidden") return;
       const now = Date.now();
       if (now - last < minGapMs) return;
       last = now;
       busy = true;
-      Promise.resolve(ref.current())
+      let pending: Promise<void> | void;
+      try {
+        pending = ref.current(ctl.signal);
+      } catch {
+        pending = undefined;
+      }
+      Promise.resolve(pending)
         .catch(() => undefined)
         .finally(() => {
           busy = false;
@@ -49,6 +58,7 @@ export function useAutoRefresh(
       Math.min(intervalMs, 60_000),
     );
     return () => {
+      ctl.abort();
       window.removeEventListener("focus", run);
       document.removeEventListener("visibilitychange", onVisible);
       window.clearInterval(timer);

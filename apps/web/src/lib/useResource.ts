@@ -59,11 +59,11 @@ export function useResource<T>(
   // data when the answer arrives, ignores failures (the next trigger tries again).
   const current = useRef<{ key: string | null; ready: boolean }>({ key: null, ready: false });
   current.current = { key, ready: state.key === key && state.status === "ready" };
-  useAutoRefresh(async () => {
+  useAutoRefresh(async (signal) => {
     const at = current.current.key;
     if (at === null || !current.current.ready) return;
-    const data = await fetchRef.current(new AbortController().signal);
-    if (current.current.key === at) {
+    const data = await fetchRef.current(signal);
+    if (!signal.aborted && current.current.key === at) {
       setState((s) => (s.key === at && s.status === "ready" ? { ...s, data } : s));
     }
   }, key !== null);

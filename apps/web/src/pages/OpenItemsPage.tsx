@@ -9,7 +9,7 @@ import { EmptyState } from "../components/EmptyState";
 import { ActiveFilter, FilterBar } from "../components/FilterBar";
 import { FreshnessStamp } from "../components/FreshnessStamp";
 import { Money } from "../components/Money";
-import { itemTitle } from "../components/OpenItemDetailBody";
+import { POSSIBLY_PAID_LABEL, itemTitle } from "../components/OpenItemDetailBody";
 import { OpenItemSheet } from "../components/OpenItemSheets";
 import { PageHeader } from "../components/PageHeader";
 import { BUCKET_LABEL, BUCKET_TONE } from "../lib/ageing";
@@ -18,8 +18,7 @@ import { NO_VALUE, describeDue, formatCount, formatDate } from "../lib/format";
 import { useCursorList } from "../lib/useCursorList";
 import { useSearchText } from "../lib/useSearchText";
 
-/** Shown for an open row the last complete full read did not see (review S8). */
-export const POSSIBLY_PAID_LABEL = "Possibly paid — not seen in the last sync";
+export { POSSIBLY_PAID_LABEL } from "../components/OpenItemDetailBody";
 /** Scope of the Closed and All views (review S9). */
 export const CLOSED_SCOPE_NOTE =
   "Closed shows only items that were open at some sync since this app first read Exact. Items that were already closed then are not included.";

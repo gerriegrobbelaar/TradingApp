@@ -27,6 +27,12 @@ export function isPlausibleIban(normalised: string): boolean {
  * end, letters become 10..35, the number mod 97 must be 1. Country lengths are not checked.
  * The sync stores IBANs that fail this check (they are still what Exact holds, and a new one still
  * raises the payment-safety flag); paying to one must be refused (Phase 9).
+ *
+ * PHASE 9 PAYMENT PRE-CHECK (ADR 0019, 0024 addendum S10, 0025): the stored IBANs can be up to
+ * IBAN_OVERDUE_MS (3 days) old, since the IBAN read runs after the ledger in a full cycle. When a
+ * payment is prepared, ALWAYS re-read the supplier's bank accounts from Exact
+ * (`listBankAccounts({ accountId })`), compare with the stored IBAN and treat any difference as
+ * "new or changed bank details" (second approver, CLAUDE.md 4.4). Never pay from the cache alone.
  */
 export function hasValidIbanChecksum(normalised: string): boolean {
   if (!isPlausibleIban(normalised)) return false;

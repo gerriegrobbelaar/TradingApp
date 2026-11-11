@@ -420,11 +420,13 @@ export interface ApprovalsResponse {
   freshness: Freshness;
   available: boolean;
   /**
-   * True once an admin has recorded that the status mapping was verified against Exact (review S2,
-   * ADR 0025). While false the screen shows a non-dismissable notice and nothing may rely on the
-   * statuses for a payment.
+   * True only while an admin's "verified" mark exists AND was made for the status table and join
+   * rule as they are now (the mark stores their SHA-256; review S2, ADR 0025). While false the
+   * screen shows a non-dismissable notice and nothing may rely on the statuses for a payment.
    */
   mappingVerified: boolean;
+  /** True when a mark exists but the table or join rule changed since it was made. */
+  mappingChanged: boolean;
 }
 
 /**
@@ -436,8 +438,14 @@ export interface ApprovalsResponse {
 export interface ApprovalStatusCodesResponse {
   division: { id: number; name: string };
   table: { statusCode: number; status: ApprovalStatus }[];
-  /** The stored marker, null while the mapping is not verified. */
-  mappingVerified: { verifiedAt: string; verifiedBy: string; adrRef: string } | null;
+  /** True only when `marker` exists and its hash equals `currentMappingHash`. */
+  mappingVerified: boolean;
+  /** A mark exists but was made for another table or join rule (it no longer counts). */
+  mappingChanged: boolean;
+  /** The stored mark (also when it no longer counts), null when there is none. */
+  marker: { verifiedAt: string; verifiedBy: string; adrRef: string; mappingHash: string } | null;
+  /** SHA-256 of the current table and join rule; PUT mapping-verified must send it back. */
+  currentMappingHash: string;
   codes: {
     statusCode: number | null;
     storedStatus: ApprovalStatus;

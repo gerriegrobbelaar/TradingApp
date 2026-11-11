@@ -113,9 +113,34 @@ export const ENTITIES: readonly EntityName[] = [
   // Bank accounts of relations come LAST (review S10, ADR 0019/0024): the read is one piece of
   // about rows / 50 calls that cannot be resumed, so it must not take the budget of the approvals
   // and the ledger, which can be. It starts only when the budget left covers what the last read
-  // needed (otherwise `budget_exhausted`, and the next attempt of the night reads it).
+  // needed (otherwise `budget_exhausted`, and the next attempt of the night reads it). When the
+  // last complete IBAN read is older than IBAN_OVERDUE_MS (or there never was one), a full run
+  // moves it up to right after the relations (`fullSyncOrder`), so a ledger that needs several
+  // nights cannot starve it.
   "relation_ibans",
 ];
+
+/**
+ * Longest the IBAN read may wait behind the ledger. Past it, a full run reads the IBANs right after
+ * the relations, before the purchase entries and the ledger (review S10 starvation bound): with a
+ * ledger that takes every call of several nights, the IBANs still get a near-full budget at least
+ * every 3 days (the first attempt of the night that finds them overdue, or the next attempt when
+ * the relations used too much of it).
+ */
+export const IBAN_OVERDUE_MS = 3 * 24 * 60 * 60 * 1000;
+
+/** Entity order of a FULL run: ENTITIES, with relation_ibans moved up while it is overdue. */
+export function fullSyncOrder(
+  ibansLastCompletedAt: string | null | undefined,
+  nowMs: number,
+): readonly EntityName[] {
+  const t = ibansLastCompletedAt == null ? Number.NaN : Date.parse(ibansLastCompletedAt);
+  const overdue = Number.isNaN(t) || nowMs - t >= IBAN_OVERDUE_MS;
+  if (!overdue) return ENTITIES;
+  const rest = ENTITIES.filter((e) => e !== "relation_ibans");
+  const at = rest.indexOf("relations") + 1;
+  return [...rest.slice(0, at), "relation_ibans", ...rest.slice(at)];
+}
 /**
  * Order of an INCREMENTAL run: the cheap approval-status read (usually one call) goes before the
  * relations, whose first walk after a reset can use the whole hourly budget.
@@ -798,7 +823,14 @@ export async function syncDivision(
         callsSoFar: () => [...tally.values()].reduce((a, b) => a + b, 0),
       };
 
-      for (const entity of opts.mode === "full" ? ENTITIES : INCREMENTAL_ORDER) {
+      // Only scheduled full runs read IBANs; the order is judged at the run's start.
+      const order =
+        opts.mode === "full" && readIbans
+          ? fullSyncOrder(state.get("relation_ibans")?.last_completed_at, Date.parse(startedAt))
+          : opts.mode === "full"
+            ? ENTITIES
+            : INCREMENTAL_ORDER;
+      for (const entity of order) {
         if (fatal !== null) break;
         current = entity;
         ctx.progress = 0;

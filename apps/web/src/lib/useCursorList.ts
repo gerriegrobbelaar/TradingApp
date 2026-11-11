@@ -142,11 +142,12 @@ export function useCursorList<T, P extends CursorPage<T>>(
   // Quiet refresh of the first page's summary (freshness, totals, as-of) on focus and every 30
   // minutes (review N5). The rows already shown stay, so scroll position and "Load more" progress
   // survive; a failure is ignored.
-  useAutoRefresh(async () => {
+  useAutoRefresh(async (signal) => {
     const s = latest.current;
     if (s.key === null || s.status !== "ready") return;
     const key = s.key;
-    const p = await fetchRef.current(null, new AbortController().signal);
+    const p = await fetchRef.current(null, signal);
+    if (signal.aborted) return;
     setState((c) => (c.key === key && c.status === "ready" ? { ...c, first: p } : c));
   }, queryKey !== null);
 
