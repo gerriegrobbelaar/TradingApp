@@ -7,8 +7,8 @@ Orchestrator log. Update after every merge and every direct (trivial) edit.
 |---|---|---|
 | 1 | Foundation | Done (open go-live gate: confirm Google returns auth_time, ADR 0007) |
 | 2 | Exact connection | Code complete (E1-E3, G1-G3 merged, reviews done). NOT verified against real Exact: see docs/DEPLOY.md step 10 |
-| 3 | Scheduler | Built; review fixes J1/J2 in progress (J1 code and defaults, J2 deploy runbook). Not run on real Cloudflare Queues or Durable Objects |
-| 4 | Read-only screens | Not started |
+| 3 | Scheduler | Done: H1, H2, J1 (review fixes), J2 (DEPLOY runbook; docs only, not separately reviewed). Not run on real Cloudflare Queues/DOs. Exact jobs ship disabled |
+| 4 | Read-only screens | In progress: K1 (read API, ageing, KPIs) merged; K2 (ledger sync, report builders) building; K3 (screens) next |
 | 5 | Revolut connection | Not started |
 | 6 | ECB FX | Not started |
 | 7 | Matching | Not started |
@@ -45,3 +45,4 @@ Oldest first. Within a day, entries follow the order the work landed.
 
 ## Open decisions (CLAUDE.md §9)
 Answered: 7 (Workers only), 8 (domain only). Unanswered: 1-6 (needed from Phase 2 onward). Record answers as ADRs in `docs/decisions/`.
+- 2026-11-11: Phase 3 review fixes J1 (handler contract, lateness, schedule rules, atomic retry), J2 (DEPLOY.md rewrite), and Phase 4 K1 (open-items read API, ageing, KPIs, indexed search) merged.
