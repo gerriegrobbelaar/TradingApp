@@ -122,8 +122,12 @@ describe("all migrations on a database populated at the first schema", () => {
     ).results;
     const actual: Record<string, string> = {};
     for (const r of rows) actual[r.name] = await sha256(r.sql.replace(/\s+/g, " ").trim());
-    expect(Object.keys(actual).sort()).toEqual(Object.keys(pinned.triggers).sort());
-    expect(actual).toEqual(pinned.triggers);
+    const how =
+      "Triggers differ from test/fixtures/trigger-hashes.json. If the change is deliberate, run " +
+      "`pnpm --filter @camelthorn/worker run triggers:update` and review the diff (a trigger that " +
+      "disappears or gets weaker must be intended).";
+    expect(Object.keys(actual).sort(), how).toEqual(Object.keys(pinned.triggers).sort());
+    expect(actual, how).toEqual(pinned.triggers);
 
     // 0023 on migrated data: the old matches are not booked, nothing is in the outbox, booking is
     // off (no settings row), and the new columns and the call ledger exist.

@@ -1023,12 +1023,16 @@ describe("auto-match needs fresh open items", () => {
     expect((await runMatching(jobContext())).summary).toMatchObject(stale);
   });
 
-  it("only the kind of the candidate matters: receivables stale blocks a receivable, payables stale does not", async () => {
+  it("both kinds must be fresh, whatever the candidate settles (competitors and credit notes)", async () => {
     await perfect();
     await enableAuto();
     await markOpenItemsSynced(w.divisionId, at(30 * H), at(H));
     expect((await runMatching(jobContext())).summary).toMatchObject(stale);
+    // A stale payables list blocks a receivable too: money in can also settle a supplier credit
+    // note the stale list does not show.
     await markOpenItemsSynced(w.divisionId, at(H), at(30 * H));
+    expect((await runMatching(jobContext())).summary).toMatchObject(stale);
+    await markOpenItemsSynced(w.divisionId, at(H), at(H));
     expect((await runMatching(jobContext())).summary).toMatchObject({ auto_matched: 1 });
   });
 

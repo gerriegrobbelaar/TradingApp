@@ -562,6 +562,20 @@ describe("S4: housekeeping of webhook_events and webhook_rejections", () => {
     expect(housekeepingStatements(s2.sql)).toBe(1);
   });
 
+  it("the outbox payload retention costs one statement per hour, none on the other ticks", async () => {
+    let total = 0;
+    for (let m = 0; m < 60; m++) {
+      resetHousekeepingState();
+      const s = spyEnv();
+      await tickScheduler(s.env, NOW + m * MIN);
+      const n = s.sql.filter((q) => q.includes("exact_write_outbox")).length;
+      // NOW is a whole hour: only minute 3 of the hour sends the one statement.
+      expect(n, `minute ${m}`).toBe(m === HOUSEKEEPING_MINUTE ? 1 : 0);
+      total += n;
+    }
+    expect(total).toBe(1);
+  });
+
   it("a failing housekeeping never breaks the tick's job claiming", async () => {
     await seedEvent(1, { ageMs: 20 * MIN });
     const s = spyEnv();

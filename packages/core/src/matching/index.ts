@@ -11,6 +11,7 @@ export {
   MIN_RECENT_IBAN_DAYS,
   type AutoSafetyFields,
   isLoosening,
+  MATCH_CONFIG_FIELD_SAFETY,
   REGEX_PROBLEM_CODES,
   type RegexProblemCode,
   assertMatchConfig,

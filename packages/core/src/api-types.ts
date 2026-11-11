@@ -880,14 +880,24 @@ export interface MatchConfigResponse {
   updatedBy: string | null;
   /** The text that must be typed to switch automatic matching on. */
   autoConfirmPhrase: string;
+  /**
+   * Revision of the matching settings (opaque; null before the first save). Send it back as `rev`
+   * in the PUT to get 409 `conflict` instead of overwriting somebody else's change.
+   */
+  rev?: string | null;
 }
 
-/** PUT /api/matching/config (admin, step-up): every field optional; `confirm` only to switch auto on. */
+/**
+ * PUT /api/matching/config (admin, step-up): every field optional. `confirm` (the typed phrase) to
+ * switch auto on, and again for a config change that loosens automatic matching while it is on
+ * (422 `confirmation_required`). `rev`: optional optimistic-concurrency check (409 `conflict`).
+ */
 export interface MatchConfigRequest {
   enabled?: boolean;
   autoEnabled?: boolean;
   config?: Partial<MatchTunablesDto>;
   confirm?: string;
+  rev?: string | null;
 }
 
 export interface MatchAccountMapDto {

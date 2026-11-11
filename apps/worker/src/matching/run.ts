@@ -162,7 +162,14 @@ export function autoInputGap(
   return null;
 }
 
-/** Phase 7 review S4: the last COMPLETE open-items pass must be younger than this. */
+const BOTH_KINDS = ["receivable", "payable"] as const;
+
+/**
+ * Phase 7 review S4: the last COMPLETE open-items pass must be younger than this (strictly: a pass
+ * exactly 26 hours old is stale). A pass that a full cycle resumed over several runs counts from
+ * the time it completed, so its first chunk can be older (at most the 36-hour cycle); the item
+ * close rule (two strikes) is unchanged by this gate.
+ */
 export const OPEN_ITEMS_MAX_AGE_MS = 26 * 3_600_000;
 
 export interface OpenItemsFreshness {
@@ -308,15 +315,14 @@ export async function runMatching(ctx: JobContext): Promise<HandlerResult> {
       const currentStatus = status.get(tx.id) ?? "unmatched";
 
       // Automatic match: opt-in, and only what the engine itself calls automatic, with complete inputs.
-      const kinds: ("receivable" | "payable")[] = [];
-      for (const a of r.chosen?.allocations ?? []) {
-        const k = itemsById.get(a.itemId)?.kind;
-        // An item the assembly does not know cannot be verified: treat it as both kinds stale.
-        if (k === undefined) kinds.push("receivable", "payable");
-        else kinds.push(k);
-      }
+      // Freshness (review S4): BOTH kinds, whatever the candidate settles. The gap rule needs every
+      // competing candidate, and money in can also settle a supplier credit note (a payable), money
+      // out a customer credit note; a ledger-pattern match has no item at all but may pre-empt an
+      // invoice the stale list does not show yet.
       const gap =
-        settings.autoEnabled && r.decision === "auto" ? autoInputGap(tx, { kinds, fresh }) : null;
+        settings.autoEnabled && r.decision === "auto"
+          ? autoInputGap(tx, { kinds: BOTH_KINDS, fresh })
+          : null;
       if (gap !== null) skip(gap);
       if (settings.autoEnabled && r.decision === "auto" && r.chosen !== null && gap === null) {
         const chosen = r.chosen;

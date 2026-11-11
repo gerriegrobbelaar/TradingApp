@@ -7,11 +7,24 @@
 // sha-256 of each body. test/migrations-all.test.ts computes the same values from the real D1 test
 // database and compares. Run this after any migration that creates, changes or drops a trigger and
 // review the diff: a trigger that disappears or gets weaker must be a deliberate change.
+//
+// Needs node:sqlite without a flag: Node 22.13 or later (the repo's .nvmrc says 22, i.e. the latest
+// 22.x). Normalisation is whitespace only: comments, case, operator and statement order all change
+// the hash, so any real edit of a trigger shows up.
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { DatabaseSync } from "node:sqlite";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+let DatabaseSync;
+try {
+  ({ DatabaseSync } = await import("node:sqlite"));
+} catch {
+  console.error(
+    `node:sqlite is not available in Node ${process.version}; use Node 22.13 or later (see .nvmrc).`,
+  );
+  process.exit(1);
+}
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const dir = join(root, "migrations");

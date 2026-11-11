@@ -5,6 +5,7 @@ import {
   DEFAULT_MATCH_CONFIG,
   explainBlock,
   isLoosening,
+  MATCH_CONFIG_FIELD_SAFETY,
   matchBatch,
   matchTransaction,
   validateMatchConfig,
@@ -191,5 +192,130 @@ describe("incoming payment from an unknown IBAN (default: review)", () => {
   it("the block code is exported and explained", () => {
     expect(BLOCK_CODES).toContain("iban_unknown_for_customer");
     expect(explainBlock("iban_unknown_for_customer")).toContain("customer");
+  });
+});
+
+describe("review U2: every config field is classified", () => {
+  it("MATCH_CONFIG_FIELD_SAFETY has exactly the keys of DEFAULT_MATCH_CONFIG", () => {
+    // A new MatchConfig field fails here (and in the type) until somebody decides whether a change
+    // to it can make more matches automatic, and isLoosening checks it if so.
+    expect(Object.keys(MATCH_CONFIG_FIELD_SAFETY).sort()).toEqual(
+      Object.keys(DEFAULT_MATCH_CONFIG).sort(),
+    );
+  });
+
+  // For every auto_safety field: one change that loosens and one that tightens.
+  const full: AutoSafetyFields = {
+    autoMatchMinScore: 97,
+    autoMatchMinGap: 20,
+    blockAutoOnRecentIbanChangeDays: 90,
+    autoLedgerPatterns: true,
+    autoIncomingUnknownIban: false,
+    amountToleranceMinor: 5,
+    autoTxTypes: ["transfer"],
+    noMatchTxTypes: ["exchange"],
+    internalAccountTypes: ["self"],
+    ownIbans: [IBAN],
+    patterns: [{ id: "p1", ledgerAccountCode: "4510", description: "Fees", test: { type: "fee" } }],
+  };
+  const cases: Record<string, [Partial<AutoSafetyFields>, Partial<AutoSafetyFields>]> = {
+    autoMatchMinScore: [{ autoMatchMinScore: 96 }, { autoMatchMinScore: 98 }],
+    autoMatchMinGap: [{ autoMatchMinGap: 19 }, { autoMatchMinGap: 21 }],
+    amountToleranceMinor: [{ amountToleranceMinor: 6 }, { amountToleranceMinor: 4 }],
+    blockAutoOnRecentIbanChangeDays: [
+      { blockAutoOnRecentIbanChangeDays: 89 },
+      { blockAutoOnRecentIbanChangeDays: 91 },
+    ],
+    autoIncomingUnknownIban: [{ autoIncomingUnknownIban: true }, {}],
+    autoLedgerPatterns: [{}, { autoLedgerPatterns: false }],
+    patterns: [
+      {
+        patterns: [
+          { id: "p1", ledgerAccountCode: "4510", description: "Fees", test: { type: "fee" } },
+          { id: "p2", ledgerAccountCode: "4520", description: "Card", test: { type: "card" } },
+        ],
+      },
+      { patterns: [] },
+    ],
+    autoTxTypes: [{ autoTxTypes: ["transfer", "topup"] }, { autoTxTypes: [] }],
+    noMatchTxTypes: [{ noMatchTxTypes: [] }, { noMatchTxTypes: ["exchange", "fee"] }],
+    internalAccountTypes: [
+      { internalAccountTypes: [] },
+      { internalAccountTypes: ["self", "pocket"] },
+    ],
+    ownIbans: [{ ownIbans: [] }, { ownIbans: [IBAN, OTHER] }],
+  };
+  const safety = Object.entries(MATCH_CONFIG_FIELD_SAFETY)
+    .filter(([, v]) => v === "auto_safety")
+    .map(([k]) => k);
+  it("every auto_safety field has a loosening and a tightening case", () => {
+    expect(Object.keys(cases).sort()).toEqual(safety.sort());
+  });
+  for (const [field, [loosen, tighten]] of Object.entries(cases)) {
+    if (Object.keys(loosen).length > 0) {
+      it(`${field}: loosening detected`, () =>
+        expect(isLoosening(full, { ...full, ...loosen })).toBe(true));
+    }
+    it(`${field}: tightening is not loosening`, () =>
+      expect(isLoosening(full, { ...full, ...tighten })).toBe(false));
+  }
+  it("autoLedgerPatterns: switching it on is loosening", () =>
+    expect(isLoosening({ ...full, autoLedgerPatterns: false }, full)).toBe(true));
+  it("a changed pattern (wider test, other account, higher limit) is loosening; a rename is not", () => {
+    const p = { id: "p1", ledgerAccountCode: "4510", description: "Fees", test: { type: "fee" } };
+    const with_ = (q: typeof p & { test: Record<string, unknown> }) => ({ ...full, patterns: [q] });
+    expect(isLoosening(full, with_({ ...p, description: "Bank fees" }))).toBe(false);
+    expect(isLoosening(full, with_({ ...p, id: "p9" }))).toBe(false);
+    expect(isLoosening(full, with_({ ...p, ledgerAccountCode: "4999" }))).toBe(true);
+    expect(isLoosening(full, with_({ ...p, test: { type: "fee", maxAmountMinor: 10n } }))).toBe(
+      true,
+    );
+    // With ledger auto off, patterns cannot be automatic: not loosening.
+    const off = { ...full, autoLedgerPatterns: false };
+    expect(isLoosening(off, { ...off, patterns: [] })).toBe(false);
+    expect(isLoosening(off, { ...off, patterns: [{ ...p, ledgerAccountCode: "4999" }] })).toBe(
+      false,
+    );
+  });
+  it("own IBANs compare normalised (spaces, case)", () => {
+    expect(isLoosening(full, { ...full, ownIbans: ["nl91 abna 0417 1643 00"] })).toBe(false);
+  });
+});
+
+describe("review U2: suggestMinScore cannot hide a close runner-up", () => {
+  // Rule 1 at the top (100) and an automatic ledger pattern close behind (95): gap 5 < 20.
+  const pcfg: MatchConfig = {
+    ...cfg,
+    autoMatchMinScore: 97,
+    autoLedgerPatterns: true,
+    patterns: [
+      { id: "p1", ledgerAccountCode: "8000", description: "Any in", test: { direction: "in" } },
+    ],
+  };
+  it("shown: the close second blocks", () => {
+    const r = matchTransaction(tx(), [item()], pcfg);
+    expect(r.candidates.map((c) => c.score)).toEqual([100, 95]);
+    expect(r.decision).toBe("review");
+    expect(r.candidates[0]?.blockedReasons).toContain("close_second_candidate");
+  });
+  it("hidden by a higher suggestMinScore: still blocks (it used to become automatic)", () => {
+    const hide = { ...pcfg, suggestMinScore: 96 };
+    expect(validateMatchConfig(hide)).toEqual([]);
+    const r = matchTransaction(tx(), [item()], hide);
+    expect(r.candidates.map((c) => c.score)).toEqual([100]);
+    expect(r.decision).toBe("review");
+    expect(r.candidates[0]?.blockedReasons).toContain("close_second_candidate");
+  });
+});
+
+describe("review U2: unknown IBAN on a customer credit note (money out)", () => {
+  it("a refund to an account we do not know for the customer is review only", () => {
+    const cn = item({ openMinor: -50000n, invoiceNumber: "CN-2024-001" });
+    const t = tx({ direction: "out", amountMinor: 50000n, reference: "CN-2024-001" });
+    const known = matchTransaction(t, [cn], cfg);
+    const unknown = matchTransaction({ ...t, counterpartyIban: OTHER }, [cn], cfg);
+    expect(unknown.decision).toBe("review");
+    expect(unknown.candidates[0]?.blockedReasons).toContain("iban_unknown_for_customer");
+    expect(known.candidates[0]?.blockedReasons ?? []).not.toContain("iban_unknown_for_customer");
   });
 });

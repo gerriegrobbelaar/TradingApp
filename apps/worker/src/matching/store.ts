@@ -473,7 +473,9 @@ export async function claimMatchForBooking(
   nextState: string,
 ): Promise<boolean> {
   const out = await claimStatement(db, matchId, nextState).run();
-  return (out.meta.changes ?? 0) === 1;
+  // `>= 1`: D1 also counts the allocation rows the claim trigger refreshes (the settlement baseline,
+  // migration 0025); the UPDATE targets one id, so any change means this caller won.
+  return (out.meta.changes ?? 0) >= 1;
 }
 
 /**

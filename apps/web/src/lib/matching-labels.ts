@@ -181,7 +181,9 @@ export const ERROR_TEXT: Record<string, string> = {
   pattern_not_allowed: "That pattern is outside the safe subset. Simplify it.",
   too_many_patterns: "There are too many patterns. Remove one first.",
   config_invalid: "The stored matching settings are not valid. Fix them before switching on.",
-  confirmation_required: "Type the confirmation text exactly.",
+  confirmation_required:
+    "Type the confirmation text exactly. A change that lets automatic matching do more needs it again: switch automatic matching off, save, then switch it on.",
+  conflict: "Somebody else changed these settings just now. Reload the page to see their change.",
   bad_config: "These settings are not valid. Check the highlighted values.",
   unknown_division: "That administration is not available for matching.",
   unknown_account: "That bank account does not exist.",
@@ -198,6 +200,7 @@ export const ERROR_TEXT: Record<string, string> = {
   bad_max_amount: "The maximum amount is not valid.",
   bad_enabled: "The on/off value was not valid. Try again.",
   bad_auto_enabled: "The on/off value was not valid. Try again.",
+  bad_rev: "The settings version was not valid. Reload the page and try again.",
   bad_account: "That bank account is not valid.",
   bad_division: "That administration is not valid.",
   bad_journal_code: "That journal code is not valid.",

@@ -22,6 +22,13 @@ import {
 export const SETTING_CONFIG = "matching.config";
 export const SETTING_ENABLED = "matching.enabled";
 export const SETTING_AUTO = "matching.auto_enabled";
+/**
+ * Revision of the three matching settings above (review U2): a random id, replaced by every write
+ * in the same batch. A PUT writes only while the revision is still the one it read, so two
+ * concurrent PUTs cannot combine into a state neither was checked against (for example a
+ * loosening saved while auto was off, racing a switch-on that checked the old config).
+ */
+export const SETTING_REV = "matching.rev";
 
 /** Typed by the admin to switch automatic matching on (the UI shows it; the API requires it). */
 export const AUTO_CONFIRM_PHRASE = AUTO_MATCH_CONFIRM_PHRASE;
@@ -148,6 +155,8 @@ export interface MatchingSettings {
   configErrors: string[];
   configUpdatedAt: string | null;
   configUpdatedBy: string | null;
+  /** The stored revision (raw value_json) or null before the first write. */
+  rev: string | null;
 }
 
 interface SettingRow {
@@ -161,9 +170,9 @@ export async function loadMatchingSettings(db: D1Database): Promise<MatchingSett
   const rows = (
     await db
       .prepare(
-        "SELECT key, value_json, updated_by, updated_at FROM settings WHERE key IN (?1, ?2, ?3)",
+        "SELECT key, value_json, updated_by, updated_at FROM settings WHERE key IN (?1, ?2, ?3, ?4)",
       )
-      .bind(SETTING_CONFIG, SETTING_ENABLED, SETTING_AUTO)
+      .bind(SETTING_CONFIG, SETTING_ENABLED, SETTING_AUTO, SETTING_REV)
       .all<SettingRow>()
   ).results;
   const by = new Map(rows.map((r) => [r.key, r]));
@@ -195,6 +204,7 @@ export async function loadMatchingSettings(db: D1Database): Promise<MatchingSett
     configErrors,
     configUpdatedAt: cfgRow?.updated_at ?? null,
     configUpdatedBy: cfgRow?.updated_by ?? null,
+    rev: by.get(SETTING_REV)?.value_json ?? null,
   };
 }
 
