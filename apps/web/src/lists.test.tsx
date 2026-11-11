@@ -106,7 +106,7 @@ describe("Invoices list", () => {
     await waitFor(() => expect(listCalls(calls)).toHaveLength(2));
     expect(params(listCalls(calls)[1]).get("overdue")).toBe("1");
     expect(params(listCalls(calls)[1]).get("status")).toBe("open");
-    await user.click(within(seg).getByRole("button", { name: "Closed" }));
+    await user.click(within(seg).getByRole("button", { name: "Closed since first sync" }));
     await waitFor(() => expect(listCalls(calls)).toHaveLength(3));
     expect(params(listCalls(calls)[2]).get("status")).toBe("closed");
     expect(params(listCalls(calls)[2]).has("overdue")).toBe(false);
@@ -380,7 +380,7 @@ describe("Invoices list", () => {
     expect(norm(dl("Amount as stored") ?? "")).toBe("€ 1.000,00");
     expect(dl("Due date")).toBe("1 Oct 2026");
     expect(within(dialog).getByText(/Last seen in Exact 11 Nov 2026, 03:00/)).toBeTruthy();
-    expect(within(dialog).getByText(/Source: Open items list/)).toBeTruthy();
+    expect(within(dialog).getByText(/Source: Nightly full read/)).toBeTruthy();
     expect(within(dialog).getByText(/Missed in 1 full reads since/)).toBeTruthy();
     // No emails, IBANs or buttons for actions that do not exist yet.
     expect(dialog.textContent).not.toMatch(/@|IBAN/);

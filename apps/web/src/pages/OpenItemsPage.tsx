@@ -14,9 +14,15 @@ import { OpenItemSheet } from "../components/OpenItemSheets";
 import { PageHeader } from "../components/PageHeader";
 import { BUCKET_LABEL, BUCKET_TONE } from "../lib/ageing";
 import { describeLoadError } from "../lib/errors";
-import { describeDue, formatCount, formatDate } from "../lib/format";
+import { NO_VALUE, describeDue, formatCount, formatDate } from "../lib/format";
 import { useCursorList } from "../lib/useCursorList";
 import { useSearchText } from "../lib/useSearchText";
+
+/** Shown for an open row the last complete full read did not see (review S8). */
+export const POSSIBLY_PAID_LABEL = "Possibly paid — not seen in the last sync";
+/** Scope of the Closed and All views (review S9). */
+export const CLOSED_SCOPE_NOTE =
+  "Closed shows only items that were open at some sync since this app first read Exact. Items that were already closed then are not included.";
 
 export type OpenItemsView = "open" | "overdue" | "closed" | "all";
 const VIEWS: readonly OpenItemsView[] = ["open", "overdue", "closed", "all"];
@@ -246,6 +252,7 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
             <span className="age">
               {r.bucket && <Chip tone={BUCKET_TONE[r.bucket]}>{BUCKET_LABEL[r.bucket]}</Chip>}
               <span className="cap">{describeDue(r.daysOverdue)}</span>
+              {r.possiblyPaid && <Chip tone="warn">{POSSIBLY_PAID_LABEL}</Chip>}
             </span>
           ),
       },
@@ -253,13 +260,27 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
         key: "amount",
         header: "Open balance",
         align: "right",
-        render: (r) => <Money minor={r.openMinor} currency={r.currency} />,
+        render: (r) =>
+          r.status === "closed" ? (
+            // A closed row has no open balance: never show a misleading € 0,00.
+            r.originalMinor === null ? (
+              <span className="muted">{NO_VALUE}</span>
+            ) : (
+              <>
+                <Money minor={r.originalMinor} currency={r.currency} />{" "}
+                <span className="cap">invoiced</span>
+              </>
+            )
+          ) : (
+            <Money minor={r.openMinor} currency={r.currency} />
+          ),
       },
     ],
     [copy.kind, copy.party],
   );
 
   const totals = list.first?.totalsByCurrency ?? [];
+  const possiblyPaidTotal = totals.reduce((n, t) => n + t.possiblyPaid, 0);
   const noDivision = divStatus === "ready" && selected === null;
   const status = list.status === "ready" ? "ready" : list.status === "error" ? "error" : "loading";
   const filtered = view !== "open" || q.trim() !== "" || currency !== "" || relationId !== "";
@@ -308,6 +329,7 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
             {list.first && (
               <span className="cap">Balances as of {formatDate(list.first.asOf)}</span>
             )}
+            <span className="cap">Open items refresh nightly</span>
           </>
         }
       />
@@ -325,7 +347,7 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
             options: [
               { value: "open", label: "Open" },
               { value: "overdue", label: "Overdue" },
-              { value: "closed", label: "Closed" },
+              { value: "closed", label: "Closed since first sync" },
               { value: "all", label: "All" },
             ],
             onChange: (v) => setParam({ view: v === "open" ? null : v }),
@@ -358,6 +380,14 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
           )}
         </FilterBar>
 
+        {(view === "closed" || view === "all") && <p className="cap">{CLOSED_SCOPE_NOTE}</p>}
+        {possiblyPaidTotal > 0 && (
+          <p className="cap" role="status">
+            {formatCount(possiblyPaidTotal)} of the matching items {possiblyPaidTotal === 1 ? "is" : "are"}{" "}
+            possibly paid: Exact did not list {possiblyPaidTotal === 1 ? "it" : "them"} in the last
+            nightly read, so the totals may include paid items.
+          </p>
+        )}
         {noDivision ? (
           <EmptyState
             title="No data yet."
@@ -418,7 +448,11 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
                     Total {t.currency}, all {formatCount(t.count)} matching
                   </th>
                   <td className="r">
-                    <Money minor={t.openMinor} currency={t.currency} />
+                    {view === "closed" ? (
+                      <span className="muted">{NO_VALUE}</span>
+                    ) : (
+                      <Money minor={t.openMinor} currency={t.currency} />
+                    )}
                   </td>
                 </tr>
               ))}

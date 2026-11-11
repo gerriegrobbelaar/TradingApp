@@ -83,6 +83,7 @@ export function row(over: Partial<OpenItemRow> = {}): OpenItemRow {
     daysOverdue: 41,
     source: "sync",
     lastSeenAt: "2026-11-11T02:00:00.000Z",
+    possiblyPaid: false,
     ...over,
   };
 }
@@ -103,6 +104,7 @@ export function listResponse(
     dcMinor: t.minor,
     dcMissing: 0,
     dcComplete: true,
+    possiblyPaid: items.filter((i) => i.currency === currency && i.possiblyPaid).length,
   }));
   return {
     division: DIV_REF,

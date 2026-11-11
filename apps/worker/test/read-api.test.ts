@@ -67,6 +67,7 @@ interface ItemSpec {
   source?: "list" | "sync" | null;
   iban?: string | null;
   syncedAt?: string;
+  missed?: number;
 }
 
 function itemStmt(s: ItemSpec): D1PreparedStatement {
@@ -79,7 +80,7 @@ function itemStmt(s: ItemSpec): D1PreparedStatement {
          synced_at, entry_number, original_minor, open_dc_minor, dc_currency, source, last_seen_sync_id,
          missed_cycles)
        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, '2026-01-01', ?12, ?13, ?14, ?15, ?16, ?17,
-         ?18, ?19, 7, 1)`,
+         ?18, ?19, 7, ?20)`,
     )
     .bind(
       s.division ?? divA,
@@ -101,6 +102,7 @@ function itemStmt(s: ItemSpec): D1PreparedStatement {
       s.dc === undefined ? null : s.dc,
       s.dcCurrency ?? null,
       s.source === undefined ? "sync" : s.source,
+      s.missed ?? 1,
     );
 }
 
@@ -308,6 +310,25 @@ describe("division selection and isolation", () => {
   });
 });
 
+describe("possibly paid (review S8)", () => {
+  it("flags open rows the last full read missed, in rows, totals and the detail, not closed rows", async () => {
+    await addItems([
+      { number: "seen", missed: 0, open: 100 },
+      { number: "missed", missed: 2, open: 200 },
+      { number: "closed-missed", missed: 1, status: "closed" },
+    ]);
+    const all = await get<OpenItemListResponse>("/api/invoices?status=all");
+    const by = Object.fromEntries(all.body.items.map((i) => [i.invoiceNumber, i.possiblyPaid]));
+    expect(by).toEqual({ seen: false, missed: true, "closed-missed": false });
+    expect(all.body.totalsByCurrency[0]?.possiblyPaid).toBe(1);
+    const open = await get<OpenItemListResponse>("/api/invoices");
+    expect(open.body.totalsByCurrency[0]).toMatchObject({ count: 2, possiblyPaid: 1 });
+    const id = all.body.items.find((i) => i.invoiceNumber === "missed")?.id;
+    const d = await get<{ item: { possiblyPaid: boolean } }>(`/api/open-items/${id}`);
+    expect(d.body.item.possiblyPaid).toBe(true);
+  });
+});
+
 describe("lists", () => {
   it("separates invoices from bills and open from closed", async () => {
     await addItems([
@@ -466,10 +487,35 @@ describe("lists", () => {
         dcMinor: 3000,
         dcMissing: 0,
         dcComplete: true,
+        possiblyPaid: 300,
       },
-      { currency: "GBP", count: 1, openMinor: -2500, dcMinor: 0, dcMissing: 1, dcComplete: false },
-      { currency: "JPY", count: 1, openMinor: 123, dcMinor: 0, dcMissing: 1, dcComplete: false },
-      { currency: "USD", count: 2, openMinor: 11, dcMinor: 4, dcMissing: 1, dcComplete: false },
+      {
+        currency: "GBP",
+        count: 1,
+        openMinor: -2500,
+        dcMinor: 0,
+        dcMissing: 1,
+        dcComplete: false,
+        possiblyPaid: 1,
+      },
+      {
+        currency: "JPY",
+        count: 1,
+        openMinor: 123,
+        dcMinor: 0,
+        dcMissing: 1,
+        dcComplete: false,
+        possiblyPaid: 1,
+      },
+      {
+        currency: "USD",
+        count: 2,
+        openMinor: 11,
+        dcMinor: 4,
+        dcMissing: 1,
+        dcComplete: false,
+        possiblyPaid: 2,
+      },
     ]);
   });
 

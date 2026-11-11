@@ -88,7 +88,7 @@ function where(f: ListFilter): Built {
 export const ROW_COLUMNS = `oi.id, oi.exact_id, oi.kind, oi.status, oi.invoice_number, oi.entry_number,
   oi.reference, oi.relation_id AS relation_exact_id, oi.relation_name, r.id AS relation_row_id,
   r.name AS relation_row_name, oi.invoice_date, oi.due_date, oi.currency, oi.original_minor,
-  oi.open_minor, oi.open_dc_minor, oi.dc_currency, oi.source, oi.synced_at`;
+  oi.open_minor, oi.open_dc_minor, oi.dc_currency, oi.source, oi.synced_at, oi.missed_cycles`;
 
 export interface ListRow {
   id: number;
@@ -111,6 +111,7 @@ export interface ListRow {
   dc_currency: string | null;
   source: "list" | "sync" | null;
   synced_at: string;
+  missed_cycles: number;
 }
 
 /**
@@ -156,8 +157,10 @@ export function buildTotalsQuery(f: ListFilter, dc: DivisionCurrency): Built {
   return {
     sql: `SELECT currency, COUNT(*) AS n, COALESCE(SUM(open_minor), 0) AS open_minor,
             COALESCE(SUM(dcm), 0) AS dc_minor,
-            COALESCE(SUM(CASE WHEN dcm IS NULL THEN 1 ELSE 0 END), 0) AS dc_missing
-          FROM (SELECT oi.currency AS currency, oi.open_minor AS open_minor, ${DCM} AS dcm
+            COALESCE(SUM(CASE WHEN dcm IS NULL THEN 1 ELSE 0 END), 0) AS dc_missing,
+            COALESCE(SUM(pp), 0) AS possibly_paid
+          FROM (SELECT oi.currency AS currency, oi.open_minor AS open_minor, ${DCM} AS dcm,
+                  CASE WHEN oi.status = 'open' AND oi.missed_cycles > 0 THEN 1 ELSE 0 END AS pp
                 ${FROM} WHERE ${w.sql})
           GROUP BY currency ORDER BY currency`,
     binds: [dc.currency, dc.known ? 1 : 0, dc.currency, ...w.binds],
@@ -170,6 +173,7 @@ export interface TotalsRow {
   open_minor: number;
   dc_minor: number;
   dc_missing: number;
+  possibly_paid: number;
 }
 
 export function totalsFromSql(rows: readonly TotalsRow[]): CurrencyTotal[] {
@@ -180,6 +184,7 @@ export function totalsFromSql(rows: readonly TotalsRow[]): CurrencyTotal[] {
     dcMinor: r.dc_minor,
     dcMissing: r.dc_missing,
     dcComplete: r.dc_missing === 0,
+    possiblyPaid: r.possibly_paid,
   }));
 }
 
@@ -216,6 +221,7 @@ export function mapRow(r: ListRow, division: DivisionRef, asOf: string): OpenIte
     daysOverdue: open ? daysOverdue(r.due_date, asOf) : null,
     source: r.source,
     lastSeenAt: r.synced_at,
+    possiblyPaid: open && r.missed_cycles > 0,
   };
 }
 

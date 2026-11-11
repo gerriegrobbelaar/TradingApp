@@ -237,6 +237,7 @@ describe("drill-down sheets show exactly the items behind each figure", () => {
               dcMinor: 1_000_000,
               dcMissing: 0,
               dcComplete: true,
+              possiblyPaid: 0,
             },
           ],
         }),
@@ -317,7 +318,7 @@ describe("list filters in the address", () => {
     await screen.findByRole("button", { name: "INV-1001" });
     await user.click(screen.getByRole("button", { name: "Overdue" }));
     await waitFor(() => expect(nav.search).toBe("?view=overdue"));
-    await user.click(screen.getByRole("button", { name: "Closed" }));
+    await user.click(screen.getByRole("button", { name: "Closed since first sync" }));
     await waitFor(() => expect(nav.search).toBe("?view=closed"));
     act(() => nav.go?.(-1));
     await waitFor(() => expect(nav.search).toBe("?view=overdue"));

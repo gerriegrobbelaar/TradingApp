@@ -9,7 +9,8 @@ import { useResource } from "../lib/useResource";
 import { ErrorNotice } from "./EmptyState";
 import { Money } from "./Money";
 
-const SOURCE_LABEL = { list: "Open items list", sync: "Full sync" } as const;
+/** `list` is the nightly full read of the open-item lists, `sync` the hourly incremental read. */
+const SOURCE_LABEL = { list: "Nightly full read", sync: "Hourly update" } as const;
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -76,6 +77,7 @@ export function OpenItemDetailView({
           {item.status === "open" ? "Open" : "Closed"}
         </Chip>
         {item.bucket && <Chip tone={BUCKET_TONE[item.bucket]}>{BUCKET_LABEL[item.bucket]}</Chip>}
+        {item.possiblyPaid && <Chip tone="warn">Possibly paid — not seen in the last sync</Chip>}
       </div>
       <dl className="dl">
         <Row label="Document">{item.invoiceNumber ?? NO_VALUE}</Row>

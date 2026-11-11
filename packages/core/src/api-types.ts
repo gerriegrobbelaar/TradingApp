@@ -60,6 +60,11 @@ export interface OpenItemRow {
   source: "list" | "sync" | null;
   /** When a sync last saw this item (open_items.synced_at). */
   lastSeenAt: string;
+  /**
+   * True for an open item that the last complete full read did not see (`missed_cycles > 0`): it
+   * may have been paid in Exact since. Open items refresh nightly (review S8).
+   */
+  possiblyPaid: boolean;
 }
 
 /** Totals over ALL rows matching the filters (not just the page), per currency. */
@@ -73,6 +78,8 @@ export interface CurrencyTotal {
   dcMissing: number;
   /** False when `dcMissing > 0`: dcMinor then understates the total. */
   dcComplete: boolean;
+  /** Open rows in this total that the last complete full read did not see (review S8). */
+  possiblyPaid: number;
 }
 
 export interface OpenItemListResponse {

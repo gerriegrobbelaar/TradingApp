@@ -59,6 +59,7 @@ const ROW = keysOf<OpenItemRow>()([
   "daysOverdue",
   "source",
   "lastSeenAt",
+  "possiblyPaid",
 ]);
 const TOTAL = keysOf<CurrencyTotal>()([
   "currency",
@@ -67,6 +68,7 @@ const TOTAL = keysOf<CurrencyTotal>()([
   "dcMinor",
   "dcMissing",
   "dcComplete",
+  "possiblyPaid",
 ]);
 const LIST = keysOf<OpenItemListResponse>()([
   "division",
