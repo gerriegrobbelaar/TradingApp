@@ -1,0 +1,228 @@
+/**
+ * Generic handler contract test (review S1, types.ts "HANDLER CONTRACT").
+ *
+ * Every registered handler that has a `run` is executed TWICE with the same inputs. The test
+ * records what crosses the external boundary (Exact transport; the idempotency table) and asserts:
+ *  - no external write is repeated: a write needs an idempotency key claimed by the business
+ *    object, and the second run adds no write that the first already made;
+ *  - the data tables are stable after the second run (no duplicated rows);
+ *  - the stored result holds counts and codes only: short strings, no IBAN, e-mail or URL.
+ *
+ * A handler that gets a `run` without a fixture here fails the suite on purpose: the author must
+ * say how to run it twice.
+ */
+import { env } from "cloudflare:test";
+import type { ExactRequest, ExactTransport } from "@camelthorn/exact";
+import { beforeEach, describe, expect, it } from "vitest";
+import { HANDLERS } from "../src/jobs/handlers";
+import type { HandlerResult, JobContext } from "../src/jobs/types";
+import { FakeExact, addDivision, fakeGate, resetSync } from "./sync-helpers";
+
+const db = env.DB;
+const NOW = Date.parse("2026-07-15T00:00:00Z"); // 02:00 CEST
+const MAX_STRING = 40;
+
+/** Tables where a repeated run must not add rows. */
+const DATA_TABLES = [
+  "open_items",
+  "relations",
+  "relation_bank_accounts",
+  "bank_accounts",
+  "bank_transactions",
+  "matches",
+  "match_suggestions",
+  "payments",
+  "payment_batches",
+  "approvals",
+  "fx_rates",
+  "fx_revaluations",
+  "email_log",
+  "reminders",
+  "dq_issues",
+  "idempotency_keys",
+] as const;
+
+async function counts(): Promise<Record<string, number>> {
+  const out: Record<string, number> = {};
+  for (const t of DATA_TABLES) {
+    out[t] = (await db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).first<{ n: number }>())?.n ?? -1;
+  }
+  return out;
+}
+
+/** What the handler did to the outside world, as seen at the fake boundary. */
+interface Effects {
+  /** Every external call (method and path only). */
+  calls: { method: string; path: string }[];
+  /** Calls that change something outside (anything but GET). */
+  writes: { method: string; path: string; body: string }[];
+}
+
+interface Fixture {
+  /** Prepares the database and the fakes; returns the syncDeps-style test seam and the effects log. */
+  setup(): Promise<{ syncDeps: JobContext["syncDeps"]; effects: Effects }>;
+}
+
+function recording(inner: ExactTransport, effects: Effects): ExactTransport {
+  return async (req: ExactRequest) => {
+    effects.calls.push({ method: req.method, path: req.path });
+    if (req.method !== "GET") {
+      effects.writes.push({ method: req.method, path: req.path, body: req.body ?? "" });
+    }
+    return inner(req);
+  };
+}
+
+async function exactFixture(): Promise<{ syncDeps: JobContext["syncDeps"]; effects: Effects }> {
+  await resetSync();
+  const div = await addDivision();
+  const fx = new FakeExact(div.exactDivision);
+  fx.divisions = [{ code: div.exactDivision, description: "Camelthorn Advisory B.V." }];
+  fx.accounts = [
+    { n: 1, name: "Acme BV", ts: 1, supplier: true, email: "billing@acme.example" },
+    { n: 2, name: "Globex", ts: 2, customer: true, email: "ap@globex.example" },
+  ];
+  fx.banks = [{ n: 1, account: 1, iban: "NL91ABNA0417164300" }];
+  fx.receivables = [
+    {
+      n: 101,
+      account: 2,
+      name: "Globex",
+      amount: 100.5,
+      currency: "EUR",
+      invoiceNumber: 2026001,
+      ts: 3,
+    },
+  ];
+  fx.payables = [
+    { n: 201, account: 1, name: "Acme BV", amount: 40, currency: "EUR", invoiceNumber: 77, ts: 4 },
+  ];
+  const effects: Effects = { calls: [], writes: [] };
+  return {
+    syncDeps: { transport: recording(fx.transport, effects), gate: fakeGate(), now: () => NOW },
+    effects,
+  };
+}
+
+/** One entry per implemented handler. */
+const FIXTURES: Record<string, Fixture> = {
+  "exact.full_sync": { setup: exactFixture },
+  "exact.incremental_sync": { setup: exactFixture },
+};
+
+function contextFor(
+  key: string,
+  trigger: JobContext["trigger"],
+  syncDeps: JobContext["syncDeps"],
+): JobContext {
+  const budget = key === "exact.full_sync" ? 240 : 40;
+  return {
+    env,
+    job: { id: 1, name: key, handler: key, exactBudget: budget },
+    run: { id: 1, attempt: 1, scheduledFor: new Date(NOW).toISOString(), requestedBy: "system" },
+    trigger,
+    budget,
+    deadlineMs: NOW + 60 * 60_000,
+    signal: new AbortController().signal,
+    log: () => undefined,
+    now: () => NOW,
+    ...(syncDeps ? { syncDeps } : {}),
+  };
+}
+
+/** Counts and codes only: numbers, booleans, short plain strings, nothing that looks like personal data. */
+export function assertCountsAndCodesOnly(value: unknown, path = "summary"): void {
+  if (value === null || typeof value === "number" || typeof value === "boolean") return;
+  if (typeof value === "string") {
+    expect(value.length, `${path} is too long`).toBeLessThanOrEqual(MAX_STRING);
+    expect(value, `${path} looks like an IBAN`).not.toMatch(/\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b/);
+    expect(value, `${path} looks like an e-mail address`).not.toMatch(/\S+@\S+/);
+    expect(value, `${path} looks like a URL`).not.toMatch(/https?:\/\//i);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => assertCountsAndCodesOnly(v, `${path}[${i}]`));
+    return;
+  }
+  if (typeof value === "object") {
+    for (const [k, v] of Object.entries(value)) assertCountsAndCodesOnly(v, `${path}.${k}`);
+    return;
+  }
+  expect.fail(`${path} has an unsupported type ${typeof value}`);
+}
+
+const implemented = Object.entries(HANDLERS).filter(([, d]) => d.run !== undefined);
+
+describe("handler contract: every implemented handler", () => {
+  it("has a contract fixture (add one when a handler gets a run)", () => {
+    for (const [key] of implemented) {
+      expect(FIXTURES[key], `no contract fixture for ${key}`).toBeDefined();
+    }
+    for (const key of Object.keys(FIXTURES)) {
+      expect(HANDLERS[key]?.run, `fixture for ${key} but it is not implemented`).toBeDefined();
+    }
+  });
+
+  it("declares sane contract fields", () => {
+    for (const [key, d] of implemented) {
+      expect(d.maxAttempts, key).toBeGreaterThanOrEqual(1);
+      expect(d.maxLatenessMs, `${key} should bound its lateness`).toBeGreaterThan(0);
+      for (const r of d.runRoles ?? [])
+        expect(["admin", "finance", "approver", "viewer"]).toContain(r);
+    }
+  });
+
+  for (const [key, def] of implemented) {
+    for (const trigger of ["schedule", "manual"] as const) {
+      describe(`${key} (${trigger})`, () => {
+        beforeEach(async () => {
+          await db.batch(DATA_TABLES.map((t) => db.prepare(`DELETE FROM ${t}`)));
+        });
+
+        it("run twice with the same context: no duplicated external effect, stable rows, counts and codes only", async () => {
+          const fixture = FIXTURES[key] as Fixture;
+          const { syncDeps, effects } = await fixture.setup();
+          const run = def.run as (ctx: JobContext) => Promise<HandlerResult>;
+
+          const first = await run(contextFor(key, trigger, syncDeps));
+          expect(
+            effects.calls.length,
+            "the first run should really talk to the boundary",
+          ).toBeGreaterThan(0);
+          const writes1 = effects.writes.length;
+          const idemAfterFirst = (await counts())["idempotency_keys"];
+          const rowsAfterFirst = await counts();
+
+          const second = await run(contextFor(key, trigger, syncDeps));
+          const rowsAfterSecond = await counts();
+
+          // The sync handlers only read from Exact and write to D1.
+          expect(effects.writes, "external writes").toEqual([]);
+          // Generic rule for handlers that do write: a second run adds no write, and every write
+          // had its idempotency key claimed first.
+          expect(effects.writes.length - writes1).toBe(0);
+          if (writes1 > 0) expect(idemAfterFirst).toBeGreaterThanOrEqual(writes1);
+          expect(rowsAfterSecond).toEqual(rowsAfterFirst);
+          expect(first.status).not.toBe("error");
+          expect(second.status).not.toBe("error");
+
+          for (const r of [first, second]) {
+            assertCountsAndCodesOnly(r.summary);
+            if (r.code !== undefined) expect(r.code).toMatch(/^[a-z][a-z0-9_]*$/);
+            expect(JSON.stringify(r).length).toBeLessThan(4000);
+          }
+        });
+      });
+    }
+  }
+
+  it("the checker really rejects personal data and long strings", () => {
+    expect(() => assertCountsAndCodesOnly({ x: "NL91ABNA0417164300" })).toThrow();
+    expect(() => assertCountsAndCodesOnly({ x: "someone@example.com" })).toThrow();
+    expect(() => assertCountsAndCodesOnly({ x: ["https://example.com/a"] })).toThrow();
+    expect(() => assertCountsAndCodesOnly({ x: "a".repeat(MAX_STRING + 1) })).toThrow();
+    expect(() =>
+      assertCountsAndCodesOnly({ ok: 1, code: "done_today", list: [{ id: 3 }] }),
+    ).not.toThrow();
+  });
+});

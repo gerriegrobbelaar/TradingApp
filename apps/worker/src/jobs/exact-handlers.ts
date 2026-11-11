@@ -34,6 +34,7 @@ import {
   type SubrequestMeter,
   type SyncMode,
 } from "../exact/sync";
+import { HEARTBEAT_MS, runnerOverhead } from "./overhead";
 import type { HandlerResult, JobContext } from "./types";
 
 /** Exact calls per run and administration (the defaults of the two jobs). */
@@ -84,7 +85,9 @@ export async function runExactSync(
   const clock = deps.now ?? ctx.now;
   const nowMs = clock();
   const deadlineMs = Math.min(ctx.deadlineMs, clock() + SYNC_MAX_MS);
-  meter.used += 2;
+  // Pre-charge what the runner spends around us (heartbeats until the deadline plus a grace beat,
+  // the finish batch, the lock release, endJob) so the meter reflects the whole invocation.
+  meter.used += 2 + runnerOverhead(deadlineMs - nowMs + HEARTBEAT_MS);
 
   const conn = await env.DB.prepare(
     "SELECT id, status, last_error FROM connections WHERE kind = 'exact' ORDER BY id LIMIT 1",
@@ -199,6 +202,11 @@ export async function runExactSync(
   const partial = count("partial");
   const error = count("error");
   const reauth = count("needs_reauth");
+  // An administration that failed earlier today (or used up its retries) did not complete OK today:
+  // it counts as an error in the roll-up even though this run skipped it (review S4).
+  const failedEarlier = rows.filter(
+    (r) => r.why === "failed_today" || r.why === "retries_used",
+  ).length;
   const summary = {
     mode,
     divisions: rows.map((r) =>
@@ -212,18 +220,18 @@ export async function runExactSync(
     status = "error";
     code = "needs_reauth";
     retryWanted = false;
-  } else if (ok + partial + error === 0) {
+  } else if (ok + partial + error + failedEarlier === 0) {
     const locked = rows.some((r) => r.why === "sync_locked");
     status = "skipped";
     code = locked ? "sync_locked" : "nothing_to_do";
   } else if (error > 0 && ok === 0 && partial === 0) {
     status = "error";
     code = errorCode ?? "error";
-  } else if (error === 0 && partial === 0) {
+  } else if (error === 0 && partial === 0 && failedEarlier === 0) {
     status = "ok";
   } else {
     status = "partial";
-    code = errorCode;
+    code = failedEarlier > 0 ? "administration_failed" : errorCode;
   }
   return {
     status,

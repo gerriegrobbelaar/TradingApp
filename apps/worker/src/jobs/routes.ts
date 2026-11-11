@@ -19,15 +19,27 @@
  *                               lock and the Exact budget apply unchanged.
  */
 import { auditStatement } from "../db/audit";
-import { describeSchedule, nextRun, validateSchedule, type Schedule } from "@camelthorn/core";
+import {
+  checkScheduleRules,
+  describeSchedule,
+  GLOBAL_MIN_INTERVAL_MINUTES,
+  MAX_PROJECTED_EXACT_CALLS_PER_DAY,
+  nextRun,
+  projectedExactCalls,
+  validateSchedule,
+  type ExactJobLoad,
+  type Schedule,
+} from "@camelthorn/core";
+import { isStepUpFresh } from "../auth/session";
 import { json, type Ctx, type Router } from "../router";
+import { defaultJobFor } from "./defaults";
 import { handlerFor, isImplemented } from "./handlers";
 import { createManualRun, LAST_TICK_KEY, parseSchedule } from "./runner";
-import type { JobRow, RunRow } from "./types";
+import { DEFAULT_RUN_ROLES, type JobRow, type RunRow } from "./types";
 
 const ANY_ROLE = { roles: ["admin", "finance", "approver", "viewer"] } as const;
 const ADMIN = { roles: ["admin"] } as const;
-const RUN_ROLES = { roles: ["admin", "finance"] } as const;
+// The route lets every signed-in role in; runNow applies the handler's own runRoles and stepUp.
 
 /** Hard server-side ceiling for Exact calls per administration and run. */
 export const MAX_EXACT_BUDGET = 1000;
@@ -94,6 +106,7 @@ async function listJobs(ctx: Ctx): Promise<Response> {
       now: iso(ctx.nowMs),
     },
     maxExactBudget: MAX_EXACT_BUDGET,
+    maxProjectedExactCallsPerDay: MAX_PROJECTED_EXACT_CALLS_PER_DAY,
     jobs: jobs.results.map((j) => {
       const def = handlerFor(j.handler);
       const schedule = parseSchedule(j.schedule_json);
@@ -106,6 +119,23 @@ async function listJobs(ctx: Ctx): Promise<Response> {
         implemented: isImplemented(j.handler),
         phase: def?.phase ?? null,
         usesExact: def?.usesExact ?? false,
+        runRoles: def?.runRoles ?? DEFAULT_RUN_ROLES,
+        stepUpToRun: def?.stepUp === true,
+        maxLatenessMinutes:
+          def?.maxLatenessMs === undefined ? null : Math.round(def.maxLatenessMs / 60_000),
+        scheduleRules: {
+          minIntervalMinutes: Math.max(
+            def?.scheduleRules?.minIntervalMinutes ?? 0,
+            GLOBAL_MIN_INTERVAL_MINUTES,
+          ),
+          allowedIntervalMinutes: def?.scheduleRules?.allowedIntervalMinutes ?? null,
+          workingDaysOnly: def?.scheduleRules?.workingDaysOnly === true,
+        },
+        // Admin-visible: a default job that ships switched off says why (until it is switched on).
+        defaultEnabled: defaultJobFor(j.name)?.enabled ?? null,
+        ...(j.enabled !== 1 && defaultJobFor(j.name)?.disabledReason
+          ? { disabledReason: defaultJobFor(j.name)?.disabledReason }
+          : {}),
         schedule,
         scheduleText: schedule ? describeSchedule(schedule) : "Invalid schedule",
         timezone: j.timezone,
@@ -190,6 +220,9 @@ async function patchJob(ctx: Ctx): Promise<Response> {
     const v = validateSchedule(body["schedule"]);
     // A stable code for programs, and the validator's sentence for people.
     if (!v.ok) return json({ error: "schedule_invalid", message: v.error }, 400);
+    // Per-handler limits (no every-minute jobs, Revolut 5 to 15 minutes, ECB on working days).
+    const refused = checkScheduleRules(v.schedule, def?.scheduleRules);
+    if (refused !== null) return json({ error: "schedule_not_allowed", message: refused }, 400);
     schedule = v.schedule;
     scheduleChanged = true;
   }
@@ -202,6 +235,38 @@ async function patchJob(ctx: Ctx): Promise<Response> {
     }
     if (def?.usesExact !== true) return json({ error: "budget_not_applicable" }, 400);
     budget = b;
+  }
+
+  // The Exact jobs together must stay inside the daily budget: fires per Amsterdam day (the 25-hour
+  // autumn day counts) x calls per run x attempts, summed over the enabled Exact jobs.
+  if (def?.usesExact === true && enabled) {
+    const all = await ctx.env.DB.prepare("SELECT * FROM jobs ORDER BY id").all<JobRow>();
+    const loads: ExactJobLoad[] = [];
+    for (const other of all.results) {
+      const od = handlerFor(other.handler);
+      if (od?.usesExact !== true) continue;
+      const mine = other.id === job.id;
+      if (!mine && other.enabled !== 1) continue;
+      const sch = mine ? schedule : parseSchedule(other.schedule_json);
+      if (sch === null) continue;
+      loads.push({
+        schedule: sch,
+        budget: mine ? budget : other.exact_budget,
+        maxAttempts: od.maxAttempts,
+      });
+    }
+    const projected = projectedExactCalls(loads);
+    if (projected > MAX_PROJECTED_EXACT_CALLS_PER_DAY) {
+      return json(
+        {
+          error: "budget_cap_exceeded",
+          projected,
+          max: MAX_PROJECTED_EXACT_CALLS_PER_DAY,
+          message: `The enabled Exact jobs would use up to ${projected.toLocaleString("en-US")} calls per administration per day. The most allowed is ${MAX_PROJECTED_EXACT_CALLS_PER_DAY.toLocaleString("en-US")}.`,
+        },
+        400,
+      );
+    }
   }
 
   const before = {
@@ -270,6 +335,15 @@ async function runNow(ctx: Ctx): Promise<Response> {
   if (id === null || !email) return json({ error: "not_found" }, 404);
   const job = await loadJob(ctx, id);
   if (!job) return json({ error: "not_found" }, 404);
+  // Who may start this job by hand is part of the handler's contract (review S1).
+  const def = handlerFor(job.handler);
+  const roles = def?.runRoles ?? DEFAULT_RUN_ROLES;
+  if (!ctx.session || !ctx.session.roles.some((r) => roles.includes(r))) {
+    return json({ error: "forbidden" }, 403);
+  }
+  if (def?.stepUp === true && !isStepUpFresh(ctx.session, ctx.nowMs)) {
+    return json({ error: "step_up_required" }, 401);
+  }
   // A disabled job may run on demand, but only if there is something to run.
   if (!isImplemented(job.handler)) return json({ error: "not_implemented" }, 409);
   if (typeof ctx.env.JOBS_QUEUE?.send !== "function") {
@@ -287,5 +361,5 @@ export function registerJobRoutes(router: Router): void {
   router.add("GET", "/api/jobs", ANY_ROLE, listJobs);
   router.add("GET", "/api/jobs/:id/runs", ANY_ROLE, listRuns);
   router.add("PATCH", "/api/jobs/:id", ADMIN, patchJob);
-  router.add("POST", "/api/jobs/:id/run", RUN_ROLES, runNow);
+  router.add("POST", "/api/jobs/:id/run", ANY_ROLE, runNow);
 }

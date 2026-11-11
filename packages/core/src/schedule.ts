@@ -297,26 +297,104 @@ export function nextRun(s: Schedule, afterMs: number): number | null {
 }
 
 /**
- * True if a fire time exists in (lastRunMs ?? createdMs, nowMs]. Catches up at most one missed run:
- * the caller runs once and records lastRunMs = now, so a long outage never replays every missed fire.
+ * The schedule slot a job is due for, or null if it is not due. This is the ONE rule behind both
+ * "is it due" (`isDue`) and "which slot do I claim" (the scheduler tick), so they cannot diverge.
  *
- * Clock going backwards: if the reference (lastRunMs ?? createdMs) is up to one day in the future,
- * the job waits for the first fire after the reference, so a job that already ran never runs twice
- * for the same slot. A reference more than one day in the future is treated as corrupt: the job then
- * runs on its normal schedule (a fire in the minute ending at nowMs) instead of stalling for good,
- * and recording lastRunMs = now afterwards returns it to normal.
+ * The slot is the first fire after the reference (lastRunMs ?? createdMs) and is due when it is at
+ * or before nowMs. Catches up at most one missed run: the caller runs once and records
+ * lastRunMs = now, so a long outage never replays every missed fire.
+ *
+ * Clock going backwards: if the reference is up to one day in the future, the job waits for the
+ * first fire after the reference, so a job that already ran never runs twice for the same slot. A
+ * reference more than one day in the future is treated as corrupt: the job then runs on its normal
+ * schedule (a fire in the minute ending at nowMs) instead of stalling for good, and recording
+ * lastRunMs = now afterwards returns it to normal.
  */
+export function dueSlot(
+  s: Schedule,
+  lastRunMs: number | null,
+  nowMs: number,
+  createdMs: number,
+): number | null {
+  if (!Number.isFinite(nowMs)) return null;
+  const ref = lastRunMs ?? createdMs;
+  const base = Number.isFinite(ref) && ref - nowMs > DAY_MS ? nowMs - MIN_MS : ref;
+  const next = nextRun(s, base);
+  return next !== null && next <= nowMs ? next : null;
+}
+
+/** True if a fire time exists in (lastRunMs ?? createdMs, nowMs]. See `dueSlot`. */
 export function isDue(
   s: Schedule,
   lastRunMs: number | null,
   nowMs: number,
   createdMs: number,
 ): boolean {
-  if (!Number.isFinite(nowMs)) return false;
-  const ref = lastRunMs ?? createdMs;
-  const base = Number.isFinite(ref) && ref - nowMs > DAY_MS ? nowMs - MIN_MS : ref;
-  const next = nextRun(s, base);
-  return next !== null && next <= nowMs;
+  return dueSlot(s, lastRunMs, nowMs, createdMs) !== null;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Analysis (used to bound what an admin may configure)
+
+/** What the real fire times of a schedule look like over about 13 months from 2026-01-01. */
+export interface ScheduleAnalysis {
+  /** Most fires on one Amsterdam calendar day (the 25-hour autumn day counts as it really is). */
+  maxFiresPerDay: number;
+  /** Shortest gap between two consecutive fires, in minutes (null if fewer than two fires). */
+  minGapMinutes: number | null;
+  /** Longest gap between two consecutive fires, in minutes (null if fewer than two fires). */
+  maxGapMinutes: number | null;
+}
+
+const ANALYSIS_START = "2026-01-01";
+const ANALYSIS_DAYS = 400;
+
+/**
+ * Counts the schedule's real fire instants (same engine as nextRun, including daylight saving and
+ * TARGET working days) over 400 days from 2026-01-01, which contains one spring and one autumn
+ * change. Returns null for an invalid or never-firing schedule.
+ */
+export function analyseSchedule(s: Schedule): ScheduleAnalysis | null {
+  let maxFiresPerDay = 0;
+  let minGap = Infinity;
+  let maxGap = 0;
+  let prev: number | null = null;
+  const take = (instants: readonly number[]): void => {
+    maxFiresPerDay = Math.max(maxFiresPerDay, instants.length);
+    for (const t of instants) {
+      if (prev !== null) {
+        const gap = t - prev;
+        minGap = Math.min(minGap, gap);
+        maxGap = Math.max(maxGap, gap);
+      }
+      prev = t;
+    }
+  };
+  if (s.kind === "cron") {
+    const p = parseCron(s.expr);
+    if (typeof p === "string") return null;
+    for (let i = 0; i < ANALYSIS_DAYS; i++) {
+      const date = addDaysIso(ANALYSIS_START, i);
+      if (dayMatches(p, date, s.workingDaysOnly === true)) {
+        take(dayInstants(date, p.hours, p.minutes));
+      }
+    }
+  } else {
+    let t = Date.UTC(2026, 0, 1) - 1;
+    const end = Date.UTC(2027, 1, 5);
+    for (let i = 0; i < 20; i++) {
+      const n = nextRun(s, t);
+      if (n === null || n > end) break;
+      take([n]);
+      t = n;
+    }
+  }
+  if (prev === null) return null;
+  return {
+    maxFiresPerDay,
+    minGapMinutes: minGap === Infinity ? null : minGap / MIN_MS,
+    maxGapMinutes: minGap === Infinity ? null : maxGap / MIN_MS,
+  };
 }
 
 function two(n: number): string {
