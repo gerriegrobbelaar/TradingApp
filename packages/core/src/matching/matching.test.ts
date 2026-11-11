@@ -6,6 +6,7 @@ import {
   formatAmount,
   matchBatch,
   matchTransaction,
+  findInvoiceNumber,
   normaliseReference,
   referenceContainsInvoiceNumber,
   type MatchConfig,
@@ -30,7 +31,7 @@ function tx(over: Partial<MatchTx> = {}): MatchTx {
     counterpartyName: null,
     counterpartyIban: null,
     counterpartyRef: null,
-    type: null,
+    type: "transfer",
     isFinal: true,
     state: "completed",
     requestId: null,
@@ -108,7 +109,9 @@ describe("referenceContainsInvoiceNumber", () => {
   });
   it("does not match Cyrillic look-alikes", () => {
     no("\u0410BC-1", "ABC-1"); // Cyrillic A
-    no("INV-2024-001", "ІNV-2024-001");
+    // Only the digit run of a Cyrillic-prefixed number matches: never exact, never automatic.
+    expect(findInvoiceNumber("INV-2024-001", "ІNV-2024-001")).toBe("digits");
+    expect(findInvoiceNumber("ІNV-2024-001", "INV-2024-001")).toBe("digits");
   });
 });
 
@@ -226,8 +229,21 @@ describe("rule 1: invoice number in reference", () => {
       [item()],
       c,
     );
-    expect(r.decision).toBe("auto");
-    expect(r.chosen?.allocatedMinor).toBe(123400n);
+    // Tolerance widens what is offered as full, but a difference is never booked silently.
+    expect(r.decision).toBe("review");
+    expect(r.candidates[0]?.kind).toBe("full");
+    expect(r.candidates[0]?.blockedReasons).toEqual(["amount_difference"]);
+    expect(r.candidates[0]?.allocatedMinor).toBe(123398n);
+    expect(r.candidates[0]?.remainingMinor).toBe(2n);
+    expect(r.explanation.join(" ")).toContain("€ 0,02 difference");
+    const over = matchTransaction(
+      tx({ reference: "INV-2024-001", amountMinor: 123403n }),
+      [item()],
+      c,
+    );
+    expect(over.candidates[0]?.allocatedMinor).toBe(123400n);
+    expect(over.candidates[0]?.surplusMinor).toBe(3n);
+    expect(over.decision).toBe("review");
     expect(
       matchTransaction(tx({ reference: "INV-2024-001", amountMinor: 123390n }), [item()], c)
         .decision,
@@ -278,7 +294,10 @@ describe("rule 1: group payment", () => {
       [a, b, c],
       cfg,
     );
-    expect(r.chosen?.groupId).toBe("g:2-3");
+    // The reference also names INV-2024-001, which the group leaves out: a person decides.
+    expect(r.decision).toBe("review");
+    expect(r.candidates[0]?.groupId).toBe("g:2-3");
+    expect(r.candidates[0]?.blockedReasons).toEqual(["reference_names_other_item"]);
   });
   it("sum that does not match is not a group", () => {
     const r = matchTransaction(
@@ -452,8 +471,6 @@ describe("rule 4: ledger patterns", () => {
       description: "Card payment",
       test: { referenceRegex: "CARD\\s+PAYMENT" },
     },
-    { id: "bad", ledgerAccountCode: "9999", description: "broken", test: { referenceRegex: "(" } },
-    { id: "empty", ledgerAccountCode: "9998", description: "empty", test: {} },
   ];
   const c: MatchConfig = { ...cfg, patterns };
   it("matches a pattern, review only by default", () => {
@@ -542,7 +559,7 @@ describe("auto-match block conditions", () => {
     ]) {
       const r = matchTransaction({ ...good(), ...over }, [item()], cfg);
       expect(r.decision).toBe("none");
-      expect(r.explanation[0]).toContain("not final");
+      expect(r.explanation[0]).toContain("not completed");
     }
     expect(matchTransaction(tx({ amountMinor: 0n }), [item()], cfg).decision).toBe("none");
   });
@@ -629,12 +646,13 @@ describe("auto-match block conditions", () => {
     expect(r.decision).toBe("review");
     expect(r.candidates[0]?.blockedReasons).toContain("iban_not_known_for_supplier");
     expect(r.explanation.join(" ")).toContain("check for fraud");
+    // No account number on an outgoing payment: nothing to verify, so never automatic.
     expect(
       matchTransaction({ ...t, counterpartyIban: null }, [item({ kind: "payable" })], cfg).decision,
-    ).toBe("auto");
+    ).toBe("review");
     expect(
       matchTransaction({ ...t, counterpartyIban: "  " }, [item({ kind: "payable" })], cfg).decision,
-    ).toBe("auto");
+    ).toBe("review");
     expect(
       matchTransaction(
         { ...t, counterpartyIban: IBAN.toLowerCase() },
@@ -659,7 +677,7 @@ describe("auto-match block conditions", () => {
     const items = Array.from({ length: 9 }, (_, i) => item({ id: i + 1, invoiceNumber: null }));
     expect(matchTransaction(tx(), items, cfg).candidates).toHaveLength(5);
     expect(matchTransaction(tx(), items, { ...cfg, maxCandidates: 2 }).candidates).toHaveLength(2);
-    expect(matchTransaction(tx(), items, { ...cfg, maxCandidates: 0 }).candidates).toHaveLength(0);
+    expect(() => matchTransaction(tx(), items, { ...cfg, maxCandidates: 0 })).toThrow(RangeError);
     expect(matchTransaction(tx(), items, { ...cfg, suggestMinScore: 60 }).decision).toBe("none");
   });
   it("null and empty fields", () => {
@@ -897,7 +915,10 @@ describe("properties", () => {
         const same = withIban.candidates.find(
           (x) => x.itemId === c.itemId && x.rule === c.rule && x.groupId === c.groupId,
         );
-        if (same) expect(same.score).toBeGreaterThanOrEqual(c.score);
+        // A known IBAN of ANOTHER relation is negative evidence by design.
+        if (same && !same.reasons.some((r) => r.code === "iban_belongs_to_other_relation")) {
+          expect(same.score).toBeGreaterThanOrEqual(c.score);
+        }
       }
       const top = (x: typeof base) => x.candidates[0]?.score ?? 0;
       const target = items.find((i) => i.invoiceNumber);

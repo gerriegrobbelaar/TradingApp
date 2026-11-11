@@ -1,5 +1,5 @@
 /**
- * Matching engine types (Phase 7, ADR 0040). Pure: no I/O, no clock.
+ * Matching engine types (Phase 7, ADR 0041). Pure: no I/O, no clock.
  *
  * Contract notes:
  *  - One call sees the items of ONE Exact division. Items of several divisions must be matched in
@@ -25,7 +25,13 @@ export interface MatchTx {
   /** Full, normalised. Never logged. */
   counterpartyIban: string | null;
   counterpartyRef: string | null;
+  /** Revolut transaction type ('transfer', 'topup', 'card_payment', 'exchange', 'fee', ...). */
   type: string | null;
+  /**
+   * Revolut counterparty account type ('self' = our own account, 'revolut' = another Revolut
+   * customer, 'external'). Optional: absent or null means unknown.
+   */
+  counterpartyAccountType?: string | null;
   isFinal: boolean;
   state: string;
   requestId: string | null;
@@ -78,6 +84,17 @@ export interface MatchConfig {
   /** Opt in to auto-matching ledger patterns (their score becomes 95). Default false. */
   autoLedgerPatterns: boolean;
   patterns: LedgerPattern[];
+  /**
+   * Transaction types that may be matched to an invoice automatically. Any other type (and a
+   * missing type) is review only (`tx_type_not_auto`).
+   */
+  autoTxTypes: string[];
+  /** Transaction types that are never matched at all (FX exchange legs). */
+  noMatchTxTypes: string[];
+  /** Counterparty account types that mean "our own account": never matched at all. */
+  internalAccountTypes: string[];
+  /** IBANs of our own accounts (any bank): a transfer from or to one is never matched. */
+  ownIbans: string[];
 }
 
 export type ReasonCode =
@@ -93,7 +110,10 @@ export type ReasonCode =
   | "name_similar"
   | "pattern"
   | "due_date_near"
-  | "currency_mismatch";
+  | "currency_mismatch"
+  | "reference_not_exact"
+  | "iban_belongs_to_other_relation"
+  | "amount_within_tolerance";
 
 export interface Reason {
   code: ReasonCode;
@@ -112,12 +132,16 @@ export interface Candidate {
   ledgerAccountCode: string | null;
   /** Integer 0-100. */
   score: number;
+  /** How the invoice number was found in the reference (rule 1 only). */
+  referenceLevel?: "exact" | "not_exact" | "digits";
   rule: 1 | 2 | 3 | 4;
   kind: "full" | "partial" | "overpayment" | "ledger";
   /** Total allocated to items (for a ledger match: the transaction amount). */
   allocatedMinor: bigint;
-  /** Open balance left after this match; 0 for full, overpayment and ledger. */
+  /** Open balance left after this match (> 0 only for a part payment or a tolerance shortfall). */
   remainingMinor: bigint;
+  /** Money received or paid beyond the allocation (> 0 only for an overpayment or tolerance surplus). */
+  surplusMinor: bigint;
   reasons: Reason[];
   autoEligible: boolean;
   blockedReasons: string[];
