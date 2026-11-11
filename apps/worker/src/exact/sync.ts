@@ -310,6 +310,9 @@ function classify(e: unknown): Failure {
   return { kind: "stop", status: "error", code: "internal_error" };
 }
 
+/** True for failures that pass by themselves (rate limit, 502/503/504, network, gate unavailable). */
+export const isTransientFailure = (e: unknown): boolean => classify(e).transient === true;
+
 const iso = (ms: number): string => new Date(ms).toISOString();
 
 /** Counts one subrequest, refusing it when only the reserve would be left. */

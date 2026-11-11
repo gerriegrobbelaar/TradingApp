@@ -8,7 +8,7 @@ workers_dev = false
 routes = [{ pattern = "finance.camelthorncapital.com", custom_domain = true }]
 
 [triggers]
-crons = ["0 * * * *"]
+crons = ["* * * * *"]
 
 [vars]
 GOOGLE_CLIENT_ID = "123-abc.apps.googleusercontent.com"
@@ -24,9 +24,26 @@ database_id = "6f1c2a8e-1b2c-4d5e-8f90-123456789abc"
 name = "EXACT_GATE"
 class_name = "ExactGate"
 
+[[durable_objects.bindings]]
+name = "JOB_LOCK"
+class_name = "JobLock"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ExactGate"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["JobLock"]
+
+[[queues.producers]]
+binding = "JOBS_QUEUE"
+queue = "camelthorn-jobs"
+
+[[queues.consumers]]
+queue = "camelthorn-jobs"
+max_batch_size = 1
+dead_letter_queue = "camelthorn-jobs-dlq"
 `;
 
 describe("deploy config guard", () => {
@@ -93,23 +110,30 @@ describe("review G3: cron trigger check", () => {
   it("blocks a config without [triggers] crons", () => {
     const none = ready.replace(/\[triggers\]\ncrons = .*\n/, "");
     expect(deployConfigProblems(none).join("\n")).toContain(NO_CRON);
-    const empty = ready.replace('crons = ["0 * * * *"]', "crons = []");
+    const empty = ready.replace('crons = ["* * * * *"]', "crons = []");
     expect(deployConfigProblems(empty).join("\n")).toContain(NO_CRON);
-    const tableOnly = ready.replace('crons = ["0 * * * *"]', "");
+    const tableOnly = ready.replace('crons = ["* * * * *"]', "");
     expect(deployConfigProblems(tableOnly).join("\n")).toContain(NO_CRON);
   });
 
   it("ignores a commented-out cron and a crons key under another table", () => {
-    const commented = ready.replace('crons = ["0 * * * *"]', '# crons = ["0 * * * *"]');
+    const commented = ready.replace('crons = ["* * * * *"]', '# crons = ["* * * * *"]');
     expect(deployConfigProblems(commented).join("\n")).toContain(NO_CRON);
     const elsewhere = ready
-      .replace('crons = ["0 * * * *"]', "")
-      .replace("[vars]", '[vars]\ncrons = ["0 * * * *"]');
+      .replace('crons = ["* * * * *"]', "")
+      .replace("[vars]", '[vars]\ncrons = ["* * * * *"]');
     expect(deployConfigProblems(elsewhere).join("\n")).toContain(NO_CRON);
   });
 
+  it("requires the every-minute tick: the old hourly stopgap alone is not enough", () => {
+    const hourly = ready.replace('crons = ["* * * * *"]', 'crons = ["0 * * * *"]');
+    expect(deployConfigProblems(hourly).join("\n")).toContain(NO_CRON);
+    const both = ready.replace('crons = ["* * * * *"]', 'crons = ["0 * * * *", "* * * * *"]');
+    expect(deployConfigProblems(both)).toEqual([]);
+  });
+
   it("accepts the cron anywhere inside [triggers], with other keys around it", () => {
-    const t = ready.replace('crons = ["0 * * * *"]', '# a comment\ncrons = [\n  "0 * * * *",\n]');
+    const t = ready.replace('crons = ["* * * * *"]', '# a comment\ncrons = [\n  "* * * * *",\n]');
     expect(deployConfigProblems(t)).toEqual([]);
   });
 });
@@ -130,5 +154,48 @@ describe("review E2: Exact deploy checks", () => {
     expect(deployConfigProblems(noMigration).join("\n")).toContain("ExactGate");
     const commented = ready.replace('class_name = "ExactGate"', '# class_name = "ExactGate"');
     expect(deployConfigProblems(commented).join("\n")).toContain("ExactGate");
+  });
+});
+
+describe("task H2: scheduler deploy checks", () => {
+  it("keeps the committed wrangler.toml's scheduler wiring", () => {
+    const p = deployConfigProblems(committed).join("\n");
+    expect(p).not.toContain("JobLock");
+    expect(p).not.toContain("JOBS_QUEUE");
+    expect(p).not.toContain("consumer");
+    expect(p).not.toContain("dead_letter_queue");
+    expect(p).not.toContain("no cron trigger");
+  });
+
+  it("blocks a config without the JobLock binding or its migration", () => {
+    const noBinding = ready.replace(
+      /\[\[durable_objects.bindings\]\]\nname = "JOB_LOCK"\nclass_name = "JobLock"\n/,
+      "",
+    );
+    expect(deployConfigProblems(noBinding)).toEqual([
+      "the JobLock Durable Object binding or its migration is missing",
+    ]);
+    const noMigration = ready.replace('new_sqlite_classes = ["JobLock"]', "new_classes = []");
+    expect(deployConfigProblems(noMigration)).toEqual([
+      "the JobLock Durable Object binding or its migration is missing",
+    ]);
+  });
+
+  it("blocks a config without the queue producer, consumer or dead-letter queue", () => {
+    const noProducer = ready.replace(
+      /\[\[queues.producers\]\]\nbinding = "JOBS_QUEUE"\nqueue = "camelthorn-jobs"\n/,
+      "",
+    );
+    expect(deployConfigProblems(noProducer)).toEqual([
+      "the JOBS_QUEUE queue producer binding is missing",
+    ]);
+    const noConsumer = ready.replace(/\[\[queues.consumers\]\][\s\S]*$/, "");
+    expect(deployConfigProblems(noConsumer)).toEqual([
+      "the job queue consumer ([[queues.consumers]]) is missing",
+    ]);
+    const noDlq = ready.replace(/dead_letter_queue = .*\n/, "");
+    expect(deployConfigProblems(noDlq)).toEqual([
+      "the job queue consumer has no dead_letter_queue",
+    ]);
   });
 });

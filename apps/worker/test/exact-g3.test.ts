@@ -5,7 +5,7 @@
 import { env } from "cloudflare:test";
 import type { ExactTransport } from "@camelthorn/exact";
 import { beforeEach, describe, expect, it } from "vitest";
-import { runScheduledExactSync } from "../src/exact/scheduled";
+import { callExact, divisionsOf } from "./job-helpers";
 import {
   INCREMENTAL_OPEN_ITEMS_KEY,
   SYNC_ENTITIES,
@@ -525,12 +525,11 @@ describe("incremental open items are off by default (S4)", () => {
   it("the hourly scheduled tick is cheap: divisions and relations only", async () => {
     await db.prepare("DELETE FROM settings WHERE key = ?1").bind(INCREMENTAL_OPEN_ITEMS_KEY).run();
     seed();
-    // 12:00 UTC is outside the 02:00-05:59 full window.
-    const r = await runScheduledExactSync(env, Date.parse("2026-07-15T10:00:00Z"), {
+    const r = await callExact("incremental", Date.parse("2026-07-15T10:00:00Z"), {
       transport: fx.transport,
       gate,
     });
-    expect(r.ran).toEqual([{ divisionId: div.id, mode: "incremental", status: "ok" }]);
+    expect(divisionsOf(r)).toEqual([{ id: div.id, status: "ok" }]);
     expect(fx.pathsCalled().sort()).toEqual(["/sync/CRM/Accounts", "/system/Divisions"]);
   });
 });
@@ -544,14 +543,18 @@ describe("which divisions sync, and in which currency (S7)", () => {
       .bind(div.connectionId, div.exactDivision + 1)
       .run();
     const deps = { transport: fx.transport, gate };
-    const t1 = await runScheduledExactSync(env, Date.parse("2026-07-15T10:00:00Z"), deps);
-    expect(t1.ran.map((x) => x.divisionId)).toEqual([div.id]);
+    const t1 = await callExact("incremental", Date.parse("2026-07-15T10:00:00Z"), deps);
+    expect(divisionsOf(t1).map((x) => x.id)).toEqual([div.id]);
     await db
       .prepare("UPDATE divisions SET sync_enabled = 1 WHERE id = ?1")
       .bind(other.meta.last_row_id)
       .run();
-    const t2 = await runScheduledExactSync(env, Date.parse("2026-07-15T11:00:00Z"), deps);
-    expect(t2.ran.map((x) => x.divisionId).sort()).toEqual([div.id, other.meta.last_row_id].sort());
+    const t2 = await callExact("incremental", Date.parse("2026-07-15T11:00:00Z"), deps);
+    expect(
+      divisionsOf(t2)
+        .map((x) => x.id)
+        .sort(),
+    ).toEqual([div.id, other.meta.last_row_id].sort());
   });
 
   it("a division list read adds other divisions DISABLED and does not touch the toggle of known ones", async () => {

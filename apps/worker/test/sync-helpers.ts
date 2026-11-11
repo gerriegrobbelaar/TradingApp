@@ -230,7 +230,9 @@ export async function resetSync(): Promise<void> {
     db.prepare("DELETE FROM exact_usage"),
     db.prepare("DELETE FROM divisions"),
     db.prepare("DELETE FROM connections"),
+    db.prepare("DELETE FROM job_runs"),
     db.prepare("DELETE FROM jobs"),
+    db.prepare("DELETE FROM settings WHERE key = 'seed.default_jobs'"),
     // Most sync tests exercise incremental open-item reads, which are OFF by default in
     // production (ADR 0017); the default has its own tests, which delete this row.
     db.prepare(

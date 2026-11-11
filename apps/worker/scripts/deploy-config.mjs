@@ -47,13 +47,34 @@ export function deployConfigProblems(toml) {
       "DO_JURISDICTION_DISABLED has no effect and must not be set: Durable Objects are always EU (ADR 0018)",
     );
   }
-  // The cron trigger drives the Exact sync (hourly tick, nightly full pass); without it nothing
-  // is ever refreshed. Looked for inside the [triggers] table only.
+  // The scheduler: a cron tick every minute (the Worker decides per job which are due), the
+  // JobLock Durable Object with its migration, and the job queue with producer, consumer and
+  // dead-letter queue. Without them no job ever runs. Looked for inside the right tables only.
   const triggers = /^\[triggers\][ \t]*\n((?:(?!\[).*\n?)*)/m.exec(text);
-  if (!triggers || !/^\s*crons\s*=\s*\[\s*"[^"]+"/m.test(triggers[1] ?? "")) {
+  if (!triggers || !/^\s*crons\s*=\s*\[[^\]]*"\* \* \* \* \*"/m.test(triggers[1] ?? "")) {
     problems.push(
-      'no cron trigger: [triggers] crons = ["0 * * * *"] is missing (the Exact sync would never run)',
+      'no cron trigger: [triggers] crons = ["* * * * *"] is missing (no job would ever run)',
     );
+  }
+  if (
+    !/^\s*class_name\s*=\s*"JobLock"/m.test(text) ||
+    !/^\s*new_sqlite_classes\s*=\s*\[[^\]]*"JobLock"/m.test(text)
+  ) {
+    problems.push("the JobLock Durable Object binding or its migration is missing");
+  }
+  const producers = /^\[\[queues\.producers\]\][ \t]*\n((?:(?!\[).*\n?)*)/m.exec(text);
+  if (
+    !producers ||
+    !/^\s*binding\s*=\s*"JOBS_QUEUE"/m.test(producers[1] ?? "") ||
+    !/^\s*queue\s*=\s*"[^"]+"/m.test(producers[1] ?? "")
+  ) {
+    problems.push("the JOBS_QUEUE queue producer binding is missing");
+  }
+  const consumers = /^\[\[queues\.consumers\]\][ \t]*\n((?:(?!\[).*\n?)*)/m.exec(text);
+  if (!consumers || !/^\s*queue\s*=\s*"[^"]+"/m.test(consumers[1] ?? "")) {
+    problems.push("the job queue consumer ([[queues.consumers]]) is missing");
+  } else if (!/^\s*dead_letter_queue\s*=\s*"[^"]+"/m.test(consumers[1] ?? "")) {
+    problems.push("the job queue consumer has no dead_letter_queue");
   }
   if (!/^\s*(routes?\s*=|\[\[routes\]\])/m.test(text)) {
     problems.push("no routes set (workers_dev is off, so the Worker would be unreachable)");

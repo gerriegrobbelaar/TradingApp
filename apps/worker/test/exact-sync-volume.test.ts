@@ -2,11 +2,12 @@ import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { ExactBudgetExhaustedError } from "@camelthorn/exact";
 import {
-  SCHEDULED_FULL_BUDGET,
-  SCHEDULED_INCREMENTAL_BUDGET,
+  FULL_SYNC_BUDGET,
+  FULL_SYNC_MAX_ATTEMPTS,
+  INCREMENTAL_SYNC_BUDGET,
   SCHEDULED_WORST_CASE_CALLS_PER_DAY,
-  runScheduledExactSync,
-} from "../src/exact/scheduled";
+} from "../src/jobs/exact-handlers";
+import { callExact } from "./job-helpers";
 import { MANUAL_SYNC_BUDGET } from "../src/exact/sync-routes";
 import {
   newMeter,
@@ -19,7 +20,7 @@ import { FakeExact, addDivision, db, fakeGate, resetSync, type FakeItem } from "
 
 /**
  * Volume tests (review G1): the reference division of the Phase 2 review end to end through
- * syncDivision / runScheduledExactSync with a scripted transport that enforces the gate's job
+ * syncDivision / callExact with a scripted transport that enforces the gate's job
  * budget. 10,000 relations, 4,000 relation bank accounts, 5,000 open items (3,000 receivables,
  * 2,000 payables). Exact's page sizes are an assumption (60 on list endpoints, 1,000 on sync
  * endpoints), so the matrix also covers 60 everywhere and 1,000 everywhere.
@@ -133,66 +134,61 @@ describe.each(MATRIX)("reference division, $label", ({ list, sync }) => {
     const fx = referenceExact(div.exactDivision, list, sync);
     const { gate, delivered } = budgetedGate(fx);
 
-    // Winter day: Amsterdam is UTC+1, so 23:00Z on the 14th is 00:00 on the 15th.
-    const firstTick = Date.parse("2026-01-14T23:00:00Z");
+    // Winter day: Amsterdam is UTC+1, so 23:00Z on the 14th is 00:00 on the 15th. The full job
+    // fires at 02:00 and is re-queued 5 minutes after each partial run (at most 4 attempts); the
+    // incremental job fires at half past every hour.
+    const dayStart = Date.parse("2026-01-14T23:00:00Z");
     let dayCalls = 0;
-    let completedAtTick: number | null = null;
     let maxSubrequests = 0;
-    for (let tick = 0; tick < 24; tick++) {
-      const at = firstTick + tick * 3_600_000;
+    let fullAttempts = 0;
+    let completedHour: number | null = null;
+    const runJob = async (mode: "full" | "incremental", t: number) => {
       const meter: SubrequestMeter = newMeter();
       const before = delivered();
-      const r = await runScheduledExactSync(
-        env,
-        at,
-        { transport: fx.transport, gate, now: () => at },
-        meter,
+      const r = await callExact(
+        mode,
+        t,
+        { transport: fx.transport, gate, now: () => t },
+        { meter, runId: t },
       );
       const used = delivered() - before;
       dayCalls += used;
       maxSubrequests = Math.max(maxSubrequests, meter.used);
       expect(meter.used).toBeLessThanOrEqual(meter.limit);
-      expect(r.ran).toHaveLength(1);
-      const ran = r.ran[0];
-      expect(ran?.status === "ok" || ran?.status === "partial").toBe(true);
-
-      const local = tick; // local hour of the day: tick 0 is 00:00
-      const inWindow = local >= 2 && local <= 5;
-      if (!inWindow) expect(ran?.mode).toBe("incremental");
       expect(used).toBeLessThanOrEqual(
-        ran?.mode === "full" ? SCHEDULED_FULL_BUDGET : SCHEDULED_INCREMENTAL_BUDGET,
+        mode === "full" ? FULL_SYNC_BUDGET : INCREMENTAL_SYNC_BUDGET,
       );
-
-      // Forward progress: a tick that ends partial must have written rows or finished work.
-      if (ran?.status === "partial") {
+      expect(r.status === "ok" || r.status === "partial").toBe(true);
+      // Forward progress: a run that ends partial must have written rows or finished work.
+      if (r.status === "partial") {
         const run = await db
           .prepare("SELECT rows_seen FROM sync_state WHERE division_id = ?1 AND entity = 'run'")
           .bind(div.id)
           .first<{ rows_seen: number }>();
         expect(run?.rows_seen ?? 0).toBeGreaterThan(0);
       }
-
-      const full = await db
-        .prepare(
-          "SELECT last_full_completed_at AS t FROM sync_state WHERE division_id = ?1 AND entity = 'run'",
-        )
-        .bind(div.id)
-        .first<{ t: string | null }>();
-      if (full?.t && completedAtTick === null) completedAtTick = tick;
-
+      return { r, used };
+    };
+    for (let h = 0; h < 24; h++) {
+      const hourStart = dayStart + h * 3_600_000;
+      if (h === 2) {
+        let r;
+        do {
+          fullAttempts++;
+          r = (await runJob("full", hourStart + (fullAttempts - 1) * 300_000)).r;
+        } while (r.retry && fullAttempts < FULL_SYNC_MAX_ATTEMPTS);
+        if (r.status === "ok") completedHour = h;
+      }
       // The incremental cursors of the open items start at 0 after the full sync and walk the
       // sync endpoint once (ADR 0017), inside the hourly budget; after that an hour without
       // changes costs a handful of calls.
-      if (completedAtTick !== null && tick > completedAtTick) {
-        expect(ran?.mode).toBe("incremental");
-        if (tick >= completedAtTick + 5) expect(used).toBeLessThanOrEqual(6);
-      }
+      const { used } = await runJob("incremental", hourStart + 30 * 60_000);
+      if (completedHour !== null && h >= completedHour + 5) expect(used).toBeLessThanOrEqual(6);
     }
 
-    // The reference division is complete inside the 02:00-05:59 window.
-    expect(completedAtTick).not.toBeNull();
-    expect(completedAtTick as number).toBeGreaterThanOrEqual(2);
-    expect(completedAtTick as number).toBeLessThanOrEqual(5);
+    // The reference division is complete within the full job's attempts.
+    expect(completedHour).toBe(2);
+    expect(fullAttempts).toBeLessThanOrEqual(FULL_SYNC_MAX_ATTEMPTS);
     expect(await counts(div.id)).toEqual({
       relations: RELATIONS,
       open: RECEIVABLES + PAYABLES,
@@ -210,32 +206,32 @@ describe.each(MATRIX)("reference division, $label", ({ list, sync }) => {
     const fx = referenceExact(div.exactDivision, list, sync);
     const { gate, delivered } = budgetedGate(fx);
     const night = Date.parse("2026-01-15T01:00:00Z"); // 02:00 local
-    for (let tick = 0; tick < 4; tick++) {
-      const at = night + tick * 3_600_000;
-      await runScheduledExactSync(env, at, { transport: fx.transport, gate, now: () => at });
-    }
+    const fullNight = async (start: number) => {
+      let attempts = 0;
+      let calls = 0;
+      let r;
+      do {
+        const t = start + attempts * 300_000;
+        attempts++;
+        const before = delivered();
+        r = await callExact(
+          "full",
+          t,
+          { transport: fx.transport, gate, now: () => t },
+          { runId: t },
+        );
+        calls += delivered() - before;
+      } while (r.retry && attempts < FULL_SYNC_MAX_ATTEMPTS);
+      return { r, calls, attempts };
+    };
+    expect((await fullNight(night)).r.status).toBe("ok");
     expect((await counts(div.id)).open).toBe(RECEIVABLES + PAYABLES);
 
     // Next day: 100 receivables are paid in Exact (3.3 %, under the close guard).
     fx.receivables = fx.receivables.slice(100);
-    const before = delivered();
-    let nightCalls = 0;
-    let done = false;
-    for (let tick = 0; tick < 4 && !done; tick++) {
-      const at = night + 24 * 3_600_000 + tick * 3_600_000;
-      const calls0 = delivered();
-      const r = await runScheduledExactSync(env, at, {
-        transport: fx.transport,
-        gate,
-        now: () => at,
-      });
-      nightCalls += delivered() - calls0;
-      expect(r.ran[0]?.mode).toBe("full");
-      done = r.ran[0]?.status === "ok";
-    }
-    expect(done).toBe(true);
-    expect(nightCalls).toBe(delivered() - before);
-    expect(nightCalls).toBeLessThanOrEqual(4 * SCHEDULED_FULL_BUDGET);
+    const second = await fullNight(night + 24 * 3_600_000);
+    expect(second.r.status).toBe("ok");
+    expect(second.calls).toBeLessThanOrEqual(FULL_SYNC_MAX_ATTEMPTS * FULL_SYNC_BUDGET);
     expect(await counts(div.id)).toMatchObject({
       open: RECEIVABLES - 100 + PAYABLES,
       closed: 100,

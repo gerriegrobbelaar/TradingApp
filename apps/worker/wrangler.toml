@@ -24,11 +24,11 @@ preview_urls = false
 # or, on an existing proxied hostname:
 # routes = [{ pattern = "app.example.com/*", zone_name = "example.com" }]
 
-# STOPGAP (Phase 3 replaces it with the jobs table and Queues): one tick per hour (UTC). The handler
-# decides from the Amsterdam wall clock whether the tick is the daily full sync (02:00) or an
-# incremental one, so daylight saving needs no second cron. See src/exact/scheduled.ts.
+# The scheduler tick (Phase 3): every minute (UTC). The Worker decides from each job's own schedule
+# (Europe/Amsterdam, daylight saving aware) which jobs are due, claims a run in D1 and puts it on the
+# Queue below. Do not change this expression; change a job's schedule in Settings, Schedules.
 [triggers]
-crons = ["0 * * * *"]
+crons = ["* * * * *"]
 
 [observability]
 enabled = true
@@ -80,3 +80,30 @@ class_name = "ExactGate"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ExactGate"]
+
+# One JobLock per job name ("job:<name>"): the no-overlap lease (ADR 0020).
+[[durable_objects.bindings]]
+name = "JOB_LOCK"
+class_name = "JobLock"
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["JobLock"]
+
+# Job runs. Create both queues once before the first deploy (docs/DEPLOY.md):
+#   wrangler queues create camelthorn-jobs
+#   wrangler queues create camelthorn-jobs-dlq
+[[queues.producers]]
+binding = "JOBS_QUEUE"
+queue = "camelthorn-jobs"
+
+[[queues.consumers]]
+queue = "camelthorn-jobs"
+# One run per invocation: each run has its own subrequest budget and 15-minute wall-time limit.
+max_batch_size = 1
+max_batch_timeout = 1
+# A run that cannot be started is retried a few times, then parked in the dead-letter queue; the
+# scheduler's sweep marks such a run as an error after a while.
+max_retries = 3
+retry_delay = 60
+dead_letter_queue = "camelthorn-jobs-dlq"

@@ -14,6 +14,8 @@ import {
   getExactGate,
   setGateNamespaceResolverForTests,
 } from "../src/exact/gate-transport";
+import { getEuObject } from "../src/eu-object";
+import type { JobLock } from "../src/jobs/job-lock";
 import type { ExactGate } from "../src/exact/gate";
 import { buildUrl, validateRequest } from "../src/exact/request";
 import { unwrap } from "../src/exact/wire";
@@ -1028,7 +1030,10 @@ describe("per-job budget", () => {
   it("takes the default budget from jobs.exact_budget, else 500", async () => {
     const gate = gateStub(gateName(freshDivision()));
     await db
-      .prepare("INSERT INTO jobs (name, cron, exact_budget) VALUES ('nightly', '0 2 * * *', 42)")
+      .prepare(
+        `INSERT INTO jobs (name, handler, schedule_json, exact_budget)
+         VALUES ('nightly', 'x', '{"kind":"cron","expr":"0 2 * * *"}', 42)`,
+      )
       .run();
     expect(await gate.startJob("nightly")).toEqual({ jobId: "nightly", budget: 42 });
     expect(await gate.startJob("unknown-job")).toEqual({ jobId: "unknown-job", budget: 500 });
@@ -1351,7 +1356,7 @@ describe("review G2/S6: EU jurisdiction for every Durable Object stub", () => {
     }
   });
 
-  it("no source file obtains a gate stub except through getExactGate, or uses the test seam", () => {
+  it("no source file obtains a Durable Object stub except through getEuObject, or uses the test seam", () => {
     const files = import.meta.glob("../src/**/*.ts", {
       query: "?raw",
       import: "default",
@@ -1360,13 +1365,53 @@ describe("review G2/S6: EU jurisdiction for every Durable Object stub", () => {
     expect(Object.keys(files).length).toBeGreaterThan(10);
     const offenders: string[] = [];
     for (const [path, text] of Object.entries(files)) {
-      if (path.endsWith("/exact/gate-transport.ts")) continue;
-      if (/setGateNamespaceResolverForTests|DO_JURISDICTION_DISABLED/.test(text))
+      if (path.endsWith("/exact/gate-transport.ts") || path.endsWith("/eu-object.ts")) continue;
+      if (
+        /setGateNamespaceResolverForTests|setEuNamespaceResolverForTests|DO_JURISDICTION_DISABLED/.test(
+          text,
+        )
+      )
         offenders.push(path);
-      if (/EXACT_GATE\s*\.\s*(idFromName|get|newUniqueId|idFromString)\b/.test(text)) {
+      // Any binding of the Env (EXACT_GATE, JOB_LOCK, a later one): no direct stub access.
+      if (
+        /\b[A-Z][A-Z_]*\s*\.\s*(idFromName|get|newUniqueId|idFromString|jurisdiction)\s*\(/.test(
+          text,
+        )
+      ) {
+        offenders.push(path);
+      }
+      if (/\.\s*(idFromName|newUniqueId|idFromString|jurisdiction)\s*\(/.test(text)) {
         offenders.push(path);
       }
     }
-    expect(offenders).toEqual([]);
+    expect([...new Set(offenders)]).toEqual([]);
+  });
+
+  it("the generic helper serves every namespace from the EU jurisdiction (JobLock too)", () => {
+    const seen: string[] = [];
+    const ns = {
+      idFromName: (n: string) => ({ n }) as unknown as DurableObjectId,
+      get: (id: unknown) => ({ id }) as unknown,
+    };
+    const fake = {
+      jurisdiction: (j: string) => {
+        seen.push(j);
+        return ns;
+      },
+      idFromName: () => {
+        throw new Error("the global namespace must not be used");
+      },
+    };
+    setGateNamespaceResolverForTests(null);
+    try {
+      const stub = getEuObject(
+        fake as unknown as DurableObjectNamespace<JobLock>,
+        "job:exact.full_sync",
+      ) as unknown as { id: { n: string } };
+      expect(seen).toEqual(["eu"]);
+      expect(stub.id.n).toBe("job:exact.full_sync");
+    } finally {
+      setGateNamespaceResolverForTests((n) => n);
+    }
   });
 });

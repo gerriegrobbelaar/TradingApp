@@ -1,29 +1,18 @@
 import { ExactApiError, type ExactTransport } from "@camelthorn/exact";
 import type { Env } from "../env";
+import { getEuObject, setEuNamespaceResolverForTests } from "../eu-object";
 import type { ExactGate } from "./gate";
 import { unwrap, type GateResult } from "./wire";
 
 /** Gate instance name for a division (0 = the "current division" gate used for /current/Me). */
 export const gateName = (division: number): string => `exact:${division}`;
 
-type GateNamespace = DurableObjectNamespace<ExactGate>;
-
-/** Production: every ExactGate object lives in the EU jurisdiction (docs/decisions/0018). */
-const euNamespace = (ns: GateNamespace): GateNamespace => ns.jurisdiction("eu");
-let resolveNamespace: (ns: GateNamespace) => GateNamespace = euNamespace;
-
 /**
- * TEST SEAM ONLY. workerd (Miniflare, the vitest pool) does not implement Durable Object
- * jurisdictions, so the vitest setup file replaces the resolver with the identity function.
- * There is deliberately no environment variable or binding that can switch the jurisdiction off:
- * only code can, and no file under `src/` may call this (a test scans `src/` for it). `null`
- * restores the EU resolver.
+ * TEST SEAM ONLY, kept under its old name: it switches the jurisdiction off for EVERY Durable
+ * Object namespace (the generic helper in ../eu-object.ts), because workerd does not implement
+ * jurisdictions. See docs/decisions/0018.
  */
-export function setGateNamespaceResolverForTests(
-  fn: ((ns: GateNamespace) => GateNamespace) | null,
-): void {
-  resolveNamespace = fn ?? euNamespace;
-}
+export const setGateNamespaceResolverForTests = setEuNamespaceResolverForTests;
 
 /**
  * The only way to reach an ExactGate instance (division gate `exact:<n>` or token authority
@@ -34,8 +23,7 @@ export function getExactGate(
   env: Pick<Env, "EXACT_GATE">,
   name: string,
 ): DurableObjectStub<ExactGate> {
-  const ns = resolveNamespace(env.EXACT_GATE);
-  return ns.get(ns.idFromName(name));
+  return getEuObject(env.EXACT_GATE, name);
 }
 
 async function viaGate(
