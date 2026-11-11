@@ -15,6 +15,10 @@ import { TopNav } from "./components/TopNav";
 import { PLACEHOLDERS } from "./routes";
 import { ToastProvider, useToast } from "./toasts";
 import { ComingSoon, NotFound } from "./pages/Placeholder";
+import { Approvals } from "./pages/Approvals";
+import { Invoices } from "./pages/Invoices";
+import { Overview } from "./pages/Overview";
+import { Payables } from "./pages/Payables";
 import { Settings } from "./pages/Settings";
 import { Checking, SessionError, SignedOut } from "./pages/SignedOut";
 
@@ -51,7 +55,7 @@ function SignedInShell() {
   const toast = useToast();
   const { pathname, search } = useLocation();
   // A failed step-up lands on /?auth=denied while the session is still valid. Read it once,
-  // before the / to /today redirect drops the query, and tell the user.
+  // before the / to /overview redirect drops the query, and tell the user.
   const [denied] = useState(() => new URLSearchParams(search).get("auth") === "denied");
   useEffect(() => {
     if (denied) toast.show(STEP_UP_DENIED_MESSAGE);
@@ -77,7 +81,11 @@ function SignedInShell() {
         <TopNav />
         <main ref={mainRef} id="main" tabIndex={-1} className="main">
           <Routes>
-            <Route path="/" element={<Navigate to="/today" replace />} />
+            <Route path="/" element={<Navigate to="/overview" replace />} />
+            <Route path="/overview" element={<Overview />} />
+            <Route path="/invoices" element={<Invoices />} />
+            <Route path="/purchases/payables" element={<Payables />} />
+            <Route path="/purchases/approvals" element={<Approvals />} />
             {PLACEHOLDERS.map((p) => (
               <Route key={p.to} path={p.to} element={<ComingSoon path={p.to} title={p.label} />} />
             ))}

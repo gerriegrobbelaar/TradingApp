@@ -234,6 +234,37 @@ export interface OverviewResponse {
   lastSync: SyncFreshnessEntry[];
 }
 
+// ---- approvals (task K4 owns these types; K3a declares them to build against) -----------------
+// GET /api/approvals?division=&status=pending_approval|approved|rejected|all&q=&limit=&cursor=
+
+export type ApprovalStatus = "pending_approval" | "approved" | "rejected" | "unknown";
+
+export interface ApprovalItemDto {
+  id: number;
+  exactId: string;
+  entryNumber: string | null;
+  relation: { id: number | null; name: string } | null;
+  currency: string;
+  amountMinor: number;
+  dueDate: string | null;
+  entryDate: string | null;
+  status: ApprovalStatus;
+  submittedAt: string | null;
+  ageDays: number | null;
+  hasPdf: boolean | null;
+}
+
+export interface ApprovalsResponse {
+  division: { id: number; name: string };
+  items: ApprovalItemDto[];
+  nextCursor: string | null;
+  total: number;
+  countsByStatus: Record<ApprovalStatus, number>;
+  freshness: Freshness;
+  /** False until the entity has been synced. */
+  available: boolean;
+}
+
 // ---- ledger and reports (task K2, ADR 0024) -----------------------------------------------------
 // Every ledger amount is integer minor units in the DIVISION currency (`division.currency`), at
 // that currency's scale. Nothing here is converted. Report builders live in ./reports.

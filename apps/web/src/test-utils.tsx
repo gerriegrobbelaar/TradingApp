@@ -9,6 +9,8 @@ export interface Call {
   method: string;
   headers: Record<string, string>;
   body: unknown;
+  /** The request's abort signal, so tests can check that stale requests are cancelled. */
+  signal: AbortSignal | undefined;
 }
 
 type Handler = (call: Call) => { status?: number; body?: unknown };
@@ -61,9 +63,12 @@ export function mockFetch(overrides: Record<string, Handler>) {
       method: init?.method ?? "GET",
       headers: (init?.headers ?? {}) as Record<string, string>,
       body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
+      signal: init?.signal ?? undefined,
     };
     calls.push(call);
-    const h = handlers[`${call.method} ${url}`];
+    // A handler may be keyed by the full URL (with query) or by the path alone.
+    const h = handlers[`${call.method} ${url}`] ?? handlers[`${call.method} ${url.split("?")[0]}`];
+    if (init?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
     const r = h ? h(call) : { status: 404, body: { error: "not_found" } };
     return new Response(JSON.stringify(r.body ?? {}), {
       status: r.status ?? 200,

@@ -1,0 +1,59 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { isAbort } from "./errors";
+
+export type ResourceStatus = "idle" | "loading" | "ready" | "error";
+
+export interface Resource<T> {
+  status: ResourceStatus;
+  data: T | null;
+  error: unknown;
+  reload: () => void;
+}
+
+interface State<T> {
+  key: string | null;
+  status: ResourceStatus;
+  data: T | null;
+  error: unknown;
+}
+
+/**
+ * Loads one value for `key` and reloads when the key changes. The previous request is aborted and
+ * its answer is dropped, and state belonging to another key is never returned (no flash of the
+ * old division's data). `key: null` means "not ready to load".
+ */
+export function useResource<T>(
+  key: string | null,
+  fetcher: (signal: AbortSignal) => Promise<T>,
+): Resource<T> {
+  const [state, setState] = useState<State<T>>({
+    key: null,
+    status: "idle",
+    data: null,
+    error: null,
+  });
+  const [tick, setTick] = useState(0);
+  const fetchRef = useRef(fetcher);
+  fetchRef.current = fetcher;
+
+  useEffect(() => {
+    if (key === null) return;
+    const ac = new AbortController();
+    setState({ key, status: "loading", data: null, error: null });
+    fetchRef.current(ac.signal).then(
+      (data) => {
+        if (!ac.signal.aborted) setState({ key, status: "ready", data, error: null });
+      },
+      (error: unknown) => {
+        if (ac.signal.aborted || isAbort(error)) return;
+        setState({ key, status: "error", data: null, error });
+      },
+    );
+    return () => ac.abort();
+  }, [key, tick]);
+
+  const reload = useCallback(() => setTick((t) => t + 1), []);
+  if (key === null) return { status: "idle", data: null, error: null, reload };
+  if (state.key !== key) return { status: "loading", data: null, error: null, reload };
+  return { status: state.status, data: state.data, error: state.error, reload };
+}

@@ -118,7 +118,7 @@ describe("session ending while signed in", () => {
     mockFetch(ME_OK(ADMIN));
     renderApp("/?auth=denied");
     expect(await screen.findByText(STEP_UP_DENIED_MESSAGE)).toBeTruthy();
-    expect(await screen.findByRole("heading", { level: 1, name: "Today" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { level: 1, name: "Overview" })).toBeTruthy();
   });
 
   it("signs out with the CSRF header and reloads even if the session was already gone", async () => {
@@ -138,7 +138,7 @@ describe("session ending while signed in", () => {
 describe("navigation", () => {
   it("renders the top menu and a coming-soon page with one h1", async () => {
     mockFetch(ME_OK(VIEWER));
-    renderApp("/overview");
+    renderApp("/close");
     const nav = await screen.findByRole("navigation", { name: "Main" });
     for (const name of ["Today", "Overview", "Invoices", "Close", "Settings"]) {
       expect(within(nav).getByRole("link", { name })).toBeTruthy();
@@ -146,19 +146,19 @@ describe("navigation", () => {
     for (const name of ["Purchases", "Treasury", "Reporting"]) {
       expect(within(nav).getByText(name)).toBeTruthy();
     }
-    expect(within(nav).getByRole("link", { name: "Overview" }).getAttribute("aria-current")).toBe(
+    expect(within(nav).getByRole("link", { name: "Close" }).getAttribute("aria-current")).toBe(
       "page",
     );
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
-    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Overview");
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Close");
     expect(screen.getByText(/not built yet/i)).toBeTruthy();
     expect(screen.getByRole("link", { name: "Skip to main content" })).toBeTruthy();
   });
 
-  it("redirects / to Today", async () => {
+  it("redirects / to Overview", async () => {
     mockFetch(ME_OK(VIEWER));
     renderApp("/");
-    expect(await screen.findByRole("heading", { level: 1, name: "Today" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { level: 1, name: "Overview" })).toBeTruthy();
   });
 
   it("opens a dropdown by keyboard, lists its links and closes on Escape", async () => {

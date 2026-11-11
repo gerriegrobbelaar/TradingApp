@@ -44,8 +44,18 @@ export function isGroup(i: NavItem): i is Extract<NavItem, { id: string }> {
   return "items" in i;
 }
 
-/** Every page outside Phase 1, flattened. Titles come from the menu labels. */
-export const PLACEHOLDERS: NavLeaf[] = NAV.flatMap((i) => (isGroup(i) ? i.items : [i]));
+/** Pages with a real screen. Everything else in the menu is a placeholder. */
+export const BUILT_PAGES: readonly string[] = [
+  "/overview",
+  "/invoices",
+  "/purchases/payables",
+  "/purchases/approvals",
+];
+
+/** Every page without a screen yet, flattened. Titles come from the menu labels. */
+export const PLACEHOLDERS: NavLeaf[] = NAV.flatMap((i) => (isGroup(i) ? i.items : [i])).filter(
+  (l) => !BUILT_PAGES.includes(l.to),
+);
 
 export function groupLabel(path: string): string | null {
   for (const i of NAV) {

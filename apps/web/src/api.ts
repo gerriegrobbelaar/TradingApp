@@ -1,6 +1,14 @@
 /** Thin typed client for the Worker API. Same-origin; the session cookie does the auth. */
 
-import { safeReturnTo, type Role, type Schedule } from "@camelthorn/core";
+import {
+  safeReturnTo,
+  type ApprovalsResponse,
+  type OpenItemDetail,
+  type OpenItemListResponse,
+  type OverviewResponse,
+  type Role,
+  type Schedule,
+} from "@camelthorn/core";
 
 export { ROLES, safeReturnTo, type Role } from "@camelthorn/core";
 
@@ -103,6 +111,8 @@ interface RequestOptions {
   body?: unknown;
   /** Report a 401 as "session ended". Off for the session check and sign-out themselves. */
   notifyOn401?: boolean;
+  /** Abort the request (screens abort stale reads when the division or filters change). */
+  signal?: AbortSignal;
 }
 
 async function errorInfo(
@@ -140,7 +150,13 @@ export async function request<T>(path: string, opts: RequestOptions = {}): Promi
     headers["content-type"] = "application/json";
     body = JSON.stringify(opts.body);
   }
-  const res = await fetch(path, { method, headers, body, credentials: "include" });
+  const res = await fetch(path, {
+    method,
+    headers,
+    body,
+    credentials: "include",
+    ...(opts.signal ? { signal: opts.signal } : {}),
+  });
   if (res.status === 401) {
     const code = await errorCode(res);
     if (code === "step_up_required") throw new StepUpRequired();
@@ -388,3 +404,40 @@ export const patchJob = (
 ) => request<{ id: number; changed: boolean }>(`/api/jobs/${id}`, { method: "PATCH", body });
 export const runJobNow = (id: number) =>
   request<{ runId: number; status: "queued" }>(`/api/jobs/${id}/run`, { method: "POST" });
+
+// ---- read-only screens (Phase 4) --------------------------------------------------------------
+
+export type QueryParams = Record<string, string | number | undefined | null>;
+
+/** `?a=1&b=2` from the given parameters; empty values are left out. */
+export function queryString(params: QueryParams): string {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== "") q.set(k, String(v));
+  }
+  const s = q.toString();
+  return s ? `?${s}` : "";
+}
+
+export const getOverview = (division: number, signal?: AbortSignal) =>
+  request<OverviewResponse>(`/api/overview${queryString({ division })}`, {
+    ...(signal ? { signal } : {}),
+  });
+
+/** Receivables (/api/invoices) or payables (/api/bills), or a drill-down hint's path. */
+export const listOpenItems = (
+  path: "/api/invoices" | "/api/bills",
+  params: QueryParams,
+  signal?: AbortSignal,
+) =>
+  request<OpenItemListResponse>(`${path}${queryString(params)}`, {
+    ...(signal ? { signal } : {}),
+  });
+
+export const getOpenItem = (id: number, signal?: AbortSignal) =>
+  request<OpenItemDetail>(`/api/open-items/${id}`, { ...(signal ? { signal } : {}) });
+
+export const listApprovals = (params: QueryParams, signal?: AbortSignal) =>
+  request<ApprovalsResponse>(`/api/approvals${queryString(params)}`, {
+    ...(signal ? { signal } : {}),
+  });
