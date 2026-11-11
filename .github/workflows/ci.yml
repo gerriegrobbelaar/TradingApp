@@ -1,8 +1,11 @@
 name: CI
 
 on:
+  # Agent branches (review N7) run on push too. A push to a branch with an open PR then runs twice
+  # (push and pull_request); the two use different refs, so neither cancels the other and the PR's
+  # own check always completes. Accepted: the suite is short and the branches are short-lived.
   push:
-    branches: [main]
+    branches: [main, "claude/**", "build/**"]
   pull_request:
 
 permissions:

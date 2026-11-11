@@ -37,4 +37,5 @@ pnpm --filter @camelthorn/web dev                         # UI on :5173, proxies
 Local sign-in needs `OAUTH_REDIRECT_URI=http://localhost:5173/api/auth/callback` (set in
 `.dev.vars`, which overrides `wrangler.toml`) and that URI registered on the Google OAuth client.
 
-Deploying: [docs/DEPLOY.md](docs/DEPLOY.md).
+Deploying, operations (emergency stop, dead-letter queue, restore) and local-development caveats:
+[docs/DEPLOY.md](docs/DEPLOY.md), one ordered runbook with a checklist of what a human must do first.

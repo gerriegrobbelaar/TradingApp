@@ -12,3 +12,4 @@ export * from "./kpis";
 export * from "./search";
 export * from "./reports";
 export * from "./api-types";
+export * from "./schedule-rules";

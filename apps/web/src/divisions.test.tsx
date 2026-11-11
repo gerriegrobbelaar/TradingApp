@@ -144,6 +144,21 @@ const ok: SyncResponse = {
 };
 
 describe("Settings, Connections: data sync", () => {
+  it("says how the buttons here differ from the scheduled jobs, with a link to them (ADR 0023)", async () => {
+    mockFetch({
+      ...ME_OK(ADMIN),
+      ...CONNECTIONS,
+      ...divisions({ selectedId: 1, divisions: [div(1, "Alpha BV")] }),
+    });
+    renderApp("/settings/connections");
+    const text = await screen.findByText(/These buttons never read bank account numbers/);
+    expect(text.textContent).toContain("60 Exact calls or 20 seconds");
+    expect(text.textContent).toContain("1 minute after the last one");
+    expect(text.textContent).toContain("30-second wait between Run now presses");
+    const link = within(text).getByRole("link", { name: "Settings, Schedules" });
+    expect(link.getAttribute("href")).toBe("/settings/schedules");
+  });
+
   it("shows a skeleton, then last sync as an 'Updated x ago' stamp per administration", async () => {
     const fiveMinAgo = new Date(Date.now() - 5 * 60_000).toISOString();
     mockFetch({

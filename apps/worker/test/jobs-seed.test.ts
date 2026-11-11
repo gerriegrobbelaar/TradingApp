@@ -67,10 +67,9 @@ describe("default jobs (CLAUDE.md 4.1)", () => {
     expect(sched("exact.full_sync")).toEqual({ kind: "cron", expr: "0 2 * * *" });
     expect(sched("exact.incremental_sync")).toMatchObject({ kind: "cron" });
     expect(sched("fx.revaluation")).toEqual({ kind: "last_working_day", time: "16:30" });
-    expect(rows.filter((r) => r.enabled === 1).map((r) => r.name)).toEqual([
-      "exact.full_sync",
-      "exact.incremental_sync",
-    ]);
+    // Nothing ships enabled: later phases are not built and the Exact jobs wait for the first
+    // live connection checks (review S6).
+    expect(rows.filter((r) => r.enabled === 1).map((r) => r.name)).toEqual([]);
     expect(rows.every((r) => r.timezone === "Europe/Amsterdam" && r.kind === "system")).toBe(true);
     // Enabled jobs have a next run in the future; disabled ones none.
     for (const r of rows) {

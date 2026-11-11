@@ -1,5 +1,12 @@
 import { useMemo, useState } from "react";
-import { nextRun, validateSchedule, type Schedule } from "@camelthorn/core";
+import {
+  checkScheduleRules,
+  describeScheduleRules,
+  nextRun,
+  validateSchedule,
+  type Schedule,
+  type ScheduleRules,
+} from "@camelthorn/core";
 import { Button } from "@camelthorn/ui";
 
 export type PresetKind = "every10" | "hourly" | "daily" | "working" | "lastWorking" | "custom";
@@ -99,11 +106,15 @@ export interface EditorValue {
   exactBudget: number;
 }
 
+/** One sentence on what this job allows, shown under the schedule choice (same text as core). */
+export const rulesText = (rules: ScheduleRules | undefined): string => describeScheduleRules(rules);
+
 export function ScheduleEditor({
   initial,
   usesExact,
   budget,
   maxBudget,
+  rules,
   busy,
   error,
   nowMs,
@@ -114,6 +125,8 @@ export function ScheduleEditor({
   usesExact: boolean;
   budget: number;
   maxBudget: number;
+  /** What this job's handler allows (from GET /api/jobs); checked live like the server does. */
+  rules?: ScheduleRules;
   busy: boolean;
   error: string | null;
   /** The clock the preview counts from (tests pass a fixed one). */
@@ -134,6 +147,11 @@ export function ScheduleEditor({
       : `Enter a whole number from 1 to ${maxBudget.toLocaleString("en-US")}.`;
   // packages/core validateSchedule says what is wrong in a sentence ("Invalid minute field: 61").
   const scheduleError = parsed.ok ? null : `This schedule is not valid. ${parsed.error}.`;
+  // The same per-handler limits the server enforces (400 schedule_not_allowed), shown as you type.
+  const rulesError = useMemo(
+    () => (parsed.ok ? checkScheduleRules(parsed.schedule, rules) : null),
+    [parsed, rules],
+  );
   const showTime =
     draft.kind === "daily" || draft.kind === "working" || draft.kind === "lastWorking";
   const set = (patch: Partial<Draft>) => setDraft((d) => ({ ...d, ...patch }));
@@ -144,7 +162,7 @@ export function ScheduleEditor({
       noValidate
       onSubmit={(e) => {
         e.preventDefault();
-        if (!parsed.ok || budgetError !== null) return;
+        if (!parsed.ok || budgetError !== null || rulesError !== null) return;
         onSave({ schedule: parsed.schedule, exactBudget: usesExact ? budgetNumber : budget });
       }}
     >
@@ -153,6 +171,8 @@ export function ScheduleEditor({
         <select
           className="input"
           value={draft.kind}
+          aria-describedby="rules-help"
+          aria-invalid={rulesError !== null}
           onChange={(e) => set({ kind: e.target.value as PresetKind })}
         >
           {PRESETS.map((p) => (
@@ -184,8 +204,8 @@ export function ScheduleEditor({
               spellCheck={false}
               autoComplete="off"
               value={draft.expr}
-              aria-invalid={scheduleError !== null}
-              aria-describedby="cron-help"
+              aria-invalid={scheduleError !== null || rulesError !== null}
+              aria-describedby="cron-help rules-help"
               onChange={(e) => set({ expr: e.target.value })}
             />
           </label>
@@ -207,6 +227,14 @@ export function ScheduleEditor({
       {scheduleError !== null && (
         <p role="alert" className="notice warn">
           {scheduleError}
+        </p>
+      )}
+      <p id="rules-help" className="lede">
+        {rulesText(rules)}
+      </p>
+      {rulesError !== null && (
+        <p role="alert" className="notice warn">
+          {rulesError}
         </p>
       )}
       {parsed.ok && (
@@ -254,7 +282,7 @@ export function ScheduleEditor({
         <Button
           type="submit"
           variant="primary"
-          disabled={busy || !parsed.ok || budgetError !== null}
+          disabled={busy || !parsed.ok || budgetError !== null || rulesError !== null}
         >
           Save schedule
         </Button>

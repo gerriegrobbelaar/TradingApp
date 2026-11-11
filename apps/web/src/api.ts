@@ -340,6 +340,22 @@ export interface JobView {
   enabled: boolean;
   /** Exact calls per administration and run (Exact jobs only). */
   exactBudget: number;
+  /** Roles that may use Run now for this job. */
+  runRoles: string[];
+  /** Run now needs a Google sign-in from the last 15 minutes. */
+  stepUpToRun: boolean;
+  /** A scheduled run later than this after its slot is skipped; null = no limit. */
+  maxLatenessMinutes: number | null;
+  /** What the schedule may be, checked live in the editor and by the server. */
+  scheduleRules: {
+    minIntervalMinutes: number;
+    allowedIntervalMinutes: [number, number] | null;
+    workingDaysOnly: boolean;
+  };
+  /** False for a default job that ships switched off. */
+  defaultEnabled: boolean | null;
+  /** Why a default job is still switched off (for example awaiting_live_verification). */
+  disabledReason?: string;
   /** Optimistic concurrency token: send it back with patchJob. */
   rev: string | null;
   nextRunAt: string | null;
@@ -358,6 +374,8 @@ export interface JobsResponse {
     now: string;
   };
   maxExactBudget: number;
+  /** Most Exact calls per administration and day that all switched-on jobs may add up to. */
+  maxProjectedExactCallsPerDay: number;
   jobs: JobView[];
 }
 
