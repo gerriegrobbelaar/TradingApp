@@ -1,4 +1,4 @@
-# ADR 0020: Scheduler, job queue and the JobLock lease
+# ADR 0021: Scheduler, job queue and the JobLock lease
 Status: accepted (task H2, Phase 3)
 
 ## Context

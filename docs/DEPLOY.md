@@ -50,7 +50,7 @@ Durable Objects of the account, so use a test deployment or a throwaway database
 data).
 
 **Durable Object migration tags.** `wrangler.toml` declares `ExactGate` in `[[migrations]]` with
-`tag = "v1"` and `JobLock` (the scheduler's per-job no-overlap lease, ADR 0020) with `tag = "v2"`,
+`tag = "v1"` and `JobLock` (the scheduler's per-job no-overlap lease, ADR 0021) with `tag = "v2"`,
 both in `new_sqlite_classes`. Never edit or reuse a tag that has been deployed: a new Durable Object
 class or a rename needs a new `[[migrations]]` entry with the next tag (`v3`). The deploy check
 refuses a config without the `ExactGate` or `JobLock` binding or its migration. `JobLock` objects

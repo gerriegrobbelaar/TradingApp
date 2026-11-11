@@ -81,7 +81,7 @@ class_name = "ExactGate"
 tag = "v1"
 new_sqlite_classes = ["ExactGate"]
 
-# One JobLock per job name ("job:<name>"): the no-overlap lease (ADR 0020).
+# One JobLock per job name ("job:<name>"): the no-overlap lease (ADR 0021).
 [[durable_objects.bindings]]
 name = "JOB_LOCK"
 class_name = "JobLock"

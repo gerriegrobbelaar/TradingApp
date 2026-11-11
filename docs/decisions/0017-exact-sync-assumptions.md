@@ -165,7 +165,7 @@ is local to `apps/worker/src/exact/sync.ts` or to the client field lists.
   is unsafe here. Columns are added instead (`entry_number`, `closed_at`, `last_seen_sync_id`) and
   the `status IN ('open','closed')` rule is enforced by triggers. `kind` keeps its 0003 values:
   `invoice` = receivable, `bill` = payable. Tested on a populated database.
-- **Scheduled stopgap (`exact/scheduled.ts`), REPLACED in Phase 3 (task H2, ADR 0020):** the jobs
+- **Scheduled stopgap (`exact/scheduled.ts`), REPLACED in Phase 3 (task H2, ADR 0021):** the jobs
   `exact.full_sync` (daily 02:00 Amsterdam, re-queued up to 4 attempts) and
   `exact.incremental_sync` (hourly at :30) in `jobs/exact-handlers.ts` keep every behaviour below;
   the worst case is now 4 x 240 + 25 x 40 = 1,960 calls per administration and day. Original text:
@@ -292,4 +292,4 @@ is local to `apps/worker/src/exact/sync.ts` or to the client field lists.
   `relation.iban_added` audit rows (ADR 0019).
 - `sync_state.entity = 'run'` is the single place for "last sync" timestamps; the UI "Updated x ago"
   stamps use `last_completed_at` (last run that ended `ok`); `last_finished_at` is the last attempt.
-- Phase 3 (done, ADR 0020) calls `syncDivision` from the job queue consumer and dropped `scheduled.ts`.
+- Phase 3 (done, ADR 0021) calls `syncDivision` from the job queue consumer and dropped `scheduled.ts`.
