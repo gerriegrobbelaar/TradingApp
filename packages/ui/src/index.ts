@@ -5,7 +5,7 @@ export { Card, type CardProps } from "./components/Card";
 export { ErrorBoundary, type ErrorBoundaryProps } from "./components/ErrorBoundary";
 export { Chip, type ChipProps, type ChipTone } from "./components/Chip";
 export { Segmented, type SegmentedOption, type SegmentedProps } from "./components/Segmented";
-export { Sheet, type SheetProps } from "./components/Sheet";
+export { Sheet, useSheetClose, type SheetProps } from "./components/Sheet";
 export { Skeleton, type SkeletonProps } from "./components/Skeleton";
 export { Stamp, type StampProps } from "./components/Stamp";
 export { Switch, type SwitchProps } from "./components/Switch";

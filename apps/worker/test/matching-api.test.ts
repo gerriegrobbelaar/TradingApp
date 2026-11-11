@@ -11,6 +11,7 @@ import {
   type MatchDetailResponse,
   type MatchDto,
   type MatchIgnoreResponse,
+  type MatchItemBalancesResponse,
   type MatchPatternDto,
   type MatchQueueResponse,
   type MatchStatsResponse,
@@ -126,6 +127,11 @@ describe("access rules", () => {
       path: "/api/matching/transactions/1",
       roles: ["admin", "finance", "approver", "viewer"],
     },
+    {
+      method: "GET",
+      path: "/api/matching/items",
+      roles: ["admin", "finance", "approver", "viewer"],
+    },
     { method: "POST", path: "/api/matching/matches", body: {}, roles: ["admin", "finance"] },
     { method: "POST", path: "/api/matching/matches/1/undo", body: {}, roles: ["admin", "finance"] },
     {
@@ -223,6 +229,7 @@ describe("queue, auto list, detail and stats", () => {
       id: txId,
       matchStatus: "suggested",
       mapped: true,
+      divisionId: w.divisionId,
       stateConflict: false,
       amountMinor: 12_345,
       counterpartyIbanMasked: "NL91****4300",
@@ -1416,6 +1423,7 @@ describe("response shapes", () => {
       "counterpartyIbanMasked",
       "matchStatus",
       "mapped",
+      "divisionId",
       "stateConflict",
       "ignore",
     ];
@@ -1499,6 +1507,78 @@ describe("response shapes", () => {
       "items",
       "nextCursor",
     ]);
+  });
+});
+
+describe("transaction administration (review M7d)", () => {
+  it("queue, detail and auto list carry the mapped administration", async () => {
+    const { txId } = await seedPerfect();
+    await runMatching(jobContext());
+    const q = await get<MatchQueueResponse>("viewer", "/api/matching/queue");
+    expect(q.body.items[0]?.transaction.divisionId).toBe(w.divisionId);
+    const d = await get<MatchDetailResponse>("viewer", `/api/matching/transactions/${txId}`);
+    expect(d.body.transaction.divisionId).toBe(w.divisionId);
+    await enableAuto();
+    await runMatching(jobContext());
+    const auto = await get<MatchAutoResponse>("viewer", "/api/matching/auto");
+    expect(auto.body.items.length).toBeGreaterThan(0);
+    for (const it of auto.body.items) expect(it.transaction.divisionId).toBe(w.divisionId);
+  });
+  it("is null when the bank account is not mapped", async () => {
+    const t = await tx({ amountMinor: 777 });
+    await db.prepare("DELETE FROM bank_account_exact_map").run();
+    const after = await get<MatchDetailResponse>("viewer", `/api/matching/transactions/${t}`);
+    expect(after.body.transaction).toMatchObject({ mapped: false, divisionId: null });
+    const q = await get<MatchQueueResponse>("viewer", "/api/matching/queue");
+    expect(q.body.items.length).toBeGreaterThan(0);
+    for (const it of q.body.items) {
+      expect(it.transaction).toMatchObject({ mapped: false, divisionId: null });
+    }
+  });
+});
+
+describe("GET /api/matching/items: free balances for the manual editor (review M7d)", () => {
+  it("returns open minus live allocations, any role, refuses bad ids", async () => {
+    const a = await addItem({ divisionId: w.divisionId, openMinor: 3_000 });
+    const credit = await addItem({ divisionId: w.divisionId, openMinor: -400 });
+    const closed = await addItem({ divisionId: w.divisionId, openMinor: 1_000, status: "closed" });
+    const t = await tx({ amountMinor: 1_200 });
+    const made = await send("finance", "POST", "/api/matching/matches", {
+      transactionId: t,
+      allocations: [{ openItemId: a, allocatedMinor: 1_200 }],
+    });
+    expect(made.status).toBe(201);
+    const r = await get<MatchItemBalancesResponse>(
+      "viewer",
+      `/api/matching/items?ids=${a},${credit},${closed},999999`,
+    );
+    expect(r.status).toBe(200);
+    expect(r.body.items).toEqual([
+      expect.objectContaining({
+        openItemId: a,
+        openMinor: 3_000,
+        matchedMinor: 1_200,
+        freeMinor: 1_800,
+      }),
+      expect.objectContaining({
+        openItemId: credit,
+        openMinor: -400,
+        matchedMinor: 0,
+        freeMinor: 400,
+      }),
+      expect.objectContaining({ openItemId: closed, status: "closed", freeMinor: 0 }),
+    ]);
+    // The free amount is exactly what the server accepts: one minor unit more is refused.
+    const t2 = await tx({ amountMinor: 1_801 });
+    const over = await send("finance", "POST", "/api/matching/matches", {
+      transactionId: t2,
+      allocations: [{ openItemId: a, allocatedMinor: 1_801 }],
+    });
+    expect([over.status, err(over)]).toEqual([422, "allocation_exceeds_open"]);
+    for (const bad of ["", "?ids=", "?ids=0", "?ids=1,x", "?ids=-1", `?ids=${"1,".repeat(20)}1`]) {
+      const res = await get("viewer", `/api/matching/items${bad}`);
+      expect(res.status, bad).toBe(400);
+    }
   });
 });
 

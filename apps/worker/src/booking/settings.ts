@@ -19,10 +19,11 @@ import { BOOKING_PROTOCOL_VERSION } from "./protocol";
 export const SETTING_ENABLED = "exact.booking_enabled";
 export const SETTING_VERIFIED = "exact.booking_verified";
 
-/** Typed by an admin to switch booking on. */
-export const ENABLE_PHRASE = "ENABLE EXACT BOOKING";
-/** Typed (sent as `confirm`) to record the verification. */
-export const VERIFY_PHRASE = "I VERIFIED THE EXACT WRITE PATH ON A TEST DIVISION";
+/** The typed phrases (sent as `confirm`): ONE source for worker, web and tests (core). */
+export {
+  BOOKING_ENABLE_PHRASE as ENABLE_PHRASE,
+  BOOKING_VERIFY_PHRASE as VERIFY_PHRASE,
+} from "@camelthorn/core";
 
 export type BookingBlocker =
   | "not_verified"

@@ -3,7 +3,7 @@
  *
  *  GET  /api/booking/settings               any role   the fail-closed switch, the verification, blockers
  *  PUT  /api/booking/settings               admin      {enabled, confirm, note?}. Enabling: fresh sign-in,
- *                                                      the phrase ENABLE EXACT BOOKING and every
+ *                                                      BOOKING_ENABLE_PHRASE (core) and every
  *                                                      precondition. Disabling: no step-up, audited.
  *  POST /api/booking/verify                 admin, step-up   {note, confirm}: the write path was verified
  *                                                      on a TEST division (stores the protocol version).
@@ -20,7 +20,7 @@ import {
   type BookingSettingsResponse,
   type BookingStatus,
 } from "@camelthorn/core";
-import { maskIbans } from "@camelthorn/core";
+import { maskIbans, phraseMatches } from "@camelthorn/core";
 import { BOOKING_PROTOCOL_VERSION } from "./protocol";
 import { isStepUpFresh } from "../auth/session";
 import { auditStatement } from "../db/audit";
@@ -158,7 +158,8 @@ async function putSettingsHandler(ctx: Ctx): Promise<Response> {
   if (!ctx.session || !isStepUpFresh(ctx.session, ctx.nowMs)) {
     return json({ error: "step_up_required" }, 401);
   }
-  if (b["confirm"] !== ENABLE_PHRASE) throw new ApiError("confirmation_required");
+  if (typeof b["confirm"] !== "string" || !phraseMatches(b["confirm"], ENABLE_PHRASE))
+    throw new ApiError("confirmation_required");
   const before = await loadBookingState(db);
   const blockers = blockersOf(before).filter((x) => x !== "writes_disabled");
   if (blockers.length > 0) throw new ApiError("blocked", 409, { blockers });
@@ -207,7 +208,8 @@ async function verifyHandler(ctx: Ctx): Promise<Response> {
   const db = ctx.env.DB;
   const who = actor(ctx);
   const b = await readBody(ctx, ["note", "confirm"]);
-  if (b["confirm"] !== VERIFY_PHRASE) throw new ApiError("confirmation_required");
+  if (typeof b["confirm"] !== "string" || !phraseMatches(b["confirm"], VERIFY_PHRASE))
+    throw new ApiError("confirmation_required");
   const text = note(b["note"], 10, 500, "bad_note");
   const before = await loadBookingState(db);
   const mark = {

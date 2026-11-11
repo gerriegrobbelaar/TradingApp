@@ -9,6 +9,11 @@ export interface Resource<T> {
   data: T | null;
   error: unknown;
   reload: () => void;
+  /**
+   * Re-read without a loading state: what is shown stays until the new answer replaces it (no
+   * flash, components below keep their state). A failure keeps the old data. Used after a write.
+   */
+  refresh: () => void;
 }
 
 interface State<T> {
@@ -55,6 +60,9 @@ export function useResource<T>(
 
   const reload = useCallback(() => setTick((t) => t + 1), []);
 
+  const quiet = useRef<AbortController | null>(null);
+  useEffect(() => () => quiet.current?.abort(), []);
+
   // Quiet refresh on focus and every 30 minutes (review N5): keeps what is shown, replaces the
   // data when the answer arrives, ignores failures (the next trigger tries again).
   const current = useRef<{ key: string | null; ready: boolean }>({ key: null, ready: false });
@@ -68,7 +76,25 @@ export function useResource<T>(
     }
   }, key !== null);
 
-  if (key === null) return { status: "idle", data: null, error: null, reload };
-  if (state.key !== key) return { status: "loading", data: null, error: null, reload };
-  return { status: state.status, data: state.data, error: state.error, reload };
+  const refresh = useCallback(() => {
+    const at = current.current.key;
+    if (at === null || !current.current.ready) {
+      setTick((t) => t + 1);
+      return;
+    }
+    quiet.current?.abort();
+    const ac = new AbortController();
+    quiet.current = ac;
+    fetchRef.current(ac.signal).then(
+      (data) => {
+        if (ac.signal.aborted || current.current.key !== at) return;
+        setState((s) => (s.key === at && s.status === "ready" ? { ...s, data } : s));
+      },
+      () => undefined,
+    );
+  }, []);
+
+  if (key === null) return { status: "idle", data: null, error: null, reload, refresh };
+  if (state.key !== key) return { status: "loading", data: null, error: null, reload, refresh };
+  return { status: state.status, data: state.data, error: state.error, reload, refresh };
 }

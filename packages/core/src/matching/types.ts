@@ -115,6 +115,30 @@ export type ReasonCode =
   | "iban_belongs_to_other_relation"
   | "amount_within_tolerance";
 
+const REASON_SET: Record<ReasonCode, true> = {
+  invoice_number_in_reference: true,
+  group_sum_equals_amount: true,
+  amount_equals_open: true,
+  amount_partial: true,
+  amount_over: true,
+  iban_matches_relation: true,
+  unique_for_relation: true,
+  single_amount_candidate: true,
+  multiple_amount_candidates: true,
+  name_similar: true,
+  pattern: true,
+  due_date_near: true,
+  currency_mismatch: true,
+  reference_not_exact: true,
+  iban_belongs_to_other_relation: true,
+  amount_within_tolerance: true,
+};
+
+/** Every reason code a candidate can carry (exhaustive by type; the web labels them all). */
+export const REASON_CODES: readonly ReasonCode[] = Object.freeze(
+  Object.keys(REASON_SET) as ReasonCode[],
+);
+
 export interface Reason {
   code: ReasonCode;
   weight: number;

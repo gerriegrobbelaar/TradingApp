@@ -239,3 +239,23 @@ describe("legal transitions only", () => {
     ).rejects.toThrow(/immutable/);
   });
 });
+
+describe("one settlement predicate everywhere (review M7c)", () => {
+  it("every SQL that sums allocations per item uses allocCounts (no divergent copy)", async () => {
+    const files = import.meta.glob("../src/**/*.ts", {
+      query: "?raw",
+      import: "default",
+      eager: true,
+    });
+    const offenders: string[] = [];
+    for (const [name, text] of Object.entries(files) as [string, string][]) {
+      for (const m of text.matchAll(/SUM\(a2?\.allocated_minor\)/g)) {
+        const window = text.slice(m.index ?? 0, (m.index ?? 0) + 300);
+        // sums per MATCH (a.match_id = m.id) are not about an item's balance
+        if (/a2?\.match_id = m\.id/.test(window)) continue;
+        if (!window.includes("allocCounts(")) offenders.push(`${name}: ${window.slice(0, 160)}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+});

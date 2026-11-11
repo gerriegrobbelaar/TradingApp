@@ -1,0 +1,241 @@
+/* Bank matching screens and Settings, Matching (M7d). Layout only: every colour is a token already
+   used by the Bank screen (--ink, --muted, --fill, --hover, --control-line, --accent-text, chips),
+   so the pairs are covered by contrast.test.ts and matching-contrast.test.ts. */
+.app .bank-tabs {
+  margin: 4px 0 14px;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.app .mt-chips {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.app .mt-chips .chip {
+  white-space: normal;
+  text-align: left;
+}
+.app .mt-best {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 0;
+}
+.app .mt-sheet,
+.app .mt-choose,
+.app .mt-panel,
+.app .mt-confirm,
+.app .mt-phrase,
+.app .mt-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.app .mt-panel,
+.app .mt-confirm {
+  padding: 14px;
+  border: 1px solid var(--control-line);
+  border-radius: 18px;
+}
+.app .mt-cands {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+.app .mt-cand {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 12px 14px;
+  background: var(--fill);
+  border: 1px solid var(--control-line);
+  border-radius: 18px;
+  color: var(--ink);
+  min-width: 0;
+}
+.app .mt-cand.sel-able {
+  cursor: pointer;
+}
+.app .mt-cand.sel {
+  background: var(--hover);
+  border-color: var(--accent-text);
+  box-shadow: inset 0 0 0 1px var(--accent-text);
+}
+.app .mt-cand input[type="radio"] {
+  margin-top: 4px;
+  flex: none;
+  width: 18px;
+  height: 18px;
+}
+.app .mt-cand-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.app .mt-cand-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.app .mt-cand-allocs,
+.app .mt-cand-explain {
+  font-size: 13px;
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.app .mt-actions {
+  margin-top: 0;
+}
+.app .mt-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.app .mt-picker-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: flex-end;
+}
+.app .mt-picker-list,
+.app .mt-alloc-list,
+.app .mt-map-list,
+.app .mt-pattern-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.app .mt-picker-row,
+.app .mt-alloc-row,
+.app .mt-map-row,
+.app .mt-pattern-row {
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  align-items: flex-start;
+  padding: 10px 12px;
+  background: var(--fill);
+  border: 1px solid var(--control-line);
+  border-radius: 14px;
+}
+.app .mt-picker-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.app .mt-alloc-row,
+.app .mt-map-row {
+  flex-direction: column;
+  align-items: stretch;
+}
+.app .mt-alloc-head,
+.app .mt-map-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+}
+.app .mt-map-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+.app .mt-unmapped {
+  border-color: var(--accent-text);
+  border-style: dashed;
+}
+.app .mt-pattern-row {
+  flex-wrap: wrap;
+}
+.app .mt-mono {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+.app .mt-note {
+  height: auto;
+  padding: 10px 12px;
+  resize: vertical;
+}
+.app .mt-test {
+  border: 1px solid var(--control-line);
+  border-radius: 14px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.app .mt-test-results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.app .mt-problems {
+  margin: 0;
+  padding-left: 30px;
+}
+.app .mt-ask {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.app .mt-undo {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+.app .mt-outbox {
+  margin-top: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+@media (max-width: 560px) {
+  .app .mt-picker-row,
+  .app .mt-pattern-row {
+    flex-direction: column;
+  }
+  .app .mt-cand {
+    padding: 10px;
+  }
+}
+
+/* Sheet: "Discard what you typed?" (packages/ui Sheet, review M7d) */
+.sheet-discard {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.sheet-discard p {
+  margin: 0;
+}
+.sheet-discard-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}

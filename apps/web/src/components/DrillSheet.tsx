@@ -1,5 +1,11 @@
 import { useEffect, useRef, type ReactNode } from "react";
-import { Button, Sheet } from "@camelthorn/ui";
+import { Button, Sheet, useSheetClose } from "@camelthorn/ui";
+
+/** Close at the bottom: the same path as Escape, so a dirty sheet asks first. */
+function CloseButton() {
+  const close = useSheetClose();
+  return <Button onClick={close}>Close</Button>;
+}
 
 /**
  * Detail sheet over the page. Focus moves into the dialog on open and returns to the control that
@@ -14,6 +20,7 @@ export function DrillSheet({
   subtitle,
   onClose,
   viewKey,
+  dirty = false,
   children,
 }: {
   open: boolean;
@@ -21,6 +28,8 @@ export function DrillSheet({
   subtitle?: ReactNode;
   onClose: () => void;
   viewKey?: string;
+  /** Typed input would be lost by closing: Escape, the scrim and Close ask first. */
+  dirty?: boolean;
   children: ReactNode;
 }) {
   const body = useRef<HTMLDivElement>(null);
@@ -39,12 +48,12 @@ export function DrillSheet({
     (target ?? dialog)?.focus();
   }, [open, viewKey]);
   return (
-    <Sheet open={open} title={title} onClose={onClose}>
+    <Sheet open={open} title={title} onClose={onClose} dirty={dirty}>
       <div className="drill" ref={body}>
         {subtitle && <div className="drill-sub">{subtitle}</div>}
         {children}
         <div className="drill-close">
-          <Button onClick={onClose}>Close</Button>
+          <CloseButton />
         </div>
       </div>
     </Sheet>

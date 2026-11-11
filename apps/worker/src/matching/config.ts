@@ -12,6 +12,7 @@
  */
 import {
   DEFAULT_MATCH_CONFIG,
+  AUTO_MATCH_CONFIRM_PHRASE,
   normalizeIban,
   validateMatchConfig,
   type LedgerPattern,
@@ -23,7 +24,7 @@ export const SETTING_ENABLED = "matching.enabled";
 export const SETTING_AUTO = "matching.auto_enabled";
 
 /** Typed by the admin to switch automatic matching on (the UI shows it; the API requires it). */
-export const AUTO_CONFIRM_PHRASE = "ENABLE AUTOMATIC MATCHING";
+export const AUTO_CONFIRM_PHRASE = AUTO_MATCH_CONFIRM_PHRASE;
 
 /** The tunable part of MatchConfig, as stored (plain JSON numbers). */
 export interface Tunables {

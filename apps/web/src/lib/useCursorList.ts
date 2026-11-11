@@ -21,6 +21,12 @@ export interface CursorList<T, P extends CursorPage<T>> {
   moreError: unknown;
   loadMore: () => void;
   reload: () => void;
+  /**
+   * Re-read as many rows as are shown now, without a loading state, and swap them in at once
+   * (review M7d): after a write the changed row simply disappears; the list neither flashes nor
+   * jumps back to the first page. A failure keeps what is shown.
+   */
+  refresh: () => void;
 }
 
 interface State<T, P> {
@@ -48,6 +54,9 @@ function appendNew<T>(
   const seen = new Set(shown.map(keyOf));
   return [...shown, ...page.filter((r) => !seen.has(keyOf(r)))];
 }
+
+/** A refresh re-reads at most this many pages (the shown rows), then stops. */
+const REFRESH_MAX_PAGES = 8;
 
 function blank<T, P>(key: string | null, status: CursorListStatus): State<T, P> {
   return {
@@ -139,6 +148,37 @@ export function useCursorList<T, P extends CursorPage<T>>(
 
   const reload = useCallback(() => setTick((t) => t + 1), []);
 
+  const refresh = useCallback(() => {
+    const s = latest.current;
+    const ac = controller.current;
+    if (s.key === null || s.status !== "ready" || !ac || ac.signal.aborted) {
+      setTick((t) => t + 1);
+      return;
+    }
+    const key = s.key;
+    const want = Math.max(1, s.items.length);
+    void (async () => {
+      let rows: T[] = [];
+      let first: P | null = null;
+      let next: string | null = null;
+      for (let page = 0; page < REFRESH_MAX_PAGES; page++) {
+        const p = await fetchRef.current(next, ac.signal);
+        if (ac.signal.aborted) return;
+        if (first === null) first = p;
+        rows = appendNew(rows, p.items, keyRef.current);
+        next = p.nextCursor;
+        if (next === null || rows.length >= want) break;
+      }
+      const head = first;
+      if (head === null) return;
+      setState((c) =>
+        c.key === key && c.status === "ready" && !c.loadingMore
+          ? { ...c, items: rows, first: head, next, moreError: null }
+          : c,
+      );
+    })().catch(() => undefined);
+  }, []);
+
   // Quiet refresh of the first page's summary (freshness, totals, as-of) on focus and every 30
   // minutes (review N5). The rows already shown stay, so scroll position and "Load more" progress
   // survive; a failure is ignored.
@@ -167,5 +207,6 @@ export function useCursorList<T, P extends CursorPage<T>>(
     moreError: view.moreError,
     loadMore,
     reload,
+    refresh,
   };
 }

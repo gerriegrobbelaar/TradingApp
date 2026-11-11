@@ -747,6 +747,11 @@ export interface MatchTxDto {
   matchStatus: MatchStatus;
   /** The bank account has an Exact administration mapping (matching needs it). */
   mapped: boolean;
+  /**
+   * The Exact administration (divisions.id) the bank account is mapped to: the only one whose open
+   * items this line can be matched to. Null exactly when `mapped` is false (review M7d).
+   */
+  divisionId: number | null;
   stateConflict: boolean;
   ignore: { reason: MatchIgnoreReason; note: string | null; by: string; at: string } | null;
 }
@@ -947,6 +952,29 @@ export interface MatchPatternRequest {
   enabled?: boolean;
 }
 
+/**
+ * GET /api/matching/items?ids=1,2 (any role; up to 20 ids): what is still FREE on open items for a
+ * manual match, i.e. the open balance from Exact minus the live matches in this app (the same
+ * number the server checks on POST /api/matching/matches). Unknown ids are left out.
+ */
+export interface MatchItemBalanceDto {
+  openItemId: number;
+  divisionId: number;
+  kind: "invoice" | "bill";
+  currency: string;
+  status: string;
+  /** Signed open balance from Exact (credit notes negative). */
+  openMinor: number;
+  /** Sum of live in-app allocations on this item (a magnitude, never negative). */
+  matchedMinor: number;
+  /** max(0, |openMinor| - matchedMinor): the most a new allocation may take. */
+  freeMinor: number;
+}
+
+export interface MatchItemBalancesResponse {
+  items: MatchItemBalanceDto[];
+}
+
 /** GET /api/matching/stats */
 export interface MatchStatsResponse {
   unmatched: number;
@@ -1017,18 +1045,18 @@ export interface BookingSettingsResponse {
   blockers: string[];
 }
 
-// ---- Booking request shapes (M7c, ADR 0044). The block above is byte-identical to M7d's copy. ------
+// ---- Booking request shapes (M7c, ADR 0044). One definition, shared with the web (M7d). ------
 // GET /api/booking/settings: any role. Blockers: not_verified, protocol_changed,
 // bank_entries_undecided, no_exact_connection, writes_disabled.
 
-/** PUT /api/booking/settings (admin; enabling needs a fresh sign-in and the typed phrase ENABLE EXACT BOOKING). */
+/** PUT /api/booking/settings (admin; enabling needs a fresh sign-in and confirm = BOOKING_ENABLE_PHRASE). */
 export interface BookingSettingsRequest {
   enabled: boolean;
   confirm: string;
   note?: string;
 }
 
-/** POST /api/booking/verify (admin, step-up): confirm = I VERIFIED THE EXACT WRITE PATH ON A TEST DIVISION. */
+/** POST /api/booking/verify (admin, step-up): confirm = BOOKING_VERIFY_PHRASE (confirm-phrases.ts). */
 export interface BookingVerifyRequest {
   note: string;
   confirm: string;

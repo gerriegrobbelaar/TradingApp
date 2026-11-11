@@ -11,6 +11,7 @@ import { extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { answerApi, takeUnmocked, type MockRoute } from "./api-mock";
+import { matchingApi } from "./matching-mock";
 import { fxRates } from "../src/test-fixtures-fx";
 
 const ADMIN = {
@@ -217,7 +218,7 @@ function api(path: string, state: State): unknown {
         source: "webhook",
       };
     default:
-      return null;
+      return matchingApi(path);
   }
 }
 

@@ -13,6 +13,7 @@ import { extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { answerApi, takeUnmocked, type MockRoute } from "./api-mock";
+import { matchingApi } from "./matching-mock";
 import { strFromU8, unzipSync } from "fflate";
 import { addDays, buildBalanceSheet, type BalanceSheetResponse } from "@camelthorn/core";
 import { ONE_DIVISION, listResponse, row } from "../src/test-fixtures";
@@ -166,7 +167,7 @@ function api(path: string, search: URLSearchParams): unknown {
     default: {
       const m = /^\/api\/ledger\/accounts\/(\d+)\/balances$/.exec(path);
       if (m) return accountBalancesResponse(Number(m[1]));
-      return null;
+      return matchingApi(path);
     }
   }
 }

@@ -10,6 +10,7 @@ import type {
 } from "@camelthorn/core";
 import { BOOKING_PROTOCOL_VERSION } from "../src/booking/protocol";
 import { beforeEach, describe, expect, it } from "vitest";
+import { BOOKING_ENABLE_PHRASE, BOOKING_VERIFY_PHRASE } from "@camelthorn/core";
 import { ENABLE_PHRASE, VERIFY_PHRASE } from "../src/booking/settings";
 import { checkMatchingInvariants } from "../src/matching/invariants";
 import { FakeExact } from "./booking-fake-exact";
@@ -64,6 +65,27 @@ const verify = (role: Role | "staleAdmin" = "admin", over: Record<string, unknow
   });
 const enable = (role: Role | "staleAdmin" = "admin", over: Record<string, unknown> = {}) =>
   send(role, "PUT", "/api/booking/settings", { enabled: true, confirm: ENABLE_PHRASE, ...over });
+
+describe("typed phrases: exactly the shared constants (core confirm-phrases.ts)", () => {
+  it("are the agreed values, case-sensitive and never trimmed", async () => {
+    expect(BOOKING_ENABLE_PHRASE).toBe("ENABLE EXACT BOOKING");
+    expect(BOOKING_VERIFY_PHRASE).toBe("I VERIFIED THE EXACT WRITE PATH ON A TEST DIVISION");
+    expect(VERIFY_PHRASE).toBe(BOOKING_VERIFY_PHRASE);
+    expect(ENABLE_PHRASE).toBe(BOOKING_ENABLE_PHRASE);
+    for (const confirm of [
+      ` ${BOOKING_VERIFY_PHRASE}`,
+      `${BOOKING_VERIFY_PHRASE} `,
+      BOOKING_VERIFY_PHRASE.toLowerCase(),
+      BOOKING_ENABLE_PHRASE,
+      ["x"],
+    ]) {
+      expect(err(await verify("admin", { confirm }))).toBe("confirmation_required");
+    }
+    for (const confirm of [`${BOOKING_ENABLE_PHRASE} `, BOOKING_ENABLE_PHRASE.toLowerCase(), 1]) {
+      expect(err(await enable("admin", { confirm }))).toBe("confirmation_required");
+    }
+  });
+});
 
 describe("GET /api/booking/settings", () => {
   it("is readable by every signed-in role and says why booking cannot run", async () => {
