@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router";
 import { Button, Card, Chip, Skeleton, Stamp, type ChipTone } from "@camelthorn/ui";
 import { ApiError, runSync, type DivisionInfo, type SyncResponse } from "../api";
 import { useDivision } from "../division";
@@ -177,6 +178,15 @@ export function SyncPanel({ canSync }: { canSync: boolean }) {
         Relations, open receivables and open payables are copied from Exact. A sync that does not
         finish in one go continues where it stopped. Open items and bank account numbers are
         refreshed by the nightly sync. Only administrations with sync switched on are copied.
+      </p>
+      <p className="lede" id="sync-paths">
+        Sync now and Full sync here work on one administration at a time, in steps of up to 60 Exact
+        calls or 20 seconds; press again to continue. A new sync of the same administration can
+        start 1 minute after the last one. These buttons never read bank account numbers. The
+        scheduled Exact jobs in <Link to="/settings/schedules">Settings, Schedules</Link> run in the
+        background for every administration with sync switched on, with the call budgets set there
+        and a 30-second wait between Run now presses; only the full sync job reads bank account
+        numbers. Two syncs of one administration never run at the same time.
       </p>
       {status === "loading" && (
         <div className="stack" role="status" aria-label="Loading sync status">

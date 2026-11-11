@@ -49,9 +49,7 @@ describe("Schedules: handler rules in the editor", () => {
     expect(rulesText({ allowedIntervalMinutes: [5, 15] })).toBe(
       "It must run every 5 to 15 minutes, all day.",
     );
-    expect(rulesText({ minIntervalMinutes: 60 })).toBe(
-      "It cannot run more often than every 60 minutes.",
-    );
+    expect(rulesText({ minIntervalMinutes: 60 })).toBe("It cannot run more often than every hour.");
     expect(rulesText(undefined)).toBe("It cannot run more often than every 5 minutes.");
     expect(rulesText({ workingDaysOnly: true })).toContain("working days only");
   });
@@ -167,5 +165,34 @@ describe("Schedules: switched-off default jobs and run permissions", () => {
       screen.queryByRole("button", { name: "Run Revolut balances and transactions now" }),
     ).toBeNull();
     expect(screen.getByRole("button", { name: "Run Open job now" })).toBeTruthy();
+  });
+});
+
+describe("Schedules: Run now that needs a fresh sign-in (reviewer addition)", () => {
+  it("offers a sign-in instead of a dead-end toast", async () => {
+    mockFetch({
+      ...ME_OK(ADMIN),
+      ...list(resp([job({ stepUpToRun: true })])),
+      "POST /api/jobs/1/run": () => ({ status: 401, body: { error: "step_up_required" } }),
+    });
+    const user = userEvent.setup();
+    renderApp("/settings/schedules");
+    await user.click(
+      await screen.findByRole("button", { name: "Run Revolut balances and transactions now" }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByText(/Running Revolut balances and transactions by hand needs a/),
+    ).toBeTruthy();
+    expect(within(dialog).getByRole("button", { name: "Sign in again" })).toBeTruthy();
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("names the new run codes in words", async () => {
+    const { codeText } = await import("./pages/Schedules");
+    expect(codeText("too_late")).toBe("Started too long after its time, so it was skipped");
+    expect(codeText("lock_lost")).toBe("Lost its lock while running");
+    expect(codeText("administration_failed")).toBe("An administration did not sync today");
   });
 });

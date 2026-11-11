@@ -42,8 +42,10 @@ export const HANDLERS: Record<string, HandlerDef> = {
     phase: "Phase 6, ECB FX",
     // 16:15 plus seven retries ten minutes apart reaches 17:25.
     maxAttempts: 8,
-    // Rates exist on TARGET working days only; retries stop with the 17:30 window.
-    scheduleRules: { workingDaysOnly: true },
+    // Rates exist on TARGET working days only and are published once a day. Retries carry the
+    // 16:15 slot, so 75 minutes of lateness ends them at 17:30 (16:15 + 75 min), whatever the
+    // attempt number; an attempt that would start after 17:30 is recorded too_late.
+    scheduleRules: { workingDaysOnly: true, minIntervalMinutes: 60 },
     maxLatenessMs: 75 * MIN,
   },
   "dq.checks": {
@@ -61,6 +63,7 @@ export const HANDLERS: Record<string, HandlerDef> = {
     ...later("Phase 10, Reminders"),
     // Sends e-mail to customers: a fresh sign-in is needed to start it by hand.
     stepUp: true,
+    scheduleRules: { minIntervalMinutes: 60 },
     maxLatenessMs: 6 * HOUR,
   },
   "exact.full_sync": {
@@ -89,11 +92,16 @@ export const HANDLERS: Record<string, HandlerDef> = {
     description: "Revalues open foreign-currency items at the month-end ECB rate as a draft.",
     usesExact: true,
     ...later("Phase 12, Monthly FX revaluation"),
-    // Creates a journal in Exact: only admins, with a fresh sign-in. A late run is still the same
-    // month (the period comes from the slot), so the limit is generous.
+    // Creates a journal in Exact: only admins, with a fresh sign-in. No lateness limit: the month
+    // to revalue comes from the slot (period.ts scheduledMonth), and a catch-up run claims the
+    // LATEST missed month-end (core dueSlot), so a run that starts days late (an outage over the
+    // month-end) still books the month that just ended, as a draft, once (idempotency key per
+    // month). A limit would silently skip that month until the next month-end.
     runRoles: ["admin"],
     stepUp: true,
-    maxLatenessMs: 12 * HOUR,
+    // A monthly job: never more often than every 12 hours (a whole day cannot be the minimum: the
+    // spring daylight saving day is 23 hours, so a daily cron would be refused).
+    scheduleRules: { minIntervalMinutes: 12 * 60 },
   },
 };
 

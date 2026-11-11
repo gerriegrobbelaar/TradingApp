@@ -34,7 +34,7 @@ import {
   type SubrequestMeter,
   type SyncMode,
 } from "../exact/sync";
-import { HEARTBEAT_MS, runnerOverhead } from "./overhead";
+import { runnerOverhead } from "./overhead";
 import type { HandlerResult, JobContext } from "./types";
 
 /** Exact calls per run and administration (the defaults of the two jobs). */
@@ -85,9 +85,10 @@ export async function runExactSync(
   const clock = deps.now ?? ctx.now;
   const nowMs = clock();
   const deadlineMs = Math.min(ctx.deadlineMs, clock() + SYNC_MAX_MS);
-  // Pre-charge what the runner spends around us (heartbeats until the deadline plus a grace beat,
-  // the finish batch, the lock release, endJob) so the meter reflects the whole invocation.
-  meter.used += 2 + runnerOverhead(deadlineMs - nowMs + HEARTBEAT_MS);
+  // Pre-charge what the runner spends in this invocation (load, claim and lock before us, the
+  // heartbeats until our deadline, release, finish and retry enqueue after us) plus our own two
+  // reads below, so the meter reflects the whole invocation (review S7). Counted once.
+  meter.used += 2 + runnerOverhead(deadlineMs - nowMs);
 
   const conn = await env.DB.prepare(
     "SELECT id, status, last_error FROM connections WHERE kind = 'exact' ORDER BY id LIMIT 1",

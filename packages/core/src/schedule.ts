@@ -300,9 +300,13 @@ export function nextRun(s: Schedule, afterMs: number): number | null {
  * The schedule slot a job is due for, or null if it is not due. This is the ONE rule behind both
  * "is it due" (`isDue`) and "which slot do I claim" (the scheduler tick), so they cannot diverge.
  *
- * The slot is the first fire after the reference (lastRunMs ?? createdMs) and is due when it is at
- * or before nowMs. Catches up at most one missed run: the caller runs once and records
- * lastRunMs = now, so a long outage never replays every missed fire.
+ * Due when a fire exists in (reference, nowMs], reference = lastRunMs ?? createdMs. The slot is the
+ * LATEST such fire, not the first: after an outage the one catch-up run is the most recent missed
+ * slot, so a handler's lateness limit (maxLatenessMs) and the period it derives from the slot refer
+ * to the newest missed slot (J1 review; before, a long outage made the catch-up run of the OLDEST
+ * slot, which was then skipped as too late while a fresh slot existed). Catches up at most one
+ * missed run: the caller runs once and records lastRunMs = now, so a long outage never replays
+ * every missed fire.
  *
  * Clock going backwards: if the reference is up to one day in the future, the job waits for the
  * first fire after the reference, so a job that already ran never runs twice for the same slot. A
@@ -319,8 +323,32 @@ export function dueSlot(
   if (!Number.isFinite(nowMs)) return null;
   const ref = lastRunMs ?? createdMs;
   const base = Number.isFinite(ref) && ref - nowMs > DAY_MS ? nowMs - MIN_MS : ref;
-  const next = nextRun(s, base);
-  return next !== null && next <= nowMs ? next : null;
+  const first = nextRun(s, base);
+  if (first === null || first > nowMs) return null;
+  return latestFire(s, first, nowMs);
+}
+
+/** Search windows (back from now) for the latest missed fire; the last one reaches `first`. */
+const LATEST_WINDOWS_MS = [HOUR_MS, DAY_MS, 8 * DAY_MS, 32 * DAY_MS, 367 * DAY_MS, Infinity];
+/** Upper bound on nextRun steps inside one window (a day of every-minute fires is 1,500). */
+const LATEST_MAX_STEPS = 2000;
+
+/** The latest fire in [first, nowMs], given that `first` is a fire at or before nowMs. */
+function latestFire(s: Schedule, first: number, nowMs: number): number {
+  const after = nextRun(s, first);
+  if (after === null || after > nowMs) return first; // the usual case: nothing was missed
+  for (const w of LATEST_WINDOWS_MS) {
+    // Never look before `first`: fires before it are already done.
+    let f = nextRun(s, Math.max(first - 1, nowMs - w));
+    if (f === null || f > nowMs) continue;
+    for (let i = 0; i < LATEST_MAX_STEPS; i++) {
+      const n = nextRun(s, f);
+      if (n === null || n > nowMs) return f;
+      f = n;
+    }
+    return f;
+  }
+  return first;
 }
 
 /** True if a fire time exists in (lastRunMs ?? createdMs, nowMs]. See `dueSlot`. */
@@ -336,7 +364,7 @@ export function isDue(
 // ---------------------------------------------------------------------------------------------
 // Analysis (used to bound what an admin may configure)
 
-/** What the real fire times of a schedule look like over about 13 months from 2026-01-01. */
+/** What the real fire times of a schedule look like over four years and a bit from 2026-01-01. */
 export interface ScheduleAnalysis {
   /** Most fires on one Amsterdam calendar day (the 25-hour autumn day counts as it really is). */
   maxFiresPerDay: number;
@@ -347,42 +375,77 @@ export interface ScheduleAnalysis {
 }
 
 const ANALYSIS_START = "2026-01-01";
-const ANALYSIS_DAYS = 400;
+/**
+ * 2026-01-01 to early 2030: four spring and four autumn changes, a leap day (29 February 2028)
+ * and four Easters, so a cron that fires only on 29 February or around Easter is still seen.
+ */
+export const ANALYSIS_DAYS = 4 * 365 + 1 + 40;
 
 /**
  * Counts the schedule's real fire instants (same engine as nextRun, including daylight saving and
- * TARGET working days) over 400 days from 2026-01-01, which contains one spring and one autumn
- * change. Returns null for an invalid or never-firing schedule.
+ * TARGET working days) over ANALYSIS_DAYS from 2026-01-01. Days without a daylight saving change
+ * reuse one precomputed pattern (same instants as dayInstants, which a test checks), so even an
+ * every-minute cron is analysed in a few milliseconds. Returns null for an invalid or never-firing
+ * schedule.
  */
 export function analyseSchedule(s: Schedule): ScheduleAnalysis | null {
   let maxFiresPerDay = 0;
   let minGap = Infinity;
   let maxGap = 0;
   let prev: number | null = null;
+  const gapTo = (t: number): void => {
+    if (prev !== null) {
+      const gap = t - prev;
+      if (gap < minGap) minGap = gap;
+      if (gap > maxGap) maxGap = gap;
+    }
+  };
   const take = (instants: readonly number[]): void => {
     maxFiresPerDay = Math.max(maxFiresPerDay, instants.length);
     for (const t of instants) {
-      if (prev !== null) {
-        const gap = t - prev;
-        minGap = Math.min(minGap, gap);
-        maxGap = Math.max(maxGap, gap);
-      }
+      gapTo(t);
       prev = t;
     }
   };
   if (s.kind === "cron") {
     const p = parseCron(s.expr);
     if (typeof p === "string") return null;
+    // Wall minutes of an ordinary day, sorted, with their internal gaps.
+    const wall = [...new Set(p.hours.flatMap((h) => p.minutes.map((m) => h * 60 + m)))].sort(
+      (a, b) => a - b,
+    );
+    let innerMin = Infinity;
+    let innerMax = 0;
+    for (let i = 1; i < wall.length; i++) {
+      const g = ((wall[i] as number) - (wall[i - 1] as number)) * MIN_MS;
+      innerMin = Math.min(innerMin, g);
+      innerMax = Math.max(innerMax, g);
+    }
+    const firstWall = wall[0] as number;
+    const lastWall = wall[wall.length - 1] as number;
     for (let i = 0; i < ANALYSIS_DAYS; i++) {
       const date = addDaysIso(ANALYSIS_START, i);
-      if (dayMatches(p, date, s.workingDaysOnly === true)) {
-        take(dayInstants(date, p.hours, p.minutes));
+      if (!dayMatches(p, date, s.workingDaysOnly === true)) continue;
+      const [y, mo, d] = date.split("-").map(Number) as [number, number, number];
+      const base = Date.UTC(y, mo - 1, d);
+      const o1 = offsetMin(base);
+      if (o1 !== offsetMin(base + 12 * HOUR_MS)) {
+        take(dayInstants(date, p.hours, p.minutes)); // a daylight saving day: the exact engine
+        continue;
       }
+      const shift = base - o1 * MIN_MS;
+      maxFiresPerDay = Math.max(maxFiresPerDay, wall.length);
+      gapTo(shift + firstWall * MIN_MS);
+      if (wall.length > 1) {
+        minGap = Math.min(minGap, innerMin);
+        maxGap = Math.max(maxGap, innerMax);
+      }
+      prev = shift + lastWall * MIN_MS;
     }
   } else {
     let t = Date.UTC(2026, 0, 1) - 1;
-    const end = Date.UTC(2027, 1, 5);
-    for (let i = 0; i < 20; i++) {
+    const end = Date.UTC(2026, 0, 1) + ANALYSIS_DAYS * DAY_MS;
+    for (let i = 0; i < 60; i++) {
       const n = nextRun(s, t);
       if (n === null || n > end) break;
       take([n]);

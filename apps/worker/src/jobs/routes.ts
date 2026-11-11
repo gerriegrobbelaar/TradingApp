@@ -11,9 +11,16 @@
  *                               time zone is always Europe/Amsterdam. The change and its audit row
  *                               are one batch (ADR 0013), guarded by the job's `rev`: the one the
  *                               client sends (409 conflict when stale) and the one read here.
- *                               A bad schedule is 400 `schedule_invalid` with a `message`.
- *  POST  /api/jobs/:id/run      admin or finance: "Run now". 202 with the run id; 409 while the job
- *                               is queued or running, 429 within 30 s of the last manual run, 409
+ *                               A bad schedule is 400 `schedule_invalid` with a `message`; one
+ *                               outside the handler's scheduleRules (also checked when a job is
+ *                               switched on) is 400 `schedule_not_allowed`; a change that would
+ *                               raise the switched-on Exact jobs above 3,000 projected calls per
+ *                               administration and day is 400 `budget_cap_exceeded`.
+ *  POST  /api/jobs/:id/run      the roles in the handler's runRoles (default admin and finance;
+ *                               403 forbidden otherwise), plus a fresh sign-in when the handler
+ *                               says stepUp (401 step_up_required): "Run now". 202 with the run
+ *                               id; 409 while the job is queued or running, 429 within 30 s of
+ *                               the last manual run, 409
  *                               not_implemented for a job whose phase is not built, 503 when the
  *                               queue is not configured. It enqueues like a scheduled run, so the
  *                               lock and the Exact budget apply unchanged.
@@ -237,32 +244,48 @@ async function patchJob(ctx: Ctx): Promise<Response> {
     budget = b;
   }
 
+  // Switching a job on with a schedule stored before these rules existed (or edited directly in
+  // D1) is checked like a new schedule: enabling must not bypass the per-handler limits.
+  if (!scheduleChanged && enabled && job.enabled !== 1) {
+    const refused = checkScheduleRules(schedule, def?.scheduleRules);
+    if (refused !== null) return json({ error: "schedule_not_allowed", message: refused }, 400);
+  }
+
   // The Exact jobs together must stay inside the daily budget: fires per Amsterdam day (the 25-hour
-  // autumn day counts) x calls per run x attempts, summed over the enabled Exact jobs.
+  // autumn day counts) x calls per run x attempts, summed over the enabled Exact jobs. Checked on
+  // every change that leaves this Exact job on (switching it on, a new budget, a new schedule). A
+  // change that lowers the load is always allowed, so an installation that is over the cap (for
+  // example from before the cap existed) can be brought down step by step.
   if (def?.usesExact === true && enabled) {
     const all = await ctx.env.DB.prepare("SELECT * FROM jobs ORDER BY id").all<JobRow>();
-    const loads: ExactJobLoad[] = [];
-    for (const other of all.results) {
-      const od = handlerFor(other.handler);
-      if (od?.usesExact !== true) continue;
-      const mine = other.id === job.id;
-      if (!mine && other.enabled !== 1) continue;
-      const sch = mine ? schedule : parseSchedule(other.schedule_json);
-      if (sch === null) continue;
-      loads.push({
-        schedule: sch,
-        budget: mine ? budget : other.exact_budget,
-        maxAttempts: od.maxAttempts,
-      });
-    }
-    const projected = projectedExactCalls(loads);
-    if (projected > MAX_PROJECTED_EXACT_CALLS_PER_DAY) {
+    const loads = (withChange: boolean): ExactJobLoad[] => {
+      const out: ExactJobLoad[] = [];
+      for (const other of all.results) {
+        const od = handlerFor(other.handler);
+        if (od?.usesExact !== true) continue;
+        const mine = other.id === job.id && withChange;
+        if (!mine && other.enabled !== 1) continue;
+        const sch = mine ? schedule : parseSchedule(other.schedule_json);
+        if (sch === null) continue;
+        out.push({
+          schedule: sch,
+          budget: mine ? budget : other.exact_budget,
+          maxAttempts: od.maxAttempts,
+        });
+      }
+      return out;
+    };
+    const projected = projectedExactCalls(loads(true));
+    if (
+      projected > MAX_PROJECTED_EXACT_CALLS_PER_DAY &&
+      projected > projectedExactCalls(loads(false))
+    ) {
       return json(
         {
           error: "budget_cap_exceeded",
           projected,
           max: MAX_PROJECTED_EXACT_CALLS_PER_DAY,
-          message: `The enabled Exact jobs would use up to ${projected.toLocaleString("en-US")} calls per administration per day. The most allowed is ${MAX_PROJECTED_EXACT_CALLS_PER_DAY.toLocaleString("en-US")}.`,
+          message: `The switched-on Exact jobs would use up to ${projected.toLocaleString("en-US")} calls per administration per day. The most allowed is ${MAX_PROJECTED_EXACT_CALLS_PER_DAY.toLocaleString("en-US")}.`,
         },
         400,
       );

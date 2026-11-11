@@ -11,10 +11,12 @@ import {
 } from "@camelthorn/ui";
 import {
   ApiError,
+  StepUpRequired,
   listJobRuns,
   listJobs,
   patchJob,
   runJobNow,
+  stepUp,
   type JobRunStatus,
   type JobRunView,
   type JobView,
@@ -61,6 +63,9 @@ const CODE_TEXT: Record<string, string> = {
   budget_exhausted: "Used its Exact call budget",
   time_limit: "Ran out of time",
   transient: "Exact was busy or did not answer",
+  too_late: "Started too long after its time, so it was skipped",
+  lock_lost: "Lost its lock while running",
+  administration_failed: "An administration did not sync today",
 };
 
 export const codeText = (code: string | null): string | null =>
@@ -150,7 +155,11 @@ function failureText(e: unknown, title: string): string {
   return "Could not reach the server. Try again.";
 }
 
-type Dialog = null | { kind: "history"; job: JobView } | { kind: "edit"; job: JobView };
+type Dialog =
+  | null
+  | { kind: "history"; job: JobView }
+  | { kind: "edit"; job: JobView }
+  | { kind: "stepup"; job: JobView };
 
 export function Schedules() {
   const me = useSignedIn();
@@ -215,6 +224,11 @@ export function Schedules() {
       setNow(Date.now());
       toast.show(`Started ${job.title}.`);
     } catch (e) {
+      if (e instanceof StepUpRequired) {
+        // This job needs a Google sign-in from the last 15 minutes: offer it, never redirect unasked.
+        setDialog({ kind: "stepup", job });
+        return;
+      }
       if (e instanceof ApiError && e.code === "cooldown" && e.retryAfterSeconds !== undefined) {
         const wait = e.retryAfterSeconds;
         setUntil((u) => ({ ...u, [job.id]: Date.now() + wait * 1000 }));
@@ -430,6 +444,23 @@ export function Schedules() {
           </div>
         )}
       </Card>
+
+      <Sheet
+        open={dialog?.kind === "stepup"}
+        title="Confirm it's you"
+        onClose={() => setDialog(null)}
+      >
+        <p className="lede">
+          {dialog?.kind === "stepup" ? `Running ${dialog.job.title} by hand` : "This"} needs a
+          Google sign-in from the last 15 minutes. Sign in again, then run it again.
+        </p>
+        <div className="chips">
+          <Button variant="primary" onClick={() => stepUp()}>
+            Sign in again
+          </Button>
+          <Button onClick={() => setDialog(null)}>Cancel</Button>
+        </div>
+      </Sheet>
 
       {dialog?.kind === "history" && (
         <History job={dialog.job} now={now} onClose={() => setDialog(null)} />

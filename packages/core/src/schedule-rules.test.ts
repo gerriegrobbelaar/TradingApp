@@ -18,7 +18,8 @@ describe("dueSlot", () => {
   it("returns the slot that isDue is true for, and null otherwise", () => {
     expect(dueSlot(s, null, t("2026-11-02T07:59:59Z"), created)).toBeNull();
     expect(dueSlot(s, null, t("2026-11-02T08:00:00Z"), created)).toBe(t("2026-11-02T08:00:00Z"));
-    expect(dueSlot(s, null, t("2026-11-11T12:00:00Z"), created)).toBe(t("2026-11-02T08:00:00Z"));
+    // After missed days the catch-up slot is the LATEST missed fire, not the oldest.
+    expect(dueSlot(s, null, t("2026-11-11T12:00:00Z"), created)).toBe(t("2026-11-11T08:00:00Z"));
   });
   it("isDue and dueSlot agree for every minute of a day and several baselines", () => {
     for (const last of [null, t("2026-11-10T08:00:00Z"), t("2026-11-11T07:00:00Z")]) {
@@ -73,11 +74,11 @@ describe("analyseSchedule", () => {
     expect(analyseSchedule(cron("bad"))).toBeNull();
     expect(analyseSchedule(cron("0 0 25 12 *", true))).toBeNull();
   });
-  it("a single fire has no gaps", () => {
+  it("a yearly cron has gaps of a year (365 or 366 days)", () => {
     expect(analyseSchedule(cron("0 9 1 6 *"))).toEqual({
       maxFiresPerDay: 1,
-      minGapMinutes: null,
-      maxGapMinutes: null,
+      minGapMinutes: 365 * 24 * 60,
+      maxGapMinutes: 366 * 24 * 60,
     });
   });
   it("sees gaps across midnight", () => {

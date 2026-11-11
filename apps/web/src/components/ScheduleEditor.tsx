@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import {
-  GLOBAL_MIN_INTERVAL_MINUTES,
   checkScheduleRules,
+  describeScheduleRules,
   nextRun,
   validateSchedule,
   type Schedule,
@@ -106,19 +106,8 @@ export interface EditorValue {
   exactBudget: number;
 }
 
-/** One sentence on what this job allows, shown under the schedule choice. */
-export function rulesText(rules: ScheduleRules | undefined): string {
-  const min = Math.max(rules?.minIntervalMinutes ?? 0, GLOBAL_MIN_INTERVAL_MINUTES);
-  const parts: string[] = [];
-  if (rules?.allowedIntervalMinutes) {
-    const [lo, hi] = rules.allowedIntervalMinutes;
-    parts.push(`It must run every ${lo} to ${hi} minutes, all day.`);
-  } else {
-    parts.push(`It cannot run more often than every ${min} minutes.`);
-  }
-  if (rules?.workingDaysOnly) parts.push("It runs on working days only.");
-  return parts.join(" ");
-}
+/** One sentence on what this job allows, shown under the schedule choice (same text as core). */
+export const rulesText = (rules: ScheduleRules | undefined): string => describeScheduleRules(rules);
 
 export function ScheduleEditor({
   initial,
@@ -182,6 +171,8 @@ export function ScheduleEditor({
         <select
           className="input"
           value={draft.kind}
+          aria-describedby="rules-help"
+          aria-invalid={rulesError !== null}
           onChange={(e) => set({ kind: e.target.value as PresetKind })}
         >
           {PRESETS.map((p) => (
@@ -213,8 +204,8 @@ export function ScheduleEditor({
               spellCheck={false}
               autoComplete="off"
               value={draft.expr}
-              aria-invalid={scheduleError !== null}
-              aria-describedby="cron-help"
+              aria-invalid={scheduleError !== null || rulesError !== null}
+              aria-describedby="cron-help rules-help"
               onChange={(e) => set({ expr: e.target.value })}
             />
           </label>

@@ -13,14 +13,14 @@ import {
 } from "../src/jobs/exact-handlers";
 import { DEFAULT_JOBS } from "../src/jobs/defaults";
 import { HANDLERS } from "../src/jobs/handlers";
-import { HEARTBEAT_MS, runnerOverhead } from "../src/jobs/overhead";
+import { runnerOverhead } from "../src/jobs/overhead";
 import { callExact, divisionsOf } from "./job-helpers";
 import { FakeExact, addDivision, db, fakeGate, resetSync } from "./sync-helpers";
 
 const at = (iso: string) => Date.parse(iso);
 const NIGHT = at("2026-07-15T00:00:00Z"); // 02:00 CEST
-/** What runExactSync pre-charges for the runner (heartbeats to the 12-minute deadline, finish, release). */
-const RUNNER = runnerOverhead(12 * 60_000 + HEARTBEAT_MS);
+/** What runExactSync pre-charges for the runner (before, heartbeats to the 12-minute deadline, after). */
+const RUNNER = runnerOverhead(12 * 60_000);
 
 async function addSecondDivision(a: { connectionId: number; exactDivision: number }, name = "B") {
   const r = await db
@@ -370,6 +370,15 @@ describe("exact.full_sync / exact.incremental_sync handlers", () => {
         { meter },
       );
       expect(meter.used).toBeGreaterThanOrEqual(RUNNER + 2);
+    });
+
+    it("pre-charges exactly once: before, 25 beats over the 12-minute window, after, own reads", async () => {
+      const meter = newMeter();
+      const r = await callExact("full", NIGHT, {}, { meter }); // no connection: nothing else spent
+      expect(r.code).toBe("no_connection");
+      // 3 before + (24 + 1) beats x 2 + 3 after = 56, plus the handler's two reads.
+      expect(RUNNER).toBe(56);
+      expect(meter.used).toBe(58);
     });
 
     it("stops retrying after too many transient failures today (the per-day counter)", async () => {

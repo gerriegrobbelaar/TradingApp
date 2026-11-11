@@ -446,19 +446,6 @@ export async function executeRun(
     });
   }
 
-  // Too late to be useful (handler.maxLatenessMs): scheduled and retry runs only. The next slot
-  // proceeds as normal; a manual run is a person asking now and is never too late.
-  if (def.maxLatenessMs !== undefined && row.trigger !== "manual") {
-    const late = latenessMs({ run: { scheduledFor: row.scheduled_for } }, startMs);
-    if (late > def.maxLatenessMs) {
-      return finish({
-        status: "skipped",
-        code: "too_late",
-        summary: { lateMinutes: Math.floor(late / 60_000) },
-      });
-    }
-  }
-
   const lock = lockFor(env, row.job_name);
   const ttl = deps.lockTtlMs ?? LOCK_TTL_MS;
   /** Gives the row back exactly as it was before our claim (queued, or the previous executor's). */
@@ -499,6 +486,23 @@ export async function executeRun(
       code: "already_running",
       summary: {},
     });
+  }
+
+  // Too late to be useful (handler.maxLatenessMs): scheduled and retry runs only, measured from
+  // the slot (a retry keeps its slot's scheduled_for, so retries stop at slot + limit). The next
+  // slot proceeds as normal; a manual run is a person asking now and is never too late. Checked
+  // only once we hold the lease: a takeover of a run whose executor is still alive was handed
+  // back above, so a live run is never recorded too_late while it is working.
+  if (def.maxLatenessMs !== undefined && row.trigger !== "manual") {
+    const late = latenessMs({ run: { scheduledFor: row.scheduled_for } }, startMs);
+    if (late > def.maxLatenessMs) {
+      await lock.release(token).catch(() => undefined);
+      return finish({
+        status: "skipped",
+        code: "too_late",
+        summary: { lateMinutes: Math.floor(late / 60_000) },
+      });
+    }
   }
 
   const ac = new AbortController();

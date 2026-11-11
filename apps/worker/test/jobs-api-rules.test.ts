@@ -57,6 +57,8 @@ beforeEach(async () => {
   for (const [key, email] of [
     ["admin", "gerrie.grobbelaar@camelthorncapital.com"],
     ["finance", "fin@camelthorncapital.com"],
+    ["viewer", "view@camelthorncapital.com"],
+    ["approver", "appr@camelthorncapital.com"],
   ] as const) {
     tokens[key] = await addSession(await addUser(email, [key]));
   }
@@ -126,6 +128,80 @@ describe("handler contract: who may run a job", () => {
       expect((await run("admin", id)).status).toBe(202); // signed in just now
     } finally {
       HANDLERS["exact.full_sync"] = orig;
+    }
+  });
+});
+
+describe("Run now refusals (reviewer additions)", () => {
+  it("viewers and approvers get 403 on every job, and nothing is queued or audited", async () => {
+    const before = (await auditRows("job.run_now")).length;
+    for (const role of ["viewer", "approver"]) {
+      for (const name of ["exact.full_sync", "exact.incremental_sync", "fx.revaluation"]) {
+        const res = await run(role, await jobId(name));
+        expect(res.status, `${role} ${name}`).toBe(403);
+        expect(((await res.json()) as { error: string }).error).toBe("forbidden");
+      }
+    }
+    expect(q.sent).toEqual([]);
+    expect((await auditRows("job.run_now")).length).toBe(before);
+  });
+
+  it("finance cannot run the admin-only revaluation; an admin is told what is missing", async () => {
+    const id = await jobId("fx.revaluation");
+    expect((await run("finance", id)).status).toBe(403);
+    // Admin with a fresh sign-in passes the role and step-up checks and meets not_implemented.
+    const res = await run("admin", id);
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe("not_implemented");
+  });
+
+  it("an accepted Run now is audited with the actor", async () => {
+    const before = (await auditRows("job.run_now")).length;
+    expect((await run("finance", await jobId("exact.incremental_sync"))).status).toBe(202);
+    const rows = await auditRows("job.run_now");
+    expect(rows.length).toBe(before + 1);
+  });
+
+  it("GET /api/jobs for a viewer carries no secrets or bank details", async () => {
+    const text = await (await send("viewer", "/api/jobs")).text();
+    expect(text).not.toMatch(/NL\d{2}[A-Z]{4}\d{6,}/);
+    expect(text).not.toMatch(/token|secret|password/i);
+  });
+});
+
+describe("schedule rules when switching a job on", () => {
+  it("a schedule stored before the rules cannot be switched on as it is", async () => {
+    const id = await jobId("dq.checks");
+    await db
+      .prepare("UPDATE jobs SET schedule_json = ?2, enabled = 0 WHERE id = ?1")
+      .bind(id, JSON.stringify(cronOf("* * * * *")))
+      .run();
+    const res = await patch("admin", id, { enabled: true });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe("schedule_not_allowed");
+    // Switching it on together with an allowed schedule works.
+    expect(
+      (await patch("admin", id, { enabled: true, schedule: cronOf("20 * * * *") })).status,
+    ).toBe(200);
+  });
+
+  it("over the cap from before, lowering the load is allowed while raising it is not", async () => {
+    await enable("exact.full_sync", "exact.incremental_sync");
+    const inc = await jobId("exact.incremental_sync");
+    await db.prepare("UPDATE jobs SET exact_budget = 200 WHERE id = ?1").bind(inc).run();
+    // 960 + 25 x 200 = 5,960 > 3,000. Lowering to 150 (4,710) is still over but lower: allowed.
+    expect((await patch("admin", inc, { exactBudget: 150 })).status).toBe(200);
+    expect((await patch("admin", inc, { exactBudget: 160 })).status).toBe(400);
+    // A schedule edit that adds fires is refused; switching it off always works.
+    expect((await patch("admin", inc, { schedule: cronOf("0,30 * * * *") })).status).toBe(400);
+    expect((await patch("admin", inc, { enabled: false })).status).toBe(200);
+  });
+
+  it("budgets cannot be set on jobs that do not use Exact", async () => {
+    for (const name of ["revolut.sync", "dq.checks", "ecb.fx_import", "reminders.send"]) {
+      const res = await patch("admin", await jobId(name), { exactBudget: 10 });
+      expect(res.status, name).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBe("budget_not_applicable");
     }
   });
 });

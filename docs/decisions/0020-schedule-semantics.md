@@ -38,7 +38,11 @@ replaced this with the rule above because it depends on one field only and needs
 
 `isDue(s, lastRunMs, nowMs, createdMs)` is true when a fire exists in
 `(lastRunMs ?? createdMs, nowMs]`. The caller runs the job once and records `lastRunMs = now`, so
-after any outage the job runs **once**, never once per missed slot. A never-run job counts from
+after any outage the job runs **once**, never once per missed slot. The slot it runs for (`dueSlot`, shared by
+`isDue` and the scheduler tick) is the **latest** missed fire, not the oldest (J1 review): a
+handler's lateness limit and the period it derives from the slot then refer to the newest missed
+slot, so an hourly job back after a 3-hour outage runs for the last hour instead of being skipped
+as too late, and a month-end job caught up days later books the month that just ended. A never-run job counts from
 `createdMs` (created at 16:20 with a 16:15 schedule: first run tomorrow).
 
 Clock going backwards: if the reference is up to one day in the future the job waits for the first
