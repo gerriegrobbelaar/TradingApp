@@ -17,8 +17,10 @@
  * code, card bill amount, the card's last four digits and the merchant are stored with the leg.
  * Once a final row is matched (a live match, or match_status other than 'unmatched') it is FROZEN
  * (review S9): the fields a match was built on are never rewritten; different data from Revolut
- * only sets `state_conflict` (and is counted) for Phase 7/8 to alert on. A refused state change
- * sets the same flag (review S7). The flag is sticky: only a person (later phases) clears it.
+ * only sets `state_conflict` (and is counted) for Phase 7/8 to alert on. A refused final -> final
+ * change (failed -> completed, ...) sets the same flag (review S7); a stale pending read of a final
+ * row is counted but not flagged (it is a lagging read, not a contradiction). The flag is sticky:
+ * only a person clears it (conflicts.ts, for Phase 7/8).
  *
  * Amounts are the leg's signed minor units and currency exactly as Revolut gives them. The
  * counterparty IBAN is stored in full (matching needs it) and never logged or returned. Ingestion
@@ -78,6 +80,8 @@ export interface IngestResult {
   skipped: number;
   /** Frozen (matched, final) legs that received different money data or a different state. */
   frozenConflicts: number;
+  /** Legs whose `state_conflict` flag this call turned on (0 -> 1); a standing flag is not counted. */
+  flagged: number;
   /** True when the transaction had legs and none of them was stored before. */
   missing: boolean;
 }
@@ -123,6 +127,7 @@ const WRITE_COLS = [
   "currency",
   "counterparty_name",
   "counterparty_iban",
+  "counterparty_iban_cached",
   "reference",
   "description",
   "booked_at",
@@ -249,6 +254,7 @@ export async function upsertTransaction(
     blocked: { regress: 0, conflict: 0, unknownIgnored: 0 },
     skipped: 0,
     frozenConflicts: 0,
+    flagged: 0,
     missing: false,
   };
   // Ids go into SQL binds only, but they are also used to build gate paths elsewhere: strict.
@@ -308,6 +314,7 @@ export async function upsertTransaction(
   let finalCounts = { updated: 0, unchanged: 0 };
   let blocked = { regress: 0, conflict: 0, unknownIgnored: 0 };
   let frozenConflicts = 0;
+  let flaggedLegs = 0;
   let settled = false;
 
   for (let pass = 0; pass < MAX_PASSES; pass++) {
@@ -317,12 +324,14 @@ export async function upsertTransaction(
 
     const statements: D1PreparedStatement[] = [];
     const changedLegs = new Map<string, boolean>();
+    const flaggedLegs0 = new Set<string>();
     // kind per statement after the account inserts: how to read its meta.changes.
     const kinds: ("account" | "insert" | "cas" | "touch" | "noop")[] = [];
     const legOf: (string | null)[] = [];
     const counts = { updated: 0, unchanged: 0 };
     blocked = { regress: 0, conflict: 0, unknownIgnored: 0 };
     frozenConflicts = 0;
+    let flagged = 0;
 
     for (const account of new Set(prepared.map((p) => p.account))) {
       const first = prepared.find((p) => p.account === account) as PreparedLeg;
@@ -356,6 +365,16 @@ export async function upsertTransaction(
         cp?.id !== undefined
           ? (cachedIbans.get(`${cpRef ?? ""}\n${cp.accountId ?? ""}`) ?? null)
           : null;
+      // Where the IBAN comes from: the leg itself (Revolut), the lookup cache, or the stored row.
+      const directIban = compactIban(cp?.iban);
+      const ibanCached: number =
+        directIban !== null
+          ? 0
+          : cached !== null
+            ? 1
+            : cur
+              ? (cur.counterparty_iban_cached as number)
+              : 0;
       const incoming: Values = {
         type: tx.type,
         request_id: tx.requestId ?? null,
@@ -365,9 +384,8 @@ export async function upsertTransaction(
         counterparty_name: cp?.name ?? tx.merchant?.name ?? null,
         // The stored IBAN is kept when this delivery has none (a lookup may have filled it).
         counterparty_iban:
-          compactIban(cp?.iban) ??
-          cached ??
-          (cur ? (cur.counterparty_iban as string | null) : null),
+          directIban ?? cached ?? (cur ? (cur.counterparty_iban as string | null) : null),
+        counterparty_iban_cached: ibanCached,
         reference: tx.reference ?? null,
         description: leg.description ?? null,
         booked_at: bookedAt,
@@ -415,17 +433,23 @@ export async function upsertTransaction(
         if (frozen) {
           for (const c of FROZEN_COLS) {
             const was = cur[c];
-            if (incoming[c] !== null && was !== null && incoming[c] !== was) conflict = true;
+            // An IBAN that only came from our own lookup cache is not Revolut contradicting itself.
+            const fromRevolut = c !== "counterparty_iban" || directIban !== null;
+            if (fromRevolut && incoming[c] !== null && was !== null && incoming[c] !== was) {
+              conflict = true;
+            }
             values[c] = was;
           }
+          values.counterparty_iban_cached = cur.counterparty_iban_cached;
           if (cur.state !== tx.state) conflict = true;
           // The booking date stays too, but a late `completed_at` alone is not a conflict.
           values.booked_at = cur.booked_at;
           if (conflict) frozenConflicts++;
         }
-        const flagged = conflict && cur.state_conflict === 0;
-        const changed = flagged || WRITE_COLS.some((c) => cur[c] !== values[c]);
+        const flags = conflict && cur.state_conflict === 0;
+        const changed = flags || WRITE_COLS.some((c) => cur[c] !== values[c]);
         changedLegs.set(leg.legId, changed);
+        if (flags) flaggedLegs0.add(leg.legId);
         statements.push(
           db
             .prepare(UPDATE_SQL)
@@ -447,9 +471,9 @@ export async function upsertTransaction(
         legOf.push(leg.legId);
         continue;
       }
-      // Not applied: note that the event was seen; a refused state change flags the row (S7).
-      const refused =
-        decision.reason === "regress_blocked" || decision.reason === "conflict_blocked";
+      // Not applied: note that the event was seen. A refused final -> final change flags the row
+      // (S7). A pending read of a final row (regress_blocked) is a lagging read: counted, not flagged.
+      const refused = decision.reason === "conflict_blocked";
       statements.push(
         db
           .prepare(
@@ -461,8 +485,10 @@ export async function upsertTransaction(
       );
       kinds.push("touch");
       legOf.push(leg.legId);
-      if (refused && cur.state_conflict === 0) counts.updated++;
-      else counts.unchanged++;
+      if (refused && cur.state_conflict === 0) {
+        counts.updated++;
+        flagged++;
+      } else counts.unchanged++;
       if (decision.reason === "regress_blocked") blocked.regress++;
       else if (decision.reason === "conflict_blocked") blocked.conflict++;
       else if (decision.reason === "unknown_ignored") blocked.unknownIgnored++;
@@ -477,8 +503,12 @@ export async function upsertTransaction(
         if (r.meta.changes === 1) insertedLegs.add(leg);
         else lost = true; // somebody inserted it meanwhile: decide again from a fresh read
       } else if (k === "cas") {
-        if (r.meta.changes !== 1) lost = true;
-        else if (!insertedLegs.has(leg)) {
+        if (r.meta.changes !== 1) {
+          lost = true;
+          return;
+        }
+        if (flaggedLegs0.has(leg)) flagged++;
+        if (!insertedLegs.has(leg)) {
           // The row is rewritten either way (last_event_at); it only counts as updated when
           // something in it really differs.
           if (changedLegs.get(leg) === true) counts.updated++;
@@ -487,6 +517,7 @@ export async function upsertTransaction(
       }
     });
     finalCounts = counts;
+    flaggedLegs = flagged;
     if (!lost) {
       settled = true;
       break;
@@ -501,6 +532,7 @@ export async function upsertTransaction(
   // A leg that was inserted in an earlier pass shows up as stored (updated or unchanged) later.
   result.blocked = blocked;
   result.frozenConflicts = frozenConflicts;
+  result.flagged = flaggedLegs;
   result.missing = insertedLegs.size === prepared.length;
   return result;
 }

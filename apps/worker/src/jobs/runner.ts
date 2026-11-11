@@ -34,7 +34,7 @@ import { auditStatement, maskDeep } from "../db/audit";
 import type { Env } from "../env";
 import { getEuObject } from "../eu-object";
 import { isTransientFailure, type SyncDeps } from "../exact/sync";
-import { processRevolutEvent, type EventDeps } from "../revolut/events";
+import { EVENT_MAX_ATTEMPTS, processRevolutEvent, type EventDeps } from "../revolut/events";
 import { handlerFor } from "./handlers";
 import { HEARTBEAT_MS } from "./overhead";
 import { latenessMs } from "./period";
@@ -760,6 +760,17 @@ export async function handleQueue(
       else msg.ack();
     } catch (e) {
       console.error("queue message failed", e instanceof Error ? e.name : "unknown");
+      // The last delivery of a Revolut event goes to the dead-letter queue next: settle the row
+      // first (best effort), so it is never left `queued` with nobody to finish it.
+      if (parsed.kind === "revolut_event" && (msg.attempts ?? 1) >= EVENT_MAX_ATTEMPTS) {
+        await env.DB.prepare(
+          `UPDATE webhook_events SET status = 'error', error_code = 'internal', processed_at = ?2
+           WHERE id = ?1 AND status = 'queued'`,
+        )
+          .bind(parsed.webhookEventId, new Date().toISOString())
+          .run()
+          .catch(() => undefined);
+      }
       msg.retry({ delaySeconds: 30 });
     }
   }

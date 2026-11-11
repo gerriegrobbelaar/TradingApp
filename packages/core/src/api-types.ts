@@ -540,6 +540,12 @@ export interface BankAccountsResponse {
      * additive: absent from older servers; 0 when nothing is waiting.
      */
     quarantined?: number;
+    /** Of `quarantined`, the rows whose retries ran out (still counted, no more calls). */
+    quarantineGaveUp?: number;
+    /** Transactions flagged `state_conflict` (Revolut contradicted a final or matched row). */
+    stateConflicts?: number;
+    /** True while the one-off 90-day initial backfill has not completed (review S1, N7). */
+    initialBackfillPending?: boolean;
   } | null;
   accounts: BankAccountDto[];
   /** Per currency, ACTIVE accounts with a known balance only; `accounts` counts those. */

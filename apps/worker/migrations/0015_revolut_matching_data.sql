@@ -12,19 +12,29 @@
 --        bill_amount_minor / bill_currency the card bill amount in the merchant's currency
 --        card_last4                        the last four digits ONLY (masked at parse time)
 --        merchant_name                     card merchant, kept apart from counterparty_name
+--      counterparty_iban_cached = 1 when counterparty_iban came from the lookup cache (c), not from
+--      the leg itself: such a value follows the cache when a refresh finds a changed IBAN (only on
+--      unmatched rows), a value Revolut sent on the leg never does.
 --      Ingest flags (review S7, S9): skipped_legs (legs of the transaction without our account id,
 --      same value on every stored leg) and state_conflict (1 = a state change was refused, or a
 --      matched final row received different money data / a reversal: Phase 7/8 alert on it).
 --  (b) revolut_quarantine: transactions of a page that could not be stored (review S2). IDs and a
---      fixed code only, never a payload. attempts is bounded by the sync (gave_up = 1).
+--      fixed code only, never a payload. attempts is bounded by the sync (gave_up = 1). Bounded:
+--      at most 1,000 rows per connection (least recently seen go first) and a gave_up row is
+--      deleted 30 days after it was last seen (quarantine.ts pruneQuarantine, ADR 0034).
 --  (c) revolut_counterparties: a bounded cache of GET /counterparty/{id} so a leg that carries only
 --      a counterparty id can still get the counterparty's IBAN (review S6, ADR 0034). The IBAN is
 --      stored in full, never returned by an API, never logged. accounts_json holds
---      [{"a": <counterparty account id>, "i": <IBAN>, "c": <currency>}] (at most 10).
+--      [{"a": <counterparty account id>, "i": <IBAN>, "c": <currency>}] (at most 10). fetched_at =
+--      last answer from Revolut (ok / not_found), checked_at = last attempt; attempts = failed
+--      attempts since the last answer. Answers are refreshed after 7 days (ADR 0034).
 --  (d) bank_accounts: bank-details lookup bookkeeping (review N4). details_status 'ok' (IBAN
 --      stored), 'no_iban' (Revolut answered and the account has none), 'error' (the lookup failed;
 --      retried after 24 hours, at most 5 attempts). Accounts looked up before this migration without
 --      an IBAN (bic = '') were 'error' or 'no_iban' at the time and are checked once more.
+--  (e) revolut_sync_state.pending_replacement (entity 'accounts'): JSON list of the account ids
+--      known before a complete accounts read that contained none of them (review N3). A second
+--      such read confirms the replacement; a read that lists one of them again clears it.
 --
 -- Additive only (no rebuild), so a populated database migrates in place.
 
@@ -41,6 +51,8 @@ ALTER TABLE bank_transactions ADD COLUMN bill_currency TEXT;
 ALTER TABLE bank_transactions ADD COLUMN card_last4 TEXT
   CHECK (card_last4 IS NULL OR (length(card_last4) = 4 AND card_last4 NOT GLOB '*[^0-9]*'));
 ALTER TABLE bank_transactions ADD COLUMN merchant_name TEXT;
+ALTER TABLE bank_transactions ADD COLUMN counterparty_iban_cached INTEGER NOT NULL DEFAULT 0
+  CHECK (counterparty_iban_cached IN (0, 1));
 ALTER TABLE bank_transactions ADD COLUMN skipped_legs INTEGER NOT NULL DEFAULT 0
   CHECK (skipped_legs >= 0);
 ALTER TABLE bank_transactions ADD COLUMN state_conflict INTEGER NOT NULL DEFAULT 0
@@ -80,11 +92,13 @@ CREATE TABLE revolut_counterparties (
   iban             TEXT,
   type             TEXT,
   accounts_json    TEXT,
-  attempts         INTEGER NOT NULL DEFAULT 1,
+  attempts         INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
   fetched_at       TEXT NOT NULL,
+  checked_at       TEXT NOT NULL,
   UNIQUE (connection_id, counterparty_ref)
 );
 CREATE INDEX idx_revolut_cp_fetched ON revolut_counterparties (connection_id, fetched_at);
+CREATE INDEX idx_revolut_quarantine_seen ON revolut_quarantine (connection_id, last_seen_at);
 
 -- (d) -------------------------------------------------------------------------------------------
 ALTER TABLE bank_accounts ADD COLUMN details_status TEXT
@@ -98,3 +112,6 @@ UPDATE bank_accounts SET details_status = 'ok', details_attempts = 1
 UPDATE bank_accounts SET details_status = 'error', details_attempts = 1,
                          details_checked_at = COALESCE(updated_at, created_at)
   WHERE iban IS NULL AND bic = '';
+
+-- (e) -------------------------------------------------------------------------------------------
+ALTER TABLE revolut_sync_state ADD COLUMN pending_replacement TEXT;

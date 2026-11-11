@@ -240,9 +240,11 @@ describe("compare-and-swap under interleaving (webhook consumer vs poll)", () =>
     expect(rows[0]?.["updated_at"]).toBe("2026-07-10T08:00:09.000Z");
     // A lost the swap, read again, and its pending is now a refused regression.
     expect(r.blocked.regress).toBe(1);
-    // The refusal flags the row for Phase 7/8 (review S7): that is the one change.
-    expect(r.updated).toBe(1);
-    expect(rows[0]?.["state_conflict"]).toBe(1);
+    // A pending read that lost a race to the completion is ordinary ordering, not a contradiction:
+    // counted, but the row is NOT flagged (only a refused final -> final change is, review S7).
+    expect(r.updated).toBe(0);
+    expect(r.flagged).toBe(0);
+    expect(rows[0]?.["state_conflict"]).toBe(0);
   });
 
   it("two first sightings racing: one insert wins, the other decides again from the stored row", async () => {

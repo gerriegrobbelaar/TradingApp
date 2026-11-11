@@ -30,6 +30,12 @@ describe("migration 0015 on a populated database", () => {
          VALUES (1, 7, 1, 'tx-1', 'l-1', 'completed', 12345, 'EUR', '2026-01-02T10:00:00.000Z',
                  '2026-01-02T10:00:00.000Z', 'matched')`,
       ),
+      mdb.prepare(
+        `INSERT INTO revolut_sync_state (connection_id, entity, cursor, window_from, window_days,
+           walk_started_at, requested_days, initial)
+         VALUES (7, 'backfill', '{"toIso":"2026-01-05T00:00:00.000Z","seen":[]}',
+                 '2025-10-01T00:00:00.000Z', 90, '2026-01-05T00:00:00.000Z', 90, 1)`,
+      ),
     ]);
 
     await applyD1Migrations(mdb, all);
@@ -99,13 +105,53 @@ describe("migration 0015 on a populated database", () => {
     const cp = (ref: string, status: string) =>
       mdb
         .prepare(
-          `INSERT INTO revolut_counterparties (connection_id, counterparty_ref, status, fetched_at)
-           VALUES (7, ?1, ?2, '2026-01-01T00:00:00.000Z')`,
+          `INSERT INTO revolut_counterparties (connection_id, counterparty_ref, status, fetched_at, checked_at)
+           VALUES (7, ?1, ?2, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`,
         )
         .bind(ref, status)
         .run();
     await cp("cp-1", "ok");
     await expect(cp("cp-1", "ok")).rejects.toThrow();
     await expect(cp("cp-2", "weird")).rejects.toThrow();
+    await bad("UPDATE revolut_counterparties SET attempts = -1");
+
+    // The IBAN source flag defaults to 0 (a stored IBAN came from Revolut) and is 0/1 only.
+    expect(
+      await mdb
+        .prepare("SELECT counterparty_iban_cached AS c FROM bank_transactions WHERE id = 1")
+        .first(),
+    ).toEqual({ c: 0 });
+    await bad("UPDATE bank_transactions SET counterparty_iban_cached = 2 WHERE id = 1");
+
+    // A sync state row stored before the migration keeps its walk and has no pending replacement.
+    expect(
+      await mdb
+        .prepare(
+          "SELECT cursor, window_from, requested_days, pending_replacement FROM revolut_sync_state WHERE connection_id = 7 AND entity = 'backfill'",
+        )
+        .first(),
+    ).toEqual({
+      cursor: '{"toIso":"2026-01-05T00:00:00.000Z","seen":[]}',
+      window_from: "2025-10-01T00:00:00.000Z",
+      requested_days: 90,
+      pending_replacement: null,
+    });
+
+    // The new indexes exist (the conflict list and the quarantine prune use them).
+    const indexes = (
+      await mdb
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%' ORDER BY name",
+        )
+        .all<{ name: string }>()
+    ).results.map((r) => r.name);
+    for (const name of [
+      "idx_bank_tx_conflict",
+      "idx_bank_tx_cp_ref",
+      "idx_revolut_cp_fetched",
+      "idx_revolut_quarantine_seen",
+    ]) {
+      expect(indexes).toContain(name);
+    }
   });
 });

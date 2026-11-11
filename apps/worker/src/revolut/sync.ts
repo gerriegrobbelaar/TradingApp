@@ -47,6 +47,7 @@ import { queueInitialBackfill } from "./initial-backfill";
 import { startJobClient } from "./job-client";
 import {
   clearQuarantine,
+  pruneQuarantine,
   QUARANTINE_RETRIES_PER_RUN,
   quarantineCounts,
   recordQuarantine,
@@ -104,6 +105,7 @@ interface StateRow {
   rows_missing: number;
   last_status: string | null;
   last_error: string | null;
+  pending_replacement: string | null;
 }
 
 async function loadState(db: D1Database, connectionId: number, entity: Entity): Promise<StateRow> {
@@ -116,7 +118,7 @@ async function loadState(db: D1Database, connectionId: number, entity: Entity): 
   const row = await db
     .prepare(
       `SELECT cursor, watermark, window_from, window_days, walk_started_at, requested_days, initial,
-              rows_seen, rows_missing, last_status, last_error
+              rows_seen, rows_missing, last_status, last_error, pending_replacement
        FROM revolut_sync_state WHERE connection_id = ?1 AND entity = ?2`,
     )
     .bind(connectionId, entity)
@@ -141,6 +143,7 @@ const STATE_COLUMNS = new Set([
   "rows_missing",
   "last_missing",
   "calls_used",
+  "pending_replacement",
 ]);
 
 async function saveState(
@@ -159,6 +162,40 @@ async function saveState(
     )
     .bind(connectionId, entity, ...keys.map((k) => patch[k] ?? null))
     .run();
+}
+
+/** The walk a run works on: its window and start, as stored when the walk began. */
+interface WalkIdent {
+  from: string;
+  startedAt: string | null;
+}
+
+/**
+ * Saves walk progress ONLY while the stored walk is still the one this run works on (same window
+ * and start). Another writer (a reset after an account replacement, review N3) may have forgotten
+ * the walk meanwhile: then nothing is written, so a finishing old walk can neither resurrect its
+ * cursor nor consume a new 90-day request. False when the walk is no longer ours.
+ */
+async function saveWalk(
+  db: D1Database,
+  connectionId: number,
+  entity: "transactions" | "backfill",
+  ident: WalkIdent,
+  patch: Record<string, string | number | null>,
+): Promise<boolean> {
+  const keys = Object.keys(patch);
+  for (const k of keys) if (!STATE_COLUMNS.has(k)) throw new Error("unknown state column");
+  if (keys.length === 0) return true;
+  const n = keys.length;
+  const r = await db
+    .prepare(
+      `UPDATE revolut_sync_state SET ${keys.map((k, i) => `${k} = ?${i + 3}`).join(", ")}
+       WHERE connection_id = ?1 AND entity = ?2
+         AND window_from IS ?${n + 3} AND walk_started_at IS ?${n + 4}`,
+    )
+    .bind(connectionId, entity, ...keys.map((k) => patch[k] ?? null), ident.from, ident.startedAt)
+    .run();
+  return r.meta.changes === 1;
 }
 
 /** The one-off backfill asked for at confirmation: picked up by the next backfill run. */
@@ -210,6 +247,8 @@ interface Counts {
   quarantinedIds: Set<string>;
   /** Matched final rows that received different data or a different state, review S9. */
   frozenConflicts: number;
+  /** Rows whose state_conflict flag this run turned on (S7, S9). */
+  conflictsFlagged: number;
 }
 const zero = (): Counts => ({
   seen: 0,
@@ -221,6 +260,7 @@ const zero = (): Counts => ({
   quarantined: 0,
   quarantinedIds: new Set(),
   frozenConflicts: 0,
+  conflictsFlagged: 0,
 });
 
 /** Counts rows that could not be stored; a known id counts once per run, however often it is met. */
@@ -234,8 +274,13 @@ function noteQuarantined(into: Counts, items: QuarantineItem[]): void {
   }
 }
 
-/** The code of a run that finished its walk but met data it could not fully use, or null. */
+/**
+ * The code of a run that finished its walk but met data it could not fully use, or null. A newly
+ * flagged state conflict comes first: it concerns money that may be booked (the flag stays on the
+ * row; the next run is ok again unless something new happens).
+ */
 function dataQualityCode(c: Counts): string | null {
+  if (c.conflictsFlagged > 0) return "state_conflict";
   if (c.quarantined > 0) return "rows_quarantined";
   if (c.skippedLegs > 0) return "legs_skipped";
   return null;
@@ -252,6 +297,7 @@ function addResult(into: Counts, tx: RevolutTransaction, r: IngestResult, nowMs:
   into.blocked += r.blocked.regress + r.blocked.conflict;
   into.skippedLegs += r.skipped;
   into.frozenConflicts += r.frozenConflicts;
+  into.conflictsFlagged += r.flagged;
 }
 
 /**
@@ -298,18 +344,22 @@ interface WalkOptions {
   deadlineMs: number;
   now: () => number;
   counts: Counts;
-  /** Called after each page has been ingested and its cursor saved. */
-  onPage?: () => Promise<void>;
+  ident: WalkIdent;
+  /** More progress to save with each page's cursor (one statement, so they never disagree). */
+  pagePatch?: () => Record<string, string | number | null>;
 }
+
+/** How a walk ended: complete, stopped (resumable), or superseded (another writer reset it). */
+type WalkEnd = "complete" | "stopped" | "superseded";
 
 /**
  * Walks /transactions newest first from the persisted cursor, ingesting each page and saving the
- * cursor after it (so a crash or a stop resumes there). True when the walk reached its end.
+ * cursor after it (so a crash or a stop resumes there).
  */
-async function walk(w: WalkOptions, startCursor: TransactionCursor | null): Promise<boolean> {
+async function walk(w: WalkOptions, startCursor: TransactionCursor | null): Promise<WalkEnd> {
   let cursor = startCursor;
   for (let page = 0; page < w.maxPages; page++) {
-    if (w.signal.aborted || w.now() >= w.deadlineMs) return false;
+    if (w.signal.aborted || w.now() >= w.deadlineMs) return "stopped";
     const chunk = await w.client.listTransactionsChunk({
       from: w.from,
       count: w.count,
@@ -321,13 +371,14 @@ async function walk(w: WalkOptions, startCursor: TransactionCursor | null): Prom
       noteQuarantined(w.counts, chunk.rejected);
     }
     cursor = chunk.nextCursor;
-    await saveState(w.env.DB, w.connectionId, w.entity, {
+    const ours = await saveWalk(w.env.DB, w.connectionId, w.entity, w.ident, {
       cursor: cursor === null ? null : JSON.stringify(cursor),
+      ...(w.pagePatch ? w.pagePatch() : {}),
     });
-    if (w.onPage) await w.onPage();
-    if (cursor === null) return true;
+    if (!ours) return "superseded";
+    if (cursor === null) return "complete";
   }
-  return false;
+  return "stopped";
 }
 
 function outcome(e: unknown): { result: HandlerResult; code: string } {
@@ -355,29 +406,79 @@ interface AccountRow {
   currency: string;
 }
 
+/** pending_replacement value after the confirm route already reset the walks (review N3). */
+const ALREADY_RESET = '"reset"';
+
+function parseIdList(raw: string | null): string[] | null {
+  if (raw === null) return null;
+  try {
+    const v = JSON.parse(raw) as unknown;
+    return Array.isArray(v) && v.every((x) => typeof x === "string") ? (v as string[]) : null;
+  } catch {
+    return null;
+  }
+}
+
+interface AccountsOutcome {
+  accounts: number;
+  retired: number;
+  /** Confirmed: a second complete read in a row without any of the accounts known before. */
+  replaced: boolean;
+  /** First such read: nothing reset, nothing retired; the next read decides. */
+  replacementSuspected: boolean;
+}
+
 async function syncAccounts(
   env: Env,
   client: RevolutClient,
   connectionId: number,
   nowIso: string,
-): Promise<{ accounts: number; retired: number; replaced: boolean }> {
+  pendingRaw: string | null,
+): Promise<AccountsOutcome> {
   const db = env.DB;
   const list = await client.listAccounts();
   // Review N3: accounts this connection has read before (balance_at is only set by this function)
-  // and not one of them is in a complete, non-empty answer: the connection now points at other
-  // accounts (re-authorised as a different Revolut business). The old accounts are retired below.
-  const previous = (
-    await db
-      .prepare(
-        `SELECT external_id FROM bank_accounts
-         WHERE connection_id = ?1 AND is_active = 1 AND balance_at IS NOT NULL`,
-      )
-      .bind(connectionId)
-      .all<{ external_id: string }>()
-  ).results;
+  // and not one of them is in a complete, non-empty answer: the connection may now point at other
+  // accounts (re-authorised as a different Revolut business). One such answer could also be a
+  // glitch or a permission change at Revolut, so it only marks the replacement as SUSPECTED (the
+  // old ids are kept in revolut_sync_state.pending_replacement, nothing is retired or reset); a
+  // second complete answer in a row that still has none of them confirms it. An answer that lists
+  // one of them again clears the suspicion. An empty answer decides nothing.
   const listed = new Set(list.map((a) => a.id));
-  const replaced =
-    list.length > 0 && previous.length > 0 && !previous.some((p) => listed.has(p.external_id));
+  const pending = parseIdList(pendingRaw);
+  let replaced = false;
+  let suspected = false;
+  let pendingOut: string | null = pendingRaw;
+  if (list.length > 0) {
+    if (pendingRaw === ALREADY_RESET) {
+      // The confirm route reset the walks itself (replacesAccounts): this read only retires.
+      pendingOut = null;
+    } else if (pending !== null && pending.length > 0) {
+      if (pending.some((id) => listed.has(id))) pendingOut = null;
+      else {
+        replaced = true;
+        pendingOut = null;
+      }
+    } else {
+      const previous = (
+        await db
+          .prepare(
+            `SELECT external_id FROM bank_accounts
+             WHERE connection_id = ?1 AND is_active = 1 AND balance_at IS NOT NULL`,
+          )
+          .bind(connectionId)
+          .all<{ external_id: string }>()
+      ).results.map((p) => p.external_id);
+      pendingOut = null;
+      if (previous.length > 0 && !previous.some((id) => listed.has(id))) {
+        suspected = true;
+        pendingOut = JSON.stringify(previous.slice(0, 200));
+      }
+    }
+  }
+  if (pendingOut !== pendingRaw) {
+    await saveState(db, connectionId, "accounts", { pending_replacement: pendingOut });
+  }
   const statements: D1PreparedStatement[] = list.map((a) =>
     db
       .prepare(
@@ -401,9 +502,11 @@ async function syncAccounts(
       ),
   );
   // Retire accounts that are gone, but only after a COMPLETE and non-empty read: an empty answer
-  // is more likely a fault than every account closing.
+  // is more likely a fault than every account closing; and not while a replacement is only
+  // suspected (the old accounts stay as they were until a second read confirms it).
   // The ids travel as ONE JSON bind (json_each): D1 caps bound parameters at 100 per statement.
-  if (list.length > 0) {
+  const retires = list.length > 0 && !suspected;
+  if (retires) {
     statements.push(
       db
         .prepare(
@@ -414,10 +517,12 @@ async function syncAccounts(
         .bind(connectionId, nowIso, JSON.stringify(list.map((a) => a.id))),
     );
   }
-  if (statements.length === 0) return { accounts: 0, retired: 0, replaced: false };
+  if (statements.length === 0) {
+    return { accounts: 0, retired: 0, replaced: false, replacementSuspected: false };
+  }
   const out = await db.batch(statements);
-  const retired = list.length > 0 ? (out[out.length - 1]?.meta.changes ?? 0) : 0;
-  return { accounts: list.length, retired, replaced };
+  const retired = retires ? (out[out.length - 1]?.meta.changes ?? 0) : 0;
+  return { accounts: list.length, retired, replaced, replacementSuspected: suspected };
 }
 
 /**
@@ -429,9 +534,16 @@ async function syncAccounts(
 export async function resetSyncForReplacedAccounts(
   db: D1Database,
   connectionId: number,
+  opts: { fromConfirm?: boolean } = {},
 ): Promise<void> {
+  await loadState(db, connectionId, "accounts");
   await loadState(db, connectionId, "transactions");
   await loadState(db, connectionId, "backfill");
+  // From the confirm route the next accounts read must not detect (and reset) the same
+  // replacement again: it is told the reset happened and only retires the old accounts.
+  await saveState(db, connectionId, "accounts", {
+    pending_replacement: opts.fromConfirm === true ? ALREADY_RESET : null,
+  });
   await db
     .prepare(
       `UPDATE revolut_sync_state SET cursor = NULL, watermark = NULL, window_from = NULL,
@@ -445,19 +557,22 @@ export async function resetSyncForReplacedAccounts(
 }
 
 /**
- * The details entry that is the account's OWN IBAN for its currency (review N4): not a pooled
- * (shared) one, and for EUR the SEPA scheme, for other currencies SWIFT. ASSUMPTION (verify with
- * the sandbox, ADR 0030): `pooled` marks shared details and `schemes` lists 'sepa' / 'swift'.
+ * The details entry that is the account's OWN IBAN for its currency (review N4): never a pooled
+ * (shared) one, and for EUR the SEPA scheme first, for other currencies SWIFT first, else the first
+ * own entry with an IBAN. A pooled IBAN is Revolut's collection account shared by many customers
+ * (told apart by a reference): stored as "our IBAN" it would identify the wrong account in Exact
+ * and in matching, so an account with only pooled details counts as `no_iban`. ASSUMPTION (verify
+ * with the sandbox, ADR 0030): `pooled` marks shared details and `schemes` lists 'sepa' / 'swift'.
  */
 export function pickOwnDetails(
   details: RevolutBankDetails[],
   currency: string,
 ): RevolutBankDetails | undefined {
-  const withIban = details.filter((d) => d.iban !== undefined && d.iban !== "");
-  const own = withIban.filter((d) => d.pooled !== true);
-  const pool = own.length > 0 ? own : withIban;
-  const scheme = currency === "EUR" ? "sepa" : "swift";
-  return pool.find((d) => d.schemes.some((x) => x.toLowerCase() === scheme)) ?? pool[0];
+  const own = details.filter(
+    (d) => d.iban !== undefined && d.iban.trim() !== "" && d.pooled !== true,
+  );
+  const scheme = currency.toUpperCase() === "EUR" ? "sepa" : "swift";
+  return own.find((d) => d.schemes.some((x) => x.toLowerCase() === scheme)) ?? own[0];
 }
 
 /**
@@ -495,6 +610,7 @@ async function fillBankDetails(
     try {
       details = await client.getAccountBankDetails(a.external_id);
     } catch (e) {
+      if (e instanceof RevolutAuthError) throw e; // the connection, not the account
       if (classifyRevolutError(e).retryable) break; // try again next run
     }
     const pick = details === null ? undefined : pickOwnDetails(details, a.currency);
@@ -502,7 +618,8 @@ async function fillBankDetails(
     const anyBic = details?.find((d) => d.bic !== undefined)?.bic;
     await db
       .prepare(
-        `UPDATE bank_accounts SET iban = COALESCE(iban, ?2), bic = COALESCE(bic, ?3),
+        `UPDATE bank_accounts SET iban = COALESCE(iban, ?2),
+           bic = CASE WHEN bic IS NULL OR (bic = '' AND ?3 IS NOT NULL) THEN ?3 ELSE bic END,
            details_status = ?4, details_attempts = details_attempts + 1, details_checked_at = ?5
          WHERE id = ?1`,
       )
@@ -589,8 +706,9 @@ export async function runRevolutSync(ctx: JobContext): Promise<HandlerResult> {
   let accountsOk = false;
   let retired = 0;
   let walkStarted = nowIso;
+  let walkFrom: string | null = null;
 
-  await loadState(db, conn.id, "accounts");
+  const accState = await loadState(db, conn.id, "accounts");
   await saveState(db, conn.id, "accounts", { last_started_at: nowIso, last_status: "running" });
   const before = await loadState(db, conn.id, "transactions");
   await saveState(db, conn.id, "transactions", { last_started_at: nowIso, last_status: "running" });
@@ -600,7 +718,7 @@ export async function runRevolutSync(ctx: JobContext): Promise<HandlerResult> {
     const client = job.client;
 
     // (a) accounts and balances
-    const acc = await syncAccounts(env, client, conn.id, nowIso);
+    const acc = await syncAccounts(env, client, conn.id, nowIso, accState.pending_replacement);
     accountsOk = true;
     retired = acc.retired;
     summary["accounts"] = acc.accounts;
@@ -611,6 +729,7 @@ export async function runRevolutSync(ctx: JobContext): Promise<HandlerResult> {
       last_status: "ok",
       last_error: null,
     });
+    if (acc.replacementSuspected) summary["accountsReplacementSuspected"] = true;
     if (acc.replaced) {
       // Review N3: other accounts than before. Old cursors are meaningless; walk 90 days again.
       summary["accountsReplaced"] = true;
@@ -655,23 +774,26 @@ export async function runRevolutSync(ctx: JobContext): Promise<HandlerResult> {
         walk_started_at: walkStarted,
       });
     }
-    walkComplete = await walk(
-      {
-        env,
-        client,
-        connectionId: conn.id,
-        entity: "transactions",
-        source: "poll",
-        from,
-        count: SYNC_PAGE_SIZE,
-        maxPages: SYNC_MAX_PAGES,
-        signal: ctx.signal,
-        deadlineMs,
-        now: ctx.now,
-        counts,
-      },
-      hasWalk ? resume : null,
-    );
+    walkFrom = from;
+    walkComplete =
+      (await walk(
+        {
+          env,
+          client,
+          connectionId: conn.id,
+          entity: "transactions",
+          source: "poll",
+          from,
+          count: SYNC_PAGE_SIZE,
+          maxPages: SYNC_MAX_PAGES,
+          signal: ctx.signal,
+          deadlineMs,
+          now: ctx.now,
+          counts,
+          ident: { from, startedAt: walkStarted },
+        },
+        hasWalk ? resume : null,
+      )) === "complete";
 
     // (c) old pending rows
     summary["pendingRefreshed"] = await refreshPending(
@@ -705,6 +827,7 @@ export async function runRevolutSync(ctx: JobContext): Promise<HandlerResult> {
     );
     summary["quarantineRetried"] = retry.tried;
     summary["quarantineCleared"] = retry.cleared;
+    summary["quarantinePruned"] = await pruneQuarantine(db, conn.id, ctx.now()).catch(() => 0);
 
     // (e) counterparty IBANs for matching (review S6): own job id, own small budget
     try {
@@ -763,26 +886,36 @@ export async function runRevolutSync(ctx: JobContext): Promise<HandlerResult> {
   summary["quarantined"] = counts.quarantined;
   summary["skippedLegs"] = counts.skippedLegs;
   summary["frozenConflicts"] = counts.frozenConflicts;
+  summary["conflictsFlagged"] = counts.conflictsFlagged;
   summary["calls"] = calls;
-  summary["quarantineOpen"] = await quarantineCounts(db, conn.id)
-    .then((q) => q.open)
-    .catch(() => null);
+  const q = await quarantineCounts(db, conn.id).catch(() => null);
+  summary["quarantineOpen"] = q?.open ?? null;
+  summary["quarantineGaveUp"] = q?.gaveUp ?? null;
   result = { ...result, summary, callsUsed: calls };
 
-  const tPatch: Record<string, string | number | null> = {
+  await saveState(db, conn.id, "transactions", {
     last_finished_at: finishedIso,
     last_status: result.status === "skipped" ? "skipped" : result.status,
     last_error: errorCode ?? result.code ?? null,
     rows_seen: counts.seen,
     calls_used: calls,
-  };
-  if (walkComplete) {
-    tPatch["last_completed_at"] = finishedIso;
-    tPatch["watermark"] = walkStarted;
-    tPatch["window_from"] = null;
-    tPatch["walk_started_at"] = null;
+  }).catch(() => undefined);
+  if (walkComplete && walkFrom !== null) {
+    // Only if the walk is still the stored one (a reset meanwhile wins, review N3).
+    await saveWalk(
+      db,
+      conn.id,
+      "transactions",
+      { from: walkFrom, startedAt: walkStarted },
+      {
+        last_completed_at: finishedIso,
+        watermark: walkStarted,
+        cursor: null,
+        window_from: null,
+        walk_started_at: null,
+      },
+    ).catch(() => false);
   }
-  await saveState(db, conn.id, "transactions", tPatch).catch(() => undefined);
   if (!accountsOk) {
     await saveState(db, conn.id, "accounts", {
       last_finished_at: finishedIso,
@@ -811,6 +944,7 @@ export async function runRevolutSync(ctx: JobContext): Promise<HandlerResult> {
         quarantined: counts.quarantined,
         skippedLegs: counts.skippedLegs,
         frozenConflicts: counts.frozenConflicts,
+        conflictsFlagged: counts.conflictsFlagged,
         calls,
       },
     })
@@ -841,42 +975,52 @@ export async function runRevolutBackfill(ctx: JobContext): Promise<HandlerResult
   // from its first page with the SAME bounds and the same initial flag, so a failing first page
   // can never turn the 90-day initial backfill into a 35-day walk. The window comes from the slot,
   // not the clock (handler contract rule 3). The one-off request (`requested_days`) is cleared only
-  // when an initial walk COMPLETES.
+  // when an initial walk COMPLETES (and only if that walk is still the stored one, see saveWalk).
+  // An initial request that arrives while an ordinary daily walk is in progress supersedes it: the
+  // 90-day window covers the 35-day one, and the "Run now" queued with the request must do the
+  // initial walk, not finish a daily one (the daily walk's missing count is simply not recorded).
   const resume = parseCursor(state.cursor);
-  const resuming = state.window_from !== null;
+  const supersede =
+    state.window_from !== null && state.initial === 0 && state.requested_days !== null;
+  const resuming = state.window_from !== null && !supersede;
   let from: string;
   let days: number;
   let initial: boolean;
+  let startedAt: string | null;
   const counts = zero();
   if (resuming) {
     from = state.window_from as string;
     days = state.window_days ?? BACKFILL_DAYS;
     initial = state.initial === 1;
+    startedAt = state.walk_started_at;
     counts.missing = state.rows_missing;
   } else {
     days = state.requested_days ?? BACKFILL_DAYS;
     initial = state.requested_days !== null;
     from = iso(scheduledForMs(ctx) - days * DAY_MS);
+    startedAt = nowIso;
     await saveState(db, conn.id, "backfill", {
       cursor: null,
       window_from: from,
       window_days: days,
-      walk_started_at: nowIso,
+      walk_started_at: startedAt,
       initial: initial ? 1 : 0,
       rows_seen: 0,
       rows_missing: 0,
     });
   }
+  const ident: WalkIdent = { from, startedAt };
   await saveState(db, conn.id, "backfill", { last_started_at: nowIso, last_status: "running" });
   const seenBefore = resuming ? state.rows_seen : 0;
 
   let job: Awaited<ReturnType<typeof startJobClient>> | null = null;
   let result: HandlerResult;
   let complete = false;
+  let superseded = false;
   let errorCode: string | null = null;
   try {
     job = await startJobClient(env, conn.id, BACKFILL_JOB_ID, BACKFILL_CALL_BUDGET);
-    complete = await walk(
+    const end = await walk(
       {
         env,
         client: job.client,
@@ -890,28 +1034,31 @@ export async function runRevolutBackfill(ctx: JobContext): Promise<HandlerResult
         deadlineMs,
         now: ctx.now,
         counts,
-        onPage: () =>
-          saveState(db, conn.id, "backfill", {
-            rows_seen: seenBefore + counts.seen,
-            rows_missing: counts.missing,
-          }),
+        ident,
+        pagePatch: () => ({ rows_seen: seenBefore + counts.seen, rows_missing: counts.missing }),
       },
       resuming ? resume : null,
     );
+    complete = end === "complete";
+    superseded = end === "superseded";
     const quality = dataQualityCode(counts);
     result = complete
       ? quality === null
         ? { status: "ok", summary: {} }
         : { status: "partial", code: quality, summary: {} }
-      : {
-          status: "partial",
-          // The initial 90-day walk is usually a manual run, which the runner never retries: its
-          // own code makes the stop visible in Settings > Schedules, and the stored window and
-          // cursor are resumed by the next run of the job (the daily slot or another "Run now").
-          code: initial ? "initial_backfill_incomplete" : "walk_incomplete",
-          retry: { delaySeconds: BACKFILL_RETRY_SECONDS },
-          summary: {},
-        };
+      : superseded
+        ? // Another writer reset the walks meanwhile (accounts replaced): the next run starts the
+          // walk that was asked for; nothing of this one is saved.
+          { status: "partial", code: "walk_superseded", summary: {} }
+        : {
+            status: "partial",
+            // The initial 90-day walk is usually a manual run, which the runner never retries: its
+            // own code makes the stop visible in Settings > Schedules, and the stored window and
+            // cursor are resumed by the next run of the job (the daily slot or another "Run now").
+            code: initial ? "initial_backfill_incomplete" : "walk_incomplete",
+            retry: { delaySeconds: BACKFILL_RETRY_SECONDS },
+            summary: {},
+          };
   } catch (e) {
     const o = outcome(e);
     errorCode = o.code;
@@ -938,6 +1085,9 @@ export async function runRevolutBackfill(ctx: JobContext): Promise<HandlerResult
       windowDays: days,
       initial,
       complete,
+      // An initial walk that did not complete (whatever stopped it, a failing first page
+      // included): the 90-day request is still pending and the next run resumes it.
+      initialBackfillPending: initial && !complete,
       seen: counts.seen,
       missing: counts.missing,
       inserted: counts.inserted,
@@ -946,16 +1096,20 @@ export async function runRevolutBackfill(ctx: JobContext): Promise<HandlerResult
       quarantined: counts.quarantined,
       skippedLegs: counts.skippedLegs,
       frozenConflicts: counts.frozenConflicts,
+      conflictsFlagged: counts.conflictsFlagged,
       calls,
     },
   };
-  const patch: Record<string, string | number | null> = {
+  await saveState(db, conn.id, "backfill", {
     last_finished_at: finished,
     last_status: result.status,
     last_error: errorCode ?? result.code ?? null,
+    calls_used: calls,
+  }).catch(() => undefined);
+  // The walk's own progress only while it is still the stored walk (a reset meanwhile wins).
+  const patch: Record<string, string | number | null> = {
     rows_seen: totalSeen,
     rows_missing: counts.missing,
-    calls_used: calls,
   };
   if (complete) {
     patch["last_completed_at"] = finished;
@@ -968,7 +1122,7 @@ export async function runRevolutBackfill(ctx: JobContext): Promise<HandlerResult
     // everything is "missing" in the initial backfill).
     if (!initial) patch["last_missing"] = counts.missing;
   }
-  await saveState(db, conn.id, "backfill", patch).catch(() => undefined);
+  if (!superseded) await saveWalk(db, conn.id, "backfill", ident, patch).catch(() => false);
 
   const code = errorCode ?? result.code ?? null;
   if (
@@ -992,6 +1146,7 @@ export async function runRevolutBackfill(ctx: JobContext): Promise<HandlerResult
         quarantined: counts.quarantined,
         skippedLegs: counts.skippedLegs,
         frozenConflicts: counts.frozenConflicts,
+        conflictsFlagged: counts.conflictsFlagged,
       },
     })
       .run()

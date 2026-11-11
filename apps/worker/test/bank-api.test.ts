@@ -236,6 +236,9 @@ describe("GET /api/bank/accounts", () => {
         createsBankEntries: false,
         paymentsMode: "drafts",
         quarantined: 0,
+        quarantineGaveUp: 0,
+        stateConflicts: 0,
+        initialBackfillPending: false,
       });
       expect(body.accounts.length, status).toBe(3);
       expect(JSON.stringify(body)).not.toContain("ref-secret");
@@ -253,9 +256,41 @@ describe("GET /api/bank/accounts", () => {
       )
       .bind(connId)
       .run();
+    await db
+      .prepare(
+        "UPDATE revolut_quarantine SET gave_up = 1, attempts = 5 WHERE external_id = 'bad-2'",
+      )
+      .run();
     const { body } = await get<BankAccountsResponse>("/api/bank/accounts");
     expect(body.connection?.quarantined).toBe(2);
+    expect(body.connection?.quarantineGaveUp).toBe(1);
     expect(JSON.stringify(body)).not.toContain("bad-1");
+  });
+
+  it("counts flagged state conflicts and a pending initial backfill (counts only)", async () => {
+    await seedAccounts();
+    await db
+      .prepare(
+        `INSERT INTO bank_transactions (connection_id, bank_account_id, external_id, leg_id, state,
+           amount_minor, currency, booked_at, created_at, state_conflict)
+         SELECT ?1, id, 'conf-' || n, 'l', 'completed', -100, 'EUR', '2026-07-10T08:00:00.000Z',
+                '2026-07-10T08:00:00.000Z', f
+         FROM bank_accounts, (SELECT 1 AS n, 1 AS f UNION ALL SELECT 2, 0)
+         WHERE connection_id = ?1 AND external_id = ?2`,
+      )
+      .bind(connId, ACC_EUR)
+      .run();
+    await db
+      .prepare(
+        `INSERT INTO revolut_sync_state (connection_id, entity, requested_days) VALUES (?1, 'backfill', 90)
+         ON CONFLICT (connection_id, entity) DO UPDATE SET requested_days = 90`,
+      )
+      .bind(connId)
+      .run();
+    const { body } = await get<BankAccountsResponse>("/api/bank/accounts");
+    expect(body.connection?.stateConflicts).toBe(1);
+    expect(JSON.stringify(body)).not.toContain("conf-");
+    expect(body.connection?.initialBackfillPending).toBe(true);
   });
 
   it("without any connection it is empty and available false", async () => {

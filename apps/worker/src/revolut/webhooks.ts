@@ -17,6 +17,7 @@
  *    `webhook_secret_prev_enc` and stays valid until a delivery verifies with the new one), then
  *    delete the old subscription.
  */
+import { revolutClientSleep } from "./client-timing";
 import { createRevolutClient, type RevolutClient } from "@camelthorn/revolut";
 import { auditStatement } from "../db/audit";
 import type { Env } from "../env";
@@ -34,12 +35,15 @@ class SecretNotSaved extends Error {}
 export type WebhookRegistration =
   { status: "registered" | "already_registered" } | { status: "failed"; code: string };
 
-const clientFor = (env: Env, connectionId: number, jobId: string): RevolutClient =>
-  createRevolutClient(createRevolutGateTransport(env, connectionId), {
+const clientFor = (env: Env, connectionId: number, jobId: string): RevolutClient => {
+  const sleep = revolutClientSleep();
+  return createRevolutClient(createRevolutGateTransport(env, connectionId), {
     connectionId,
     jobId,
     priority: "user",
+    ...(sleep ? { sleep } : {}),
   });
+};
 
 export async function registerWebhook(
   env: Env,

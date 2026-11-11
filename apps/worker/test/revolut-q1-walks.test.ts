@@ -174,24 +174,43 @@ describe("S1: a failing first page does not shrink the initial backfill", () => 
     expect(await rowsOf("bank_transactions")).toHaveLength(3);
   });
 
-  it("an initial request that arrives during a daily walk is kept until an initial walk completes", async () => {
+  it("an initial request that arrives during a daily walk supersedes it: the next run is the 90-day walk", async () => {
     api.maxCount = 2;
     api.transactions = Array.from({ length: 14 }, (_, i) =>
       simpleTx(`d-${i}`, { createdAt: ago(1 + i) }),
     );
     const first = await backfill();
     expect(first.status).toBe("partial");
+    expect(first.summary).toMatchObject({ initial: false, windowDays: 35 });
+    const daily = await stateRow("backfill");
     await requestBackfill(db, connId, INITIAL_BACKFILL_DAYS);
+    const next = await backfill({ trigger: "manual" });
+    // Not the daily walk resumed: a new 90-day window, and the daily missing count is not recorded.
+    expect(next.summary).toMatchObject({ initial: true, windowDays: 90 });
+    const mid = await stateRow("backfill");
+    expect(mid?.["window_from"]).not.toBe(daily?.["window_from"]);
+    expect(mid).toMatchObject({ initial: 1, window_days: 90, requested_days: 90 });
     let guard = 0;
-    let last = first;
-    while (last.status === "partial" && guard++ < 6) last = await backfill();
+    let last = next;
+    while (last.status === "partial" && guard++ < 12) last = await backfill();
     expect(last.status).toBe("ok");
-    // The daily walk finished without consuming the request.
-    expect((await stateRow("backfill"))?.["requested_days"]).toBe(INITIAL_BACKFILL_DAYS);
-    api.maxCount = null;
-    const init = await backfill();
-    expect(init.summary).toMatchObject({ initial: true, windowDays: 90, complete: true });
-    expect((await stateRow("backfill"))?.["requested_days"]).toBeNull();
+    expect(await stateRow("backfill")).toMatchObject({
+      requested_days: null,
+      window_from: null,
+      last_missing: null,
+    });
+    expect(await rowsOf("bank_transactions")).toHaveLength(14);
+  });
+
+  it("a daily walk keeps going when no initial request is pending (no supersede without one)", async () => {
+    api.maxCount = 2;
+    api.transactions = Array.from({ length: 6 }, (_, i) =>
+      simpleTx(`e-${i}`, { createdAt: ago(1 + i) }),
+    );
+    await backfill();
+    const daily = await stateRow("backfill");
+    await backfill();
+    expect((await stateRow("backfill"))?.["window_from"]).toBe(daily?.["window_from"]);
   });
 
   it("the poll keeps its window when its first page fails", async () => {
@@ -394,24 +413,69 @@ describe("S2: per-row quarantine", () => {
     expect(await quarantine()).toEqual([]);
   });
 
-  it("the quarantine retry does not count trouble that is not the row's fault as an attempt", async () => {
-    await db
-      .prepare(
-        `INSERT INTO revolut_quarantine (connection_id, external_id, code, first_seen_at, last_seen_at)
-         VALUES (?1, 'rl', 'bad_shape', ?2, ?2)`,
-      )
-      .bind(connId, T(40))
-      .run();
-    raw.rows = [rawTx("rl", T(30), [{ amount: "x" }])];
-    await sync();
-    const inner = raw.handle;
-    stub.api = (c) =>
-      c.url.pathname.startsWith("/api/1.0/transaction/")
-        ? new Response("{}", { status: 400 })
-        : inner(c);
-    await sync();
-    // A 400 is a permanent API error, not a bad row: no attempt is counted.
-    expect((await quarantine())[0]).toMatchObject({ attempts: 0, gave_up: 0 });
+  describe("the quarantine retry and errors from Revolut", () => {
+    async function seedOne(): Promise<void> {
+      await db
+        .prepare(
+          `INSERT INTO revolut_quarantine (connection_id, external_id, code, first_seen_at, last_seen_at)
+           VALUES (?1, 'rl', 'bad_shape', ?2, ?2)`,
+        )
+        .bind(connId, T(40))
+        .run();
+    }
+    const failSingle = (status: number) => {
+      const inner = raw.handle;
+      stub.api = (c) =>
+        c.url.pathname.startsWith("/api/1.0/transaction/")
+          ? new Response("{}", { status, headers: status === 429 ? { "retry-after": "1" } : {} })
+          : inner(c);
+    };
+    const singleCalls = () =>
+      stub.apiCalls.filter((c) => c.url.pathname === "/api/1.0/transaction/rl").length;
+
+    it("a 4xx for the one transaction counts as an attempt (so it gives up in the end)", async () => {
+      await seedOne();
+      failSingle(400);
+      await sync();
+      expect((await quarantine())[0]).toMatchObject({ attempts: 1, gave_up: 0 });
+      for (let i = 1; i <= QUARANTINE_MAX_ATTEMPTS + 2; i++) {
+        await sync(later(i * (QUARANTINE_RETRY_MS + 60_000)));
+      }
+      expect((await quarantine())[0]).toMatchObject({
+        attempts: QUARANTINE_MAX_ATTEMPTS,
+        gave_up: 1,
+      });
+      expect(singleCalls()).toBe(QUARANTINE_MAX_ATTEMPTS);
+    });
+
+    it("a 5xx is not an attempt, but the row waits an hour: no call every poll", async () => {
+      await seedOne();
+      failSingle(503);
+      await fakeRevolutClock(connId); // the client's 5xx backoff and the gate's waits are not real
+      await sync();
+      const after = singleCalls();
+      expect(after).toBeGreaterThan(0);
+      expect((await quarantine())[0]).toMatchObject({ attempts: 0, gave_up: 0 });
+      expect((await quarantine())[0]?.["last_attempt_at"]).toBeTruthy();
+      await sync(later(10 * 60_000));
+      await sync(later(20 * 60_000));
+      expect(singleCalls()).toBe(after);
+      await sync(later(QUARANTINE_RETRY_MS + 60_000));
+      expect(singleCalls()).toBeGreaterThan(after);
+      expect((await quarantine())[0]).toMatchObject({ attempts: 0, gave_up: 0 });
+    });
+
+    it("a rate limit records nothing at all: it is nobody's verdict on the row", async () => {
+      await seedOne();
+      await fakeRevolutClock(connId);
+      failSingle(429);
+      await sync();
+      expect((await quarantine())[0]).toMatchObject({
+        attempts: 0,
+        gave_up: 0,
+        last_attempt_at: null,
+      });
+    });
   });
 });
 

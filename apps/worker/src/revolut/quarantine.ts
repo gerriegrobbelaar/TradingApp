@@ -16,6 +16,10 @@ export const QUARANTINE_MAX_ATTEMPTS = 5;
 /** A quarantined row is retried at most this often. */
 export const QUARANTINE_RETRY_MS = 3600_000;
 export const QUARANTINE_RETRIES_PER_RUN = 1;
+/** Rows kept per connection: the least recently seen go first beyond this. */
+export const QUARANTINE_MAX_ROWS = 1000;
+/** A row that gave up is deleted this long after a walk last saw it. */
+export const QUARANTINE_GAVE_UP_TTL_MS = 30 * 86_400_000;
 const ID_RE = /^[A-Za-z0-9_-]{1,100}$/;
 const CODE_RE = /^[a-z][a-z0-9_]{0,40}$/;
 
@@ -97,7 +101,8 @@ export interface RetryOutcome {
 /**
  * Retries up to `limit` quarantined rows with one read each. `store` ingests the transaction (it may
  * throw an IngestError, which counts as a failed attempt). A transaction Revolut no longer has is
- * cleared. A retryable failure stops the loop without counting an attempt.
+ * cleared. A retryable failure stops the loop without counting an attempt, but the row still waits
+ * an hour (`last_attempt_at`): a row Revolut keeps failing on cannot cost a call every poll.
  */
 export async function retryQuarantined(
   db: D1Database,
@@ -137,9 +142,26 @@ export async function retryQuarantined(
         out.cleared++;
         continue;
       }
-      // Only a bad row counts as an attempt; trouble with Revolut or D1 is not the row's fault.
-      const badRow = (e instanceof RevolutApiError && e.status === 200) || e instanceof IngestError;
-      if (!badRow) break;
+      // A bad row (it does not map or store) or a 4xx Revolut gives for this one transaction counts
+      // as an attempt. A 5xx for it is not counted but the row waits an hour (it must not cost a
+      // call every ten minutes, forever). A rate limit, an exhausted budget, the gate, the network
+      // or D1 is nobody's verdict on the row: the loop stops and nothing is recorded.
+      const api = e instanceof RevolutApiError && !e.code?.match(/^(network|gate_unavailable)$/);
+      const badRow =
+        e instanceof IngestError ||
+        (api && (e as RevolutApiError).status >= 200 && (e as RevolutApiError).status < 500);
+      if (!badRow) {
+        if (!api) break;
+        await db
+          .prepare(
+            `UPDATE revolut_quarantine SET last_attempt_at = ?3
+             WHERE connection_id = ?1 AND external_id = ?2`,
+          )
+          .bind(connectionId, r.external_id, nowIso)
+          .run()
+          .catch(() => undefined);
+        break;
+      }
       out.stillBad.push(r.external_id);
       await db
         .prepare(
@@ -158,4 +180,33 @@ export async function retryQuarantined(
     }
   }
   return out;
+}
+
+/**
+ * Keeps the table bounded (ADR 0034): a row that gave up goes 30 days after a walk last saw it (it
+ * is outside every walk window by then), and beyond QUARANTINE_MAX_ROWS per connection the least
+ * recently seen rows go. A deleted row that is still bad is simply quarantined again when met.
+ */
+export async function pruneQuarantine(
+  db: D1Database,
+  connectionId: number,
+  nowMs: number,
+): Promise<number> {
+  const out = await db.batch([
+    db
+      .prepare(
+        `DELETE FROM revolut_quarantine
+         WHERE connection_id = ?1 AND gave_up = 1 AND last_seen_at < ?2`,
+      )
+      .bind(connectionId, new Date(nowMs - QUARANTINE_GAVE_UP_TTL_MS).toISOString()),
+    db
+      .prepare(
+        `DELETE FROM revolut_quarantine
+         WHERE connection_id = ?1 AND id NOT IN (
+           SELECT id FROM revolut_quarantine WHERE connection_id = ?1
+           ORDER BY last_seen_at DESC, id DESC LIMIT ?2)`,
+      )
+      .bind(connectionId, QUARANTINE_MAX_ROWS),
+  ]);
+  return out.reduce((n, r) => n + r.meta.changes, 0);
 }

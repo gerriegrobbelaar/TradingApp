@@ -30,6 +30,7 @@ import {
   type FreshnessEntity,
 } from "@camelthorn/core";
 import { json, type Ctx, type Router } from "../router";
+import { countStateConflicts } from "../revolut/conflicts";
 import { quarantineCounts } from "../revolut/quarantine";
 import { loadRevolutConnection } from "../revolut/store";
 import { ANY_ROLE, BadRequest, guarded, positiveIntParam } from "./routes";
@@ -190,9 +191,7 @@ async function accountsHandler(ctx: Ctx): Promise<Response> {
       createsBankEntries:
         conn.bank_entries_decided_at === null ? null : conn.creates_bank_entries === 1,
       paymentsMode: conn.payments_mode,
-      quarantined: await quarantineCounts(db, conn.id)
-        .then((q) => q.open)
-        .catch(() => 0),
+      ...(await connectionHealth(db, conn.id)),
     },
     accounts,
     totalsByCurrency: [...totals.entries()]
@@ -202,6 +201,38 @@ async function accountsHandler(ctx: Ctx): Promise<Response> {
     available: freshness.lastCompletedAt !== null,
   };
   return json(body);
+}
+
+/**
+ * Counts for the connection line (Phase 5 review Q1, all optional and additive): rows the sync
+ * keeps retrying (and how many of them it gave up on), rows flagged with a state conflict, and
+ * whether the one-off 90-day initial backfill is still to complete. Counts only, never ids.
+ */
+async function connectionHealth(
+  db: D1Database,
+  connectionId: number,
+): Promise<{
+  quarantined: number;
+  quarantineGaveUp: number;
+  stateConflicts: number;
+  initialBackfillPending: boolean;
+}> {
+  const q = await quarantineCounts(db, connectionId).catch(() => ({ open: 0, gaveUp: 0 }));
+  const conflicts = await countStateConflicts(db, connectionId).catch(() => 0);
+  const pending = await db
+    .prepare(
+      `SELECT requested_days FROM revolut_sync_state
+       WHERE connection_id = ?1 AND entity = 'backfill'`,
+    )
+    .bind(connectionId)
+    .first<{ requested_days: number | null }>()
+    .catch(() => null);
+  return {
+    quarantined: q.open,
+    quarantineGaveUp: q.gaveUp,
+    stateConflicts: conflicts,
+    initialBackfillPending: pending !== null && pending.requested_days !== null,
+  };
 }
 
 // ---- transactions -------------------------------------------------------------------------------

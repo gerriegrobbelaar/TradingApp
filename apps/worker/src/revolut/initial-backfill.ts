@@ -5,6 +5,7 @@
  * the normal "Run now" path (audited, JobLock, queue). Idempotent: asking again re-walks the same
  * window and the ingest changes nothing.
  */
+import { auditStatement } from "../db/audit";
 import type { Env } from "../env";
 import { createManualRun } from "../jobs/runner";
 import { INITIAL_BACKFILL_DAYS, requestBackfill, resetSyncForReplacedAccounts } from "./sync";
@@ -18,9 +19,19 @@ export async function queueInitialBackfill(
   nowMs: number,
   opts: { replacesAccounts?: boolean } = {},
 ): Promise<InitialBackfill> {
-  // Re-authorised to different accounts (review N3): the old cursors and windows are forgotten.
-  // The sync also notices this on its own (the accounts it knew are gone) and does the same.
-  if (opts.replacesAccounts === true) await resetSyncForReplacedAccounts(env.DB, connectionId);
+  // Re-authorised to different accounts (review N3): the old cursors and windows are forgotten,
+  // and the next accounts read is told so (it retires the old accounts without a second reset).
+  // Without this signal the sync notices on its own after two reads in a row (ADR 0034).
+  if (opts.replacesAccounts === true) {
+    await resetSyncForReplacedAccounts(env.DB, connectionId, { fromConfirm: true });
+    await auditStatement(env.DB, {
+      actorEmail,
+      action: "revolut.accounts_replaced",
+      entity: "connection",
+      entityId: connectionId,
+      after: { source: "confirm" },
+    }).run();
+  }
   await requestBackfill(env.DB, connectionId, INITIAL_BACKFILL_DAYS);
   const job = await env.DB.prepare(
     "SELECT id, name FROM jobs WHERE name = 'revolut.backfill'",

@@ -259,8 +259,8 @@ describe("S6: the counterparty lookup", () => {
       stmts.push(
         db
           .prepare(
-            `INSERT INTO revolut_counterparties (connection_id, counterparty_ref, status, fetched_at)
-             VALUES (?1, ?2, 'not_found', ?3)`,
+            `INSERT INTO revolut_counterparties (connection_id, counterparty_ref, status, fetched_at, checked_at)
+             VALUES (?1, ?2, 'not_found', ?3, ?3)`,
           )
           .bind(
             connId,
@@ -368,6 +368,12 @@ describe("N3: re-authorised to different accounts", () => {
     await sync();
     await db
       .prepare(
+        "INSERT INTO revolut_sync_state (connection_id, entity) VALUES (?1, 'backfill') ON CONFLICT DO NOTHING",
+      )
+      .bind(connId)
+      .run();
+    await db
+      .prepare(
         `UPDATE revolut_sync_state SET cursor = '{"toIso":"2026-01-01T00:00:00.000Z","seen":[]}',
            window_from = '2026-01-01T00:00:00.000Z', walk_started_at = '2026-01-01T00:00:00.000Z',
            window_days = 35, initial = 1, rows_seen = 9, rows_missing = 4
@@ -382,6 +388,18 @@ describe("N3: re-authorised to different accounts", () => {
     const auditBefore = await auditActions("revolut.accounts_replaced");
     await seedOldWalks();
     api.accounts = OTHER;
+    // The first read without any known account only raises the suspicion: nothing is retired or
+    // reset (it could be a glitch or a permission change at Revolut).
+    const first = await sync();
+    expect(first.summary).toMatchObject({ accountsReplacementSuspected: true, accountsRetired: 0 });
+    expect(first.summary["accountsReplaced"]).toBeUndefined();
+    expect((await rowsOf("revolut_sync_state", "entity = 'backfill'"))[0]).toMatchObject({
+      window_from: "2026-01-01T00:00:00.000Z",
+      rows_missing: 4,
+    });
+    expect((await rowsOf("bank_accounts", `external_id = '${ACC_EUR}'`))[0]?.["is_active"]).toBe(1);
+    expect(await auditActions("revolut.accounts_replaced")).toBe(auditBefore);
+    // The second read in a row confirms it.
     const r = await sync();
     expect(r.summary).toMatchObject({ accountsReplaced: true, accounts: 1, accountsRetired: 2 });
     const accounts = await rowsOf("bank_accounts", `connection_id = ${connId}`);
@@ -412,6 +430,64 @@ describe("N3: re-authorised to different accounts", () => {
     stub.apiCalls.length = 0;
     const { backfill } = await import("./revolut-q1-helpers");
     expect((await backfill()).summary).toMatchObject({ initial: true, windowDays: 90 });
+  });
+
+  it("a suspicion is cleared when a known account is listed again (a glitch)", async () => {
+    await seedOldWalks();
+    const known = api.accounts;
+    api.accounts = OTHER;
+    expect((await sync()).summary["accountsReplacementSuspected"]).toBe(true);
+    api.accounts = known;
+    const back = await sync();
+    expect(back.summary["accountsReplaced"]).toBeUndefined();
+    expect(back.summary["accountsReplacementSuspected"]).toBeUndefined();
+    expect(
+      (await rowsOf("revolut_sync_state", "entity = 'accounts'"))[0]?.["pending_replacement"],
+    ).toBeNull();
+    // A later single odd read starts over: suspected again, not confirmed.
+    api.accounts = OTHER;
+    const again = await sync();
+    expect(again.summary["accountsReplaced"]).toBeUndefined();
+    expect(again.summary["accountsReplacementSuspected"]).toBe(true);
+    expect((await rowsOf("revolut_sync_state", "entity = 'backfill'"))[0]?.["window_from"]).toBe(
+      "2026-01-01T00:00:00.000Z",
+    );
+  });
+
+  it("an empty or failing read between two odd reads decides nothing", async () => {
+    await seedOldWalks();
+    api.accounts = OTHER;
+    await sync();
+    api.accounts = [];
+    expect((await sync()).summary["accountsReplaced"]).toBeUndefined();
+    api.accounts = OTHER;
+    expect((await sync()).summary["accountsReplaced"]).toBe(true);
+  });
+
+  it("after the confirm route reset, the sync only retires the old accounts (no second reset)", async () => {
+    await seedOldWalks();
+    await queueInitialBackfill(env, connId, "gerrie.grobbelaar@camelthorncapital.com", Date.now(), {
+      replacesAccounts: true,
+    });
+    const audits = await auditActions("revolut.accounts_replaced");
+    // The 90-day walk starts and makes progress before the next accounts read.
+    await db
+      .prepare(
+        "UPDATE revolut_sync_state SET window_from = '2026-02-01T00:00:00.000Z', walk_started_at = '2026-05-01T00:00:00.000Z', initial = 1 WHERE entity = 'backfill'",
+      )
+      .run();
+    api.accounts = OTHER;
+    const r = await sync();
+    expect(r.summary["accountsReplaced"]).toBeUndefined();
+    expect(r.summary["accountsReplacementSuspected"]).toBeUndefined();
+    expect(r.summary["accountsRetired"]).toBe(2);
+    expect((await rowsOf("revolut_sync_state", "entity = 'backfill'"))[0]).toMatchObject({
+      window_from: "2026-02-01T00:00:00.000Z",
+      requested_days: INITIAL_BACKFILL_DAYS,
+    });
+    expect(await auditActions("revolut.accounts_replaced")).toBe(audits);
+    // Nothing pending afterwards: a further read with the same accounts is ordinary.
+    expect((await sync()).summary["accountsReplacementSuspected"]).toBeUndefined();
   });
 
   it("one account going away is not a replacement", async () => {
@@ -448,6 +524,7 @@ describe("N3: re-authorised to different accounts", () => {
 
   it("queueInitialBackfill({ replacesAccounts }) resets the cursors itself (the confirm route)", async () => {
     await seedOldWalks();
+    const audits = await auditActions("revolut.accounts_replaced");
     await queueInitialBackfill(env, connId, "gerrie.grobbelaar@camelthorncapital.com", Date.now(), {
       replacesAccounts: true,
     });
@@ -458,6 +535,7 @@ describe("N3: re-authorised to different accounts", () => {
         )
         .first(),
     ).toEqual({ cursor: null, window_from: null, requested_days: INITIAL_BACKFILL_DAYS });
+    expect(await auditActions("revolut.accounts_replaced")).toBe(audits + 1);
     // Without the flag an in-progress walk is left alone.
     await db
       .prepare(
@@ -586,8 +664,16 @@ describe("N4: bank details lookup", () => {
         )?.iban,
       ).toBe("B");
     });
-    it("falls back to pooled details when nothing else has an IBAN, and to none without one", () => {
-      expect(pickOwnDetails([d({ iban: "P", pooled: true })], "EUR")?.iban).toBe("P");
+    it("never takes a pooled (shared) IBAN as the account's own, and none without one", () => {
+      expect(pickOwnDetails([d({ iban: "P", pooled: true, schemes: ["sepa"] })], "EUR")).toBe(
+        undefined,
+      );
+      expect(
+        pickOwnDetails(
+          [d({ iban: "P", pooled: true, schemes: ["swift"] }), d({ iban: "OWN", schemes: [] })],
+          "USD",
+        )?.iban,
+      ).toBe("OWN");
       expect(pickOwnDetails([d({ accountNo: "1" }), d({ iban: "" })], "EUR")).toBeUndefined();
       expect(pickOwnDetails([], "EUR")).toBeUndefined();
     });

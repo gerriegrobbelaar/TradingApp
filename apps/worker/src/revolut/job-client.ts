@@ -4,6 +4,7 @@
  * how many calls were really made. The gate refuses a call beyond the budget.
  */
 import { createRevolutClient, RevolutApiError, type RevolutClient } from "@camelthorn/revolut";
+import { revolutClientSleep } from "./client-timing";
 import { createRevolutGateTransport, getRevolutGate } from "./gate-transport";
 
 export interface JobClient {
@@ -25,10 +26,12 @@ export async function startJobClient(
   } catch {
     throw new RevolutApiError(503, "revolut gate unavailable", "gate_unavailable");
   }
+  const sleep = revolutClientSleep();
   const client = createRevolutClient(createRevolutGateTransport(env, connectionId), {
     connectionId,
     jobId,
     priority,
+    ...(sleep ? { sleep } : {}),
   });
   let ended = false;
   return {
