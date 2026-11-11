@@ -1,5 +1,5 @@
 /**
- * Profit and loss builder (pure, deterministic, no I/O). ADR 0023 has the assumptions.
+ * Profit and loss builder (pure, deterministic, no I/O). ADR 0024 has the assumptions.
  *
  * Year to date (periods 1..periodTo) actual, budget and last year's same periods.
  *
@@ -35,7 +35,7 @@ import {
   type ResolvedAccount,
 } from "./ledger";
 
-/** Budgets use debit - credit like the ledger (assumption, ADR 0023). */
+/** Budgets use debit - credit like the ledger (assumption, ADR 0024). */
 export const BUDGET_SIGN: 1n | -1n = 1n;
 
 export interface ProfitLossOptions {

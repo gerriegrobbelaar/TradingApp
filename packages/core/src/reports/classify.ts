@@ -1,5 +1,5 @@
 /**
- * Classification of Exact general ledger accounts into report sections (ADR 0023).
+ * Classification of Exact general ledger accounts into report sections (ADR 0024).
  *
  * Every Type code and keyword below is a RECOLLECTION of Exact's account types, to verify with
  * credentials. That is why the rules are conservative and why nothing is ever dropped: an account

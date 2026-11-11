@@ -97,7 +97,7 @@ export const ENTITIES: readonly EntityName[] = [
   "payables",
   "relations",
   "relation_ibans",
-  // Ledger data for the reports (ledger-sync.ts, ADR 0023): FULL runs only, after everything else.
+  // Ledger data for the reports (ledger-sync.ts, ADR 0024): FULL runs only, after everything else.
   ...LEDGER_ENTITIES,
 ];
 /**
@@ -171,7 +171,7 @@ export interface SyncOptions {
   readIbans?: boolean;
   /**
    * Full mode: read the ledger (chart of accounts, reporting balances, budgets) for the reports
-   * after everything else. Default true; the hourly incremental run never reads it (ADR 0023).
+   * after everything else. Default true; the hourly incremental run never reads it (ADR 0024).
    */
   readLedger?: boolean;
   /**

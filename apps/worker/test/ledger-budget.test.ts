@@ -10,7 +10,7 @@ import { CYCLE_MAX_AGE_MS } from "../src/exact/sync";
 import { LEDGER_PAGE_SIZE_GUESS, estimateLedgerCalls } from "../src/exact/ledger-sync";
 
 /**
- * Call arithmetic for the ledger sync (ADR 0023). The ledger is read inside the existing full-sync
+ * Call arithmetic for the ledger sync (ADR 0024). The ledger is read inside the existing full-sync
  * budget (240 Exact calls per administration and attempt, 4 attempts a day), by resuming across
  * runs, so the worst case per administration and day does not move: 1,960 of Exact's 5,000.
  */

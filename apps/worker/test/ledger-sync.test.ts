@@ -26,7 +26,7 @@ import {
 } from "./sync-helpers";
 
 /**
- * The ledger sync (task K2, ADR 0023): chart of accounts, reporting balances (current and
+ * The ledger sync (task K2, ADR 0024): chart of accounts, reporting balances (current and
  * previous year) and optional budgets, read in resumable passes inside FULL cycles. The clock is
  * fixed in July 2026, so the reporting year is 2026 and the previous one 2025.
  */

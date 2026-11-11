@@ -1,4 +1,4 @@
-# 0023 Ledger sync and the balance sheet / profit and loss reports (Phase 4, task K2)
+# 0024 Ledger sync and the balance sheet / profit and loss reports (Phase 4, task K2)
 
 Status: accepted for the code, **provisional for every Exact name and meaning below: verify with credentials.** Nothing here has run against a real Exact division. Code: `packages/exact/src/client.ts` (`listGlAccountsChunk`, `listReportingBalancesChunk`, `listBudgetsChunk`), `apps/worker/src/exact/ledger-sync.ts`, `apps/worker/migrations/0010_ledger.sql`, `packages/core/src/reports/`, `apps/worker/src/read/ledger-routes.ts`. Supersedes the "per-period, caller sums" remark of ADR 0014 item 8 for the reports.
 

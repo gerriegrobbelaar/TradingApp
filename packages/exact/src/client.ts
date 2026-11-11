@@ -167,7 +167,7 @@ export interface GlBalance {
 
 /**
  * One account of the chart (`financial/GLAccounts`). Every field name here is a recollection to
- * VERIFY with credentials (ADR 0023).
+ * VERIFY with credentials (ADR 0024).
  */
 export interface GlAccount {
   id: string;
@@ -185,7 +185,7 @@ export interface GlAccount {
 
 /**
  * One row of `financial/ReportingBalance`: an account, a reporting year and period, in the
- * division currency. Sign: `amount` = debit - credit (assumption, ADR 0023). `dimension` holds the
+ * division currency. Sign: `amount` = debit - credit (assumption, ADR 0024). `dimension` holds the
  * row's Status and cost centre ("" when none) because Exact may split a period over them and the
  * reports must add the parts, not keep one.
  */
@@ -322,7 +322,7 @@ export const GL_BALANCE_FIELDS = [
   "Amount",
 ] as const;
 /**
- * Ledger resources (ADR 0023). ALL names are recollections: VERIFY with credentials. A 400 on
+ * Ledger resources (ADR 0024). ALL names are recollections: VERIFY with credentials. A 400 on
  * `$select` means one of them is wrong. `Division` is in the path, so it is not selected.
  */
 export const GL_ACCOUNT_FIELDS = [
@@ -778,7 +778,7 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
       : { items, nextToken: r.nextToken, complete: false, error: r.error };
   }
 
-  // --- ledger (ADR 0023) -------------------------------------------------------------------
+  // --- ledger (ADR 0024) -------------------------------------------------------------------
 
   function assertYear(year: number): number {
     if (!Number.isInteger(year) || year < 1900 || year > 2200) {
@@ -1093,7 +1093,7 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
 
     /**
      * Budgets of one reporting year (`budget/Budgets`). OPTIONAL data: the module may not be
-     * licensed, so callers must treat 400/403/404 as "no budgets" (ADR 0023). Resumable chunk.
+     * licensed, so callers must treat 400/403/404 as "no budgets" (ADR 0024). Resumable chunk.
      */
     async listBudgetsChunk(
       token: string | null,

@@ -1,6 +1,6 @@
 /**
  * Read-only ledger API: balance sheet, profit and loss, the chart of accounts and the balances of
- * one account (Phase 4, task K2, ADR 0023).
+ * one account (Phase 4, task K2, ADR 0024).
  *
  *  GET /api/reports/balance-sheet     ?year&period&compare=yearend|period|none[&compareYear]
  *  GET /api/reports/profit-loss       ?year&periodTo[&scenario=<guid>|none]

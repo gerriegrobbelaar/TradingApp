@@ -1,5 +1,5 @@
 /**
- * Ledger sync (Phase 4, task K2, ADR 0023): the chart of accounts, reporting balances and budgets
+ * Ledger sync (Phase 4, task K2, ADR 0024): the chart of accounts, reporting balances and budgets
  * of one division, for the balance sheet and profit and loss reports. Part of FULL sync cycles
  * only (the hourly incremental run never reads ledger data), after open items and relations:
  *
@@ -28,7 +28,7 @@
  * max(5, 20 %) at once) applies here too.
  *
  * Money: integer minor units at the scale of the division currency. Sign: debit - credit
- * (assumption). Field and resource names: all to verify with credentials (ADR 0023).
+ * (assumption). Field and resource names: all to verify with credentials (ADR 0024).
  */
 import { ExactApiError } from "@camelthorn/exact";
 import type {
@@ -491,7 +491,7 @@ async function loadYears(
   return new Map(rows.map((r) => [r.year, r]));
 }
 
-/** The reporting year: the Amsterdam calendar year (assumption, ADR 0023). */
+/** The reporting year: the Amsterdam calendar year (assumption, ADR 0024). */
 export const reportingYear = (ms: number): number => Number(amsterdamParts(ms).date.slice(0, 4));
 
 const ageMs = (iso: string, nowMs: number): number => {

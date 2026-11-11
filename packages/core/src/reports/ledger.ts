@@ -1,17 +1,17 @@
 /**
  * Shared ledger types and arithmetic for the balance sheet and profit and loss builders (pure, no
- * I/O). Everything is integer minor units of ONE currency, the division currency (ADR 0023); the
+ * I/O). Everything is integer minor units of ONE currency, the division currency (ADR 0024); the
  * builders never see or add two currencies. Aggregates are summed as BigInt and converted back only
  * if they are safe integers, so a large ledger can never silently lose cents.
  *
- * SIGN CONVENTION of stored amounts (assumption, verify with credentials, ADR 0023):
+ * SIGN CONVENTION of stored amounts (assumption, verify with credentials, ADR 0024):
  * `amountMinor` = debit - credit. Assets and costs are normally positive, liabilities, equity and
  * revenue normally negative. The reports flip the sign for display, per section.
  */
 export type BalanceSemantics = "movement" | "cumulative";
 
 /**
- * What a reporting balance row means (ADR 0023, assumption to verify with credentials):
+ * What a reporting balance row means (ADR 0024, assumption to verify with credentials):
  *  - "movement":   the net movement of that period. A balance sheet account's balance at period P
  *                  is the sum of periods 0..P (period 0 holds the brought-forward balance), a profit
  *                  and loss account's year-to-date figure the sum of periods 1..P.

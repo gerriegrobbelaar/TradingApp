@@ -234,7 +234,7 @@ export interface OverviewResponse {
   lastSync: SyncFreshnessEntry[];
 }
 
-// ---- ledger and reports (task K2, ADR 0023) -----------------------------------------------------
+// ---- ledger and reports (task K2, ADR 0024) -----------------------------------------------------
 // Every ledger amount is integer minor units in the DIVISION currency (`division.currency`), at
 // that currency's scale. Nothing here is converted. Report builders live in ./reports.
 

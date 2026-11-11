@@ -1,11 +1,11 @@
--- 0010 Ledger data for the balance sheet and profit and loss reports (Phase 4, task K2, ADR 0023).
+-- 0010 Ledger data for the balance sheet and profit and loss reports (Phase 4, task K2, ADR 0024).
 --
 -- Three tables filled by the nightly full sync (apps/worker/src/exact/ledger-sync.ts):
 --   gl_accounts   the chart of accounts (financial/GLAccounts). Accounts that Exact stops returning
 --                 are marked is_active = 0 after two complete reads; they are never deleted.
 --   gl_balances   reporting balances (financial/ReportingBalance) per account, reporting year and
 --                 period, in the DIVISION currency. amount_minor is signed: debit - credit
---                 (assumption, ADR 0023). `dimension` is Exact's Status / cost centre of the row
+--                 (assumption, ADR 0024). `dimension` is Exact's Status / cost centre of the row
 --                 ("" when none); Exact may split one period over them and the reports add the
 --                 parts, so it is part of the key.
 --   gl_budgets    budgets (budget/Budgets), optional data. `scenario` is the budget scenario GUID

@@ -315,6 +315,31 @@ sync panel on the test division.
     is `pending` and only `GET /current/Me` may run (`wrangler tail` shows no other call).
 14. **Before Phase 7 (matching):** XML upload with bearer auth, the `_Division_` parameter, the
     message type codes, and that a MatchSet can be read back (ADR 0014 item 13).
+15. **Ledger and reports (before relying on the balance sheet and profit and loss; ADR 0024).**
+    Run a full sync on the test division (Run now on `exact.full_sync`, or "Sync now" in full mode)
+    until the cycle completes, then check, in this order:
+    - `financial/GLAccounts`, `financial/ReportingBalance` and `budget/Budgets` answer to the
+      `$select` lists in `packages/exact/src/client.ts` (`GL_ACCOUNT_FIELDS`,
+      `REPORTING_BALANCE_FIELDS`, `BUDGET_FIELDS`). A 400 names a wrong field; for budgets it shows
+      as `gl_budgets` with `last_error = budgets_unavailable_400` (budgets are optional and tried
+      again after a week, or at once with a full sync that restarts). Also: page size (60?),
+      `$skiptoken` paging, `Blocked` as the blocked flag, `Type` numeric, `BalanceSide` D/C,
+      `BalanceType` B/W.
+    - **Sign and meaning of `Amount`.** Open Reporting, Balance sheet for the last closed month and
+      compare with Exact's own trial balance: if every figure has the wrong sign or the totals are
+      off, adjust the debit - credit assumption; if balance sheet figures look like movements, or
+      a double-counted year, set `LEDGER_BALANCE_SEMANTICS` (`packages/core/src/reports/ledger.ts`)
+      to `"cumulative"`. The **check line** (`difference`) must be 0; a non-zero value usually means
+      period 0 (brought-forward balances) is missing or the semantics are wrong.
+    - **Unclassified accounts.** `GET /api/ledger/accounts` lists `section: "unclassified"` and
+      `unclassifiedCount`. Fill the real `GLAccount.Type` codes into `BS_TYPE_SECTIONS`
+      (`reports/classify.ts`) and list the type descriptions seen.
+    - Whether ReportingBalance includes draft entries, whether rows are split over more than
+      status and cost centre (compare `gl_balances` row counts per account and period with the
+      distinct keys in Exact), the budget sign and scenarios, and the reporting year when the
+      financial year is not the calendar year.
+    - Call arithmetic: a normal night adds about 65 calls for 300 accounts, the
+      weekly night about 155; read `exact_usage` after the first full cycle.
 
 ---
 

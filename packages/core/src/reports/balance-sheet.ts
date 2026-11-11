@@ -1,5 +1,5 @@
 /**
- * Balance sheet builder (pure, deterministic, no I/O). ADR 0023 has the assumptions.
+ * Balance sheet builder (pure, deterministic, no I/O). ADR 0024 has the assumptions.
  *
  * Inputs are the stored chart, reporting balances (signed debit - credit, division currency) and
  * the options. Output sections are Assets, Liabilities, Equity and Unclassified; the profit or loss
