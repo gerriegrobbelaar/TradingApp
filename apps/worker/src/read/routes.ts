@@ -11,13 +11,16 @@
  * not a positive integer, 404 when it is unknown or its connection is disabled) and defaults to the
  * user's saved choice (the same default as the switcher). Row routes (`/api/open-items/:id`,
  * `/api/relations/:id`) take the division from the row and 404 when that division is not visible.
- * Nothing here writes, so there is no CSRF or audit concern. Responses are `no-store` (json()).
+ * The only write is filling the derived `search_text` of rows that predate migration 0009 (a
+ * cache column, no business data), so there is no CSRF or audit concern. Responses are
+ * `no-store` (json()).
  */
 import {
   addDays,
   AGEING_BUCKETS,
   buildAgeing,
   buildOverviewKpis,
+  likePatterns,
   resolveDcMinor,
   toCalendarDate,
   amsterdamParts,
@@ -25,14 +28,16 @@ import {
   type AgeingReportResponse,
   type AgeingReportRow,
   type AgeingReportTotals,
+  type CurrencyKpisDto,
   type DivisionRef,
   type DrilldownHint,
   type Freshness,
+  type FreshnessEntity,
+  type KpiFigure,
   type OpenItemDetail,
   type OpenItemKind,
   type OpenItemListResponse,
   type OverviewResponse,
-  type RelationRef,
   type RelationSummary,
   type SyncFreshnessEntry,
 } from "@camelthorn/core";
@@ -43,14 +48,16 @@ import {
   buildTotalsQuery,
   decodeCursor,
   encodeCursor,
+  FILL_SEARCH_SQL,
   mapRow,
+  PENDING_SEARCH_SQL,
+  pendingSearchPairs,
   rowKey,
-  rowMatches,
-  totalsFromRows,
   totalsFromSql,
   type Cursor,
   type ListFilter,
   type ListRow,
+  type PendingSearchRow,
   type TotalsRow,
 } from "./queries";
 
@@ -59,13 +66,14 @@ const ANY_ROLE = { roles: ["admin", "finance", "approver", "viewer"] } as const;
 export const STALE_AFTER_HOURS = 36;
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
-/** Text search filters in code (SQLite cannot fold diacritics); more candidates than this is refused. */
-export const MAX_SEARCH_CANDIDATES = 20_000;
+/** Rows without search text (written before migration 0009) filled per statement, and per request. */
+export const SEARCH_FILL_CHUNK = 2_000;
+export const SEARCH_FILL_MAX_CHUNKS = 10;
 
-class BadRequest extends Error {
+export class BadRequest extends Error {
   constructor(
     readonly code: string,
-    readonly status: 400 | 404 = 400,
+    readonly status: 400 | 404 | 503 = 400,
   ) {
     super(code);
   }
@@ -118,16 +126,20 @@ function dateParam(raw: string | null, name: string): string | null {
 const today = (ctx: Ctx): string => amsterdamParts(ctx.nowMs).date;
 
 /**
- * `asOf` for lists and reports. The tables hold today's open balances only, so a past date would
- * silently omit everything paid since: refused (ADR 0022). Default: today in Amsterdam.
+ * `asOf` for lists and reports: today's Amsterdam calendar date, the only date the tables can
+ * answer for (ADR 0022). They hold today's open balances, so a past date would silently omit
+ * everything paid since, and a future one would present today's balances as a forecast: both
+ * are refused (400 `as_of_in_past` / `as_of_in_future`). Omit it to get today; the response says
+ * which date that was.
  */
-function asOfParam(ctx: Ctx): string {
-  const now = today(ctx);
-  const v = dateParam(ctx.url.searchParams.get("asOf"), "as_of");
-  if (v === null) return now;
-  if (v < now) throw new BadRequest("as_of_in_past");
-  return v;
+export function resolveAsOf(raw: string | null, nowMs: number): string {
+  const now = amsterdamParts(nowMs).date;
+  const v = dateParam(raw, "as_of");
+  if (v === null || v === now) return now;
+  throw new BadRequest(v < now ? "as_of_in_past" : "as_of_in_future");
 }
+
+const asOfParam = (ctx: Ctx): string => resolveAsOf(ctx.url.searchParams.get("asOf"), ctx.nowMs);
 
 async function resolveDivision(ctx: Ctx): Promise<DivisionRow> {
   const session = ctx.session;
@@ -156,6 +168,7 @@ function guarded(fn: (ctx: Ctx) => Promise<Response>): (ctx: Ctx) => Promise<Res
     } catch (err) {
       if (err instanceof BadRequest) {
         if (err.code === "unauthenticated") return json({ error: err.code }, 401);
+        if (err.status === 503) return json({ error: err.code }, 503, { "retry-after": "1" });
         return json({ error: err.code }, err.status);
       }
       throw err;
@@ -164,6 +177,40 @@ function guarded(fn: (ctx: Ctx) => Promise<Response>): (ctx: Ctx) => Promise<Res
 }
 
 // ---- lists ----------------------------------------------------------------------------------
+
+function searchParam(raw: string | null): string[] {
+  const q = (raw ?? "").trim();
+  if (q.length > 100) throw new BadRequest("bad_q");
+  try {
+    return likePatterns(q);
+  } catch {
+    throw new BadRequest("bad_q");
+  }
+}
+
+/**
+ * Fill `search_text` of rows written before migration 0009 (the sync writes it for every row it
+ * touches). A derived cache column, not a business change: no audit. One SELECT when nothing is
+ * pending (partial index); otherwise chunks of SEARCH_FILL_CHUNK rows, one UPDATE each, and a 503
+ * `search_index_building` (retry) if a division still has rows left after SEARCH_FILL_MAX_CHUNKS.
+ */
+export async function fillSearchText(
+  db: D1Database,
+  divisionId: number,
+  chunk = SEARCH_FILL_CHUNK,
+  maxChunks = SEARCH_FILL_MAX_CHUNKS,
+): Promise<void> {
+  for (let round = 0; round < maxChunks; round++) {
+    const rows = (
+      await db.prepare(PENDING_SEARCH_SQL).bind(divisionId, chunk).all<PendingSearchRow>()
+    ).results;
+    if (rows.length === 0) return;
+    await db.prepare(FILL_SEARCH_SQL).bind(pendingSearchPairs(rows)).run();
+    if (rows.length < chunk) return;
+  }
+  const left = await db.prepare(PENDING_SEARCH_SQL).bind(divisionId, 1).all<PendingSearchRow>();
+  if (left.results.length > 0) throw new BadRequest("search_index_building", 503);
+}
 
 function parseFilter(
   ctx: Ctx,
@@ -194,6 +241,7 @@ function parseFilter(
     dueBefore,
     dueAfter,
     noDueDate: noDue === "1",
+    search: searchParam(p.get("q")),
   };
 }
 
@@ -209,8 +257,6 @@ async function listHandler(ctx: Ctx, kind: OpenItemKind): Promise<Response> {
   const dir = sort === "due" ? "asc" : "desc";
   const limit = positiveIntParam(p.get("limit"), "limit") ?? DEFAULT_LIMIT;
   if (limit > MAX_LIMIT) throw new BadRequest("bad_limit");
-  const q = (p.get("q") ?? "").trim();
-  if (q.length > 100) throw new BadRequest("bad_q");
   const rawCursor = p.get("cursor");
   let cursor: Cursor | null = null;
   if (rawCursor !== null) {
@@ -219,59 +265,26 @@ async function listHandler(ctx: Ctx, kind: OpenItemKind): Promise<Response> {
   }
   const dc = { currency: division.base_currency, known: division.base_currency_read_at !== null };
   const db = ctx.env.DB;
+  if (filter.search.length > 0) await fillSearchText(db, division.id);
 
-  if (q === "") {
-    const list = buildListQuery(filter, dir, cursor, limit + 1);
-    const totals = buildTotalsQuery(filter, dc);
-    const [rows, totalRows] = await db.batch<ListRow | TotalsRow>([
-      db.prepare(list.sql).bind(...list.binds),
-      db.prepare(totals.sql).bind(...totals.binds),
-    ]);
-    const all = (rows?.results ?? []) as ListRow[];
-    const page = all.slice(0, limit);
-    const last = page[page.length - 1];
-    const totalsByCurrency = totalsFromSql((totalRows?.results ?? []) as TotalsRow[]);
-    const body: OpenItemListResponse = {
-      division: ref,
-      asOf,
-      items: page.map((r) => mapRow(r, ref, asOf)),
-      nextCursor:
-        all.length > limit && last ? encodeCursor({ dir, key: rowKey(last), id: last.id }) : null,
-      limit,
-      total: totalsByCurrency.reduce((n, t) => n + t.count, 0),
-      totalsByCurrency,
-    };
-    return json(body);
-  }
-
-  // Text search: fold case and diacritics in code over the rows the other filters leave.
-  const list = buildListQuery(filter, dir, null, MAX_SEARCH_CANDIDATES + 1);
-  const result = await db
-    .prepare(list.sql)
-    .bind(...list.binds)
-    .all<ListRow>();
-  if (result.results.length > MAX_SEARCH_CANDIDATES) throw new BadRequest("search_too_broad");
-  const matching = result.results.filter((r) => rowMatches(q, r));
-  const start = cursor
-    ? matching.findIndex((r) => {
-        const k = rowKey(r);
-        return dir === "asc"
-          ? k > cursor.key || (k === cursor.key && r.id > cursor.id)
-          : k < cursor.key || (k === cursor.key && r.id < cursor.id);
-      })
-    : 0;
-  const rest = start < 0 ? [] : matching.slice(start);
-  const page = rest.slice(0, limit);
+  const list = buildListQuery(filter, dir, cursor, limit + 1);
+  const totals = buildTotalsQuery(filter, dc);
+  const [rows, totalRows] = await db.batch<ListRow | TotalsRow>([
+    db.prepare(list.sql).bind(...list.binds),
+    db.prepare(totals.sql).bind(...totals.binds),
+  ]);
+  const all = (rows?.results ?? []) as ListRow[];
+  const page = all.slice(0, limit);
   const last = page[page.length - 1];
-  const totalsByCurrency = totalsFromRows(matching.map((r) => mapRow(r, ref, asOf)));
+  const totalsByCurrency = totalsFromSql((totalRows?.results ?? []) as TotalsRow[]);
   const body: OpenItemListResponse = {
     division: ref,
     asOf,
     items: page.map((r) => mapRow(r, ref, asOf)),
     nextCursor:
-      rest.length > limit && last ? encodeCursor({ dir, key: rowKey(last), id: last.id }) : null,
+      all.length > limit && last ? encodeCursor({ dir, key: rowKey(last), id: last.id }) : null,
     limit,
-    total: matching.length,
+    total: totalsByCurrency.reduce((n, t) => n + t.count, 0),
     totalsByCurrency,
   };
   return json(body);
@@ -407,7 +420,10 @@ interface AgeingSqlRow {
   dc_currency: string | null;
 }
 
-/** Filters that reproduce one ageing cell on the list endpoint. */
+/**
+ * Filters that reproduce one ageing cell on the list endpoint. Absolute dates, so a drill-down
+ * opened after midnight still returns the rows of the cell that was shown.
+ */
 export function bucketQuery(bucket: AgeingBucket | "total", asOf: string): Record<string, string> {
   switch (bucket) {
     case "total":
@@ -431,60 +447,60 @@ function hints(
   path: DrilldownHint["path"],
   currency: string,
   asOf: string,
-  relationId: number | null,
 ): Record<AgeingBucket | "total", DrilldownHint> {
   const out = {} as Record<AgeingBucket | "total", DrilldownHint>;
   for (const b of [...AGEING_BUCKETS, "total"] as const) {
-    out[b] = {
-      path,
-      query: {
-        status: "open",
-        currency,
-        asOf,
-        ...(relationId === null ? {} : { relationId: String(relationId) }),
-        ...bucketQuery(b, asOf),
-      },
-    };
+    out[b] = { path, query: { status: "open", currency, ...bucketQuery(b, asOf) } };
   }
   return out;
 }
 
-async function freshness(
-  db: D1Database,
-  divisionId: number,
-  nowMs: number,
-): Promise<{ fresh: Freshness; entries: SyncFreshnessEntry[] }> {
-  const rows = (
+interface SyncStateRow {
+  entity: string;
+  last_status: string | null;
+  last_completed_at: string | null;
+  last_finished_at: string | null;
+  last_error: string | null;
+}
+
+async function syncState(db: D1Database, divisionId: number): Promise<SyncStateRow[]> {
+  return (
     await db
       .prepare(
         `SELECT entity, last_status, last_completed_at, last_finished_at, last_error
          FROM sync_state WHERE division_id = ?1 ORDER BY entity`,
       )
       .bind(divisionId)
-      .all<{
-        entity: string;
-        last_status: string | null;
-        last_completed_at: string | null;
-        last_finished_at: string | null;
-        last_error: string | null;
-      }>()
+      .all<SyncStateRow>()
   ).results;
-  const run = rows.find((r) => r.entity === "run");
-  const completed = run?.last_completed_at ?? null;
-  const age = completed === null ? Infinity : nowMs - Date.parse(completed);
+}
+
+/**
+ * How current the open items are: the last complete read of each entity in `basis` (sync_state
+ * `last_completed_at`, set only when that entity's read reached Exact's last page). The OLDEST of
+ * them counts, and a missing one makes it null. Not the `run` row: an hourly incremental run
+ * completes without reading open items (ADR 0019), so it would hide a nightly sync that keeps
+ * failing.
+ */
+export function freshnessOf(
+  rows: readonly SyncStateRow[],
+  basis: readonly FreshnessEntity[],
+  nowMs: number,
+): Freshness {
+  let oldest: string | null = null;
+  let missing = false;
+  for (const entity of basis) {
+    const at = rows.find((r) => r.entity === entity)?.last_completed_at ?? null;
+    if (at === null || Number.isNaN(Date.parse(at))) missing = true;
+    else if (oldest === null || Date.parse(at) < Date.parse(oldest)) oldest = at;
+  }
+  const lastCompletedAt = missing ? null : oldest;
+  const age = lastCompletedAt === null ? Infinity : nowMs - Date.parse(lastCompletedAt);
   return {
-    fresh: {
-      lastCompletedAt: completed,
-      stale: !(age <= STALE_AFTER_HOURS * 3_600_000),
-      staleAfterHours: STALE_AFTER_HOURS,
-    },
-    entries: rows.map((r) => ({
-      entity: r.entity,
-      status: r.last_status,
-      completedAt: r.last_completed_at,
-      finishedAt: r.last_finished_at,
-      error: r.last_error,
-    })),
+    lastCompletedAt,
+    basis: [...basis],
+    stale: !(age <= STALE_AFTER_HOURS * 3_600_000),
+    staleAfterHours: STALE_AFTER_HOURS,
   };
 }
 
@@ -512,7 +528,7 @@ async function ageingHandler(ctx: Ctx): Promise<Response> {
       .all<AgeingSqlRow>()
   ).results;
 
-  const rowIds = new Map<string, RelationRef>();
+  const rowIds = new Map<string, number | null>();
   const dcDiv = {
     currency: division.base_currency,
     known: division.base_currency_read_at !== null,
@@ -520,7 +536,7 @@ async function ageingHandler(ctx: Ctx): Promise<Response> {
   const report = buildAgeing(
     rows.map((r) => {
       const key = r.relation_exact_id ?? "";
-      rowIds.set(key, { id: r.relation_row_id, name: r.relation_name ?? r.relation_row_name });
+      rowIds.set(key, r.relation_row_id);
       return {
         relationKey: key,
         relationName: r.relation_name ?? r.relation_row_name,
@@ -550,9 +566,13 @@ async function ageingHandler(ctx: Ctx): Promise<Response> {
     count: t.count,
     dcMinor: t.dc.minor,
     dcComplete: t.dc.complete,
-    drilldown: hints(path, t.currency, asOf, null),
+    drilldown: hints(path, t.currency, asOf),
   });
-  const { fresh } = await freshness(db, division.id, ctx.nowMs);
+  const fresh = freshnessOf(
+    await syncState(db, division.id),
+    [kindParam === "receivable" ? "receivables" : "payables"],
+    ctx.nowMs,
+  );
   const body: AgeingReportResponse = {
     division: ref,
     kind: kindParam,
@@ -560,19 +580,15 @@ async function ageingHandler(ctx: Ctx): Promise<Response> {
     currencies: report.currencies.map((c) => ({
       currency: c.currency,
       totals: totalsDto(c.totals),
-      rows: c.rows.map((row): AgeingReportRow => {
-        const rel = rowIds.get(row.relationKey) ?? { id: null, name: row.relationName };
-        return {
-          relation: { id: rel.id, name: row.relationName ?? rel.name },
-          buckets: row.buckets,
-          bucketCounts: row.bucketCounts,
-          totalMinor: row.totalMinor,
-          count: row.count,
-          dcMinor: row.dc.minor,
-          dcComplete: row.dc.complete,
-          drilldown: rel.id === null ? null : hints(path, c.currency, asOf, rel.id),
-        };
-      }),
+      rows: c.rows.map((row): AgeingReportRow => ({
+        relation: { id: rowIds.get(row.relationKey) ?? null, name: row.relationName },
+        buckets: row.buckets,
+        bucketCounts: row.bucketCounts,
+        totalMinor: row.totalMinor,
+        count: row.count,
+        dcMinor: row.dc.minor,
+        dcComplete: row.dc.complete,
+      })),
     })),
     totalsByCurrency: report.totalsByCurrency.map(totalsDto),
     freshness: fresh,
@@ -581,6 +597,24 @@ async function ageingHandler(ctx: Ctx): Promise<Response> {
 }
 
 // ---- overview -------------------------------------------------------------------------------
+
+/** Filters that reproduce one KPI figure on the list endpoint (same rules as core/kpis.ts). */
+export function kpiQuery(figure: KpiFigure, asOf: string): Record<string, string> {
+  switch (figure) {
+    case "total":
+      return {};
+    case "overdue":
+      return { dueBefore: asOf };
+    case "due7":
+      return { dueAfter: addDays(asOf, -1), dueBefore: addDays(asOf, 8) };
+    case "due30":
+      return { dueAfter: addDays(asOf, -1), dueBefore: addDays(asOf, 31) };
+    case "noDueDate":
+      return { noDueDate: "1" };
+  }
+}
+
+const KPI_FIGURES: readonly KpiFigure[] = ["total", "overdue", "due7", "due30", "noDueDate"];
 
 async function overviewHandler(ctx: Ctx): Promise<Response> {
   const division = await resolveDivision(ctx);
@@ -625,14 +659,45 @@ async function overviewHandler(ctx: Ctx): Promise<Response> {
     })),
     asOf,
   );
-  const { fresh, entries } = await freshness(db, division.id, ctx.nowMs);
+  const dto =
+    (path: DrilldownHint["path"]) =>
+    (k: (typeof kpis.receivable)[number]): CurrencyKpisDto => {
+      const drilldown = {} as Record<KpiFigure, DrilldownHint>;
+      for (const f of KPI_FIGURES) {
+        drilldown[f] = {
+          path,
+          query: { status: "open", currency: k.currency, ...kpiQuery(f, asOf) },
+        };
+      }
+      return {
+        currency: k.currency,
+        total: k.total,
+        overdue: k.overdue,
+        due7: k.due7,
+        due30: k.due30,
+        noDueDate: k.noDueDate,
+        avgDaysOverdue: k.avgDaysOverdue,
+        drilldown,
+      };
+    };
+  const state = await syncState(db, division.id);
+  const fresh = freshnessOf(state, ["receivables", "payables"], ctx.nowMs);
   const body: OverviewResponse = {
     division: ref,
     asOf,
     stale: fresh.stale,
     freshness: fresh,
-    kpis: { receivable: kpis.receivable, payable: kpis.payable },
-    lastSync: entries,
+    kpis: {
+      receivable: kpis.receivable.map(dto("/api/invoices")),
+      payable: kpis.payable.map(dto("/api/bills")),
+    },
+    lastSync: state.map((r): SyncFreshnessEntry => ({
+      entity: r.entity,
+      status: r.last_status,
+      completedAt: r.last_completed_at,
+      finishedAt: r.last_finished_at,
+      error: r.last_error,
+    })),
   };
   return json(body);
 }

@@ -5,10 +5,8 @@
 import {
   ageingBucket,
   daysOverdue,
-  matchesQuery,
-  money,
-  addMoney,
   resolveDcMinor,
+  searchText,
   type CurrencyTotal,
   type DivisionRef,
   type OpenItemKind,
@@ -31,6 +29,8 @@ export interface ListFilter {
   dueBefore: string | null;
   dueAfter: string | null;
   noDueDate: boolean;
+  /** LIKE patterns from `likePatterns` (core/search.ts) against `search_text`; all must match. */
+  search: string[];
 }
 
 export interface Cursor {
@@ -78,6 +78,10 @@ function where(f: ListFilter): Built {
     binds.push(f.dueAfter);
   }
   if (f.noDueDate) parts.push("oi.due_date IS NULL");
+  for (const pattern of f.search) {
+    parts.push("oi.search_text LIKE ? ESCAPE '\\'");
+    binds.push(pattern);
+  }
   return { sql: parts.join(" AND "), binds };
 }
 
@@ -179,34 +183,6 @@ export function totalsFromSql(rows: readonly TotalsRow[]): CurrencyTotal[] {
   }));
 }
 
-/** The same totals computed from mapped rows (used when the text search filters in code). */
-export function totalsFromRows(rows: readonly OpenItemRow[]): CurrencyTotal[] {
-  const by = new Map<string, CurrencyTotal>();
-  for (const r of rows) {
-    let t = by.get(r.currency);
-    if (!t) {
-      t = {
-        currency: r.currency,
-        count: 0,
-        openMinor: 0,
-        dcMinor: 0,
-        dcMissing: 0,
-        dcComplete: true,
-      };
-      by.set(r.currency, t);
-    }
-    t.count += 1;
-    t.openMinor = addMoney(money(t.openMinor, r.currency), money(r.openMinor, r.currency)).minor;
-    if (r.dcMinor === null) {
-      t.dcMissing += 1;
-      t.dcComplete = false;
-    } else {
-      t.dcMinor = addMoney(money(t.dcMinor, r.currency), money(r.dcMinor, r.currency)).minor;
-    }
-  }
-  return [...by.values()].sort((a, b) => (a.currency < b.currency ? -1 : 1));
-}
-
 export function mapRow(r: ListRow, division: DivisionRef, asOf: string): OpenItemRow {
   const open = r.status === "open";
   return {
@@ -243,15 +219,31 @@ export function mapRow(r: ListRow, division: DivisionRef, asOf: string): OpenIte
   };
 }
 
-/** Text search over invoice number, entry number, relation name and reference. */
-export function rowMatches(q: string, r: ListRow): boolean {
-  return matchesQuery(q, [
-    r.invoice_number,
-    r.entry_number === null ? null : String(r.entry_number),
-    r.relation_name,
-    r.relation_row_name,
-    r.reference,
-  ]);
+/** Rows written before migration 0009 have no search text yet; filled on the first search. */
+export const PENDING_SEARCH_SQL = `SELECT id, invoice_number, entry_number, relation_name, reference
+  FROM open_items WHERE division_id = ?1 AND search_text IS NULL LIMIT ?2`;
+
+export interface PendingSearchRow {
+  id: number;
+  invoice_number: string | null;
+  entry_number: number | null;
+  relation_name: string | null;
+  reference: string | null;
+}
+
+/** One statement for a whole chunk: `?1` is a JSON array of `[id, text]` pairs. */
+export const FILL_SEARCH_SQL = `UPDATE open_items SET search_text = json_extract(j.value, '$[1]')
+  FROM json_each(?1) AS j
+  WHERE open_items.id = json_extract(j.value, '$[0]') AND open_items.search_text IS NULL`;
+
+/** The same fields, in the same order, as the sync upsert (exact/sync.ts, openItemStmt). */
+export function pendingSearchPairs(rows: readonly PendingSearchRow[]): string {
+  return JSON.stringify(
+    rows.map((r) => [
+      r.id,
+      searchText([r.invoice_number, r.entry_number, r.relation_name, r.reference]),
+    ]),
+  );
 }
 
 export function rowKey(r: ListRow): string {

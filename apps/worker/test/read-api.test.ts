@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   addDays,
   amsterdamParts,
+  drilldownForRelation,
   type AgeingReportResponse,
   type OpenItemDetail,
   type OpenItemListResponse,
@@ -11,6 +12,7 @@ import {
 } from "@camelthorn/core";
 import worker from "../src/index";
 import { buildListQuery, buildTotalsQuery } from "../src/read/queries";
+import { BadRequest, fillSearchText, freshnessOf, resolveAsOf } from "../src/read/routes";
 import { addSession, addUser, authed, call, ORIGIN, resetDb } from "./helpers";
 import { resetExact, seedConnection } from "./exact-helpers";
 
@@ -155,6 +157,9 @@ beforeEach(async () => {
   divOff = await addDivision(off.meta.last_row_id, "Gamma BV");
 });
 
+const cur = (v: unknown[]): string =>
+  btoa(JSON.stringify(v)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
 describe("access and validation", () => {
   const paths = [
     "/api/invoices",
@@ -206,6 +211,22 @@ describe("access and validation", () => {
       ["/api/invoices?overdue=yes", 400, "bad_overdue"],
       ["/api/invoices?relationId=-1", 400, "bad_relation_id"],
       ["/api/invoices?asOf=2001-01-01", 400, "as_of_in_past"],
+      [`/api/invoices?asOf=${addDays(today(), 1)}`, 400, "as_of_in_future"],
+      [`/api/invoices?asOf=${today()}`, 200, ""],
+      ["/api/invoices?q=a%20b%20c%20d%20e%20f%20g%20h%20i", 400, "bad_q"],
+      ["/api/invoices?q=a%20b%20c%20d%20e%20f%20g%20h", 200, ""],
+      // Well-formed base64 of tampered cursors: id as a string, SQL in the key, negative id,
+      // unsafe id, extra element; and a valid one for the other direction.
+      [`/api/invoices?cursor=${cur(["a", "2026-01-01", "1"])}`, 400, "bad_cursor"],
+      [`/api/invoices?cursor=${cur(["a", "' OR 1=1 --", 1])}`, 400, "bad_cursor"],
+      [`/api/invoices?cursor=${cur(["a", "2026-01-01", -1])}`, 400, "bad_cursor"],
+      [`/api/invoices?cursor=${cur(["a", "2026-01-01", 2 ** 60])}`, 400, "bad_cursor"],
+      [`/api/invoices?cursor=${cur(["a", "2026-01-01", 1, 2])}`, 400, "bad_cursor"],
+      [`/api/invoices?cursor=${cur(["d", "2026-01-01", 1])}`, 400, "bad_cursor"],
+      [`/api/invoices?cursor=${cur(["a", "2026-01-01", 1])}`, 200, ""],
+      ["/api/invoices?cursor=a", 400, "bad_cursor"],
+      ["/api/invoices?sort=due;DROP%20TABLE%20open_items", 400, "bad_sort"],
+      ["/api/invoices?currency=E'R", 400, "bad_currency"],
       ["/api/invoices?asOf=2026-02-30", 400, "bad_as_of"],
       [`/api/invoices?q=${"x".repeat(101)}`, 400, "bad_q"],
       ["/api/reports/ageing", 400, "bad_kind"],
@@ -215,8 +236,8 @@ describe("access and validation", () => {
       ["/api/relations/999999", 404, "not_found"],
     ];
     for (const [path, status, code] of bad) {
-      const r = await get<{ error: string }>(path);
-      expect([path, r.status, r.body.error]).toEqual([path, status, code]);
+      const r = await get<{ error?: string }>(path);
+      expect([path, r.status, r.body.error ?? ""]).toEqual([path, status, code]);
     }
   });
 
@@ -481,6 +502,134 @@ describe("lists", () => {
   }
 });
 
+describe("text search", () => {
+  it("treats LIKE wildcards and backslashes as text", async () => {
+    await addItems([
+      { number: "A-1", ref: "Discount 100% now" },
+      { number: "A-2", ref: "a_b c\\d" },
+      { number: "A-3", ref: "plain" },
+    ]);
+    const nums = async (q: string): Promise<string[]> =>
+      (await get<OpenItemListResponse>(`/api/invoices?q=${encodeURIComponent(q)}`)).body.items.map(
+        (i) => i.invoiceNumber ?? "",
+      );
+    expect(await nums("%")).toEqual(["A-1"]);
+    expect(await nums("100%")).toEqual(["A-1"]);
+    expect(await nums("_")).toEqual(["A-2"]);
+    expect(await nums("a_b")).toEqual(["A-2"]);
+    expect(await nums("c\\d")).toEqual(["A-2"]);
+    expect(await nums("\\")).toEqual(["A-2"]);
+    expect(await nums("'; DROP TABLE open_items; --")).toEqual([]);
+    expect(
+      (await db.prepare("SELECT COUNT(*) AS n FROM open_items").first<{ n: number }>())?.n,
+    ).toBe(3);
+  });
+
+  it("fills missing search text per division, in chunks, and asks to retry when there is too much", async () => {
+    await addItems([
+      ...Array.from({ length: 5 }, (_, i) => ({ division: divA, number: `A-${i}` })),
+      { division: divB, number: "B-1" },
+    ]);
+    const pending = async (division: number): Promise<number> =>
+      (
+        await db
+          .prepare(
+            "SELECT COUNT(*) AS n FROM open_items WHERE division_id = ?1 AND search_text IS NULL",
+          )
+          .bind(division)
+          .first<{ n: number }>()
+      )?.n ?? 0;
+    const err = await fillSearchText(db, divA, 2, 2).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(BadRequest);
+    expect((err as BadRequest).status).toBe(503);
+    expect(await pending(divA)).toBe(1);
+    await fillSearchText(db, divA, 2, 2);
+    expect(await pending(divA)).toBe(0);
+    // Exactly used up: no false "still building".
+    await addItems([
+      { division: divA },
+      { division: divA },
+      { division: divA },
+      { division: divA },
+    ]);
+    await fillSearchText(db, divA, 2, 2);
+    expect(await pending(divA)).toBe(0);
+    expect(await pending(divB)).toBe(1);
+    // The text written equals what the sync writes; a row that has text is never overwritten.
+    await db
+      .prepare("UPDATE open_items SET search_text = 'kept' WHERE invoice_number = 'A-0'")
+      .run();
+    await db.prepare("UPDATE open_items SET search_text = NULL WHERE invoice_number = 'A-1'").run();
+    await fillSearchText(db, divA);
+    const t = await db
+      .prepare(
+        "SELECT invoice_number, search_text FROM open_items WHERE invoice_number IN ('A-0', 'A-1') ORDER BY 1",
+      )
+      .all<{ search_text: string }>();
+    expect(t.results.map((r) => r.search_text)).toEqual(["kept", "a-1\n2\nacme bv"]);
+  });
+});
+
+describe("as-of date and freshness helpers", () => {
+  it("uses the Amsterdam calendar day, also around midnight UTC and on DST days", () => {
+    const cases: [string, string][] = [
+      ["2026-03-28T23:30:00Z", "2026-03-29"], // 00:30 CET, the spring-forward day
+      ["2026-03-29T21:59:59Z", "2026-03-29"], // 23:59:59 CEST
+      ["2026-03-29T22:00:00Z", "2026-03-30"],
+      ["2026-10-24T22:30:00Z", "2026-10-25"], // 00:30 CEST, the fall-back day
+      ["2026-10-25T22:59:59Z", "2026-10-25"], // 23:59:59 CET
+      ["2026-12-31T23:00:00Z", "2027-01-01"],
+      ["2026-12-31T22:59:59Z", "2026-12-31"],
+    ];
+    for (const [utc, local] of cases) {
+      const ms = Date.parse(utc);
+      expect([utc, resolveAsOf(null, ms)]).toEqual([utc, local]);
+      expect(resolveAsOf(local, ms)).toBe(local);
+      // The UTC date is refused when it is not the Amsterdam date.
+      if (utc.slice(0, 10) !== local) {
+        expect(() => resolveAsOf(utc.slice(0, 10), ms)).toThrow("as_of_in_past");
+      }
+    }
+    expect(() => resolveAsOf("2026-13-01", Date.now())).toThrow("bad_as_of");
+    expect(() => resolveAsOf("2026-01-01T00:00:00Z", Date.now())).toThrow("bad_as_of");
+  });
+
+  it("takes the oldest complete read, ignores the run row, and treats bad dates as missing", () => {
+    const now = Date.parse("2026-06-30T12:00:00Z");
+    const row = (entity: string, at: string | null) => ({
+      entity,
+      last_status: "ok",
+      last_completed_at: at,
+      last_finished_at: at,
+      last_error: null,
+    });
+    const rows = [
+      row("run", "2026-06-30T11:00:00Z"),
+      row("receivables", "2026-06-29T00:00:00Z"),
+      row("payables", "2026-06-28T23:59:59Z"),
+    ];
+    expect(freshnessOf(rows, ["receivables", "payables"], now)).toEqual({
+      lastCompletedAt: "2026-06-28T23:59:59Z",
+      basis: ["receivables", "payables"],
+      stale: true,
+      staleAfterHours: 36,
+    });
+    expect(freshnessOf(rows, ["receivables"], now).stale).toBe(false);
+    // Exactly 36 hours is still fresh; a millisecond more is stale.
+    expect(freshnessOf([row("payables", "2026-06-29T00:00:00Z")], ["payables"], now).stale).toBe(
+      false,
+    );
+    expect(
+      freshnessOf([row("payables", "2026-06-28T23:59:59.999Z")], ["payables"], now).stale,
+    ).toBe(true);
+    expect(freshnessOf([row("payables", "garbage")], ["payables"], now)).toMatchObject({
+      lastCompletedAt: null,
+      stale: true,
+    });
+    expect(freshnessOf([row("run", "2026-06-30T11:00:00Z")], ["payables"], now).stale).toBe(true);
+  });
+});
+
 describe("pagination", () => {
   async function walk(qs: string): Promise<{ ids: number[]; pages: number }> {
     const ids: number[] = [];
@@ -608,11 +757,15 @@ describe("ageing report", () => {
     expect(r.body.freshness.stale).toBe(true);
 
     // Every cell's drill-down returns exactly that cell's count and amount.
+    const forRelation = (id: number) =>
+      Object.fromEntries(
+        Object.entries(eur.totals.drilldown).map(([b, h]) => [b, drilldownForRelation(h, id)]),
+      ) as typeof eur.totals.drilldown;
     const cells = [
       ...eur.rows.map((row) => ({
         buckets: row.buckets,
         counts: row.bucketCounts,
-        dd: row.drilldown,
+        dd: forRelation(row.relation.id!),
         total: row.totalMinor,
       })),
       {
@@ -622,13 +775,12 @@ describe("ageing report", () => {
         total: eur.totals.totalMinor,
       },
     ];
-    expect(cells[0]!.dd).not.toBeNull();
     let checked = 0;
     for (const cell of cells) {
       for (const b of [...Object.keys(cell.buckets), "total"] as (
         keyof typeof cell.buckets | "total"
       )[]) {
-        const hint = cell.dd![b];
+        const hint = cell.dd[b];
         const qs = new URLSearchParams({ ...hint.query, limit: "100" });
         const list = await get<OpenItemListResponse>(`${hint.path}?${qs}`);
         const wantCount =
@@ -654,47 +806,55 @@ describe("ageing report", () => {
     expect(usdOnly.body.currencies.map((c) => c.currency)).toEqual(["USD"]);
   });
 
-  it("works for an as-of date in the future and refuses the past", async () => {
+  it("accepts only today as the as-of date", async () => {
     const t = today();
-    await addItems([{ due: addDays(t, 10) }]);
-    const future = await get<AgeingReportResponse>(
-      `/api/reports/ageing?kind=receivable&asOf=${addDays(t, 20)}`,
-    );
-    expect(future.body.totalsByCurrency[0]?.buckets.d1_30).toBe(1000);
-    const past = await get<{ error: string }>(
-      `/api/reports/ageing?kind=receivable&asOf=${addDays(t, -1)}`,
-    );
-    expect(past.status).toBe(400);
+    await addItems([{ due: addDays(t, -10) }]);
+    const ok = await get<AgeingReportResponse>(`/api/reports/ageing?kind=receivable&asOf=${t}`);
+    expect(ok.body.totalsByCurrency[0]?.buckets.d1_30).toBe(1000);
+    for (const [d, code] of [
+      [addDays(t, -1), "as_of_in_past"],
+      [addDays(t, 1), "as_of_in_future"],
+    ] as const) {
+      const r = await get<{ error: string }>(`/api/reports/ageing?kind=receivable&asOf=${d}`);
+      expect([r.status, r.body.error]).toEqual([400, code]);
+    }
   });
 
-  it("gives an unresolved relation a null drill-down", async () => {
+  it("gives an unresolved relation a null id, and credit notes sort last as credits", async () => {
+    await addRelation(divA, "rel-1", "Acme BV");
     await addItems([
-      { relation: "never-synced", name: "Ghost" },
-      { relation: null, name: null },
+      { relation: "never-synced", name: "Ghost", open: 300 },
+      { relation: null, name: null, open: 200 },
+      { relation: "rel-1", name: "Acme BV", open: -500, due: addDays(today(), -40) },
     ]);
     const r = await get<AgeingReportResponse>("/api/reports/ageing?kind=receivable");
-    const rows = r.body.currencies[0]!.rows;
-    expect(rows).toHaveLength(2);
-    expect(rows.every((x) => x.drilldown === null)).toBe(true);
-    expect(r.body.currencies[0]!.totals.drilldown["total"].query["status"]).toBe("open");
+    const c = r.body.currencies[0]!;
+    expect(c.rows.map((x) => [x.relation.name, x.relation.id === null, x.totalMinor])).toEqual([
+      ["Ghost", true, 300],
+      [null, true, 200],
+      ["Acme BV", false, -500],
+    ]);
+    expect(c.totals).toMatchObject({ totalMinor: 0, count: 3 });
+    expect(c.totals.buckets.d31_60).toBe(-500);
+    expect(c.totals.drilldown["total"].query["status"]).toBe("open");
+    expect(c.totals.drilldown["total"].query).not.toHaveProperty("asOf");
   });
 });
 
 describe("overview", () => {
-  const syncRun = async (division: number, completedAt: string | null): Promise<void> => {
-    await db
-      .prepare(
-        `INSERT INTO sync_state (division_id, entity, last_status, last_completed_at, last_finished_at)
-         VALUES (?1, 'run', 'ok', ?2, ?2)`,
-      )
-      .bind(division, completedAt)
-      .run();
+  const syncState = async (
+    division: number,
+    entity: string,
+    completedAt: string | null,
+    status = "ok",
+    error: string | null = null,
+  ): Promise<void> => {
     await db
       .prepare(
         `INSERT INTO sync_state (division_id, entity, last_status, last_completed_at, last_finished_at, last_error)
-         VALUES (?1, 'receivables', 'partial', ?2, ?2, 'rate_limited')`,
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5)`,
       )
-      .bind(division, completedAt)
+      .bind(division, entity, status, completedAt, error)
       .run();
   };
 
@@ -720,21 +880,73 @@ describe("overview", () => {
     expect(r.body.kpis.payable[0]).toMatchObject({ currency: "EUR", total: { minor: 100 } });
   });
 
-  it("flags stale data when the last complete sync is older than 36 hours or missing", async () => {
+  it("flags stale data when open items were not read completely within 36 hours", async () => {
+    const now = Date.now();
+    const iso = (h: number): string => new Date(now - h * 3_600_000).toISOString();
     expect((await get<OverviewResponse>("/api/overview")).body.stale).toBe(true);
-    const old = new Date(Date.now() - 37 * 3_600_000).toISOString();
-    await syncRun(divA, old);
+    // An hourly run that completes without reading open items does not make them fresh.
+    await syncState(divA, "run", iso(0.5));
+    await syncState(divA, "relations", iso(0.5));
+    await syncState(divA, "receivables", iso(37), "partial", "rate_limited");
+    await syncState(divA, "payables", iso(2));
     const stale = await get<OverviewResponse>("/api/overview");
     expect(stale.body.stale).toBe(true);
-    expect(stale.body.freshness).toMatchObject({ lastCompletedAt: old, staleAfterHours: 36 });
-    expect(stale.body.lastSync.map((l) => l.entity)).toEqual(["receivables", "run"]);
-    expect(stale.body.lastSync[0]).toMatchObject({ status: "partial", error: "rate_limited" });
-    await db.prepare("DELETE FROM sync_state").run();
-    const fresh = new Date(Date.now() - 35 * 3_600_000).toISOString();
-    await syncRun(divA, fresh);
-    expect((await get<OverviewResponse>("/api/overview")).body.stale).toBe(false);
+    expect(stale.body.freshness).toMatchObject({
+      lastCompletedAt: iso(37),
+      basis: ["receivables", "payables"],
+      staleAfterHours: 36,
+    });
+    expect(stale.body.lastSync.map((l) => l.entity)).toEqual([
+      "payables",
+      "receivables",
+      "relations",
+      "run",
+    ]);
+    expect(stale.body.lastSync[1]).toMatchObject({ status: "partial", error: "rate_limited" });
+    // The ageing report looks at its own kind only.
+    const pay = await get<AgeingReportResponse>("/api/reports/ageing?kind=payable");
+    expect(pay.body.freshness).toMatchObject({ stale: false, lastCompletedAt: iso(2) });
+    const rec = await get<AgeingReportResponse>("/api/reports/ageing?kind=receivable");
+    expect(rec.body.freshness.stale).toBe(true);
+    // Both read within 36 hours: fresh. One never read: stale with a null date.
+    await db
+      .prepare("UPDATE sync_state SET last_completed_at = ?1 WHERE entity = 'receivables'")
+      .bind(iso(35))
+      .run();
+    const fresh = await get<OverviewResponse>("/api/overview");
+    expect(fresh.body).toMatchObject({ stale: false, freshness: { lastCompletedAt: iso(35) } });
+    await db.prepare("DELETE FROM sync_state WHERE entity = 'payables'").run();
+    const missing = await get<OverviewResponse>("/api/overview");
+    expect(missing.body).toMatchObject({ stale: true, freshness: { lastCompletedAt: null } });
     // Freshness is per division.
     expect((await get<OverviewResponse>(`/api/overview?division=${divB}`)).body.stale).toBe(true);
+  });
+
+  it("gives every KPI a drill-down that returns exactly its items", async () => {
+    const t = today();
+    await addItems([
+      ...[-40, -1, 0, 1, 7, 8, 30, 31].map((d, i) => ({ due: addDays(t, d), open: 10 + i })),
+      { due: null, open: 3 },
+      { due: addDays(t, -5), open: -4 },
+      { due: addDays(t, -5), open: 50, currency: "USD" },
+      { due: addDays(t, -5), open: 60, kind: "bill" as const },
+    ]);
+    const o = await get<OverviewResponse>("/api/overview");
+    let checked = 0;
+    for (const list of [o.body.kpis.receivable, o.body.kpis.payable]) {
+      for (const k of list) {
+        for (const f of ["total", "overdue", "due7", "due30", "noDueDate"] as const) {
+          const hint = k.drilldown[f];
+          const qs = new URLSearchParams({ ...hint.query, limit: "100" });
+          const r = await get<OpenItemListResponse>(`${hint.path}?${qs}`);
+          expect([k.currency, f, r.body.total]).toEqual([k.currency, f, k[f].count]);
+          const minor = r.body.totalsByCurrency[0]?.openMinor ?? 0;
+          expect([k.currency, f, minor]).toEqual([k.currency, f, k[f].minor]);
+          checked++;
+        }
+      }
+    }
+    expect(checked).toBe(15);
   });
 });
 
@@ -807,6 +1019,7 @@ describe("query plans and volume", () => {
     dueBefore: null,
     dueAfter: null,
     noDueDate: false,
+    search: [] as string[],
     ...over,
   });
 
@@ -824,11 +1037,13 @@ describe("query plans and volume", () => {
     for (const status of ["open", "closed", "all"] as const) {
       for (const dir of ["asc", "desc"] as const) {
         for (const cursor of [null, { dir, key: "2026-06-30", id: 5 }]) {
-          const p = await plan(buildListQuery(filterOf({ status }), dir, cursor, 51));
-          const label = `${status} ${dir} ${cursor ? "cursor" : "first"}: ${p}`;
-          expect(p, label).toMatch(/USING INDEX idx_open_items_list(_all)?\b/);
-          expect(p, label).not.toMatch(/SCAN oi\b|SCAN open_items/);
-          expect(p, label).not.toMatch(/TEMP B-TREE/);
+          for (const search of [[], ["%acme%", "%2026%"]]) {
+            const p = await plan(buildListQuery(filterOf({ status, search }), dir, cursor, 51));
+            const label = `${status} ${dir} ${cursor ? "cursor" : "first"}: ${p}`;
+            expect(p, label).toMatch(/USING (COVERING )?INDEX idx_open_items_list(_all)?\b/);
+            expect(p, label).not.toMatch(/SCAN oi\b|SCAN open_items/);
+            expect(p, label).not.toMatch(/TEMP B-TREE/);
+          }
         }
       }
     }
@@ -902,9 +1117,30 @@ describe("query plans and volume", () => {
     await (await run("/api/invoices?limit=1")).json();
     expect(calls).toBe(listCalls);
 
+    // The first search fills the search text of the 5,000 rows written without it (as before
+    // migration 0009): ceil(5000 / 2000) = 3 chunks of one SELECT and one UPDATE, then an empty SELECT
+    // is not needed because the last chunk was short.
     calls = 0;
-    await (await run("/api/invoices?limit=100&q=customer%203")).json();
-    expect(calls).toBeLessThanOrEqual(8);
+    const firstSearch = (await (
+      await run("/api/invoices?limit=100&q=CUSTOMER")
+    ).json()) as OpenItemListResponse;
+    expect(calls).toBe(listCalls + 6);
+    // Every row matches: the worst case for a search.
+    expect(firstSearch.total).toBe(5000);
+    const pending = await db
+      .prepare("SELECT COUNT(*) AS n FROM open_items WHERE search_text IS NULL")
+      .first<{ n: number }>();
+    expect(pending?.n).toBe(0);
+    // Afterwards a search costs the same as a plain list plus the one (empty) pending check.
+    calls = 0;
+    const search = (await (
+      await run("/api/invoices?limit=100&q=CUSTOMER")
+    ).json()) as OpenItemListResponse;
+    expect(calls).toBe(listCalls + 1);
+    expect(search.total).toBe(5000);
+    expect(search.totalsByCurrency).toEqual(page.totalsByCurrency);
+    expect(search.items).toHaveLength(100);
+    expect(search.nextCursor).not.toBeNull();
 
     calls = 0;
     const ageing = (await (

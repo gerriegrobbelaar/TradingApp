@@ -1,4 +1,5 @@
 import { env } from "cloudflare:test";
+import { pendingSearchPairs, type PendingSearchRow } from "../src/read/queries";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ExactApiError,
@@ -210,6 +211,23 @@ describe("full sync", () => {
     // /Date(1700000000000)/ is 2023-11-14T22:13:20Z, still the 14th in Amsterdam
     expect(byId[guid(101)]?.due_date).toBe("2023-11-14");
     expect(rows.every((r) => r.last_seen_sync_id === s.runSeq)).toBe(true);
+    // The folded search text (migration 0009) is written by the upsert, from the same fields and
+    // in the same way as the read API fills older rows.
+    const texts = (
+      await db
+        .prepare(
+          `SELECT id, invoice_number, entry_number, relation_name, reference, search_text
+           FROM open_items WHERE division_id = ?1`,
+        )
+        .bind(div.id)
+        .all<PendingSearchRow & { search_text: string | null }>()
+    ).results;
+    expect(texts).toHaveLength(4);
+    for (const t of texts) {
+      expect(t.search_text).not.toBeNull();
+      expect(JSON.parse(pendingSearchPairs([t]))).toEqual([[t.id, t.search_text]]);
+    }
+    expect(texts.find((t) => t.invoice_number === "20240001")?.search_text).toContain("20240001");
 
     for (const e of [
       "divisions",

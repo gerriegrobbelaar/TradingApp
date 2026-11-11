@@ -3,7 +3,10 @@
  * Money is always integer minor units plus a currency code; `dc*` fields are the division
  * currency amount (no FX conversion happens anywhere, EUR-equivalents come in Phase 6).
  * Dates are `YYYY-MM-DD` (Amsterdam calendar days); timestamps are UTC ISO-8601.
- * Error bodies are `{ error: string }` with 400 (bad query), 401, 404 (unknown division or row).
+ * Error bodies are `{ error: string }` with 400 (bad query), 401, 403 (no role), 404 (unknown
+ * division or row) and 503 `search_index_building` (retry after `Retry-After` seconds).
+ * `asOf` is always today's Amsterdam date; other values are refused (400 `as_of_in_past` /
+ * `as_of_in_future`). Shape tests: apps/worker/test/read-api-shapes.test.ts.
  */
 import type { AgeingBucket, BucketAmounts } from "./ageing";
 
@@ -131,8 +134,11 @@ export interface AgeingReportRow {
   count: number;
   dcMinor: number;
   dcComplete: boolean;
-  /** Per bucket and "total": filters for the underlying rows; null if the relation is unresolved. */
-  drilldown: Record<AgeingBucket | "total", DrilldownHint> | null;
+  /*
+   * No drill-down per row (it would repeat seven hints for every relation): use the currency's
+   * `totals.drilldown` with `drilldownForRelation(hint, relation.id)`. Not possible when
+   * `relation.id` is null (the relation has not been synced yet).
+   */
 }
 
 export interface AgeingReportTotals {
@@ -143,7 +149,13 @@ export interface AgeingReportTotals {
   count: number;
   dcMinor: number;
   dcComplete: boolean;
+  /** Per bucket and "total": list filters that return exactly this cell's rows. */
   drilldown: Record<AgeingBucket | "total", DrilldownHint>;
+}
+
+/** The drill-down of a totals cell narrowed to one relation (our relations.id). */
+export function drilldownForRelation(hint: DrilldownHint, relationId: number): DrilldownHint {
+  return { path: hint.path, query: { ...hint.query, relationId: String(relationId) } };
 }
 
 export interface AgeingReportResponse {
@@ -156,10 +168,18 @@ export interface AgeingReportResponse {
   freshness: Freshness;
 }
 
+/** The sync_state entities whose complete reads freshness is based on. */
+export type FreshnessEntity = "receivables" | "payables";
+
 export interface Freshness {
-  /** Last time a whole sync run ended ok, or null if never. */
+  /**
+   * The oldest last complete read of the `basis` entities (receivables, payables or both), or
+   * null when one of them was never read completely. Not the last sync run: hourly runs complete
+   * without reading open items.
+   */
   lastCompletedAt: string | null;
-  /** True when that is older than staleAfterHours (or null). */
+  basis: FreshnessEntity[];
+  /** True when lastCompletedAt is older than staleAfterHours, or null. */
   stale: boolean;
   staleAfterHours: number;
 }
@@ -171,14 +191,22 @@ export interface KpiAmountDto {
   dcComplete: boolean;
 }
 
+export type KpiFigure = "total" | "overdue" | "due7" | "due30" | "noDueDate";
+
 export interface CurrencyKpisDto {
   currency: string;
   total: KpiAmountDto;
+  /** Due before today (due today is not overdue). Credit notes reduce it. */
   overdue: KpiAmountDto;
+  /** Due from today up to and including today + 7. */
   due7: KpiAmountDto;
+  /** Due from today up to and including today + 30 (includes due7). */
   due30: KpiAmountDto;
   noDueDate: KpiAmountDto;
+  /** Amount-weighted over overdue items with a positive balance, rounded half up; null if none. */
   avgDaysOverdue: number | null;
+  /** Per figure: list filters that return exactly the items behind it. */
+  drilldown: Record<KpiFigure, DrilldownHint>;
 }
 
 export interface SyncFreshnessEntry {
@@ -193,7 +221,7 @@ export interface SyncFreshnessEntry {
 export interface OverviewResponse {
   division: DivisionRef;
   asOf: string;
-  /** True when the last complete sync is older than 36 hours (or there is none). */
+  /** Same as freshness.stale: open items not read completely within 36 hours. */
   stale: boolean;
   freshness: Freshness;
   kpis: {

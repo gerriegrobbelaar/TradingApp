@@ -48,7 +48,13 @@ import {
 import { auditStatement } from "../db/audit";
 import type { Env } from "../env";
 import { createGateTransport, gateName, getExactGate } from "./gate-transport";
-import { amsterdamDate, amsterdamParts, isPlausibleIban, normalizeIban } from "@camelthorn/core";
+import {
+  amsterdamDate,
+  amsterdamParts,
+  isPlausibleIban,
+  normalizeIban,
+  searchText,
+} from "@camelthorn/core";
 
 export type SyncMode = "full" | "incremental";
 export type RunStatus = "ok" | "partial" | "error" | "needs_reauth";
@@ -474,9 +480,9 @@ function openItemStmt(
       `INSERT INTO open_items (division_id, exact_id, kind, relation_id, relation_name,
          invoice_number, reference, currency, amount_minor, open_minor, invoice_date, due_date,
          status, closed_at, synced_at, entry_number, last_seen_sync_id, original_minor,
-         open_dc_minor, dc_currency, rate, source)
+         open_dc_minor, dc_currency, rate, source, search_text)
        SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?17, ?9), ?9, ?10, ?11, ?12, ?13, ?14,
-         ?15, ?16, ?17, ?18, ?19, ?20, ?21
+         ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
        WHERE ?12 = 'open'
           OR EXISTS (SELECT 1 FROM open_items WHERE division_id = ?1 AND exact_id = ?2)
        ON CONFLICT (division_id, exact_id) DO UPDATE SET
@@ -501,7 +507,7 @@ function openItemStmt(
                           THEN COALESCE(open_items.closed_at, excluded.closed_at) ELSE NULL END,
          synced_at = excluded.synced_at, entry_number = excluded.entry_number,
          last_seen_sync_id = excluded.last_seen_sync_id, missed_cycles = 0,
-         source = excluded.source
+         source = excluded.source, search_text = excluded.search_text
        WHERE excluded.last_seen_sync_id >= COALESCE(open_items.last_seen_sync_id, 0)`,
     )
     .bind(
@@ -526,6 +532,13 @@ function openItemStmt(
       dc === null ? null : dc.currency,
       item.rate,
       source,
+      // Folded search text (migration 0009, ADR 0022): the same fields the list search covers.
+      searchText([
+        item.invoiceNumber === null ? null : String(item.invoiceNumber),
+        item.entryNumber,
+        item.accountName,
+        item.description,
+      ]),
     );
 }
 
