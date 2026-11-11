@@ -40,6 +40,8 @@ import {
   type MatchTunablesDto,
   type MatchUndoResponse,
 } from "@camelthorn/core";
+import { bookingHealth } from "../booking/health";
+import { undoUnsentClaim } from "../booking/unsent";
 import { auditStatement, LAST_INSERT_ID } from "../db/audit";
 import { decodeTxCursor, encodeTxCursor } from "../read/bank-routes";
 import { ANY_ROLE, BadRequest, guarded, positiveIntParam } from "../read/routes";
@@ -427,6 +429,7 @@ async function statsHandler(ctx: Ctx): Promise<Response> {
     enabled: settings.enabled,
     autoEnabled: settings.autoEnabled,
     unmappedAccounts,
+    booking: await bookingHealth(db),
   };
   return json(body);
 }
@@ -648,13 +651,14 @@ async function undoHandler(ctx: Ctx): Promise<Response> {
   const id = idParam(ctx);
   const b = await readBody(ctx, ["reason"]);
   const reason = textField(b["reason"], 200, true, "bad_reason") as string;
-  const res = await undoMatch(
-    ctx.env.DB,
-    id,
-    email(ctx),
-    reason,
-    new Date(ctx.nowMs).toISOString(),
-  );
+  const nowIso = new Date(ctx.nowMs).toISOString();
+  let res = await undoMatch(ctx.env.DB, id, email(ctx), reason, nowIso);
+  if (res.kind === "already_booked_in_exact" && res.exactState === "manual_required") {
+    // A claimed match that provably never reached Exact (only stage 'none' rows, nothing sent): the
+    // booking removes its rows and the match is undone like any other (migration 0024).
+    const u = await undoUnsentClaim(ctx.env.DB, id, email(ctx), reason, nowIso);
+    if (u.kind === "done") res = { kind: "undone" };
+  }
   switch (res.kind) {
     case "not_found":
       throw new ApiError("not_found", 404);
@@ -852,6 +856,7 @@ interface MapSqlRow {
   bank_gl_account_code: string | null;
   receivable_gl_account_code: string | null;
   payable_gl_account_code: string | null;
+  opening_balance_minor: number | null;
   updated_at: string | null;
   updated_by: string | null;
 }
@@ -874,7 +879,7 @@ async function accountMapResponse(db: D1Database): Promise<MatchAccountMapRespon
       .prepare(
         `SELECT ba.id, ba.name, ba.iban, ba.currency, m.division_id, d.name AS division_name,
                 m.journal_code, m.bank_gl_account_code, m.receivable_gl_account_code,
-                m.payable_gl_account_code, m.updated_at, m.updated_by
+                m.payable_gl_account_code, m.opening_balance_minor, m.updated_at, m.updated_by
          FROM bank_accounts ba
            JOIN connections c ON c.id = ba.connection_id AND c.kind = 'revolut'
            LEFT JOIN bank_account_exact_map m ON m.bank_account_id = ba.id
@@ -895,6 +900,7 @@ async function accountMapResponse(db: D1Database): Promise<MatchAccountMapRespon
     bankGlAccountCode: r.bank_gl_account_code,
     receivableGlAccountCode: r.receivable_gl_account_code,
     payableGlAccountCode: r.payable_gl_account_code,
+    openingBalanceMinor: r.opening_balance_minor,
     updatedAt: r.updated_at,
     updatedBy: r.updated_by,
   }));
@@ -915,6 +921,7 @@ async function putMapHandler(ctx: Ctx): Promise<Response> {
     "bankGlAccountCode",
     "receivableGlAccountCode",
     "payableGlAccountCode",
+    "openingBalanceMinor",
   ]);
   const accountId = b["bankAccountId"];
   if (typeof accountId !== "number" || !Number.isSafeInteger(accountId) || accountId < 1) {
@@ -997,12 +1004,23 @@ async function putMapHandler(ctx: Ctx): Promise<Response> {
   };
   const receivable = control("receivableGlAccountCode");
   const payable = control("payableGlAccountCode");
+  // Opening balance for the FIRST bank entry of a journal with no entry in Exact (U1, A12b): an
+  // integer in minor units. Absent keeps the stored value, null clears it.
+  let opening: { provided: 0 | 1; value: number | null } = { provided: 0, value: null };
+  if ("openingBalanceMinor" in b) {
+    const v = b["openingBalanceMinor"];
+    if (v === null) opening = { provided: 1, value: null };
+    else if (typeof v === "number" && Number.isSafeInteger(v) && Math.abs(v) <= 1e13)
+      opening = { provided: 1, value: v };
+    else throw new ApiError("bad_opening_balance");
+  }
   const after = {
     division_id: divisionId,
     journal_code: journal,
     bank_gl_account_code: gl,
     ...(receivable.provided === 1 ? { receivable_gl_account_code: receivable.value } : {}),
     ...(payable.provided === 1 ? { payable_gl_account_code: payable.value } : {}),
+    ...(opening.provided === 1 ? { opening_balance_minor: opening.value } : {}),
   };
   await guardedBatch([
     auditStatement(db, {
@@ -1017,14 +1035,17 @@ async function putMapHandler(ctx: Ctx): Promise<Response> {
       .prepare(
         `INSERT INTO bank_account_exact_map
            (bank_account_id, division_id, journal_code, bank_gl_account_code, created_by, created_at,
-            updated_by, updated_at, receivable_gl_account_code, payable_gl_account_code)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?5, ?6, ?7, ?9)
+            updated_by, updated_at, receivable_gl_account_code, payable_gl_account_code,
+            opening_balance_minor)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?5, ?6, ?7, ?9, ?11)
          ON CONFLICT (bank_account_id) DO UPDATE SET division_id = excluded.division_id,
            journal_code = excluded.journal_code, bank_gl_account_code = excluded.bank_gl_account_code,
            receivable_gl_account_code = CASE WHEN ?8 = 1 THEN excluded.receivable_gl_account_code
                                              ELSE bank_account_exact_map.receivable_gl_account_code END,
            payable_gl_account_code = CASE WHEN ?10 = 1 THEN excluded.payable_gl_account_code
                                           ELSE bank_account_exact_map.payable_gl_account_code END,
+           opening_balance_minor = CASE WHEN ?12 = 1 THEN excluded.opening_balance_minor
+                                        ELSE bank_account_exact_map.opening_balance_minor END,
            updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
       )
       .bind(
@@ -1038,6 +1059,8 @@ async function putMapHandler(ctx: Ctx): Promise<Response> {
         receivable.provided,
         payable.value,
         payable.provided,
+        opening.value,
+        opening.provided,
       ),
   ]);
   return json(await accountMapResponse(db));

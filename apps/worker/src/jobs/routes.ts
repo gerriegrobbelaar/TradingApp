@@ -5,7 +5,8 @@
  *                               budget, next run and last run, plus whether the Worker's queue and
  *                               cron are set up (`scheduler`)
  *  GET   /api/jobs/:id/runs     any signed-in role: history, newest first (`?limit=`, max 100)
- *  PATCH /api/jobs/:id          admin (no step-up): `{ enabled?, schedule?, exactBudget?, rev? }`.
+ *  PATCH /api/jobs/:id          admin: `{ enabled?, schedule?, exactBudget?, rev? }`. Switching ON a handler
+ *                               that says stepUp needs a fresh sign-in (401 step_up_required).
  *                               The schedule is checked by validateSchedule, the budget must be a whole
  *                               number of 1..MAX_EXACT_BUDGET (and only Exact jobs have one), the
  *                               time zone is always Europe/Amsterdam. The change and its audit row
@@ -220,6 +221,13 @@ async function patchJob(ctx: Ctx): Promise<Response> {
   if ("enabled" in body) {
     if (typeof body["enabled"] !== "boolean") return json({ error: "invalid_enabled" }, 400);
     enabled = body["enabled"];
+    // Switching ON a job that writes to a system of record or sends mail needs the same fresh
+    // sign-in as running it by hand (review N1): enabling it is the bigger decision.
+    if (enabled && job.enabled !== 1 && def?.stepUp === true) {
+      if (!ctx.session || !isStepUpFresh(ctx.session, ctx.nowMs)) {
+        return json({ error: "step_up_required" }, 401);
+      }
+    }
   }
   let schedule: Schedule | null = parseSchedule(job.schedule_json);
   let scheduleChanged = false;

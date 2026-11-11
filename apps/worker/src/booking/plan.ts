@@ -60,8 +60,21 @@ export interface Candidate {
     counterpartyName: string | null;
     reference: string | null;
     description: string | null;
+    /** Revolut's fee for the leg (minor units, the leg's currency), null = none reported. */
+    feeMinor: number | null;
   };
-  map: { journalCode: string; receivableGl: string | null; payableGl: string | null };
+  map: {
+    journalCode: string;
+    receivableGl: string | null;
+    payableGl: string | null;
+    /** Admin-supplied; used ONLY for the first entry of a journal with no entry in Exact (A12b). */
+    openingBalanceMinor: number | null;
+  };
+  /** The booking mode of the Revolut connection this bank line belongs to (N2); null = undecided. */
+  txConnectionCreatesBankEntries: boolean | null;
+  /** Why the executor could not book it at an earlier run (not claimed), or null. */
+  deferredCode: string | null;
+  deferredAt: string | null;
   items: CandidateItem[];
 }
 
@@ -101,6 +114,43 @@ export type Plan =
     };
 
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Plan failures that are CONFIGURATION or MISSING DATA, not a property of the match (review B1):
+ * the match is NOT claimed, it stays `not_booked` with a deferral code, so Undo still works and a
+ * later run books it once the data is there. Every other plan failure is a rule of v1 (part
+ * payments, foreign currency, mixed items...) and ends as a claimed `manual_required` row that a
+ * person can still undo or retry (nothing was ever sent, migration 0024).
+ */
+export const DEFER_PLAN_CODES: readonly string[] = [
+  "control_account_unknown",
+  "ledger_account_unknown",
+  "relation_code_unknown",
+  "relation_unknown",
+  "item_entry_number_unknown",
+  "bank_balance_unknown",
+];
+
+export const isDeferralCode = (code: string): boolean => DEFER_PLAN_CODES.includes(code);
+
+/** Deferral codes whose cause is read from Exact: re-checked at most every DEFER_RECHECK_MS. */
+export const READ_DEFERRAL_CODES: readonly string[] = ["bank_balance_unknown"];
+
+export const FEE_DEFER_CODE = "fee_not_supported_v1";
+
+/**
+ * Checks that depend on the booking mode and the bank line, before any plan (review S2, N2).
+ * A line with a Revolut fee is not booked when this app creates the bank entry (v1: unclear whether
+ * the leg amount includes the fee; ADR 0044), and the line's own Revolut connection must be in the
+ * booking mode of the run. Returns a deferral code, or null.
+ */
+export function modeDeferral(c: Candidate, createsBankEntries: boolean): string | null {
+  if (c.txConnectionCreatesBankEntries !== createsBankEntries) return "mode_mismatch";
+  if (createsBankEntries && c.tx.feeMinor !== null && c.tx.feeMinor !== 0) {
+    return FEE_DEFER_CODE;
+  }
+  return null;
+}
 
 /** Stable key for rows that never reach Exact (plan failures): one per match. */
 export const planFailureKey = (matchId: number): string =>
@@ -248,6 +298,11 @@ export type PayloadDoc =
       kind: "bank_entry";
       input: BankEntryInput;
       builtHash: string;
+      /**
+       * True when the opening balance is the admin-supplied one because the journal had no entry in
+       * Exact (assumption A12b). Valid only while the journal STILL has no entry.
+       */
+      openingFromAdmin?: boolean;
       /** The MatchSet that follows once the bank line exists (null for a ledger match). */
       then: { matchset: MatchsetPlanInput; matchsetKey: string } | null;
     }

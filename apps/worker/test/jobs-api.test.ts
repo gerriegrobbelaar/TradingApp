@@ -215,6 +215,37 @@ describe("PATCH /api/jobs/:id", () => {
     expect((await patch("stale-admin", id, { enabled: false })).status).toBe(200);
   });
 
+  it("switching ON a job whose handler needs a fresh sign-in needs one too; switching it off does not (N1)", async () => {
+    tokens["stale-admin"] = await addSession(
+      await addUser("old2@camelthorncapital.com", ["admin"]),
+      {
+        lastAuthAgoMs: 3 * 3600_000,
+      },
+    );
+    for (const name of ["exact.book_matches", "reminders.send", "fx.revaluation"]) {
+      const id = await jobId(name);
+      await db
+        .prepare("UPDATE jobs SET enabled = 0, next_run_at = NULL WHERE id = ?1")
+        .bind(id)
+        .run();
+      const before = await db.prepare("SELECT * FROM jobs WHERE id = ?1").bind(id).first();
+      const refused = await patch("stale-admin", id, { enabled: true });
+      expect([refused.status, ((await refused.json()) as { error: string }).error], name).toEqual([
+        401,
+        "step_up_required",
+      ]);
+      // nothing changed, nothing audited
+      expect(await db.prepare("SELECT * FROM jobs WHERE id = ?1").bind(id).first(), name).toEqual(
+        before,
+      );
+      // a fresh sign-in is not refused for this reason
+      const fresh = await patch("admin", id, { enabled: true });
+      expect(fresh.status, name).toBe(200);
+      // switching it off is the safe direction: a stale session may do it
+      expect((await patch("stale-admin", id, { enabled: false })).status, name).toBe(200);
+    }
+  });
+
   it("needs the CSRF header", async () => {
     const id = await jobId("exact.full_sync");
     const res = await worker.fetch(

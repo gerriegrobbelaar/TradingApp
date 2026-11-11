@@ -15,6 +15,7 @@ import {
   type MatchStatus,
   type MatchTxDto,
 } from "@camelthorn/core";
+import { MATCH_UNSENT } from "../booking/unsent";
 
 const MAX_TEXT = 300;
 
@@ -246,11 +247,15 @@ interface MatchSqlRow {
   undo_reason: string | null;
   exact_state: string;
   review_reason: string | null;
+  booking_deferred_code: string | null;
+  manually_booked: number;
+  unsent_claim: number;
 }
 
 export const MATCH_COLUMNS = `m.id, m.bank_transaction_id, m.division_id, m.source, m.status,
   m.ledger_account_code, m.score, m.rule, m.note, m.created_by, m.created_at, m.undone_by,
-  m.undone_at, m.undo_reason, m.exact_state, m.review_reason`;
+  m.undone_at, m.undo_reason, m.exact_state, m.review_reason, m.booking_deferred_code,
+  m.manually_booked, ${MATCH_UNSENT("m")} AS unsent_claim`;
 
 /** Matches by id, with allocations. */
 export async function loadMatches(db: D1Database, ids: number[]): Promise<Map<number, MatchDto>> {
@@ -300,7 +305,10 @@ export async function loadMatches(db: D1Database, ids: number[]): Promise<Map<nu
       undoReason: safeText(r.undo_reason, 200),
       exactState: r.exact_state,
       reviewReason: r.review_reason,
-      undoAvailable: live && r.exact_state === "not_booked",
+      // A claimed match that provably never reached Exact can be undone as well (migration 0024).
+      undoAvailable: live && (r.exact_state === "not_booked" || r.unsent_claim === 1),
+      bookingDeferredCode: r.booking_deferred_code,
+      bookedManually: r.manually_booked === 1,
       allocations: allocs
         .filter((a) => a.match_id === r.id)
         .map((a) =>

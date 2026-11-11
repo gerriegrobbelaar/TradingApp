@@ -23,13 +23,13 @@ import {
   ExactRateLimitedError,
   buildBankEntryPayload,
   createExactWriter,
-  verifyMatchSetApplied,
   type BankEntryLineHit,
   type ExactTransport,
   type ExactWriter,
   type MatchSetResponse,
   type ReadBackVerdict,
 } from "@camelthorn/exact";
+import { auditStatement } from "../db/audit";
 import { getExactGate, createGateTransport, gateName } from "../exact/gate-transport";
 import { BOOKING_JOB_ID } from "../exact/write-policy";
 import type { HandlerResult, JobContext } from "../jobs/types";
@@ -38,14 +38,22 @@ import {
   BOOKING_DELAY_MS,
   DAILY_BOOKING_CALL_CAP,
   DAILY_CAP_WINDOW_MS,
+  DEFER_RECHECK_MS,
   MAX_AUTO_RETRIES,
   MAX_CALLS_PER_RUN,
-  MAX_MATCHES_PER_RUN,
+  MAX_CANDIDATES_SCANNED,
   RETRY_BACKOFF_MS,
   UNVERIFIED_MAX_MS,
   WAIT_FOR_LINE_MS,
 } from "./constants";
-import { bookingMayRun, blockersOf, loadBookingState, writesPermitted } from "./settings";
+import { bookingMayRun, loadBookingState, runBlockersOf, writesPermitted } from "./settings";
+import { readItemsBack } from "./readback";
+import {
+  ourPostMayHaveLanded,
+  PREFLIGHT_CODE,
+  preflightFromVerdict,
+  type Preflight,
+} from "./preflight";
 import {
   claimAndEnqueue,
   completeKeyStatement,
@@ -62,6 +70,9 @@ import {
   buildMatchsetFromPlan,
   type Candidate,
   type CandidateItem,
+  isDeferralCode,
+  modeDeferral,
+  READ_DEFERRAL_CODES,
   type MatchsetPlanInput,
   asBankEntryDoc,
   asMatchsetDoc,
@@ -80,6 +91,7 @@ export {
   DAILY_BOOKING_CALL_CAP,
   MAX_AUTO_RETRIES,
   MAX_CALLS_PER_RUN,
+  MAX_CANDIDATES_SCANNED,
   MAX_MATCHES_PER_RUN,
   UNVERIFIED_MAX_MS,
   WAIT_FOR_LINE_MS,
@@ -148,6 +160,12 @@ interface CandidateSql {
   exact_division: number;
   base_currency: string;
   ledger_gl_id: string | null;
+  fee_minor: number | null;
+  opening_balance_minor: number | null;
+  conn_creates: number | null;
+  conn_decided: string | null;
+  booking_deferred_code: string | null;
+  booking_deferred_at: string | null;
 }
 
 interface ItemSql {
@@ -164,19 +182,21 @@ interface ItemSql {
   invoice_number: string | null;
 }
 
-async function loadCandidates(
-  db: D1Database,
-  cutoffIso: string,
-  limit: number,
-): Promise<Candidate[]> {
-  const rows = (
-    await db
-      .prepare(
-        `SELECT m.id AS match_id, m.division_id, m.source, m.ledger_account_code, m.amount_minor, m.currency,
+export interface CandidateQuery {
+  /** SQL for the WHERE clause (after the common joins) and its binds, numbered from ?1. */
+  where: string;
+  binds: (string | number)[];
+  limit: number;
+}
+
+const CANDIDATE_SELECT = `SELECT m.id AS match_id, m.division_id, m.source, m.ledger_account_code, m.amount_minor, m.currency,
                 t.id AS tx_id, t.external_id, t.connection_id, t.amount_minor AS tx_amount, t.currency AS tx_currency, t.booked_at,
-                t.counterparty_name, t.reference, t.description,
+                t.counterparty_name, t.reference, t.description, t.fee_minor,
                 mp.journal_code, mp.receivable_gl_account_code, mp.payable_gl_account_code,
+                mp.opening_balance_minor,
                 d.exact_division, d.base_currency,
+                rc.creates_bank_entries AS conn_creates, rc.bank_entries_decided_at AS conn_decided,
+                m.booking_deferred_code, m.booking_deferred_at,
                 (SELECT g.exact_id FROM gl_accounts g WHERE g.division_id = m.division_id
                     AND TRIM(g.code) = m.ledger_account_code AND g.is_active = 1 LIMIT 1) AS ledger_gl_id
          FROM matches m
@@ -185,11 +205,43 @@ async function loadCandidates(
                                          AND mp.division_id = m.division_id
            JOIN divisions d ON d.id = m.division_id AND d.sync_enabled = 1
            JOIN connections c ON c.id = d.connection_id AND c.status = 'active'
-         WHERE m.undone_at IS NULL AND m.exact_state = 'not_booked' AND m.review_reason IS NULL
-           AND m.created_at <= ?1 AND t.is_final = 1 AND t.state = 'completed' AND t.state_conflict = 0
-         ORDER BY m.created_at, m.id LIMIT ?2`,
-      )
-      .bind(cutoffIso, limit)
+           LEFT JOIN connections rc ON rc.id = t.connection_id AND rc.kind = 'revolut'`;
+
+/**
+ * Matches the executor may start: live, not booked, not flagged, old enough, created at or after
+ * the booking watermark, in an allowed administration, with a final completed bank line. Fresh
+ * matches first; a deferred one is looked at again at once unless its reason came from a read of
+ * Exact (then after DEFER_RECHECK_MS), so a deferred match neither starves the others nor burns
+ * Exact calls every run.
+ */
+export function bookableQuery(
+  cutoffIso: string,
+  fromIso: string,
+  divisionIds: readonly number[],
+  recheckBeforeIso: string,
+  limit: number,
+): CandidateQuery {
+  const reads = READ_DEFERRAL_CODES.map((c) => `'${c}'`).join(", ");
+  const base = 5;
+  const marks = divisionIds.map((_, i) => `?${base + i}`).join(", ");
+  return {
+    where: `WHERE m.undone_at IS NULL AND m.exact_state = 'not_booked' AND m.review_reason IS NULL
+           AND m.created_at <= ?1 AND m.created_at >= ?2
+           AND t.is_final = 1 AND t.state = 'completed' AND t.state_conflict = 0
+           AND m.division_id IN (${marks === "" ? "NULL" : marks})
+           AND (m.booking_deferred_code IS NULL OR m.booking_deferred_code NOT IN (${reads})
+                OR m.booking_deferred_at <= ?3)
+         ORDER BY (m.booking_deferred_code IS NOT NULL), m.created_at, m.id LIMIT ?4`,
+    binds: [cutoffIso, fromIso, recheckBeforeIso, limit, ...divisionIds],
+    limit,
+  };
+}
+
+export async function loadCandidates(db: D1Database, q: CandidateQuery): Promise<Candidate[]> {
+  const rows = (
+    await db
+      .prepare(`${CANDIDATE_SELECT} ${q.where}`)
+      .bind(...q.binds)
       .all<CandidateSql>()
   ).results;
   const out: Candidate[] = [];
@@ -226,12 +278,18 @@ async function loadCandidates(
         counterpartyName: r.counterparty_name,
         reference: r.reference,
         description: r.description,
+        feeMinor: r.fee_minor,
       },
       map: {
         journalCode: r.journal_code,
         receivableGl: r.receivable_gl_account_code,
         payableGl: r.payable_gl_account_code,
+        openingBalanceMinor: r.opening_balance_minor,
       },
+      txConnectionCreatesBankEntries:
+        r.conn_decided === null || r.conn_creates === null ? null : r.conn_creates === 1,
+      deferredCode: r.booking_deferred_code,
+      deferredAt: r.booking_deferred_at,
       items: items.map((i): CandidateItem => ({
         id: i.id,
         exactId: i.exact_id,
@@ -250,6 +308,19 @@ async function loadCandidates(
   return out;
 }
 
+/** One match by id for the preview: the same joins, only "live and not booked" is required. */
+export async function loadCandidateForPreview(
+  db: D1Database,
+  matchId: number,
+): Promise<Candidate | null> {
+  const [c] = await loadCandidates(db, {
+    where: `WHERE m.id = ?1 AND m.undone_at IS NULL AND m.exact_state = 'not_booked' LIMIT 1`,
+    binds: [matchId],
+    limit: 1,
+  });
+  return c ?? null;
+}
+
 interface WorkRow extends OutboxRow {
   exact_state: string;
   undone_at: string | null;
@@ -264,6 +335,8 @@ interface WorkRow extends OutboxRow {
   tx_state_conflict: number;
   exact_division: number;
   map_journal: string | null;
+  tx_conn_mode: number | null;
+  tx_conn_decided: string | null;
 }
 
 const WORK_SELECT = `SELECT ${OUTBOX_COLUMNS.split(",")
@@ -272,12 +345,14 @@ const WORK_SELECT = `SELECT ${OUTBOX_COLUMNS.split(",")
        m.exact_state, m.undone_at, t.id AS tx_id, t.external_id AS tx_external_id,
        t.amount_minor AS tx_amount, t.currency AS tx_currency, t.booked_at AS tx_booked_at,
        t.bank_account_id AS tx_account_id, t.is_final AS tx_is_final, t.state AS tx_state,
-       t.state_conflict AS tx_state_conflict, d.exact_division, mp.journal_code AS map_journal
+       t.state_conflict AS tx_state_conflict, d.exact_division, mp.journal_code AS map_journal,
+       rc.creates_bank_entries AS tx_conn_mode, rc.bank_entries_decided_at AS tx_conn_decided
      FROM exact_write_outbox o
        JOIN matches m ON m.id = o.match_id
        JOIN bank_transactions t ON t.id = m.bank_transaction_id
        JOIN divisions d ON d.id = o.division_id
-       LEFT JOIN bank_account_exact_map mp ON mp.bank_account_id = t.bank_account_id`;
+       LEFT JOIN bank_account_exact_map mp ON mp.bank_account_id = t.bank_account_id
+       LEFT JOIN connections rc ON rc.id = t.connection_id AND rc.kind = 'revolut'`;
 
 async function loadWork(db: D1Database, id: number): Promise<WorkRow | null> {
   return db.prepare(`${WORK_SELECT} WHERE o.id = ?1`).bind(id).first<WorkRow>();
@@ -296,6 +371,8 @@ interface Counters {
   waiting: number;
   deferred: number;
   reverted: number;
+  /** Matches this run STARTED (claimed for booking): capped by `exact.booking_max_per_run`. */
+  started: number;
 }
 
 interface DivisionRuntime {
@@ -304,6 +381,43 @@ interface DivisionRuntime {
 }
 
 const iso = (ms: number): string => new Date(ms).toISOString();
+
+/**
+ * Records why a match cannot be booked yet, on the match itself. The audit row is written only when
+ * the code changes (the guard looks at the stored code), so a deferral that lasts days is one audit
+ * row, not one per run.
+ */
+async function recordDeferral(
+  db: D1Database,
+  matchId: number,
+  code: string,
+  nowIso: string,
+): Promise<void> {
+  const live = "undone_at IS NULL AND exact_state = 'not_booked'";
+  await db.batch([
+    auditStatement(
+      db,
+      {
+        actorEmail: "system",
+        action: "booking.deferred",
+        entity: "match",
+        entityId: matchId,
+        after: { code },
+      },
+      {
+        sql: `EXISTS (SELECT 1 FROM matches WHERE id = ?7 AND ${live}
+                AND booking_deferred_code IS NOT ?8)`,
+        binds: [matchId, code],
+      },
+    ),
+    db
+      .prepare(
+        `UPDATE matches SET booking_deferred_code = ?2, booking_deferred_at = ?3
+         WHERE id = ?1 AND ${live}`,
+      )
+      .bind(matchId, code, nowIso),
+  ]);
+}
 
 export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
   const { env } = ctx;
@@ -317,11 +431,12 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
     return {
       status: "skipped",
       code: "booking_disabled",
-      summary: { blockers: blockersOf(state0) },
+      summary: { blockers: runBlockersOf(state0) },
       callsUsed: 0,
     };
   }
   const createsBankEntries = state0.createsBankEntries === true;
+  const allowedDivisions = new Set(state0.divisions);
   // A daily cap of its own (the budget projection of the schedules relies on it): the persisted
   // call ledger of the last DAILY_CAP_WINDOW_MS, every call counted BEFORE it is made.
   await db
@@ -353,7 +468,10 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
     waiting: 0,
     deferred: 0,
     reverted: 0,
+    started: 0,
   };
+  /** Per-match reasons a match cannot be booked yet (codes only), shown in the run summary. */
+  const deferrals: { matchId: number; code: string }[] = [];
   let calls = 0;
   let stop: string | null = null;
   const divisions = new Map<number, DivisionRuntime>();
@@ -406,10 +524,29 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
     return rt;
   }
 
-  /** The switch is re-read right before every POST: turning it off mid-run stops the writes. */
-  async function assertStillEnabled(): Promise<void> {
+  /**
+   * The switch is re-read right before every POST: turning it off mid-run stops the writes, and so
+   * does taking the row's administration off the allow-list or changing the booking mode.
+   */
+  async function assertStillEnabled(divisionId: number): Promise<void> {
     const s = await loadBookingState(db);
-    if (!bookingMayRun(s)) throw new RunStop("writes_disabled");
+    if (!bookingMayRun(s) || !s.divisions.includes(divisionId))
+      throw new RunStop("writes_disabled");
+  }
+
+  /**
+   * The booking mode of a row, its bank line's own Revolut connection, the connection state of the
+   * run and the verification must all agree before anything is POSTed (review B2d, N2). A row
+   * claimed under another mode (or before the mode was stored) never posts: a person decides.
+   */
+  function modeAgrees(w: WorkRow): boolean {
+    return (
+      w.creates_bank_entries !== null &&
+      w.tx_conn_decided !== null &&
+      w.tx_conn_mode !== null &&
+      (w.creates_bank_entries === 1) === createsBankEntries &&
+      (w.tx_conn_mode === 1) === createsBankEntries
+    );
   }
 
   async function note(
@@ -547,29 +684,8 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
   }
 
   /** Reads the items of a MatchSet back from Exact (one or two calls). */
-  async function readBack(rt: DivisionRuntime, p: MatchsetPlanInput): Promise<ReadBackVerdict> {
-    const expected = p.items.map((i) => ({
-      entryNumber: i.entryNumber,
-      currency: p.currency,
-      openBeforeMinor: i.openBeforeMinor,
-    }));
-    const numbers = p.items.map((i) => i.entryNumber);
-    const primary = await rt.writer.readOpenItemLines({
-      kind: p.kind,
-      accountId: p.relationId,
-      entryNumbers: numbers,
-    });
-    const absent = numbers.filter((n) => !primary.some((r) => r.entryNumber === n));
-    const fullyPaid =
-      absent.length > 0
-        ? await rt.writer.readOpenItemLines({
-            kind: p.kind,
-            accountId: p.relationId,
-            entryNumbers: absent,
-            fullyPaidOnly: true,
-          })
-        : undefined;
-    return verifyMatchSetApplied(primary, expected, fullyPaid);
+  function readBack(rt: DivisionRuntime, p: MatchsetPlanInput): Promise<ReadBackVerdict> {
+    return readItemsBack(rt.writer, p);
   }
 
   /** The matchset row is verified: both rows are done and the match is booked. */
@@ -695,10 +811,18 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
         d
           .prepare(
             `INSERT INTO exact_write_outbox (match_id, division_id, journal_code, kind, idempotency_key,
-               payload_json, payload_hash, status, needs_probe, created_at, updated_at)
-             SELECT ?1, ?2, NULL, 'matchset', ?3, ?4, ?5, 'pending', 0, ?6, ?6 WHERE ${GUARD}`,
+               payload_json, payload_hash, status, needs_probe, created_at, updated_at, creates_bank_entries)
+             SELECT ?1, ?2, NULL, 'matchset', ?3, ?4, ?5, 'pending', 0, ?6, ?6, ?7 WHERE ${GUARD}`,
           )
-          .bind(w.match_id, w.division_id, nextKey, msDoc.json, msDoc.hash, at),
+          .bind(
+            w.match_id,
+            w.division_id,
+            nextKey,
+            msDoc.json,
+            msDoc.hash,
+            at,
+            w.creates_bank_entries,
+          ),
         d
           .prepare(
             `INSERT INTO idempotency_keys (scope, key) SELECT 'exact.write.matchset', ?1 WHERE ${GUARD}
@@ -798,13 +922,36 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
         count("deferred");
         return;
       }
-      if (bal.value !== doc.input.openingBalanceMinor) {
+      const unchanged =
+        bal.value === null
+          ? doc.openingFromAdmin === true // still no entry: the admin's opening balance still holds
+          : doc.openingFromAdmin !== true && bal.value === doc.input.openingBalanceMinor;
+      if (!unchanged) {
         return giveUpToManual(w, token, "bank_balance_changed");
       }
     }
 
-    // 3. POST (switch re-read first; `sending` stored first).
-    await assertStillEnabled();
+    // 3a. The items again, BEFORE the bank entry exists (review B2a): if the invoice or bill is
+    // already settled (or changed) in Exact, a bank entry we create now would be a second bank
+    // line. Nothing is sent, the row ends manual_required and the match is NEVER marked booked.
+    const followUp = doc.then;
+    if (followUp !== null) {
+      const pre = await readOr(() => readBack(rt, followUp.matchset));
+      if (!pre.ok) {
+        await releaseLease(w.id, token);
+        count("deferred");
+        return;
+      }
+      const verdict = preflightFromVerdict(pre.value);
+      if (verdict !== "open_as_expected") {
+        return giveUpToManual(w, token, PREFLIGHT_CODE[verdict]);
+      }
+    }
+    // 3b. The mode the row was claimed under is still the mode in force (review B2d, N2).
+    if (!modeAgrees(w)) return giveUpToManual(w, token, "mode_changed");
+
+    // 3c. POST (switch re-read first; `sending` stored first).
+    await assertStillEnabled(w.division_id);
     const sent = await note(w, token, {
       from: ["pending", "failed"],
       to: "sending",
@@ -1040,24 +1187,28 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
       return;
     }
     const verdict = before.value;
-    if (verdict.outcome === "verified") {
-      // Closed in Exact before OUR MatchSet was ever sent: matched by someone (or something) else,
-      // possibly to another bank line. Booked, but marked so a person can check the bank line.
-      return finishMatchset(
-        w,
-        token,
-        "already_matched",
-        w.attempts === 0 && w.needs_probe === 0 ? "already_matched_in_exact" : null,
-      );
-    }
-    if (verdict.outcome === "inconclusive")
+    if (w.attempts === 0) {
+      // Never sent by us: items that are closed or changed in Exact are somebody else's doing. Send
+      // nothing and never mark the match booked (review B2a).
+      const pf: Preflight = preflightFromVerdict(verdict);
+      if (pf !== "open_as_expected") return giveUpToManual(w, token, PREFLIGHT_CODE[pf]);
+    } else if (verdict.outcome === "verified") {
+      // We did send before and the answer was lost or unclear: the closed items may be ours. After
+      // an explicit refusal they are not (a person checks).
+      if (ourPostMayHaveLanded(w.attempts, w.last_error_code)) {
+        return finishMatchset(w, token, "verified_by_readback", null);
+      }
+      return giveUpToManual(w, token, PREFLIGHT_CODE.already_settled);
+    } else if (verdict.outcome === "inconclusive") {
       return giveUpToManual(w, token, "readback_inconclusive");
+    }
     // not_applied from here on.
     if (!txUnchanged(w, -doc.input.bankAmountMinor)) {
       return giveUpToManual(w, token, "bank_line_changed");
     }
+    if (!modeAgrees(w)) return giveUpToManual(w, token, "mode_changed");
 
-    await assertStillEnabled();
+    await assertStillEnabled(w.division_id);
     const sent = await note(w, token, {
       from: ["pending", "failed"],
       to: "sending",
@@ -1271,6 +1422,7 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
              AND ((status IN ('pending', 'waiting_for_bank_line') AND (next_attempt_at IS NULL OR next_attempt_at <= ?1))
                OR status = 'sent_unverified'
                OR (status = 'failed' AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?1 AND attempts < ?2))
+             AND division_id IN (${[...allowedDivisions].map((d) => String(Math.trunc(d))).join(", ") || "NULL"})
            ORDER BY created_at, id LIMIT ?3`,
         )
         .bind(now, MAX_AUTO_RETRIES, ROW_LIMIT)
@@ -1284,14 +1436,24 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
     }
 
     // 3. New matches.
-    const candidates = await loadCandidates(
-      db,
-      iso(nowMs() - BOOKING_DELAY_MS),
-      MAX_MATCHES_PER_RUN,
-    );
-    for (const cand of candidates) {
-      if (ctx.signal.aborted || nowMs() >= ctx.deadlineMs) throw new RunStop("time_limit");
-      await startMatch(cand);
+    // Only matches created at or after the watermark, in an allowed administration, and at most
+    // `maxPerRun` of them started per run (review B2b/B2c). No watermark = nothing is eligible.
+    if (state0.bookingFrom !== null && allowedDivisions.size > 0) {
+      const candidates = await loadCandidates(
+        db,
+        bookableQuery(
+          iso(nowMs() - BOOKING_DELAY_MS),
+          state0.bookingFrom,
+          [...allowedDivisions],
+          iso(nowMs() - DEFER_RECHECK_MS),
+          MAX_CANDIDATES_SCANNED,
+        ),
+      );
+      for (const cand of candidates) {
+        if (ctx.signal.aborted || nowMs() >= ctx.deadlineMs) throw new RunStop("time_limit");
+        if (counters.started >= state0.maxPerRun) break;
+        await startMatch(cand);
+      }
     }
   } catch (e) {
     if (e instanceof RunStop) stop = e.code;
@@ -1300,9 +1462,23 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
     for (const rt of divisions.values()) await rt.endJob();
   }
 
+  /**
+   * The match cannot be booked YET (configuration or missing data): it is NOT claimed. It stays
+   * `not_booked` (Undo works, a later run tries again) with a code the UI shows as "cannot book yet"
+   * (review B1). The code is audited when it changes, never every run.
+   */
+  async function defer(cand: Candidate, code: string): Promise<void> {
+    const c = safeCode(code);
+    counters.deferred++;
+    if (deferrals.length < 20) deferrals.push({ matchId: cand.matchId, code: c });
+    await recordDeferral(db, cand.matchId, c, nowIso());
+  }
+
   async function startMatch(cand: Candidate): Promise<void> {
+    // Mode of the bank line's own Revolut connection, fees (review S2, N2).
+    const early = modeDeferral(cand, createsBankEntries);
+    if (early !== null) return defer(cand, early);
     const plan = planMatch(cand);
-    const matchedKind = createsBankEntries ? "bank_entry" : "matchset";
     const manual = async (code: string, kind: "bank_entry" | "matchset"): Promise<void> => {
       const doc = serializeDoc({ v: 1, stage: "none", reason: safeCode(code) });
       const r = await claimAndEnqueue(db, {
@@ -1316,6 +1492,7 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
         status: "manual_required",
         errorCode: code,
         nowIso: nowIso(),
+        createsBankEntries,
       });
       if (r === "claimed") {
         counters.claimed++;
@@ -1323,6 +1500,9 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
       }
     };
     if (!plan.ok) {
+      if (isDeferralCode(plan.code)) return defer(cand, plan.code);
+      // A rule of v1 (part payment, foreign currency, ...): a person books it in Exact. Claimed as
+      // manual_required, but with nothing sent: it can still be undone or retried (migration 0024).
       return manual(
         plan.code,
         plan.mode === "ledger" || createsBankEntries ? "bank_entry" : "matchset",
@@ -1347,16 +1527,18 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
         matchId: cand.matchId,
         divisionId: cand.divisionId,
         journalCode: null,
-        kind: matchedKind === "matchset" ? "matchset" : "bank_entry",
+        kind: "matchset",
         idempotencyKey: plan.matchsetKey,
         payloadJson: doc.json,
         payloadHash: doc.hash,
         status: "pending",
         errorCode: null,
         nowIso: nowIso(),
+        createsBankEntries,
       });
       if (r === "lost") return;
       counters.claimed++;
+      counters.started++;
       return runClaimed(cand.matchId, ["matchset"]);
     }
 
@@ -1383,24 +1565,31 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
       counters.deferred++;
       return;
     }
-    if (balance.value === null) return manual("bank_balance_unknown", "bank_entry");
-    const built = buildBankEntryPayload({
-      ...plan.bankEntry,
-      openingBalanceMinor: balance.value,
-      closingBalanceMinor: balance.value + cand.tx.amountMinor,
-    });
-    if (!built.ok) return manual(built.error, "bank_entry");
+    // An empty journal: the admin-supplied opening balance, else the match waits (assumption A12b).
+    let opening = balance.value;
+    let openingFromAdmin = false;
+    if (opening === null) {
+      const given = cand.map.openingBalanceMinor;
+      if (given === null || !Number.isSafeInteger(given)) {
+        return defer(cand, "bank_balance_unknown");
+      }
+      opening = given;
+      openingFromAdmin = true;
+    }
     const input = {
       ...plan.bankEntry,
-      openingBalanceMinor: balance.value,
-      closingBalanceMinor: balance.value + cand.tx.amountMinor,
+      openingBalanceMinor: opening,
+      closingBalanceMinor: opening + cand.tx.amountMinor,
     };
+    const built = buildBankEntryPayload(input);
+    if (!built.ok) return defer(cand, `build_${built.error}`);
     const doc = serializeDoc({
       v: 1,
       stage: "built",
       kind: "bank_entry",
       input,
       builtHash: sha256Hex(built.body),
+      ...(openingFromAdmin ? { openingFromAdmin: true } : {}),
       then:
         plan.mode === "matched" ? { matchset: plan.matchset, matchsetKey: plan.matchsetKey } : null,
     });
@@ -1415,9 +1604,11 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
       status: "pending",
       errorCode: null,
       nowIso: nowIso(),
+      createsBankEntries,
     });
     if (r === "lost") return;
     counters.claimed++;
+    counters.started++;
     fresh.add(cand.matchId);
     return runClaimed(cand.matchId, ["bank_entry"]);
   }
@@ -1440,7 +1631,7 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
   }
 
   const attention = counters.failed + counters.outcomeUnknown + counters.manualRequired;
-  const summary = { ...counters, calls, budget };
+  const summary = { ...counters, calls, budget, ...(deferrals.length > 0 ? { deferrals } : {}) };
   if (stop !== null) {
     return { status: "partial", code: stop, summary, callsUsed: calls };
   }

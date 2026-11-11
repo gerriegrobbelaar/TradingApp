@@ -11,9 +11,16 @@ import {
 } from "@camelthorn/exact";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { gateName } from "../src/exact/gate-transport";
-import { allowedWriteShape, BOOKING_JOB_ID } from "../src/exact/write-policy";
+import {
+  allowedReadShape,
+  allowedWriteShape,
+  BOOKING_JOB_ID,
+  BOOKING_PREVIEW_JOB_ID,
+} from "../src/exact/write-policy";
 import { unwrap } from "../src/exact/wire";
+import { SETTING_DIVISIONS } from "../src/booking/settings";
 import { setBooking } from "./booking-helpers";
+import { setSetting } from "./matching-helpers";
 import {
   db,
   freshDivision,
@@ -69,8 +76,41 @@ const matchSet = (over: Partial<ExactRequest> = {}): Partial<ExactRequest> => ({
   ...over,
 });
 
-const call = async (div: number, over: Partial<ExactRequest>) =>
-  gateStub(gateName(div)).call(req(div, over));
+/**
+ * U1: the gate also checks that the request's division is on the booking allow-list. The tests that
+ * are not about the allow-list put the division on it right before each call.
+ */
+async function allowDivision(div: number): Promise<void> {
+  let row = await db
+    .prepare("SELECT id FROM divisions WHERE exact_division = ?1")
+    .bind(div)
+    .first<{ id: number }>();
+  if (row === null) {
+    await db
+      .prepare(
+        `INSERT INTO divisions (connection_id, exact_division, name)
+         SELECT id, ?1, 'Gate test' FROM connections WHERE kind = 'exact' ORDER BY id LIMIT 1`,
+      )
+      .bind(div)
+      .run();
+    row = await db
+      .prepare("SELECT id FROM divisions WHERE exact_division = ?1")
+      .bind(div)
+      .first<{ id: number }>();
+  }
+  const cur = await db
+    .prepare("SELECT value_json FROM settings WHERE key = 'exact.booking_divisions'")
+    .first<{ value_json: string }>();
+  const ids = cur === null ? [] : (JSON.parse(cur.value_json) as number[]);
+  if (row !== null && !ids.includes(row.id)) {
+    await setSetting(SETTING_DIVISIONS, [...ids, row.id]);
+  }
+}
+
+const call = async (div: number, over: Partial<ExactRequest>, allow = true) => {
+  if (allow) await allowDivision(div);
+  return gateStub(gateName(div)).call(req(div, over));
+};
 const posts = (): number => stub.apiCalls.filter((c) => c.method !== "GET").length;
 
 describe("fail closed at the gate", () => {
@@ -340,5 +380,102 @@ describe("posts are never retried, followed or hidden from the budget", () => {
     expect(() => unwrap(third)).toThrow(ExactBudgetExhaustedError);
     expect(posts()).toBe(2);
     expect((await gate.endJob(BOOKING_JOB_ID)).used).toBe(2);
+  });
+});
+
+describe("the booking allow-list of divisions (U1, B2c)", () => {
+  it("refuses both writes for a division that is not on the list, even with everything else in place", async () => {
+    const div = freshDivision();
+    await setBooking(true, true);
+    for (const over of [bankEntry(), matchSet()]) {
+      const r = await call(div, over, false); // not put on the list by the helper
+      expect(r).toEqual({
+        ok: false,
+        error: { kind: "api", status: 403, code: "writes_disabled" },
+      });
+    }
+    expect(posts()).toBe(0);
+    // the same division, once an admin allowed it, goes through
+    expect((await call(div, bankEntry())).ok).toBe(true);
+  });
+
+  it("an empty list refuses every write", async () => {
+    const div = freshDivision();
+    await setBooking(true, true);
+    await allowDivision(div);
+    await setSetting(SETTING_DIVISIONS, []);
+    expect((await call(div, bankEntry(), false)).ok).toBe(false);
+    expect(posts()).toBe(0);
+  });
+
+  it("another division's entry on the list does not open this one", async () => {
+    const a = freshDivision();
+    const b = freshDivision();
+    await setBooking(true, true);
+    await allowDivision(a);
+    expect((await call(b, bankEntry(), false)).ok).toBe(false);
+    expect((await call(a, bankEntry(), false)).ok).toBe(true);
+  });
+
+  it("a verification made under another booking mode closes the gate", async () => {
+    const div = freshDivision();
+    await setBooking(true, true, { mode: false }); // the connection says bank entries (1)
+    expect((await call(div, bankEntry())).ok).toBe(false);
+    expect(posts()).toBe(0);
+  });
+});
+
+describe("the preview job id can only read (U1, S8)", () => {
+  const writes: [string, Partial<ExactRequest>][] = [
+    ["bank entry, job priority", bankEntry({ jobId: BOOKING_PREVIEW_JOB_ID })],
+    ["bank entry, user priority", bankEntry({ jobId: BOOKING_PREVIEW_JOB_ID, priority: "user" })],
+    ["MatchSet, job priority", matchSet({ jobId: BOOKING_PREVIEW_JOB_ID })],
+    ["MatchSet, user priority", matchSet({ jobId: BOOKING_PREVIEW_JOB_ID, priority: "user" })],
+  ];
+
+  it.each(writes)(
+    "a POST (%s) is refused even with booking enabled and the division allowed",
+    async (_n, over) => {
+      const div = freshDivision();
+      await setBooking(true, true);
+      const r = await call(div, over);
+      expect(r).toEqual({
+        ok: false,
+        error: { kind: "api", status: 403, code: "write_not_allowed" },
+      });
+      expect(posts()).toBe(0);
+      expect(allowedWriteShape({ ...req(div), ...over } as ExactRequest)).toBe(false);
+    },
+  );
+
+  it("GET is allowed at user priority and refused at job priority", async () => {
+    const div = freshDivision();
+    await setBooking(true, true);
+    const get = (over: Partial<ExactRequest>) =>
+      call(div, {
+        method: "GET",
+        path: "/financialtransaction/BankEntries",
+        api: "rest",
+        jobId: BOOKING_PREVIEW_JOB_ID,
+        ...over,
+      });
+    expect((await get({ priority: "user" })).ok).toBe(true);
+    const job = await get({ priority: "job" });
+    expect(job).toEqual({
+      ok: false,
+      error: { kind: "api", status: 403, code: "write_not_allowed" },
+    });
+    expect(allowedReadShape({ ...req(div), jobId: BOOKING_PREVIEW_JOB_ID, priority: "job" })).toBe(
+      false,
+    );
+    expect(allowedReadShape({ ...req(div), jobId: BOOKING_PREVIEW_JOB_ID, priority: "user" })).toBe(
+      true,
+    );
+    expect(posts()).toBe(0);
+  });
+
+  it("the two job ids are different, and the preview id is not a prefix trick", () => {
+    expect(BOOKING_PREVIEW_JOB_ID).not.toBe(BOOKING_JOB_ID);
+    expect(BOOKING_PREVIEW_JOB_ID).toBe("exact-booking-preview");
   });
 });

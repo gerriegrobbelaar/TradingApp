@@ -7,8 +7,8 @@
  *    fields; one eExact document with MatchSets only: no other topic smuggled under this one),
  *  - and, checked by the gate itself at call time (not trusted from the caller), EVERY booking
  *    precondition holds: the switch is on, the verification mark matches the current protocol
- *    version, the Exact connection is active and the Revolut connection decided who creates the
- *    bank entries.
+ *    version and the booking mode in force, the Exact connection is active, the Revolut connection
+ *    decided who creates the bank entries, and the request's division is on the booking allow-list.
  *
  * Allowed writes: POST REST `/financialtransaction/BankEntries` and the XML upload for topic
  * `MatchSets`. Nothing else, whatever the settings say. Writes are never retried by the gate.
@@ -18,6 +18,13 @@ import { bookingMayRun, loadBookingState } from "../booking/settings";
 
 /** The only job id that may write. The gate budget and the allow-list use the same literal. */
 export const BOOKING_JOB_ID = "exact-booking";
+
+/**
+ * The job id of the booking PREVIEW (dry run, U1 review S8): it may only READ (GET, priority
+ * `user`). It can never write, whatever the booking switch says: `allowedWriteShape` accepts the
+ * booking job id only, and `allowedReadShape` refuses this id for anything but a user-priority GET.
+ */
+export const BOOKING_PREVIEW_JOB_ID = "exact-booking-preview";
 
 export type WriteRefusal = "write_not_allowed" | "writes_disabled";
 
@@ -109,12 +116,32 @@ export async function refuseWrite(db: D1Database, req: ExactRequest): Promise<Wr
   if (!allowedWriteShape(req)) return "write_not_allowed";
   const state = await loadBookingState(db).catch(() => null);
   if (state === null || !bookingMayRun(state)) return "writes_disabled";
+  // The division of THIS request must be one an admin allowed for booking (our ids are in the
+  // allow-list, the request carries Exact's division code).
+  const allowed = await divisionAllowed(db, req.division, state.divisions).catch(() => false);
+  if (!allowed) return "writes_disabled";
   return null;
+}
+
+async function divisionAllowed(
+  db: D1Database,
+  exactDivision: number,
+  allowedIds: readonly number[],
+): Promise<boolean> {
+  if (allowedIds.length === 0) return false;
+  const marks = allowedIds.map((_, i) => `?${i + 2}`).join(", ");
+  const row = await db
+    .prepare(`SELECT 1 AS x FROM divisions WHERE exact_division = ?1 AND id IN (${marks}) LIMIT 1`)
+    .bind(exactDivision, ...allowedIds)
+    .first();
+  return row !== null;
 }
 
 /** Reads never need the switch, but only GET may pass without it: this is the GET-side shape rule. */
 export function allowedReadShape(req: ExactRequest): boolean {
   if (req.method !== "GET") return false;
+  // The preview job reads as a user, never as a job: anything else under its id is refused.
+  if (req.jobId === BOOKING_PREVIEW_JOB_ID && req.priority !== "user") return false;
   // The XML upload endpoint takes no GET: it exists for MatchSets only, behind the write rules.
   if (req.api === "xml" && req.path === EXACT_WRITE_NAMES.xml.uploadPath) return false;
   return true;

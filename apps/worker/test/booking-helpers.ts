@@ -1,7 +1,14 @@
 import { env } from "cloudflare:test";
 import { BOOKING_PROTOCOL_VERSION } from "../src/booking/protocol";
 import { runBookMatches } from "../src/booking/executor";
-import { SETTING_ENABLED, SETTING_VERIFIED } from "../src/booking/settings";
+import { BOOKING_VERIFY_CHECKS } from "@camelthorn/core";
+import {
+  SETTING_DIVISIONS,
+  SETTING_ENABLED,
+  SETTING_FROM,
+  SETTING_MAX_PER_RUN,
+  SETTING_VERIFIED,
+} from "../src/booking/settings";
 import { applyMatch } from "../src/matching/store";
 import type { HandlerResult } from "../src/jobs/types";
 import type { FakeExact } from "./booking-fake-exact";
@@ -29,21 +36,41 @@ export interface BookingWorld extends World {
 
 export const VERIFIED_AT = "2026-07-01T00:00:00.000Z";
 
-/** Marks the write path verified at the CURRENT protocol version and switches booking on/off. */
+/**
+ * Marks the write path verified at the CURRENT protocol version (all checks ticked, under the booking
+ * mode in force) and switches booking on/off. Booking may write to every division in D1, from an
+ * early watermark, up to 10 matches per run (tests of the canary settings set their own).
+ */
 export async function setBooking(
   enabled: boolean,
   verified: boolean | string = true,
+  o: { mode?: boolean } = {},
 ): Promise<void> {
   await setSetting(SETTING_ENABLED, enabled);
   await db.prepare("DELETE FROM settings WHERE key = ?1").bind(SETTING_VERIFIED).run();
+  const rev = await db
+    .prepare(
+      "SELECT creates_bank_entries AS c FROM connections WHERE kind = 'revolut' ORDER BY id LIMIT 1",
+    )
+    .first<{ c: number }>();
   if (verified !== false) {
     await setSetting(SETTING_VERIFIED, {
       at: VERIFIED_AT,
       by: "gerrie.grobbelaar@camelthorncapital.com",
       note: "Test division verified in the test",
       protocolVersion: verified === true ? BOOKING_PROTOCOL_VERSION : verified,
+      checks: [...BOOKING_VERIFY_CHECKS],
+      createsBankEntries: o.mode ?? rev?.c === 1,
     });
   }
+  const ids = (await db.prepare("SELECT id FROM divisions ORDER BY id").all<{ id: number }>())
+    .results;
+  await setSetting(
+    SETTING_DIVISIONS,
+    ids.map((d) => d.id),
+  );
+  await setSetting(SETTING_FROM, "2026-01-01T00:00:00.000Z");
+  await setSetting(SETTING_MAX_PER_RUN, 10);
 }
 
 /** One Exact division, one mapped Revolut account (journal 90), control accounts, booking ON. */
@@ -325,3 +352,29 @@ export async function matchRow(
     .bind(id)
     .first()) as { exact_state: string; exact_note: string | null; booked_at: string | null };
 }
+
+/**
+ * Runs `fn` with the named triggers dropped and recreated from sqlite_master afterwards: for tests
+ * that must put a row in a state the guards forbid (a crashed executor, a hand-edited database).
+ */
+export async function withoutTriggers<T>(names: string[], fn: () => Promise<T>): Promise<T> {
+  const saved: string[] = [];
+  for (const name of names) {
+    const row = await db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1")
+      .bind(name)
+      .first<{ sql: string }>();
+    if (row === null) throw new Error(`no trigger ${name}`);
+    saved.push(row.sql);
+    await db.prepare(`DROP TRIGGER ${name}`).run();
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const sql of saved) await db.prepare(sql).run();
+  }
+}
+
+/** The columns an admin retry sets (the database refuses a retry without them). */
+export const ADMIN_RETRY_SQL = `needs_probe = 1, admin_resolved_by = 'admin@camelthorncapital.com',
+  admin_resolved_at = '2026-07-15T09:00:00.000Z'`;

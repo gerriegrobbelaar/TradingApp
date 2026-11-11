@@ -10,7 +10,11 @@ import type {
 } from "@camelthorn/core";
 import { BOOKING_PROTOCOL_VERSION } from "../src/booking/protocol";
 import { beforeEach, describe, expect, it } from "vitest";
-import { BOOKING_ENABLE_PHRASE, BOOKING_VERIFY_PHRASE } from "@camelthorn/core";
+import {
+  BOOKING_ENABLE_PHRASE,
+  BOOKING_VERIFY_CHECKS,
+  BOOKING_VERIFY_PHRASE,
+} from "@camelthorn/core";
 import { ENABLE_PHRASE, VERIFY_PHRASE } from "../src/booking/settings";
 import { checkMatchingInvariants } from "../src/matching/invariants";
 import { FakeExact } from "./booking-fake-exact";
@@ -22,6 +26,7 @@ import {
   runBooking,
   seedBookable,
   setBooking,
+  withoutTriggers,
   type BookingWorld,
 } from "./booking-helpers";
 import { addSession, addUser, authed, db, resetDb } from "./helpers";
@@ -61,6 +66,7 @@ const verify = (role: Role | "staleAdmin" = "admin", over: Record<string, unknow
   send(role, "POST", "/api/booking/verify", {
     note: "Created one bank entry and one MatchSet on the test division and checked both in Exact.",
     confirm: VERIFY_PHRASE,
+    checks: [...BOOKING_VERIFY_CHECKS],
     ...over,
   });
 const enable = (role: Role | "staleAdmin" = "admin", over: Record<string, unknown> = {}) =>
@@ -99,6 +105,11 @@ describe("GET /api/booking/settings", () => {
         protocolChanged: false,
         createsBankEntries: true,
         blockers: ["not_verified", "writes_disabled"],
+        // U1: the watermark, the backlog, the allow-list and the per-run cap.
+        bookingFrom: "2026-01-01T00:00:00.000Z",
+        backlogCount: 0,
+        divisions: [w.divisionId],
+        maxPerRun: 10,
       });
     }
     const anon = await authed("/api/booking/settings", "nope");
@@ -336,6 +347,7 @@ describe("GET /api/booking/outbox", () => {
       [
         "amountMinor",
         "attempts",
+        "bookedManually",
         "counterpartyName",
         "createdAt",
         "currency",
@@ -437,9 +449,30 @@ describe("POST /api/booking/outbox/:id/resolve", () => {
     expect((await resolve("admin", rowId, "retry")).status).toBe(409);
   });
 
-  it("retry is refused for rows that cannot be retried (manual plan failure, finished rows)", async () => {
+  it("retry of a claim that never reached Exact (a v1 rule, stage none): back to not_booked, row gone", async () => {
     await setBooking(true, true);
     const s = await seedBookable(w, fake, { amountMinor: 5_000, openMinor: 9_000 });
+    await runBooking(fake);
+    const row = (await outbox(s.matchId))[0];
+    expect(row?.status).toBe("manual_required");
+    const r = await resolve("admin", row?.id ?? 0, "retry", "Config fixed, try again");
+    expect(r.status).toBe(200);
+    expect(r.body.released).toBe(true);
+    expect(await outbox(s.matchId)).toEqual([]);
+    expect(await matchRow(s.matchId)).toMatchObject({
+      exact_state: "not_booked",
+      exact_note: null,
+    });
+    expect((await auditRows("booking.retry_unsent")).at(-1)?.actor_email).toBe(
+      "admin@camelthorncapital.com",
+    );
+    expect(await checkMatchingInvariants(db)).toEqual([]);
+  });
+
+  it("retry is refused for a manual row that held a real payload and for finished rows", async () => {
+    await setBooking(true, true);
+    const s = await seedBookable(w, fake);
+    fake.items[0]!.paid = true; // stale D1: the bank entry row ends manual_required (built payload)
     await runBooking(fake);
     const row = (await outbox(s.matchId))[0];
     expect(row?.status).toBe("manual_required");
@@ -477,12 +510,14 @@ describe("POST /api/booking/outbox/:id/resolve", () => {
 
   it("a row whose POST is in flight (live lease) cannot be resolved", async () => {
     const { rowId } = await unknownBankEntry();
-    await db
-      .prepare(
-        "UPDATE exact_write_outbox SET status = 'sending', lease_expires_at = '2099-01-01T00:00:00.000Z', claimed_at = 'x' WHERE id = ?1",
-      )
-      .bind(rowId)
-      .run();
+    await withoutTriggers(["outbox_guard_status"], async () => {
+      await db
+        .prepare(
+          "UPDATE exact_write_outbox SET status = 'sending', lease_expires_at = '2099-01-01T00:00:00.000Z', claimed_at = 'x' WHERE id = ?1",
+        )
+        .bind(rowId)
+        .run();
+    });
     const r = await resolve("admin", rowId, "give_up");
     expect([r.status, err(r)]).toEqual([409, "in_flight"]);
   });

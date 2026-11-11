@@ -22,6 +22,7 @@
  * admin action with a fresh sign-in (POST /confirm) activates them after the admin has seen which
  * accounts were connected. When Revolut does echo `state`, it must match (a mismatch is refused).
  */
+import { SETTING_ENABLED, SETTING_VERIFIED } from "../booking/settings";
 import { auditStatement } from "../db/audit";
 import { claimOnceAndPurge } from "../db/idempotency";
 import { clearCookie, parseCookies, REVOLUT_FLOW_COOKIE, setCookie } from "../auth/cookies";
@@ -622,6 +623,35 @@ export function registerRevolutRoutes(router: Router): void {
           nextMode,
           bankChanged ? nowIso : row.bank_entries_decided_at,
         ),
+      // Who creates the bank entries decides what the booking job may write (Phase 7 review B2d):
+      // when this changes while booking is ON, the same batch switches booking OFF (audited) and
+      // clears the verification, so it must be verified again under the new mode. If the connection
+      // update above did not apply (changes() = 0) none of this does.
+      db
+        .prepare(
+          `UPDATE settings SET value_json = 'false', updated_by = ?1,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+           WHERE key = ?2 AND value_json = 'true' AND changes() = 1
+             AND ?3 = 1`,
+        )
+        .bind(
+          session.email,
+          SETTING_ENABLED,
+          nextBank !== (row.creates_bank_entries === 1) ? 1 : 0,
+        ),
+      auditStatement(
+        db,
+        {
+          actorEmail: session.email,
+          action: "booking.disabled",
+          entity: "settings",
+          entityId: SETTING_ENABLED,
+          before: { enabled: true },
+          after: { enabled: false, reason: "booking_mode_changed", createsBankEntries: nextBank },
+        },
+        { sql: "changes() = 1", binds: [] },
+      ),
+      db.prepare("DELETE FROM settings WHERE key = ?1 AND changes() = 1").bind(SETTING_VERIFIED),
     ]);
     return json({
       ok: true,

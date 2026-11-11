@@ -777,13 +777,16 @@ export interface MatchDto {
    * tx_changed): the match is never booked in Exact; a person checks it and undoes it.
    */
   reviewReason: string | null;
-  /** Live and not booked in Exact yet. */
+  /** Live and not booked in Exact yet (or claimed but provably never sent, U1). */
   undoAvailable: boolean;
-  allocations: MatchAllocationDto[];
-  /** Booking is deferred for this match, with a code (U1; absent = not deferred). */
-  deferredCode?: string | null;
-  /** A person booked it in Exact by hand (U1). */
+  /**
+   * U1: why the booking job cannot book this match YET (configuration or missing data), for a
+   * "cannot book yet: <code>" line. null when nothing is in the way. Always present from the server.
+   */
+  bookingDeferredCode?: string | null;
+  /** U1: a person booked it in Exact by hand (resolution booked_manually). */
   bookedManually?: boolean;
+  allocations: MatchAllocationDto[];
 }
 
 export interface MatchQueueItem {
@@ -904,8 +907,11 @@ export interface MatchAccountMapDto {
   /** Control accounts the MatchSet names (M7c); null = booking stops with control_account_unknown. */
   receivableGlAccountCode?: string | null;
   payableGlAccountCode?: string | null;
-  /** Opening balance of an empty journal as a decimal string in the account's currency (U1). */
-  openingBalanceMinor?: string | null;
+  /**
+   * Admin-supplied opening balance (minor units), used ONLY for the first bank entry of a journal
+   * that has no entry in Exact yet (U1, assumption A12b). null = none.
+   */
+  openingBalanceMinor?: number | null;
   updatedAt: string | null;
   updatedBy: string | null;
 }
@@ -925,8 +931,8 @@ export interface MatchAccountMapRequest {
   /** Optional (M7c): ledger accounts of the debtors and creditors control accounts. */
   receivableGlAccountCode?: string | null;
   payableGlAccountCode?: string | null;
-  /** Minor units as a decimal string, or null to clear (U1). */
-  openingBalanceMinor?: string | null;
+  /** Optional (U1): integer minor units, or null to clear. Needs the fresh sign-in like the rest. */
+  openingBalanceMinor?: number | null;
 }
 
 export interface MatchPatternDto {
@@ -1001,13 +1007,29 @@ export interface MatchStatsResponse {
   autoEnabled: boolean;
   /** Active Revolut accounts without an Exact administration mapping. */
   unmappedAccounts: number;
-  /** Booking counters (U1/U2); absent on an older worker. */
-  manual_required?: number;
-  outcome_unknown?: number;
-  waiting_for_bank_line?: number;
-  deferred?: number;
-  bookedWithConflict?: number;
-  staleSettlements?: number;
+  /**
+   * Booking health (U1, review S10/N6). Always present from the server; optional here so older
+   * fixtures keep compiling. Counts of live matches by booking trouble.
+   */
+  booking?: MatchBookingHealth;
+}
+
+/** Counts for Phase 8 and the Matching screen: what needs a person in the booking path. */
+export interface MatchBookingHealth {
+  /** Outbox rows by status that need attention. */
+  manualRequired: number;
+  outcomeUnknown: number;
+  waitingForBankLine: number;
+  /** Live not-booked matches the executor cannot book yet (configuration or missing data). */
+  deferred: number;
+  /** Matches booked in Exact whose bank line later got a state conflict. */
+  bookedLineConflict: number;
+  /** Matches booked in Exact whose bank line later became 'reverted'. */
+  bookedLineReverted: number;
+  /** Legacy note `already_matched_in_exact` (items closed in Exact before our MatchSet). */
+  alreadyMatchedInExact: number;
+  /** Booked by a person in Exact (resolution booked_manually). */
+  bookedManually: number;
 }
 
 // ---- Booking in Exact (Phase 7, M7c). Fixed shapes shared with the web (M7d). -----------------------
@@ -1028,6 +1050,8 @@ export type BookingStatus =
   | "given_up";
 
 export interface BookingOutboxItemDto {
+  /** Set by U1: true when the item was booked by a person in Exact (resolution booked_manually). */
+  bookedManually?: boolean;
   id: number;
   matchId: number;
   kind: "bank_entry" | "matchset";
@@ -1051,71 +1075,101 @@ export interface BookingOutboxResponse {
   countsByStatus: Record<BookingStatus, number>;
 }
 
+export interface BookingVerificationMark {
+  at: string;
+  by: string;
+  note: string;
+  protocolVersion: string;
+  /** The ticked checks (always the complete BOOKING_VERIFY_CHECKS list). */
+  checks?: string[];
+  /** The booking mode (Revolut createsBankEntries) the verification was done under. */
+  createsBankEntries?: boolean;
+}
+
 export interface BookingSettingsResponse {
   enabled: boolean;
-  verified: {
-    at: string;
-    by: string;
-    note: string;
-    protocolVersion: string;
-    /** The checks that were ticked, and the mode (createsBankEntries) verified for (U1). */
-    checks?: string[];
-    createsBankEntries?: boolean | null;
-  } | null;
+  verified: BookingVerificationMark | null;
   protocolVersion: string;
   protocolChanged: boolean;
   createsBankEntries: boolean | null;
-  /**
-   * not_verified, protocol_changed, bank_entries_undecided, no_exact_connection, writes_disabled,
-   * control_accounts_missing, journal_unmapped, no_division_allowed, mode_changed (U1).
-   */
   blockers: string[];
-  /** Only matches created at or after this UTC instant are booked (U1). */
+  /**
+   * U1 (review B2). Always present from the server; optional here so older fixtures compile.
+   * bookingFrom: only matches created at or after it are booked (null = booking never enabled).
+   * backlogCount: live not-booked matches older than the watermark (all of them while null).
+   * divisions: ids of the administrations booking may write to (empty = none).
+   * maxPerRun: matches the job may START per run (1 until an admin raises it, 1 to 10).
+   */
   bookingFrom?: string | null;
-  /** Live matches older than `bookingFrom`, which will NOT be booked (U1). */
   backlogCount?: number;
-  /** Divisions (divisions.id) booking is allowed for; empty = none (U1). */
   divisions?: number[];
-  /** Matches booked per run; 1 is the canary default (U1). */
   maxPerRun?: number;
 }
 
 // ---- Booking request shapes (M7c, ADR 0044). One definition, shared with the web (M7d). ------
 // GET /api/booking/settings: any role. Blockers: not_verified, protocol_changed,
-// bank_entries_undecided, no_exact_connection, writes_disabled.
+// bank_entries_undecided, no_exact_connection, writes_disabled and (U1) mode_changed,
+// no_division_allowed, control_accounts_missing, journal_unmapped. The last two stop ENABLING only;
+// at run time they defer the single match (`bookingDeferredCode`), they never stop the job.
 
-/** PUT /api/booking/settings (admin; enabling needs a fresh sign-in and confirm = BOOKING_ENABLE_PHRASE). */
+/**
+ * PUT /api/booking/settings (admin). Two shapes, never mixed:
+ *  - switch: {enabled, confirm, note?}. Enabling needs a fresh sign-in, confirm =
+ *    BOOKING_ENABLE_PHRASE, every precondition, and sets bookingFrom to now.
+ *  - limits (U1): {bookingFrom?, divisions?, maxPerRun?, note?} without `enabled`. Widening
+ *    anything (an earlier bookingFrom, another division, a higher maxPerRun) needs a fresh sign-in.
+ */
 export interface BookingSettingsRequest {
-  enabled: boolean;
-  confirm: string;
+  enabled?: boolean;
+  confirm?: string;
   note?: string;
-  /** U1: watermark (UTC ISO), division allow-list and per-run cap; raising maxPerRun needs step-up. */
+  /** ISO date-time; not more than one day in the future. */
   bookingFrom?: string;
+  /** Division ids (our own ids, see GET /api/matching/account-map divisions). */
   divisions?: number[];
+  /** 1 to 10. */
   maxPerRun?: number;
 }
 
-/** POST /api/booking/verify (admin, step-up): confirm = BOOKING_VERIFY_PHRASE (confirm-phrases.ts). */
+/**
+ * POST /api/booking/verify (admin, step-up): confirm = BOOKING_VERIFY_PHRASE (confirm-phrases.ts).
+ * `checks` must be EXACTLY the codes of BOOKING_VERIFY_CHECKS (no more, no fewer, no duplicates)
+ * or the answer is 400 `checks_incomplete`.
+ */
 export interface BookingVerifyRequest {
   note: string;
   confirm: string;
-  /** Must equal BOOKING_VERIFY_CHECKS (U1); the server answers 400 checks_incomplete otherwise. */
-  checks?: string[];
+  checks: string[];
 }
 
-/** POST /api/booking/preview (admin, step-up): nothing is sent to Exact (U1). */
+/** POST /api/booking/preview (admin, step-up): a dry run for 1 to 3 matches, nothing is written. */
 export interface BookingPreviewRequest {
   matchIds: number[];
 }
+
 export interface BookingPreviewItem {
   matchId: number;
-  bankEntryBody: unknown;
-  matchSetXml: string | null;
-  hashes: { bankEntry?: string; matchSet?: string };
+  /** null when the match could not be planned. */
+  mode: "ledger" | "matched" | null;
+  /** Why the executor would not book this match now (code), or null. */
   wouldDefer: { code: string } | null;
-  plan: string[];
-  reads: Record<string, unknown>;
+  /** The REAL bank entry JSON body (null in feed mode, for a deferred match). Capped in size. */
+  bankEntryBody: string | null;
+  /** The REAL MatchSet XML (the bank line number is a placeholder when the line is not in Exact yet). */
+  matchSetXml: string | null;
+  bankEntryHash: string | null;
+  matchSetHash: string | null;
+  matchSetBankLinePlaceholder: boolean;
+  reads: {
+    /** Probe by YourRef: number of lines found (null = not read or the read failed). */
+    probeHits: number | null;
+    closingBalanceMinor: number | null;
+    openingBalanceSource: "exact" | "admin_opening_balance" | null;
+    preflight: "open_as_expected" | "already_settled" | "changed" | "inconclusive" | null;
+    readError: string | null;
+  };
 }
+
 export interface BookingPreviewResponse {
   items: BookingPreviewItem[];
 }
@@ -1126,5 +1180,8 @@ export interface BookingResolveRequest {
   note: string;
 }
 export interface BookingResolveResponse {
+  /** The row as it was. After a `retry` of an unsent claim (`released`) the row no longer exists. */
   item: BookingOutboxItemDto;
+  /** True when a claimed match that never reached Exact went back to the review queue (row deleted). */
+  released?: boolean;
 }

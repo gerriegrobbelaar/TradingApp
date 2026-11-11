@@ -10,6 +10,7 @@ import { transition } from "../src/booking/outbox";
 import { claimMatchForBooking, undoMatch } from "../src/matching/store";
 import { FakeExact } from "./booking-fake-exact";
 import {
+  ADMIN_RETRY_SQL,
   bookingWorld,
   countingDb,
   db,
@@ -20,6 +21,7 @@ import {
   seedBookable,
   seedLedger,
   setBooking,
+  withoutTriggers,
   type BookingWorld,
 } from "./booking-helpers";
 import { auditRows } from "./sync-helpers";
@@ -211,7 +213,7 @@ describe("a lost answer and an unclear outcome", () => {
     // An admin retry (needs_probe) lets the next run probe first: it finds the line, no duplicate.
     await db
       .prepare(
-        `UPDATE exact_write_outbox SET status = 'pending', needs_probe = 1 WHERE match_id = ?1 AND kind = 'bank_entry'`,
+        `UPDATE exact_write_outbox SET status = 'pending', ${ADMIN_RETRY_SQL} WHERE match_id = ?1 AND kind = 'bank_entry'`,
       )
       .bind(s.matchId)
       .run();
@@ -325,17 +327,19 @@ describe("a lost answer and an unclear outcome", () => {
     const s = await seedBookable(w, fake);
     fake.modes.bank_entry = ["lost"];
     await runBooking(fake);
-    await db
-      .prepare(
-        `UPDATE exact_write_outbox SET status = 'sending', lease_expires_at = '2026-07-15T09:00:00.000Z',
-           claimed_at = '2026-07-15T08:50:00.000Z' WHERE match_id = ?1`,
-      )
-      .bind(s.matchId)
-      .run();
-    await db
-      .prepare("UPDATE matches SET exact_state = 'booking' WHERE id = ?1")
-      .bind(s.matchId)
-      .run();
+    await withoutTriggers(["outbox_guard_status", "matches_guard_exact_state"], async () => {
+      await db
+        .prepare(
+          `UPDATE exact_write_outbox SET status = 'sending', lease_expires_at = '2026-07-15T09:00:00.000Z',
+             claimed_at = '2026-07-15T08:50:00.000Z' WHERE match_id = ?1`,
+        )
+        .bind(s.matchId)
+        .run();
+      await db
+        .prepare("UPDATE matches SET exact_state = 'booking' WHERE id = ?1")
+        .bind(s.matchId)
+        .run();
+    });
     await runBooking(fake);
     expect((await outbox(s.matchId))[0]).toMatchObject({
       status: "outcome_unknown",
@@ -356,9 +360,9 @@ async function adminRetry(matchId: number, kind: "bank_entry" | "matchset"): Pro
     to: "pending",
     token: null,
     nowIso: new Date(NOW).toISOString(),
-    errorCode: null,
     needsProbe: true,
     nextAttemptAt: null,
+    adminResolved: { by: "admin@camelthorncapital.com", at: new Date(NOW).toISOString() },
     ...(m.exact_state === "outcome_unknown" || m.exact_state === "booking_failed"
       ? { match: { from: m.exact_state, to: "booking", note: null } }
       : {}),
@@ -640,34 +644,69 @@ describe("the MatchSet and its read-back", () => {
     expect((await matchRow(s.matchId)).exact_state).toBe("outcome_unknown");
   });
 
-  it("the items are already matched in Exact (for example by the bank feed): no POST, verified, flagged", async () => {
+  it("the invoice is already settled in Exact (stale D1): NOTHING is sent, never matched_in_exact (B2a)", async () => {
     const s = await seedBookable(w, fake);
     fake.items[0]!.paid = true;
     await runBooking(fake);
-    expect(fake.posts("matchset")).toHaveLength(0);
+    // Not even the bank entry: the items are read BEFORE the first write.
+    expect(fake.posts()).toHaveLength(0);
+    expect(await statuses(s.matchId)).toEqual([["bank_entry", "manual_required"]]);
+    expect((await outbox(s.matchId))[0]?.last_error_code).toBe("already_settled_in_exact");
     expect(await matchRow(s.matchId)).toMatchObject({
-      exact_state: "matched_in_exact",
-      // a person checks the bank line: Exact may have matched the invoice to another line
-      exact_note: "already_matched_in_exact",
+      exact_state: "manual_required",
+      exact_note: "already_settled_in_exact",
+      booked_at: null,
     });
+    expect(await checkMatchingInvariants(db)).toEqual([]);
   });
 
-  it("an item whose open amount moved is not touched: manual_required readback_inconclusive", async () => {
+  it("an item whose open amount moved is not touched: manual_required items_changed, nothing sent", async () => {
     const s = await seedBookable(w, fake);
     fake.items[0]!.openMinor = 5_000;
     await runBooking(fake);
-    expect(fake.posts("matchset")).toHaveLength(0);
-    expect((await outbox(s.matchId)).find((r) => r.kind === "matchset")).toMatchObject({
+    expect(fake.posts()).toHaveLength(0);
+    expect((await outbox(s.matchId))[0]).toMatchObject({
+      kind: "bank_entry",
       status: "manual_required",
-      last_error_code: "readback_inconclusive",
+      last_error_code: "items_changed",
     });
     expect((await matchRow(s.matchId)).exact_state).toBe("manual_required");
+  });
+
+  it("an item Exact does not show at all: preflight_inconclusive, nothing sent", async () => {
+    const s = await seedBookable(w, fake);
+    fake.items.length = 0;
+    await runBooking(fake);
+    expect(fake.posts()).toHaveLength(0);
+    expect((await outbox(s.matchId))[0]?.last_error_code).toBe("preflight_inconclusive");
+  });
+
+  it("a failed preflight read waits: no POST, the row stays pending", async () => {
+    const s = await seedBookable(w, fake);
+    fake.hook = (req) => {
+      if (req.method === "GET" && req.path === "/cashflow/Receivables") {
+        throw new ExactApiError(503, "down", "gate_unavailable");
+      }
+    };
+    await runBooking(fake);
+    expect(fake.posts()).toHaveLength(0);
+    expect(await statuses(s.matchId)).toEqual([["bank_entry", "pending"]]);
+    fake.hook = null;
+    await runBooking(fake, { now: NOW + 10 * 60_000 });
+    expect((await matchRow(s.matchId)).exact_state).toBe("matched_in_exact");
   });
 });
 
 describe("what a person must do by hand in v1", () => {
   const codeOf = async (matchId: number): Promise<string | null> =>
     (await outbox(matchId))[0]?.last_error_code ?? null;
+  const deferredOf = async (matchId: number): Promise<string | null> =>
+    (
+      await db
+        .prepare("SELECT booking_deferred_code AS c FROM matches WHERE id = ?1")
+        .bind(matchId)
+        .first<{ c: string | null }>()
+    )?.c ?? null;
 
   it("a part payment: manual_required part_payment_not_supported_v1, nothing sent", async () => {
     const s = await seedBookable(w, fake, {
@@ -708,7 +747,7 @@ describe("what a person must do by hand in v1", () => {
     ["no control account", "control_account_unknown"],
     ["no entry number", "item_entry_number_unknown"],
     ["no relation code", "relation_code_unknown"],
-  ])("%s: manual_required %s", async (what, code) => {
+  ])("%s: deferred %s, NOT claimed (B1)", async (what, code) => {
     let seed: () => ReturnType<typeof seedBookable>;
     if (what === "no control account") {
       await db.prepare("UPDATE bank_account_exact_map SET receivable_gl_account_code = NULL").run();
@@ -722,22 +761,28 @@ describe("what a person must do by hand in v1", () => {
         });
     }
     const s = await seed();
-    await runBooking(fake);
-    expect(await codeOf(s.matchId)).toBe(code);
+    const r = await runBooking(fake);
+    // Not claimed: no outbox row, the match stays not_booked with the code (Undo still works).
+    expect(await outbox(s.matchId)).toEqual([]);
+    expect(await matchRow(s.matchId)).toMatchObject({ exact_state: "not_booked" });
+    expect(await deferredOf(s.matchId)).toBe(code);
+    expect(r.summary).toMatchObject({ deferred: 1, deferrals: [{ matchId: s.matchId, code }] });
     expect(fake.calls).toHaveLength(0);
   });
 
-  it("a ledger account Exact does not know: manual_required ledger_account_unknown", async () => {
+  it("a ledger account Exact does not know: deferred ledger_account_unknown", async () => {
     const s = await seedLedger(w, { withGl: false });
     await runBooking(fake);
-    expect(await codeOf(s.matchId)).toBe("ledger_account_unknown");
+    expect(await outbox(s.matchId)).toEqual([]);
+    expect(await deferredOf(s.matchId)).toBe("ledger_account_unknown");
   });
 
-  it("an unknown bank balance (no entry in the journal): manual_required bank_balance_unknown", async () => {
+  it("an empty journal and no opening balance: deferred bank_balance_unknown, nothing sent", async () => {
     fake.closing.clear();
     const s = await seedBookable(w, fake);
     await runBooking(fake);
-    expect(await codeOf(s.matchId)).toBe("bank_balance_unknown");
+    expect(await outbox(s.matchId)).toEqual([]);
+    expect(await deferredOf(s.matchId)).toBe("bank_balance_unknown");
     expect(fake.posts()).toHaveLength(0);
   });
 
@@ -1059,6 +1104,7 @@ describe("transitions are atomic", () => {
       token: null,
       nowIso: new Date(NOW).toISOString(),
       needsProbe: true,
+      adminResolved: { by: "admin@camelthorncapital.com", at: new Date(NOW).toISOString() },
       // ...but the match is outcome_unknown, not booking_failed
       match: { from: "booking_failed", to: "booking", note: null },
       actor: "system",
@@ -1082,7 +1128,7 @@ describe("transitions are atomic", () => {
     const row = (await outbox(s.matchId))[0];
     await db
       .prepare(
-        "UPDATE exact_write_outbox SET status = 'pending', claimed_at = 'owner', lease_expires_at = '2099-01-01T00:00:00.000Z' WHERE id = ?1",
+        `UPDATE exact_write_outbox SET status = 'pending', ${ADMIN_RETRY_SQL}, claimed_at = 'owner', lease_expires_at = '2099-01-01T00:00:00.000Z' WHERE id = ?1`,
       )
       .bind(row?.id ?? 0)
       .run();
