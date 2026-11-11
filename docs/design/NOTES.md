@@ -76,3 +76,7 @@ Decorative colours (orbs, `--in`, `--out`, meter and pace bars) are not checked.
 
 ## Orchestrator change: dark `--subtle`
 `--subtle` (dark) changed from `#7d8a9c` to `#97a3b4` so sidebar group labels reach 4.5:1 on the card surface. Applied to both `app.css` and `tokens.css`.
+
+## K3a screens
+
+Screenshots of the read-only screens, at 360 and 1280 in light and dark: `docs/design/screens/k3a-{overview,overview-drill,invoices,invoices-sheet,payables,approvals,approvals-empty}-{light,dark}-{360,1280}.png`. No horizontal page scroll at 360 (checked in the browser). Shared pieces for later screens: `apps/web/src/lib/{format,ageing,errors,useResource,useCursorList}` and `apps/web/src/components/{Money,DataTable,FilterBar,FreshnessStamp,DrillSheet,EmptyState,OpenItemSheets}`; decisions in `docs/decisions/0026-read-only-screens-web.md`.

@@ -472,3 +472,18 @@
   flex-direction: column;
   gap: 12px;
 }
+
+.app .search input::placeholder {
+  color: var(--muted);
+  opacity: 1;
+}
+.app .figcell p {
+  margin: 0;
+}
+@media (max-width: 560px) {
+  .app .filters .seg {
+    flex-wrap: wrap;
+    overflow-x: visible;
+    border-radius: 22px;
+  }
+}
