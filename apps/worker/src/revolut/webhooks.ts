@@ -1,5 +1,5 @@
 /**
- * The webhook subscription lifecycle (Phase 5, task R3a, ADR 0032).
+ * The webhook subscription lifecycle (Phase 5, task R3a, ADR 0033).
  *
  *  - Created once a connection is CONFIRMED (and by the admin action "Register webhook"):
  *    `POST /webhooks` for `<app origin>/api/webhooks/revolut` with the two transaction events. The

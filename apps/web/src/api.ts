@@ -6,6 +6,9 @@ import {
   type ApprovalStatusCodesResponse,
   type ApprovalsResponse,
   type BalanceSheetResponse,
+  type BankAccountsResponse,
+  type BankTransactionDetail,
+  type BankTransactionsResponse,
   type LedgerAccountBalancesResponse,
   type LedgerAccountsResponse,
   type OpenItemDetail,
@@ -576,3 +579,18 @@ export const getAccountBalances = (accountId: number, year: number, signal?: Abo
     `/api/ledger/accounts/${accountId}/balances${queryString({ year })}`,
     { ...(signal ? { signal } : {}) },
   );
+
+// ---- bank (Phase 5, R3b) -----------------------------------------------------------------------
+
+export const getBankAccounts = (signal?: AbortSignal) =>
+  request<BankAccountsResponse>("/api/bank/accounts", { ...(signal ? { signal } : {}) });
+
+export const listBankTransactions = (params: QueryParams, signal?: AbortSignal) =>
+  request<BankTransactionsResponse>(`/api/bank/transactions${queryString(params)}`, {
+    ...(signal ? { signal } : {}),
+  });
+
+export const getBankTransaction = (id: number, signal?: AbortSignal) =>
+  request<BankTransactionDetail>(`/api/bank/transactions/${id}`, {
+    ...(signal ? { signal } : {}),
+  });

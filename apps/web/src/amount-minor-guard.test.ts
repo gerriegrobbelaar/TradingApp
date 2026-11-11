@@ -27,6 +27,15 @@ const WEB_ALLOWED = new Set([
   "./components/AccountSheet.tsx", // ledger periods, unrelated to open items
   "./pages/Approvals.tsx", // purchase entries, unrelated
 ]);
+/**
+ * Bank screen (R3b): BankTransactionDto.amountMinor is the signed leg amount, unrelated to open
+ * items. Allowed only in these files, only on the named bank-transaction variables, and only in
+ * files that never touch an OpenItem type.
+ */
+const BANK_ALLOWED: Record<string, readonly string[]> = {
+  "./pages/Bank.tsx": ["r"],
+  "./components/BankTransactionSheet.tsx": ["detail", "l"],
+};
 const CORE_ALLOWED = new Set([
   "../../../packages/core/src/api-types.ts",
   "../../../packages/core/src/reports/ledger.ts",
@@ -40,10 +49,21 @@ describe("OpenItemDetail.amountMinor stays out of lists and totals (review S11)"
 
   it("web: only the item sheet uses amountMinor", () => {
     const offenders = Object.entries(web)
-      .filter(([n]) => !isTest(n) && !WEB_ALLOWED.has(n))
+      .filter(([n]) => !isTest(n) && !WEB_ALLOWED.has(n) && !(n in BANK_ALLOWED))
       .filter(([, t]) => /\bamountMinor\b/.test(code(t)))
       .map(([n]) => n);
     expect(offenders).toEqual([]);
+  });
+
+  it("web: bank files use amountMinor only on bank-transaction variables", () => {
+    for (const [file, vars] of Object.entries(BANK_ALLOWED)) {
+      const t = code(web[file] ?? "");
+      expect(t, file).not.toBe("");
+      expect(t, `${file} must not touch open items`).not.toMatch(/\bOpenItem/);
+      const uses = [...t.matchAll(/(\w+)?(\??\.)?\bamountMinor\b/g)].map((m) => m[1] ?? "");
+      expect(uses.length, file).toBeGreaterThan(0);
+      for (const u of uses) expect(vars, `${file}: ${u}.amountMinor`).toContain(u);
+    }
   });
 
   it("core: only the type definitions and the ledger report use amountMinor", () => {

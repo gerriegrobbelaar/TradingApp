@@ -1,12 +1,12 @@
 /**
- * The Revolut sync jobs (Phase 5, task R3a, ADR 0032): `revolut.sync` (balances and a poll of new
+ * The Revolut sync jobs (Phase 5, task R3a, ADR 0033): `revolut.sync` (balances and a poll of new
  * transactions, every 10 minutes) and `revolut.backfill` (a daily walk over the last 35 days that
  * counts what was missing, plus the one-off 90-day initial backfill after a connection is
  * confirmed). Both follow the handler contract (ADR 0021): idempotent (the ingest upserts), counts
  * and codes only in the result, `ctx.signal` checked between calls, the window of a backfill taken
  * from the slot (`run.scheduledFor`), a small per-run Revolut call budget enforced by the gate.
  *
- * Call arithmetic (ADR 0032): a poll run spends at most SYNC_CALL_BUDGET = 10 calls (1 accounts,
+ * Call arithmetic (ADR 0033): a poll run spends at most SYNC_CALL_BUDGET = 10 calls (1 accounts,
  * up to 2 bank details, up to 4 transaction pages, up to 2 refreshes of old pending rows); a quiet
  * run costs 3 (accounts and the two-call end of a walk). Backfill: at most 12 per run.
  */

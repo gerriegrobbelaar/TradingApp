@@ -1,5 +1,5 @@
 /**
- * Read-only bank API (Phase 5, task R3a, ADR 0032). Shapes are fixed in packages/core api-types
+ * Read-only bank API (Phase 5, task R3a, ADR 0033). Shapes are fixed in packages/core api-types
  * (BankAccountsResponse, BankTransactionsResponse, BankTransactionDetail); the Bank screen (R3b)
  * builds against them.
  *

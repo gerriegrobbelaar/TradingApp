@@ -1,5 +1,5 @@
 /**
- * Ingest of Revolut transactions (task R3a, ADR 0032): legs, accounts, state transitions,
+ * Ingest of Revolut transactions (task R3a, ADR 0033): legs, accounts, state transitions,
  * idempotency and reconciliation across webhook, poll and backfill.
  */
 import { mapTransaction, parseJsonRawNumbers } from "@camelthorn/revolut";
@@ -197,7 +197,7 @@ describe("state transitions", () => {
   const STATES = ["pending", "completed", "declined", "failed", "reverted", "unknown"] as const;
   const FINAL = new Set(["completed", "declined", "failed", "reverted"]);
 
-  /** ADR 0032: the legal moves, written out independently of the implementation. */
+  /** ADR 0033: the legal moves, written out independently of the implementation. */
   function expected(a: string, b: string): string {
     if (b === "unknown") return a;
     if (a === "unknown") return b;

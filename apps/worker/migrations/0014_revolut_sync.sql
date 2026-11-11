@@ -1,4 +1,4 @@
--- 0014 Revolut ingest and sync (Phase 5, task R3a, ADR 0032).
+-- 0014 Revolut ingest and sync (Phase 5, task R3a, ADR 0033).
 --
 --  (a) revolut_sync_state: where the Revolut poll and the backfill are, per connection and entity.
 --      Resumable: `cursor` is the JSON paging cursor of an unfinished walk (R1 TransactionCursor),

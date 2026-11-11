@@ -480,7 +480,7 @@ sync panel on the test division.
     - `$skiptoken` paging with this filter and order, the page size (60?), and that `Document`
       holds a GUID when a PDF is attached.
 
-### First-live checklist: Revolut webhook, sync and backfill (task R3a, ADR 0032)
+### First-live checklist: Revolut webhook, sync and backfill (task R3a, ADR 0033)
 
 The webhook URL is `<app origin>/api/webhooks/revolut`. It must be **public https** (Revolut calls
 it from the internet; a `wrangler dev` or tunnel URL works for tests, `workers.dev` is off). No
@@ -496,8 +496,8 @@ webhook is not registered, use "Register webhook" (admin, fresh sign-in).
    `bank_transactions` (`source = 'webhook'`, two rows for a transfer). A 401 in the Revolut
    delivery log means the signature check failed: record the exact header names, the timestamp unit
    (we expect epoch milliseconds in `Revolut-Request-Timestamp`) and the signed-payload format, and
-   fix ADR 0030/0032 and `packages/revolut` together.
-3. Verify the assumptions of ADR 0032 (payload shape, whether `TransactionStateChanged` fires for
+   fix ADR 0030/0033 and `packages/revolut` together.
+3. Verify the assumptions of ADR 0033 (payload shape, whether `TransactionStateChanged` fires for
    every state, retry timing, the rate limit) and note the answers there.
 4. Run "Run now" on `revolut.backfill`, then switch on `revolut.sync` (Settings, Schedules). Check
    the Bank screen shows balances and that `revolut_sync_state` has `last_status = 'ok'` for

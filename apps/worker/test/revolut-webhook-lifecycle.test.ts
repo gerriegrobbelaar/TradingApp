@@ -1,5 +1,5 @@
 /**
- * The webhook subscription lifecycle and the post-confirmation hooks (task R3a, ADR 0032):
+ * The webhook subscription lifecycle and the post-confirmation hooks (task R3a, ADR 0033):
  * creation on confirm, "Register webhook", recovery from a lost creation response, replacement
  * (rotation), failure surfacing, secrets never stored or logged from list responses, and the
  * initial 90-day backfill enqueued by the confirmation.

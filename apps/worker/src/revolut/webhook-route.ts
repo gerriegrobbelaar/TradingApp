@@ -1,5 +1,5 @@
 /**
- * POST /api/webhooks/revolut (Phase 5, task R3a; ADR 0032, CLAUDE.md 3 and 5).
+ * POST /api/webhooks/revolut (Phase 5, task R3a; ADR 0033, CLAUDE.md 3 and 5).
  *
  * Public (no cookie), exempt from the CSRF-header rule because every request authenticates itself
  * with an HMAC signature. The order is fixed:

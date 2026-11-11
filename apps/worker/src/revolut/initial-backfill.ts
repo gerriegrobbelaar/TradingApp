@@ -1,5 +1,5 @@
 /**
- * The one-off initial backfill after a Revolut connection is confirmed (task R3a, ADR 0032): the
+ * The one-off initial backfill after a Revolut connection is confirmed (task R3a, ADR 0033): the
  * 90-day request is stored in revolut_sync_state (so it survives a refused or delayed run and is
  * picked up by the next `revolut.backfill` run), then a manual run of the job is enqueued through
  * the normal "Run now" path (audited, JobLock, queue). Idempotent: asking again re-walks the same

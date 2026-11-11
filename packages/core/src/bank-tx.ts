@@ -1,5 +1,5 @@
 /**
- * Bank transaction state transitions (Phase 5, ADR 0032). Pure: no I/O.
+ * Bank transaction state transitions (Phase 5, ADR 0033). Pure: no I/O.
  *
  * A Revolut transaction is refreshed from several sources (webhook, poll, backfill) that can
  * deliver the same transaction out of order. The stored state must only move forward:

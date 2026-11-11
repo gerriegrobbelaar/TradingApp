@@ -1,5 +1,5 @@
 /**
- * The Revolut sync jobs (task R3a, ADR 0032): revolut.sync (balances, poll, pending refresh) and
+ * The Revolut sync jobs (task R3a, ADR 0033): revolut.sync (balances, poll, pending refresh) and
  * revolut.backfill (35-day walk, missing count, initial 90-day backfill), including resumable
  * cursors, skip codes, failure codes, the call budget and the "counts and codes only" results.
  */
@@ -82,7 +82,7 @@ beforeEach(async () => {
 });
 afterEach(() => stub.restore());
 
-describe("budget arithmetic (ADR 0032)", () => {
+describe("budget arithmetic (ADR 0033)", () => {
   it("the parts of a poll run fit the per-run budget, and the day fits the rate limit", () => {
     const worst = 1 + SYNC_DETAILS_PER_RUN + SYNC_MAX_PAGES + SYNC_PENDING_REFRESH;
     expect(worst).toBeLessThanOrEqual(SYNC_CALL_BUDGET);

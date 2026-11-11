@@ -1,10 +1,10 @@
 /**
- * Ingest of Revolut transactions into bank_transactions (Phase 5, ADR 0032).
+ * Ingest of Revolut transactions into bank_transactions (Phase 5, ADR 0033).
  *
  * One Revolut transaction has one or more LEGS (a transfer between own accounts, an exchange);
  * each leg is one row, unique on (connection_id, external_id, leg_id). The same transaction
  * arrives from the webhook queue, the poll and the backfill, in any order, so the write is an
- * idempotent upsert whose state only moves forward (packages/core `decideLegUpdate`, ADR 0032):
+ * idempotent upsert whose state only moves forward (packages/core `decideLegUpdate`, ADR 0033):
  * a final state is never reopened by a stale event, an unknown state never replaces a known one,
  * completed -> reverted is the one legal final-to-final change.
  *
