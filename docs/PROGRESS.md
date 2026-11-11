@@ -10,8 +10,8 @@ Orchestrator log. Update after every merge and every direct (trivial) edit.
 | 3 | Scheduler | Done: H1, H2, J1 (review fixes), J2 (DEPLOY runbook; docs only, not separately reviewed). Not run on real Cloudflare Queues/DOs. Exact jobs ship disabled |
 | 4 | Read-only screens | Done (K1-K4, K3a, K3b; review fixes M1 infra/staging/EU queues, M2 truthfulness + payment-safety gate merged). NOT verified against real Exact. Phase 9 must not enable Pay until the approval mapping is verified live (ADR 0025) |
 | 5 | Revolut connection | Done (R1-R3b, review fixes Q1-Q3 merged). NOT verified against real Revolut. Jobs revolut.sync / revolut.backfill ship DISABLED. Revolut is optional for a first deploy |
-| 6 | ECB FX | Built and merged (F1 decimal maths + ECB parser, F2 import job + rates API, F3 FX amounts + FX rates tab). Final review done; fixes T1 (booked-amount wipe, rate-table helper) and T2 (error boundary, wording, stale chips) in progress. Job ecb.fx_import is ON by default. Decision 4 (accountant approves ECB for revaluation) still open |
-| 7 | Matching | Not started |
+| 6 | ECB FX | Done (F1-F3, review fixes T1 booked amount/rate tables/rate conflicts, T2 error boundaries/wording/stale handling). ecb.fx_import ON by default. Unrealised difference is dormant until the Exact booked-amount source is verified live (ADR 0038, DEPLOY.md item 17). Decision 4 still open |
+| 7 | Matching | In progress: M7a (matching engine in core) and M7e (Exact bank-entry/MatchSet payload builders) first; then worker (suggestions, auto-match with undo, booking outbox) and review-queue UI. Exact writes stay DISABLED by default until verified live |
 | 8 | Data quality | Not started. Also owns the `exact.bank_balances` job (ING/Rabobank balances from Exact, needed for the rule 'Exact balance differs from bank balance'; review S12). Its handler is not built; the job stays off |
 | 9 | Payments | Not started |
 | 10 | Reminders and resend emails | Not started |
@@ -55,3 +55,4 @@ Oldest first. Within a day, entries follow the order the work landed.
 ## Open decisions (CLAUDE.md §9)
 Answered: 7 (Workers only), 8 (domain only). Unanswered: 1-6 (needed from Phase 2 onward). Record answers as ADRs in `docs/decisions/`.
 - 2026-11-11: Phase 6 F1, F2, F3 merged with reviewer PASS; Phase 6 final review: docs/reviews/phase-6-review.md. Direct edits: relaxed wall-clock bounds in ecb.adversarial tests; added the ECB section to docs/DEPLOY.md.
+- 2026-11-11: Phase 6 final review + fixes T1/T2 merged; full suite green (ui 252, core 680, exact 162, revolut 151, web 1017, worker 1468). Phase 7 started.
