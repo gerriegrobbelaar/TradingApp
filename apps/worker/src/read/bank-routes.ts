@@ -30,6 +30,7 @@ import {
   type FreshnessEntity,
 } from "@camelthorn/core";
 import { json, type Ctx, type Router } from "../router";
+import { quarantineCounts } from "../revolut/quarantine";
 import { loadRevolutConnection } from "../revolut/store";
 import { ANY_ROLE, BadRequest, guarded, positiveIntParam } from "./routes";
 
@@ -189,6 +190,9 @@ async function accountsHandler(ctx: Ctx): Promise<Response> {
       createsBankEntries:
         conn.bank_entries_decided_at === null ? null : conn.creates_bank_entries === 1,
       paymentsMode: conn.payments_mode,
+      quarantined: await quarantineCounts(db, conn.id)
+        .then((q) => q.open)
+        .catch(() => 0),
     },
     accounts,
     totalsByCurrency: [...totals.entries()]

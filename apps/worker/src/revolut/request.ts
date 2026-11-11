@@ -18,13 +18,21 @@ const TX_ID = "[A-Za-z0-9_-]{1,100}";
 
 /** The one job id that may list webhook subscriptions (see ALLOWED). */
 export const WEBHOOK_RECOVER_JOB_ID = "revolut-webhook-recover";
+/**
+ * The one job id that may read a counterparty (`GET /counterparty/{id}`, review S6, ADR 0034). The
+ * response holds a name and IBANs: only the sync's lazy lookup uses it, with its own small call
+ * budget, and keeps nothing but the cache row.
+ */
+export const COUNTERPARTY_LOOKUP_JOB_ID = "revolut-counterparty-lookup";
 
 interface Allowed {
   version: "1.0" | "2.0";
   methods: readonly string[];
   re: RegExp;
-  /** When set, only these job ids (with priority 'user') may use the entry. */
+  /** When set, only these job ids may use the entry. */
   onlyJobs?: readonly string[];
+  /** When set, only this priority may use the entry. */
+  onlyPriority?: "user" | "job";
 }
 
 const ALLOWED: readonly Allowed[] = [
@@ -34,6 +42,14 @@ const ALLOWED: readonly Allowed[] = [
   { version: "1.0", methods: ["GET"], re: /^\/transactions$/ },
   { version: "1.0", methods: ["GET"], re: new RegExp(`^/transaction/${TX_ID}$`) },
   { version: "1.0", methods: ["GET"], re: /^\/counterparties$/ },
+  // One counterparty by id, for the sync's lazy IBAN lookup only (job priority, one job id).
+  {
+    version: "1.0",
+    methods: ["GET"],
+    re: new RegExp("^/counterparty/" + TX_ID + "$"),
+    onlyJobs: [COUNTERPARTY_LOOKUP_JOB_ID],
+    onlyPriority: "job",
+  },
   // Webhooks (API 2.0): create our one subscription and delete it, nothing else (review R2).
   // Reading a webhook returns its signing secret, and rotation is not built yet; a later task
   // that needs them adds them here with a review. The gate also checks that a created
@@ -49,6 +65,7 @@ const ALLOWED: readonly Allowed[] = [
     methods: ["GET"],
     re: /^\/webhooks$/,
     onlyJobs: [WEBHOOK_RECOVER_JOB_ID],
+    onlyPriority: "user",
   },
   { version: "2.0", methods: ["DELETE"], re: new RegExp(`^/webhooks/${UUID}$`) },
 ];
@@ -83,9 +100,8 @@ export function validateRequest(req: RevolutRequest): void {
   if (byPath.length === 0) throw bad("path");
   const entry = byPath.find((a) => a.methods.includes(req.method));
   if (!entry) throw bad("method");
-  if (entry.onlyJobs && (!entry.onlyJobs.includes(req.jobId) || req.priority !== "user")) {
-    throw bad("job_id");
-  }
+  if (entry.onlyJobs && !entry.onlyJobs.includes(req.jobId)) throw bad("job_id");
+  if (entry.onlyPriority && req.priority !== entry.onlyPriority) throw bad("job_id");
   for (const [k, v] of Object.entries(req.query ?? {})) {
     if (!QUERY_KEY_RE.test(k) || typeof v !== "string" || v.length > MAX_QUERY_VALUE) {
       throw bad("query");

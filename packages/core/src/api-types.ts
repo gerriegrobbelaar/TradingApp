@@ -535,6 +535,11 @@ export interface BankAccountsResponse {
     status: string;
     createsBankEntries: boolean | null;
     paymentsMode: string;
+    /**
+     * Transactions the sync could not store and keeps retrying (Phase 5 review S2). Optional and
+     * additive: absent from older servers; 0 when nothing is waiting.
+     */
+    quarantined?: number;
   } | null;
   accounts: BankAccountDto[];
   /** Per currency, ACTIVE accounts with a known balance only; `accounts` counts those. */

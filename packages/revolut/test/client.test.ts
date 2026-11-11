@@ -336,7 +336,7 @@ describe("transaction mapping", () => {
       createdAt: "2024-03-01T10:00:00.123456Z",
       reference: "INV-2024-001",
       merchant: { name: "Shop", city: "Amsterdam", categoryCode: "5411", country: "NL" },
-      card: { cardNumber: "123456******7890" },
+      card: { last4: "7890" },
     });
     expect(tx.legs).toHaveLength(2);
     expect(tx.legs[0]).toMatchObject({
@@ -354,8 +354,10 @@ describe("transaction mapping", () => {
       legId: "leg-b",
       amountMinor: 11000,
       counterparty: { accountType: "external", name: "Acme BV", iban: "NL91ABNA0417164300" },
-      card: { cardNumber: "123456******7890" },
+      card: { last4: "7890" },
     });
+    // The masked number itself is not kept anywhere in the mapped object.
+    expect(JSON.stringify(tx)).not.toContain("******");
   });
 
   it("handles minimal rows, unknown state and empty card", () => {
@@ -806,16 +808,19 @@ describe("transactions paging", () => {
   });
 
   it("rejects malformed timestamps from the API and stops at the chunk limit", async () => {
+    // A row with an unusable timestamp is rejected on its own (review S2), the walk goes on.
     const bad = scripted([ok(JSON.stringify([{ id: "a", created_at: "01/05/2024", legs: [] }]))]);
-    await expect(client(bad.transport).listTransactionsChunk({ count: 5 })).rejects.toMatchObject({
-      code: "BAD_SHAPE",
+    expect(await client(bad.transport).listTransactionsChunk({ count: 5 })).toEqual({
+      transactions: [],
+      rejected: [{ id: "a", code: "bad_timestamp" }],
+      nextCursor: null,
     });
     const impossible = scripted([
       ok(JSON.stringify([{ id: "a", created_at: "2024-13-45T10:00:00Z", legs: [] }])),
     ]);
-    await expect(
-      client(impossible.transport).listTransactionsChunk({ count: 5 }),
-    ).rejects.toMatchObject({ code: "BAD_SHAPE" });
+    expect(
+      (await client(impossible.transport).listTransactionsChunk({ count: 5 })).rejected,
+    ).toEqual([{ id: "a", code: "bad_timestamp" }]);
 
     // A server that always returns one fresh older row per call and a full page.
     let n = 0;

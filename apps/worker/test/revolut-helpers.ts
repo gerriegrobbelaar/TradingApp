@@ -77,6 +77,8 @@ export async function resetRevolut(): Promise<void> {
   await db.batch([
     db.prepare("DELETE FROM webhook_events"),
     db.prepare("DELETE FROM revolut_sync_state"),
+    db.prepare("DELETE FROM revolut_quarantine"),
+    db.prepare("DELETE FROM revolut_counterparties"),
     db.prepare("DELETE FROM match_suggestions"),
     db.prepare("DELETE FROM matches"),
     db.prepare("DELETE FROM bank_transactions"),

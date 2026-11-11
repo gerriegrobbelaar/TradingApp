@@ -125,8 +125,12 @@ export interface RevolutCounterparty {
 }
 
 export interface RevolutCardInfo {
-  /** Masked by Revolut, for example 123456******7890. */
-  cardNumber?: string;
+  /**
+   * The last four digits of the card number, taken at parse time. Revolut sends the number masked
+   * (for example 123456******7890); the masked value is not kept at all, and a number that is not
+   * masked can never travel further than this function (review S6).
+   */
+  last4?: string;
 }
 
 export interface RevolutMerchant {
@@ -184,7 +188,9 @@ function mapCounterparty(raw: Row): RevolutCounterparty {
 function mapCard(raw: Row | undefined): RevolutCardInfo | undefined {
   if (raw === undefined) return undefined;
   const n = optStr(raw, "card_number");
-  return n === undefined ? {} : { cardNumber: n };
+  if (n === undefined) return {};
+  const m = /(\d{4})\s*$/.exec(n);
+  return m ? { last4: m[1] as string } : {};
 }
 
 function mapLeg(raw: unknown): RevolutLeg {

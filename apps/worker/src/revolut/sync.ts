@@ -7,8 +7,15 @@
  * from the slot (`run.scheduledFor`), a small per-run Revolut call budget enforced by the gate.
  *
  * Call arithmetic (ADR 0033): a poll run spends at most SYNC_CALL_BUDGET = 10 calls (1 accounts,
- * up to 2 bank details, up to 4 transaction pages, up to 2 refreshes of old pending rows); a quiet
- * run costs 3 (accounts and the two-call end of a walk). Backfill: at most 12 per run.
+ * up to 2 bank details, up to 4 transaction pages, up to 2 refreshes of old pending rows, up to 1
+ * retry of a quarantined row); a quiet run costs 3 (accounts and the two-call end of a walk).
+ * Counterparty lookups (review S6, ADR 0034) run under their OWN job id and budget of at most 5
+ * calls, and only when a stored transaction names a counterparty the cache does not know.
+ * Backfill: at most 12 per run.
+ *
+ * Quality of the data (Phase 5 review Q1): a run that stored everything it could but met rows it
+ * could not store (quarantined, review S2) or legs it could not place (review S7) ends `partial`
+ * with the code `rows_quarantined` / `legs_skipped`; the counts are in the summary.
  */
 import {
   RevolutAuthError,
@@ -21,10 +28,32 @@ import { auditStatement } from "../db/audit";
 import type { Env } from "../env";
 import type { HandlerResult, JobContext } from "../jobs/types";
 import { scheduledForMs } from "../jobs/period";
+import {
+  applyCounterpartyCache,
+  counterpartiesToLookUp,
+  COUNTERPARTY_LOOKUPS_PER_RUN,
+  lookUpCounterparties,
+} from "./counterparties";
 import { classifyRevolutError } from "./errors";
 import { CREDENTIALS_REJECTED } from "./gate";
-import { normStamp, upsertTransaction, type IngestSource } from "./ingest";
+import {
+  IngestError,
+  normStamp,
+  upsertTransaction,
+  type IngestResult,
+  type IngestSource,
+} from "./ingest";
+import { queueInitialBackfill } from "./initial-backfill";
 import { startJobClient } from "./job-client";
+import {
+  clearQuarantine,
+  QUARANTINE_RETRIES_PER_RUN,
+  quarantineCounts,
+  recordQuarantine,
+  retryQuarantined,
+  type QuarantineItem,
+} from "./quarantine";
+import { COUNTERPARTY_LOOKUP_JOB_ID } from "./request";
 import { loadRevolutConnection, type RevolutConnectionRow } from "./store";
 
 export const SYNC_JOB_ID = "revolut-sync";
@@ -35,6 +64,9 @@ export const SYNC_PAGE_SIZE = 200;
 export const SYNC_MAX_PAGES = 4;
 export const SYNC_DETAILS_PER_RUN = 2;
 export const SYNC_PENDING_REFRESH = 2;
+/** Bank-details lookups are retried after this long when they failed, at most this many times. */
+export const DETAILS_RETRY_MS = 24 * 3600_000;
+export const DETAILS_MAX_ATTEMPTS = 5;
 /** The poll starts this long before the end of its last complete walk. */
 export const POLL_OVERLAP_MS = 2 * 3600_000;
 /** First poll of a connection (no watermark): history is the backfill's job. */
@@ -70,6 +102,8 @@ interface StateRow {
   initial: number;
   rows_seen: number;
   rows_missing: number;
+  last_status: string | null;
+  last_error: string | null;
 }
 
 async function loadState(db: D1Database, connectionId: number, entity: Entity): Promise<StateRow> {
@@ -82,7 +116,7 @@ async function loadState(db: D1Database, connectionId: number, entity: Entity): 
   const row = await db
     .prepare(
       `SELECT cursor, watermark, window_from, window_days, walk_started_at, requested_days, initial,
-              rows_seen, rows_missing
+              rows_seen, rows_missing, last_status, last_error
        FROM revolut_sync_state WHERE connection_id = ?1 AND entity = ?2`,
     )
     .bind(connectionId, entity)
@@ -170,6 +204,12 @@ interface Counts {
   missing: number;
   blocked: number;
   skippedLegs: number;
+  /** Rows that could not be stored this run (client mapping or ingest refused), review S2. */
+  quarantined: number;
+  /** Ids already counted in `quarantined` this run (a row is counted once). */
+  quarantinedIds: Set<string>;
+  /** Matched final rows that received different data or a different state, review S9. */
+  frozenConflicts: number;
 }
 const zero = (): Counts => ({
   seen: 0,
@@ -178,8 +218,47 @@ const zero = (): Counts => ({
   missing: 0,
   blocked: 0,
   skippedLegs: 0,
+  quarantined: 0,
+  quarantinedIds: new Set(),
+  frozenConflicts: 0,
 });
 
+/** Counts rows that could not be stored; a known id counts once per run, however often it is met. */
+function noteQuarantined(into: Counts, items: QuarantineItem[]): void {
+  for (const it of items) {
+    if (it.id !== null) {
+      if (into.quarantinedIds.has(it.id)) continue;
+      into.quarantinedIds.add(it.id);
+    }
+    into.quarantined++;
+  }
+}
+
+/** The code of a run that finished its walk but met data it could not fully use, or null. */
+function dataQualityCode(c: Counts): string | null {
+  if (c.quarantined > 0) return "rows_quarantined";
+  if (c.skippedLegs > 0) return "legs_skipped";
+  return null;
+}
+
+function addResult(into: Counts, tx: RevolutTransaction, r: IngestResult, nowMs: number): void {
+  into.seen++;
+  into.inserted += r.inserted;
+  into.updated += r.updated;
+  const createdMs = Date.parse(normStamp(tx.createdAt) ?? "");
+  if (r.missing && Number.isFinite(createdMs) && createdMs < nowMs - MISS_GRACE_MS) {
+    into.missing++;
+  }
+  into.blocked += r.blocked.regress + r.blocked.conflict;
+  into.skippedLegs += r.skipped;
+  into.frozenConflicts += r.frozenConflicts;
+}
+
+/**
+ * Ingests a page row by row. A row the ingest refuses (IngestError: too many legs, a bad leg, a bad
+ * amount) is quarantined and the rest of the page goes on (review S2); anything else (D1, a lost
+ * race) propagates and the page is retried as a whole.
+ */
 async function ingestAll(
   env: Env,
   connectionId: number,
@@ -188,18 +267,22 @@ async function ingestAll(
   nowMs: number,
   into: Counts,
 ): Promise<void> {
+  const stored: string[] = [];
+  const bad: QuarantineItem[] = [];
   for (const tx of txs) {
-    const r = await upsertTransaction(env, connectionId, tx, source, nowMs);
-    into.seen++;
-    into.inserted += r.inserted;
-    into.updated += r.updated;
-    const createdMs = Date.parse(normStamp(tx.createdAt) ?? "");
-    if (r.missing && Number.isFinite(createdMs) && createdMs < nowMs - MISS_GRACE_MS) {
-      into.missing++;
+    try {
+      addResult(into, tx, await upsertTransaction(env, connectionId, tx, source, nowMs), nowMs);
+      stored.push(tx.id);
+    } catch (e) {
+      if (!(e instanceof IngestError)) throw e;
+      bad.push({ id: tx.id, code: e.code });
     }
-    into.blocked += r.blocked.regress + r.blocked.conflict;
-    into.skippedLegs += r.skipped;
   }
+  if (bad.length > 0) {
+    await recordQuarantine(env.DB, connectionId, bad, iso(nowMs));
+    noteQuarantined(into, bad);
+  }
+  await clearQuarantine(env.DB, connectionId, stored);
 }
 
 interface WalkOptions {
@@ -233,6 +316,10 @@ async function walk(w: WalkOptions, startCursor: TransactionCursor | null): Prom
       cursor,
     });
     await ingestAll(w.env, w.connectionId, chunk.transactions, w.source, w.now(), w.counts);
+    if (chunk.rejected.length > 0) {
+      await recordQuarantine(w.env.DB, w.connectionId, chunk.rejected, iso(w.now()));
+      noteQuarantined(w.counts, chunk.rejected);
+    }
     cursor = chunk.nextCursor;
     await saveState(w.env.DB, w.connectionId, w.entity, {
       cursor: cursor === null ? null : JSON.stringify(cursor),
@@ -265,6 +352,7 @@ function outcome(e: unknown): { result: HandlerResult; code: string } {
 interface AccountRow {
   id: number;
   external_id: string;
+  currency: string;
 }
 
 async function syncAccounts(
@@ -272,9 +360,24 @@ async function syncAccounts(
   client: RevolutClient,
   connectionId: number,
   nowIso: string,
-): Promise<{ accounts: number; retired: number }> {
+): Promise<{ accounts: number; retired: number; replaced: boolean }> {
   const db = env.DB;
   const list = await client.listAccounts();
+  // Review N3: accounts this connection has read before (balance_at is only set by this function)
+  // and not one of them is in a complete, non-empty answer: the connection now points at other
+  // accounts (re-authorised as a different Revolut business). The old accounts are retired below.
+  const previous = (
+    await db
+      .prepare(
+        `SELECT external_id FROM bank_accounts
+         WHERE connection_id = ?1 AND is_active = 1 AND balance_at IS NOT NULL`,
+      )
+      .bind(connectionId)
+      .all<{ external_id: string }>()
+  ).results;
+  const listed = new Set(list.map((a) => a.id));
+  const replaced =
+    list.length > 0 && previous.length > 0 && !previous.some((p) => listed.has(p.external_id));
   const statements: D1PreparedStatement[] = list.map((a) =>
     db
       .prepare(
@@ -311,48 +414,107 @@ async function syncAccounts(
         .bind(connectionId, nowIso, JSON.stringify(list.map((a) => a.id))),
     );
   }
-  if (statements.length === 0) return { accounts: 0, retired: 0 };
+  if (statements.length === 0) return { accounts: 0, retired: 0, replaced: false };
   const out = await db.batch(statements);
   const retired = list.length > 0 ? (out[out.length - 1]?.meta.changes ?? 0) : 0;
-  return { accounts: list.length, retired };
+  return { accounts: list.length, retired, replaced };
 }
 
-/** Bank details (IBAN, BIC) for accounts that never had them looked up; at most `limit` calls. */
+/**
+ * Review N3, ADR 0034. The connection now points at other accounts: forget where the old walks
+ * were (their cursors and windows belong to the old accounts), and ask for the 90-day initial
+ * backfill again. The old accounts are inactive and their transactions stay as history under the
+ * same connection; nothing is deleted.
+ */
+export async function resetSyncForReplacedAccounts(
+  db: D1Database,
+  connectionId: number,
+): Promise<void> {
+  await loadState(db, connectionId, "transactions");
+  await loadState(db, connectionId, "backfill");
+  await db
+    .prepare(
+      `UPDATE revolut_sync_state SET cursor = NULL, watermark = NULL, window_from = NULL,
+         window_days = NULL, walk_started_at = NULL, requested_days = NULL, initial = 0,
+         rows_seen = 0, rows_missing = 0, last_missing = NULL
+       WHERE connection_id = ?1 AND entity IN ('transactions', 'backfill')`,
+    )
+    .bind(connectionId)
+    .run();
+  await requestBackfill(db, connectionId, INITIAL_BACKFILL_DAYS);
+}
+
+/**
+ * The details entry that is the account's OWN IBAN for its currency (review N4): not a pooled
+ * (shared) one, and for EUR the SEPA scheme, for other currencies SWIFT. ASSUMPTION (verify with
+ * the sandbox, ADR 0030): `pooled` marks shared details and `schemes` lists 'sepa' / 'swift'.
+ */
+export function pickOwnDetails(
+  details: RevolutBankDetails[],
+  currency: string,
+): RevolutBankDetails | undefined {
+  const withIban = details.filter((d) => d.iban !== undefined && d.iban !== "");
+  const own = withIban.filter((d) => d.pooled !== true);
+  const pool = own.length > 0 ? own : withIban;
+  const scheme = currency === "EUR" ? "sepa" : "swift";
+  return pool.find((d) => d.schemes.some((x) => x.toLowerCase() === scheme)) ?? pool[0];
+}
+
+/**
+ * Bank details (IBAN, BIC) for accounts that need a lookup; at most `limit` calls. Review N4: the
+ * outcome is kept apart. `ok` stores the IBAN; `no_iban` means Revolut answered and the account
+ * has none (a non-SEPA currency): not asked again; `error` means the lookup failed permanently
+ * (bad data, a 4xx): asked again after 24 hours, at most 5 times. A transient failure (rate limit,
+ * gate, network) records nothing and ends the loop.
+ */
 async function fillBankDetails(
   env: Env,
   client: RevolutClient,
   connectionId: number,
   limit: number,
+  nowMs: number,
 ): Promise<number> {
   const db = env.DB;
-  // `bic IS NULL` means "never looked up": an account without IBAN (a non-SEPA currency) gets an
-  // empty BIC so it is not looked up on every run.
+  const nowIso = iso(nowMs);
   const todo = (
     await db
       .prepare(
-        `SELECT id, external_id FROM bank_accounts
-         WHERE connection_id = ?1 AND is_active = 1 AND iban IS NULL AND bic IS NULL
-         ORDER BY id LIMIT ?2`,
+        `SELECT id, external_id, currency FROM bank_accounts
+         WHERE connection_id = ?1 AND is_active = 1 AND iban IS NULL
+           AND (details_status IS NULL
+                OR (details_status = 'error' AND details_attempts < ?3
+                    AND (details_checked_at IS NULL OR details_checked_at <= ?2)))
+         ORDER BY id LIMIT ?4`,
       )
-      .bind(connectionId, limit)
+      .bind(connectionId, iso(nowMs - DETAILS_RETRY_MS), DETAILS_MAX_ATTEMPTS, limit)
       .all<AccountRow>()
   ).results;
   let filled = 0;
   for (const a of todo) {
-    let details: RevolutBankDetails[];
+    let details: RevolutBankDetails[] | null = null;
     try {
       details = await client.getAccountBankDetails(a.external_id);
     } catch (e) {
       if (classifyRevolutError(e).retryable) break; // try again next run
-      details = [];
     }
-    const withIban = details.find((d) => d.iban !== undefined && d.iban !== "");
-    const pick = withIban ?? details[0];
+    const pick = details === null ? undefined : pickOwnDetails(details, a.currency);
+    const status = details === null ? "error" : pick ? "ok" : "no_iban";
+    const anyBic = details?.find((d) => d.bic !== undefined)?.bic;
     await db
-      .prepare("UPDATE bank_accounts SET iban = ?2, bic = ?3 WHERE id = ?1 AND iban IS NULL")
-      .bind(a.id, withIban?.iban?.replace(/\s+/g, "").toUpperCase() ?? null, pick?.bic ?? "")
+      .prepare(
+        `UPDATE bank_accounts SET iban = COALESCE(iban, ?2), bic = COALESCE(bic, ?3),
+           details_status = ?4, details_attempts = details_attempts + 1, details_checked_at = ?5
+         WHERE id = ?1`,
+      )
+      .bind(
+        a.id,
+        pick?.iban?.replace(/\s+/g, "").toUpperCase() ?? null,
+        details === null ? null : (pick?.bic ?? anyBic ?? ""),
+        status,
+        nowIso,
+      )
       .run();
-    if (withIban) filled++;
+    if (pick) filled++;
   }
   return filled;
 }
@@ -402,6 +564,11 @@ async function refreshPending(
   return done;
 }
 
+/** True when the previous run of this entity ended the same way (same status and code). */
+function sameOutcomeAsBefore(before: StateRow, status: string, code: string | null): boolean {
+  return before.last_status === status && (before.last_error ?? null) === code;
+}
+
 export async function runRevolutSync(ctx: JobContext): Promise<HandlerResult> {
   const { env } = ctx;
   const db = env.DB;
@@ -415,6 +582,7 @@ export async function runRevolutSync(ctx: JobContext): Promise<HandlerResult> {
   const counts = zero();
   const summary: Record<string, unknown> = {};
   let job: Awaited<ReturnType<typeof startJobClient>> | null = null;
+  let lookupJob: Awaited<ReturnType<typeof startJobClient>> | null = null;
   let result: HandlerResult;
   let errorCode: string | null = null;
   let walkComplete = false;
@@ -424,7 +592,7 @@ export async function runRevolutSync(ctx: JobContext): Promise<HandlerResult> {
 
   await loadState(db, conn.id, "accounts");
   await saveState(db, conn.id, "accounts", { last_started_at: nowIso, last_status: "running" });
-  const tstate = await loadState(db, conn.id, "transactions");
+  const before = await loadState(db, conn.id, "transactions");
   await saveState(db, conn.id, "transactions", { last_started_at: nowIso, last_status: "running" });
 
   try {
@@ -443,12 +611,35 @@ export async function runRevolutSync(ctx: JobContext): Promise<HandlerResult> {
       last_status: "ok",
       last_error: null,
     });
-    summary["ibansFilled"] = await fillBankDetails(env, client, conn.id, SYNC_DETAILS_PER_RUN);
+    if (acc.replaced) {
+      // Review N3: other accounts than before. Old cursors are meaningless; walk 90 days again.
+      summary["accountsReplaced"] = true;
+      await resetSyncForReplacedAccounts(db, conn.id);
+      await auditStatement(db, {
+        actorEmail: "system",
+        action: "revolut.accounts_replaced",
+        entity: "connection",
+        entityId: conn.id,
+        after: { accounts: acc.accounts, retired: acc.retired },
+      })
+        .run()
+        .catch(() => undefined);
+      await queueInitialBackfill(env, conn.id, "system", nowMs).catch(() => undefined);
+    }
+    summary["ibansFilled"] = await fillBankDetails(
+      env,
+      client,
+      conn.id,
+      SYNC_DETAILS_PER_RUN,
+      nowMs,
+    );
 
-    // (b) transactions newer than the watermark minus the overlap, resumable
+    // (b) transactions newer than the watermark minus the overlap, resumable. A walk is in
+    // progress when its window was stored, with or without a cursor (the first page may have
+    // failed): the window must not slide (review S1).
+    const tstate = await loadState(db, conn.id, "transactions");
     const resume = parseCursor(tstate.cursor);
-    const hasWalk =
-      resume !== null && tstate.window_from !== null && tstate.walk_started_at !== null;
+    const hasWalk = tstate.window_from !== null && tstate.walk_started_at !== null;
     const from = hasWalk
       ? (tstate.window_from as string)
       : iso(
@@ -494,25 +685,88 @@ export async function runRevolutSync(ctx: JobContext): Promise<HandlerResult> {
       ctx.signal,
     );
 
+    // (d) one quarantined row is read again (review S2); it leaves the quarantine when it stores
+    const retry = await retryQuarantined(
+      db,
+      client,
+      conn.id,
+      QUARANTINE_RETRIES_PER_RUN,
+      ctx.now(),
+      ctx.signal,
+      counts.quarantinedIds,
+      async (tx) => {
+        const at = ctx.now();
+        addResult(counts, tx, await upsertTransaction(env, conn.id, tx, "poll", at), at);
+      },
+    );
+    noteQuarantined(
+      counts,
+      retry.stillBad.map((id) => ({ id, code: "bad_shape" })),
+    );
+    summary["quarantineRetried"] = retry.tried;
+    summary["quarantineCleared"] = retry.cleared;
+
+    // (e) counterparty IBANs for matching (review S6): own job id, own small budget
+    try {
+      const refs = await counterpartiesToLookUp(
+        db,
+        conn.id,
+        ctx.now(),
+        COUNTERPARTY_LOOKUPS_PER_RUN,
+      );
+      if (refs.length > 0 && !ctx.signal.aborted) {
+        lookupJob = await startJobClient(
+          env,
+          conn.id,
+          COUNTERPARTY_LOOKUP_JOB_ID,
+          COUNTERPARTY_LOOKUPS_PER_RUN,
+        );
+        const l = await lookUpCounterparties(
+          db,
+          lookupJob.client,
+          conn.id,
+          refs,
+          ctx.now(),
+          ctx.signal,
+        );
+        summary["counterpartyLookups"] = l.looked;
+        summary["counterpartiesResolved"] = l.resolved;
+        summary["counterpartyIbansFilled"] = l.filled;
+      } else {
+        summary["counterpartyIbansFilled"] = await applyCounterpartyCache(db, conn.id);
+      }
+    } catch (e) {
+      if (e instanceof RevolutAuthError) throw e;
+      // Best effort: a failed lookup never fails the sync; the next run tries again.
+      summary["counterpartyLookupError"] = classifyRevolutError(e).code;
+    }
+
     summary["complete"] = walkComplete;
-    result = {
-      status: walkComplete ? "ok" : "partial",
-      ...(walkComplete ? {} : { code: "walk_incomplete" }),
-      summary,
-    };
+    const quality = dataQualityCode(counts);
+    result = walkComplete
+      ? quality === null
+        ? { status: "ok", summary }
+        : { status: "partial", code: quality, summary }
+      : { status: "partial", code: "walk_incomplete", summary };
   } catch (e) {
     const o = outcome(e);
     errorCode = o.code;
     result = { ...o.result, summary };
   }
 
-  const calls = (await job?.end()) ?? 0;
+  const calls = ((await job?.end()) ?? 0) + ((await lookupJob?.end()) ?? 0);
   const finishedIso = iso(ctx.now());
   summary["seen"] = counts.seen;
   summary["inserted"] = counts.inserted;
   summary["updated"] = counts.updated;
   summary["blocked"] = counts.blocked;
+  summary["quarantined"] = counts.quarantined;
+  summary["skippedLegs"] = counts.skippedLegs;
+  summary["frozenConflicts"] = counts.frozenConflicts;
   summary["calls"] = calls;
+  summary["quarantineOpen"] = await quarantineCounts(db, conn.id)
+    .then((q) => q.open)
+    .catch(() => null);
   result = { ...result, summary, callsUsed: calls };
 
   const tPatch: Record<string, string | number | null> = {
@@ -537,9 +791,12 @@ export async function runRevolutSync(ctx: JobContext): Promise<HandlerResult> {
     }).catch(() => undefined);
   }
 
-  // One summary audit row for a run that changed something or did not end ok (a quiet poll every
-  // ten minutes would only add noise).
-  if (counts.inserted + counts.updated + retired > 0 || result.status !== "ok") {
+  // One summary audit row for a run that changed something, or that did not end ok in a way the
+  // previous run did not already report (a quiet poll every ten minutes, or the same standing
+  // problem every ten minutes, would only add noise).
+  const changed = counts.inserted + counts.updated + retired > 0;
+  const code = errorCode ?? result.code ?? null;
+  if (changed || (result.status !== "ok" && !sameOutcomeAsBefore(before, result.status, code))) {
     await auditStatement(db, {
       actorEmail: "system",
       action: "revolut.sync_run",
@@ -551,6 +808,9 @@ export async function runRevolutSync(ctx: JobContext): Promise<HandlerResult> {
         inserted: counts.inserted,
         updated: counts.updated,
         retired,
+        quarantined: counts.quarantined,
+        skippedLegs: counts.skippedLegs,
+        frozenConflicts: counts.frozenConflicts,
         calls,
       },
     })
@@ -576,10 +836,14 @@ export async function runRevolutBackfill(ctx: JobContext): Promise<HandlerResult
   const nowIso = iso(nowMs);
   const state = await loadState(db, conn.id, "backfill");
 
-  // Resume a walk in progress; otherwise start one. The window comes from the slot, not the clock
-  // (handler contract rule 3), and is stored so a resumed walk keeps its bounds.
+  // Resume a walk in progress; otherwise start one. A walk is in progress as soon as its window is
+  // stored, even if no page ever succeeded and no cursor was saved (review S1): it then restarts
+  // from its first page with the SAME bounds and the same initial flag, so a failing first page
+  // can never turn the 90-day initial backfill into a 35-day walk. The window comes from the slot,
+  // not the clock (handler contract rule 3). The one-off request (`requested_days`) is cleared only
+  // when an initial walk COMPLETES.
   const resume = parseCursor(state.cursor);
-  const resuming = resume !== null && state.window_from !== null;
+  const resuming = state.window_from !== null;
   let from: string;
   let days: number;
   let initial: boolean;
@@ -598,7 +862,6 @@ export async function runRevolutBackfill(ctx: JobContext): Promise<HandlerResult
       window_from: from,
       window_days: days,
       walk_started_at: nowIso,
-      requested_days: null,
       initial: initial ? 1 : 0,
       rows_seen: 0,
       rows_missing: 0,
@@ -635,19 +898,20 @@ export async function runRevolutBackfill(ctx: JobContext): Promise<HandlerResult
       },
       resuming ? resume : null,
     );
-    result = {
-      status: complete ? "ok" : "partial",
-      ...(complete
-        ? {}
-        : {
-            // The initial 90-day walk is usually a manual run, which the runner never retries: its
-            // own code makes the stop visible in Settings > Schedules, and the stored cursor is
-            // resumed by the next run of the job (the daily slot or another "Run now").
-            code: initial ? "initial_backfill_incomplete" : "walk_incomplete",
-            retry: { delaySeconds: BACKFILL_RETRY_SECONDS },
-          }),
-      summary: {},
-    };
+    const quality = dataQualityCode(counts);
+    result = complete
+      ? quality === null
+        ? { status: "ok", summary: {} }
+        : { status: "partial", code: quality, summary: {} }
+      : {
+          status: "partial",
+          // The initial 90-day walk is usually a manual run, which the runner never retries: its
+          // own code makes the stop visible in Settings > Schedules, and the stored window and
+          // cursor are resumed by the next run of the job (the daily slot or another "Run now").
+          code: initial ? "initial_backfill_incomplete" : "walk_incomplete",
+          retry: { delaySeconds: BACKFILL_RETRY_SECONDS },
+          summary: {},
+        };
   } catch (e) {
     const o = outcome(e);
     errorCode = o.code;
@@ -679,6 +943,9 @@ export async function runRevolutBackfill(ctx: JobContext): Promise<HandlerResult
       inserted: counts.inserted,
       updated: counts.updated,
       blocked: counts.blocked,
+      quarantined: counts.quarantined,
+      skippedLegs: counts.skippedLegs,
+      frozenConflicts: counts.frozenConflicts,
       calls,
     },
   };
@@ -695,13 +962,19 @@ export async function runRevolutBackfill(ctx: JobContext): Promise<HandlerResult
     patch["cursor"] = null;
     patch["window_from"] = null;
     patch["walk_started_at"] = null;
+    // The one-off request is satisfied only by a COMPLETE initial walk.
+    if (initial) patch["requested_days"] = null;
     // The data-quality signal: transactions Revolut has that we never received (daily walks only;
     // everything is "missing" in the initial backfill).
     if (!initial) patch["last_missing"] = counts.missing;
   }
   await saveState(db, conn.id, "backfill", patch).catch(() => undefined);
 
-  if (counts.inserted + counts.updated > 0 || result.status !== "ok") {
+  const code = errorCode ?? result.code ?? null;
+  if (
+    counts.inserted + counts.updated > 0 ||
+    (result.status !== "ok" && !sameOutcomeAsBefore(state, result.status, code))
+  ) {
     await auditStatement(db, {
       actorEmail: "system",
       action: "revolut.backfill_run",
@@ -716,6 +989,9 @@ export async function runRevolutBackfill(ctx: JobContext): Promise<HandlerResult
         missing: counts.missing,
         inserted: counts.inserted,
         updated: counts.updated,
+        quarantined: counts.quarantined,
+        skippedLegs: counts.skippedLegs,
+        frozenConflicts: counts.frozenConflicts,
       },
     })
       .run()

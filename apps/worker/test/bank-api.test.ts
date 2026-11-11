@@ -235,12 +235,27 @@ describe("GET /api/bank/accounts", () => {
         status,
         createsBankEntries: false,
         paymentsMode: "drafts",
+        quarantined: 0,
       });
       expect(body.accounts.length, status).toBe(3);
       expect(JSON.stringify(body)).not.toContain("ref-secret");
       const txs = await get<BankTransactionsResponse>("/api/bank/transactions");
       expect(txs.status, status).toBe(200);
     }
+  });
+
+  it("counts transactions the sync could not store (ids stay out of the response)", async () => {
+    await db
+      .prepare(
+        `INSERT INTO revolut_quarantine (connection_id, external_id, code, first_seen_at, last_seen_at)
+         VALUES (?1, 'bad-1', 'bad_shape', '2026-07-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z'),
+                (?1, 'bad-2', 'too_many_legs', '2026-07-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z')`,
+      )
+      .bind(connId)
+      .run();
+    const { body } = await get<BankAccountsResponse>("/api/bank/accounts");
+    expect(body.connection?.quarantined).toBe(2);
+    expect(JSON.stringify(body)).not.toContain("bad-1");
   });
 
   it("without any connection it is empty and available false", async () => {

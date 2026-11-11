@@ -18,6 +18,7 @@ import { HANDLERS } from "../src/jobs/handlers";
 import type { HandlerResult, JobContext } from "../src/jobs/types";
 import { assertCountsAndCodesOnly, MAX_STRING } from "./counts-only";
 import { resetRevolut, seedRevolut, stubRevolut } from "./revolut-helpers";
+import { cpRecord, rawApi, rawLeg, rawTx } from "./revolut-q1-helpers";
 import { fakeRevolut, simpleTx } from "./revolut-r3-helpers";
 import { FakeExact, addDivision, fakeGate, resetSync } from "./sync-helpers";
 
@@ -34,6 +35,9 @@ const DATA_TABLES = [
   "bank_transactions",
   "bank_accounts",
   "revolut_sync_state",
+  // Phase 5 review Q1: the quarantine and the counterparty cache must not grow on a repeated run.
+  "revolut_quarantine",
+  "revolut_counterparties",
   "webhook_events",
   "payments",
   "payment_batches",
@@ -126,10 +130,24 @@ async function revolutFixture(): Promise<{ syncDeps: JobContext["syncDeps"]; eff
     simpleTx("rc-1", { createdAt: new Date(NOW - 3_600_000).toISOString() }),
     simpleTx("rc-2", { createdAt: new Date(NOW - 7_200_000).toISOString(), state: "pending" }),
   ];
-  stub.api = api.handle;
+  // Review Q1 paths: a bad row (quarantine), a leg without our account (skipped), and a
+  // counterparty that has only an id (the lazy GET /counterparty/{id} lookup).
+  const raw = rawApi(api);
+  raw.rows = [
+    rawTx("rc-bad", new Date(NOW - 1_800_000).toISOString(), [{ amount: "x" }]),
+    rawTx("rc-skip", new Date(NOW - 2_400_000).toISOString(), [
+      rawLeg("a", { counterparty: { id: "cp-c", account_type: "external", name: "Acme" } }),
+      rawLeg("b", { account_id: undefined }),
+    ]),
+  ];
+  raw.counterparties.set(
+    "cp-c",
+    cpRecord("cp-c", [{ id: "x", iban: "NL91ABNA0417164300", currency: "EUR" }]),
+  );
+  stub.api = raw.handle;
   const effects: Effects = { calls: [], writes: [] };
   // Mirror what reaches Revolut into the effects log as the gate makes the calls.
-  const original = api.handle;
+  const original = raw.handle;
   stub.api = (c) => {
     effects.calls.push({ method: c.method, path: c.url.pathname });
     if (c.method !== "GET")

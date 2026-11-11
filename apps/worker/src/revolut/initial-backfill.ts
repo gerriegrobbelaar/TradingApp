@@ -7,7 +7,7 @@
  */
 import type { Env } from "../env";
 import { createManualRun } from "../jobs/runner";
-import { INITIAL_BACKFILL_DAYS, requestBackfill } from "./sync";
+import { INITIAL_BACKFILL_DAYS, requestBackfill, resetSyncForReplacedAccounts } from "./sync";
 
 export type InitialBackfill = "queued" | "requested";
 
@@ -16,7 +16,11 @@ export async function queueInitialBackfill(
   connectionId: number,
   actorEmail: string,
   nowMs: number,
+  opts: { replacesAccounts?: boolean } = {},
 ): Promise<InitialBackfill> {
+  // Re-authorised to different accounts (review N3): the old cursors and windows are forgotten.
+  // The sync also notices this on its own (the accounts it knew are gone) and does the same.
+  if (opts.replacesAccounts === true) await resetSyncForReplacedAccounts(env.DB, connectionId);
   await requestBackfill(env.DB, connectionId, INITIAL_BACKFILL_DAYS);
   const job = await env.DB.prepare(
     "SELECT id, name FROM jobs WHERE name = 'revolut.backfill'",

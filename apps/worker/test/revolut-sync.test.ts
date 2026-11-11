@@ -6,6 +6,7 @@
 import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CREDENTIALS_REJECTED } from "../src/revolut/gate";
+import { QUARANTINE_RETRIES_PER_RUN } from "../src/revolut/quarantine";
 import {
   BACKFILL_CALL_BUDGET,
   BACKFILL_DAYS,
@@ -85,7 +86,8 @@ afterEach(() => stub.restore());
 
 describe("budget arithmetic (ADR 0033)", () => {
   it("the parts of a poll run fit the per-run budget, and the day fits the rate limit", () => {
-    const worst = 1 + SYNC_DETAILS_PER_RUN + SYNC_MAX_PAGES + SYNC_PENDING_REFRESH;
+    const worst =
+      1 + SYNC_DETAILS_PER_RUN + SYNC_MAX_PAGES + SYNC_PENDING_REFRESH + QUARANTINE_RETRIES_PER_RUN;
     expect(worst).toBeLessThanOrEqual(SYNC_CALL_BUDGET);
     expect(BACKFILL_MAX_PAGES).toBeLessThanOrEqual(BACKFILL_CALL_BUDGET);
     // Every 5 minutes (the fastest allowed): 288 runs a day, 10 calls each, and a run's calls are

@@ -606,15 +606,45 @@ describe("queue consumer: Revolut events", () => {
     expect(stub.apiCalls.length).toBe(calls);
   });
 
-  it("an event for an unknown transaction (404) is processed with a code", async () => {
+  it("an event for an unknown transaction (404) is retried 3 times with delays, then processed with a code", async () => {
     const id = await receive("tx-gone");
-    const m = msg({ type: "revolut_event", webhookEventId: id });
-    await consume(m);
-    expect(m.ack).toHaveBeenCalled();
+    const run = async (attempts: number) => {
+      const m = msg({ type: "revolut_event", webhookEventId: id }, attempts);
+      await consume(m);
+      return m;
+    };
+    for (const [attempt, delay] of [
+      [1, 30],
+      [2, 120],
+      [3, 600],
+    ] as const) {
+      const m = await run(attempt);
+      expect(m.retry).toHaveBeenCalledWith({ delaySeconds: delay });
+      expect(m.ack).not.toHaveBeenCalled();
+      expect(await events()).toMatchObject([
+        { status: "queued", error_code: "transaction_not_found" },
+      ]);
+    }
+    const last = await run(EVENT_MAX_ATTEMPTS);
+    expect(last.ack).toHaveBeenCalled();
+    expect(last.retry).not.toHaveBeenCalled();
     expect(await events()).toMatchObject([
       { status: "processed", error_code: "transaction_not_found" },
     ]);
     expect(await rowsOf("bank_transactions")).toEqual([]);
+  });
+
+  it("a 404 that heals on the redelivery is stored and the code is cleared", async () => {
+    const id = await receive("tx-late");
+    const first = msg({ type: "revolut_event", webhookEventId: id }, 1);
+    await consume(first);
+    expect(first.retry).toHaveBeenCalledWith({ delaySeconds: 30 });
+    api.transactions = [simpleTx("tx-late")];
+    const second = msg({ type: "revolut_event", webhookEventId: id }, 2);
+    await consume(second);
+    expect(second.ack).toHaveBeenCalled();
+    expect(await events()).toMatchObject([{ status: "processed", error_code: null }]);
+    expect(await rowsOf("bank_transactions")).toHaveLength(1);
   });
 
   it("a rate limit asks the queue to retry; the row stays queued; the last attempt records the error", async () => {

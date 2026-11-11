@@ -118,9 +118,23 @@ export interface ListTransactionsOptions {
   trustShortPage?: boolean;
 }
 
+/**
+ * A row of a page that could not be mapped (review S2). Only the transaction id (when the row had a
+ * usable one) and a fixed lower-case code: never the payload, an IBAN, a name or an amount.
+ */
+export interface RejectedRow {
+  id: string | null;
+  code: string;
+}
+
 export interface TransactionChunk {
   /** Newest first, no id repeated within or across chunks of one walk. */
   transactions: RevolutTransaction[];
+  /**
+   * Rows of this page that did not map (a bad amount, a missing leg id, a zone-less timestamp).
+   * They do not stop the page: the cursor moves by the raw page, so a bad row cannot stall a walk.
+   */
+  rejected: RejectedRow[];
   /** null when the walk is complete. */
   nextCursor: TransactionCursor | null;
 }
@@ -129,12 +143,21 @@ export interface RevolutClient {
   listAccounts(): Promise<RevolutAccount[]>;
   getAccountBankDetails(accountId: string): Promise<RevolutBankDetails[]>;
   listTransactionsChunk(opts: ListTransactionsOptions): Promise<TransactionChunk>;
-  /** Walk every chunk until the cursor is null (bounded by `maxChunks`). */
+  /**
+   * Walk every chunk until the cursor is null (bounded by `maxChunks`). Rejected rows are handed to
+   * `onRejected` (when given) and otherwise dropped.
+   */
   transactionChunks(
     opts: Omit<ListTransactionsOptions, "cursor">,
     maxChunks?: number,
+    onRejected?: (rejected: RejectedRow[]) => void,
   ): AsyncGenerator<RevolutTransaction[], void, undefined>;
   getTransaction(id: string, idType?: "id" | "request_id"): Promise<RevolutTransaction>;
+  /**
+   * One counterparty by id (`GET /counterparty/{id}`). Its response carries names and IBANs: the
+   * caller keeps them out of logs and responses; error messages are redacted here.
+   */
+  getCounterparty(id: string): Promise<RevolutCounterpartyRecord>;
   listCounterparties(): Promise<RevolutCounterpartyRecord[]>;
   listWebhooks(): Promise<RevolutWebhook[]>;
   createWebhook(url: string, events?: readonly string[]): Promise<RevolutCreatedWebhook>;
@@ -181,6 +204,31 @@ function errorDetail(body: string): { message: string; code?: string } {
   } catch {
     return { message: "non-JSON response body" };
   }
+}
+
+/** The raw id and creation time of a page row, for paging; null where unusable. */
+function probeRow(r: unknown): { id: string | null; stamp: Stamp | null } {
+  if (typeof r !== "object" || r === null || Array.isArray(r)) return { id: null, stamp: null };
+  const row = r as Record<string, unknown>;
+  const id = typeof row["id"] === "string" && row["id"] !== "" ? row["id"] : null;
+  let stamp: Stamp | null = null;
+  const created = row["created_at"];
+  if (typeof created === "string") {
+    try {
+      stamp = parseStamp(created);
+    } catch {
+      stamp = null;
+    }
+  }
+  return { id, stamp };
+}
+
+/** A fixed code for a row that did not map; the error text is never used. */
+function rejectCode(e: unknown): string {
+  if (e instanceof RevolutApiError && e.code !== undefined && /^[A-Z][A-Z_]{1,30}$/.test(e.code)) {
+    return e.code.toLowerCase();
+  }
+  return "bad_shape";
 }
 
 function assertCursor(c: TransactionCursor): void {
@@ -315,15 +363,33 @@ export function createRevolutClient(
     const short = raw.length < requested;
 
     interface Entry {
-      tx: RevolutTransaction;
+      /** null: the row did not map (it still takes part in paging by its raw id and timestamp). */
+      tx: RevolutTransaction | null;
+      code: string;
       stamp: Stamp;
       id: string;
     }
     const byId = new Map<string, Entry>();
+    const unplaced: RejectedRow[] = [];
     let previous = Number.POSITIVE_INFINITY;
     for (const r of raw) {
-      const tx = mapTransaction(r);
-      const stamp = parseStamp(tx.createdAt);
+      // Each row is judged alone (review S2): paging uses the RAW id and created_at, so a row that
+      // does not map can neither stall the walk nor hide its neighbours.
+      const probe = probeRow(r);
+      let tx: RevolutTransaction | null = null;
+      let code = "";
+      try {
+        tx = mapTransaction(r);
+      } catch (e) {
+        code = rejectCode(e);
+      }
+      if (probe.id === null || probe.stamp === null) {
+        // Not placeable in the order: reported, and left out of the paging arithmetic.
+        unplaced.push({ id: probe.id, code: tx === null ? code : "bad_timestamp" });
+        continue;
+      }
+      if (tx !== null && tx.id !== probe.id) tx = null;
+      const stamp = probe.stamp;
       const at = microsOf(stamp);
       if (at > previous) {
         throw new RevolutApiError(
@@ -334,18 +400,25 @@ export function createRevolutClient(
       }
       previous = at;
       if (at > toMicros) continue; // outside the requested window: ignore
-      const known = byId.get(tx.id);
-      byId.set(
-        tx.id,
-        known === undefined
-          ? { tx, stamp, id: tx.id }
-          : { ...known, tx: laterUpdate(known.tx, tx) },
-      );
+      const known = byId.get(probe.id);
+      const entry: Entry = {
+        tx,
+        code: tx === null ? code || "bad_shape" : "",
+        stamp,
+        id: probe.id,
+      };
+      if (known === undefined) byId.set(probe.id, entry);
+      else if (known.tx === null) byId.set(probe.id, { ...entry, stamp: known.stamp });
+      else if (tx !== null) byId.set(probe.id, { ...known, tx: laterUpdate(known.tx, tx) });
     }
     const inWindow = [...byId.values()].sort(compareNewestFirst);
     const fresh = inWindow.filter((e) => !seenIds.has(e.id));
+    const rejected: RejectedRow[] = [
+      ...fresh.filter((e) => e.tx === null).map((e) => ({ id: e.id, code: e.code })),
+      ...unplaced,
+    ];
     if (fresh.length === 0) {
-      if (short) return { transactions: [], nextCursor: null };
+      if (short) return { transactions: [], rejected, nextCursor: null };
       // A full page made only of rows already returned: more rows share the boundary than a
       // call can carry. Failing loudly beats skipping rows.
       throw new RevolutApiError(
@@ -354,12 +427,14 @@ export function createRevolutClient(
         "PAGING_STUCK",
       );
     }
-    const result = fresh.map((e) => e.tx);
-    if (short && opts.trustShortPage === true) return { transactions: result, nextCursor: null };
+    const result = fresh.flatMap((e) => (e.tx === null ? [] : [e.tx]));
+    if (short && opts.trustShortPage === true) {
+      return { transactions: result, rejected, nextCursor: null };
+    }
 
     const oldest = inWindow[inWindow.length - 1];
     /* c8 ignore next */
-    if (oldest === undefined) return { transactions: result, nextCursor: null };
+    if (oldest === undefined) return { transactions: result, rejected, nextCursor: null };
     // One millisecond past the oldest row, never above the current bound.
     const candidateMs = oldest.stamp.ms + 1;
     const capped = toStamp !== undefined && candidateMs * 1000 > toMicros;
@@ -371,12 +446,13 @@ export function createRevolutClient(
     // Only rows at or below the next bound can come back.
     const keep: { id: string; ms: number }[] = [];
     for (const [id, ms] of nextSeen) if (ms <= nextToMs) keep.push({ id, ms });
-    return { transactions: result, nextCursor: { toIso: nextToIso, seen: keep } };
+    return { transactions: result, rejected, nextCursor: { toIso: nextToIso, seen: keep } };
   }
 
   async function* transactionChunks(
     opts: Omit<ListTransactionsOptions, "cursor">,
     maxChunks = 1000,
+    onRejected?: (rejected: RejectedRow[]) => void,
   ): AsyncGenerator<RevolutTransaction[], void, undefined> {
     if (!Number.isInteger(maxChunks) || maxChunks < 1 || maxChunks > 100_000) {
       throw new RangeError("maxChunks must be an integer between 1 and 100000");
@@ -384,6 +460,7 @@ export function createRevolutClient(
     let cursor: TransactionCursor | null = null;
     for (let i = 0; i < maxChunks; i++) {
       const chunk: TransactionChunk = await listTransactionsChunk({ ...opts, cursor });
+      if (chunk.rejected.length > 0) onRejected?.(chunk.rejected);
       if (chunk.transactions.length > 0) yield chunk.transactions;
       if (chunk.nextCursor === null) return;
       cursor = chunk.nextCursor;
@@ -410,6 +487,12 @@ export function createRevolutClient(
       const query = idType === "request_id" ? { id_type: "request_id" } : undefined;
       const res = await get(`/transaction/${encodeURIComponent(id)}`, query);
       return mapTransaction(parseJsonRawNumbers(res.body));
+    },
+
+    async getCounterparty(id) {
+      if (id === "") throw new RangeError("id is required");
+      const res = await get(`/counterparty/${encodeURIComponent(id)}`);
+      return mapCounterpartyRecord(parseJsonRawNumbers(res.body));
     },
 
     async listCounterparties() {

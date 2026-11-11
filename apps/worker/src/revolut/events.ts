@@ -11,8 +11,9 @@
  * ask the queue to retry with a delay, at most EVENT_MAX_ATTEMPTS deliveries in all (the queue's
  * max_retries is 3); the last attempt records `error` with the code. Permanent errors record
  * `error` at once. The transaction is then still picked up by the poll and the nightly backfill.
- * A 404 for the transaction (deleted, or an id of another environment) is `processed` with the
- * code `transaction_not_found`: nothing to retry.
+ * A 404 for the transaction is retried after 30 s, 2 min and 10 min (the read side can lag the
+ * webhook, review S8); if it is still gone after the last delivery (deleted, or an id of another
+ * environment) the event is `processed` with the code `transaction_not_found`.
  */
 import type { Env } from "../env";
 import { classifyRevolutError } from "./errors";
@@ -24,6 +25,12 @@ import { loadRevolutById } from "./store";
 export const EVENT_CALL_BUDGET = 3;
 /** Deliveries of one message: the first plus the queue's max_retries (3). */
 export const EVENT_MAX_ATTEMPTS = 4;
+/**
+ * A 404 right after a TransactionCreated is usually Revolut's read side lagging behind its
+ * webhook (review S8): the event is redelivered after these delays (seconds, by delivery number)
+ * before the 404 is accepted as final.
+ */
+export const NOT_FOUND_RETRY_SECONDS: readonly number[] = [30, 120, 600];
 const TX_ID_RE = /^[A-Za-z0-9_-]{1,100}$/;
 
 export type EventDisposition =
@@ -85,10 +92,24 @@ export async function processRevolutEvent(
     const r = await upsertTransaction(env, conn.id, tx, "webhook", clock());
     if (r.legs > 0 && r.skipped === r.legs) return await settle("ignored", "no_placeable_legs");
     const blocked = r.blocked.regress + r.blocked.conflict;
-    return await settle("processed", blocked > 0 ? "state_change_blocked" : null);
+    if (blocked > 0) return await settle("processed", "state_change_blocked");
+    if (r.frozenConflicts > 0) return await settle("processed", "frozen_conflict");
+    if (r.skipped > 0) return await settle("processed", "legs_skipped");
+    return await settle("processed", null);
   } catch (e) {
     const c = classifyRevolutError(e);
-    if (c.code === "not_found") return settle("processed", "transaction_not_found");
+    if (c.code === "not_found") {
+      const delay = NOT_FOUND_RETRY_SECONDS[attempt - 1];
+      if (delay !== undefined && attempt < EVENT_MAX_ATTEMPTS) {
+        await db
+          .prepare("UPDATE webhook_events SET error_code = ?2 WHERE id = ?1 AND status = 'queued'")
+          .bind(row.id, "transaction_not_found")
+          .run()
+          .catch(() => undefined);
+        return { kind: "retry", delaySeconds: delay };
+      }
+      return settle("processed", "transaction_not_found");
+    }
     if (c.retryable && attempt < EVENT_MAX_ATTEMPTS) {
       // Visible on the row while it waits; the status stays queued.
       await db
