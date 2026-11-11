@@ -155,9 +155,13 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
   // What the form shows: the saved values for a connection, else the admin's pending choice.
   const shownBank = connected ? (live?.createsBankEntries ?? null) : bank;
   const shownMode = connected ? (live?.paymentsMode ?? "drafts") : mode;
-  const shownEnv: RevolutEnvironment | null = connected ? (live?.environment ?? null) : env;
+  // A saved connection keeps its environment; one without a recorded environment (an older row)
+  // must have it chosen again before re-authorising, never silently assumed.
+  const savedEnv = connected ? (live?.environment ?? null) : null;
+  const shownEnv: RevolutEnvironment | null = savedEnv ?? env;
   const needsBankChoice = shownBank === null;
-  const needsEnvChoice = !connected && shownEnv === null;
+  const needsEnvChoice = shownEnv === null;
+  const choosesEnv = savedEnv === null;
   // Nothing to set up and nothing connected: Revolut is not used on this deployment.
   const unavailable = !configured && state === "not_connected" && !pending;
 
@@ -297,8 +301,11 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
               />
             )}
 
-            {!pending && !connected && isAdmin && !unavailable && (
-              <fieldset className="choices">
+            {!pending && choosesEnv && isAdmin && !unavailable && (
+              <fieldset
+                className="choices"
+                aria-describedby={needsEnvChoice ? envRequiredId : undefined}
+              >
                 <legend>Environment</legend>
                 {(["production", "sandbox"] as const).map((v) => (
                   <label key={v} className="choice">
@@ -322,7 +329,10 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
             )}
 
             {!pending && !unavailable && (
-              <fieldset className="choices">
+              <fieldset
+                className="choices"
+                aria-describedby={!connected && isAdmin && needsBankChoice ? requiredId : undefined}
+              >
                 <legend>Who creates bank entries in Exact?</legend>
                 {BANK_OPTIONS.map((o) => (
                   <label key={String(o.value)} className="choice">
@@ -394,10 +404,10 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
                     variant="primary"
                     disabled={busy || !configured || needsBankChoice || needsEnvChoice}
                     aria-describedby={
-                      !connected && (needsBankChoice || needsEnvChoice)
+                      needsEnvChoice || (!connected && needsBankChoice)
                         ? [
                             needsEnvChoice ? envRequiredId : null,
-                            needsBankChoice ? requiredId : null,
+                            !connected && needsBankChoice ? requiredId : null,
                           ]
                             .filter(Boolean)
                             .join(" ")

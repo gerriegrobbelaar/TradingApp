@@ -3,10 +3,11 @@
 #   database_id (EU D1), routes, GOOGLE_CLIENT_ID, OAUTH_REDIRECT_URI,
 #   EXACT_CLIENT_ID, EXACT_REDIRECT_URI (same origin as OAUTH_REDIRECT_URI, fixed path),
 #   Revolut is OPTIONAL as a whole: leave REVOLUT_CLIENT_ID, REVOLUT_REDIRECT_URI and REVOLUT_ISSUER
-#   all empty and the deploy guard passes with a notice (the Revolut routes answer
-#   server_misconfigured and the Revolut jobs stay off). To use Revolut set ALL THREE:
-#   REVOLUT_CLIENT_ID, REVOLUT_REDIRECT_URI (same origin as OAUTH_REDIRECT_URI, fixed path) and
-#   REVOLUT_ISSUER (the host of REVOLUT_REDIRECT_URI), plus the secret REVOLUT_PRIVATE_KEY.
+#   all empty and the deploy guard passes with a notice (the Revolut connect routes answer
+#   server_misconfigured, the webhook endpoint 401, and the Revolut jobs skip). To use Revolut set
+#   ALL THREE: REVOLUT_CLIENT_ID, REVOLUT_REDIRECT_URI (same origin as OAUTH_REDIRECT_URI, fixed
+#   path) and REVOLUT_ISSUER (the host of REVOLUT_REDIRECT_URI), plus the secret
+#   REVOLUT_PRIVATE_KEY.
 # Secrets are never in this file: GOOGLE_CLIENT_SECRET, SESSION_SECRET, EXACT_CLIENT_SECRET,
 # REVOLUT_PRIVATE_KEY (PKCS#8 PEM) and TOKEN_ENC_KEY (and TOKEN_ENC_KEY_PREVIOUS while rotating)
 # go in with `wrangler secret put`.
@@ -100,8 +101,8 @@ EXACT_CLIENT_ID = ""
 EXACT_REDIRECT_URI = "https://app.example.com/api/connections/exact/callback"
 # OPTIONAL (all three REVOLUT_* settings empty = Revolut not used; set all three or none).
 # Client ID of the Revolut Business API certificate (Revolut Business, Settings, APIs). While
-# empty, /api/connections/revolut/* answers 500 server_misconfigured. The private key is the secret
-# REVOLUT_PRIVATE_KEY.
+# empty, /api/connections/revolut/start and /callback answer 500 server_misconfigured. The private
+# key is the secret REVOLUT_PRIVATE_KEY.
 REVOLUT_CLIENT_ID = ""
 # Registered as the OAuth redirect URI on the Revolut API certificate; same origin as
 # OAUTH_REDIRECT_URI: https://<app host>/api/connections/revolut/callback

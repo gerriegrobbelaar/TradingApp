@@ -95,7 +95,7 @@ GOOGLE_CLIENT_ID = "123-abc.apps.googleusercontent.com"
 OAUTH_REDIRECT_URI = "https://staging.camelthorncapital.com/api/auth/callback"
 EXACT_CLIENT_ID = "11111111-2222-3333-4444-555555555555"
 EXACT_REDIRECT_URI = "https://staging.camelthorncapital.com/api/connections/exact/callback"
-REVOLUT_CLIENT_ID = "aaaaaaaa-1111-2222-3333-444444444444"
+REVOLUT_CLIENT_ID = "bbbbbbbb-1111-2222-3333-444444444444"
 REVOLUT_REDIRECT_URI = "https://staging.camelthorncapital.com/api/connections/revolut/callback"
 REVOLUT_ISSUER = "staging.camelthorncapital.com"
 

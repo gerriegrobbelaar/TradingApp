@@ -19,11 +19,14 @@ Exact connection, the Revolut connection and the scheduler can run at all.
 
 **Revolut is optional as a whole.** A deployment that leaves `REVOLUT_CLIENT_ID`,
 `REVOLUT_REDIRECT_URI` and `REVOLUT_ISSUER` all empty in `wrangler.toml` (as committed) passes the
-deploy guard with a printed notice ("Revolut is not configured: the Revolut routes will answer
-server_misconfigured and the Revolut jobs stay off"). Settings, Connections then shows "Revolut is
-not configured on this deployment" instead of a Connect button, and the `revolut.sync` and
-`revolut.backfill` jobs skip with `revolut_not_configured`. If only some of the three are set the
-guard fails and names the empty ones. The `REVOLUT_GATE` binding and its migration stay mandatory
+deploy guard with a printed notice ("Revolut is not configured: ..."). Settings, Connections then
+shows "Revolut is not configured on this deployment" instead of a Connect button, the Revolut
+connect routes answer `500 server_misconfigured`, the webhook endpoint answers the same plain 401 as
+to any unsigned delivery, the Bank screen has no Revolut data (`available: false`), and the
+`revolut.sync` and `revolut.backfill` jobs (off by default anyway) skip with
+`revolut_not_configured`. If only some of the three are set, or one is not a string, the guard fails
+and names them. Values are compared after trimming spaces, as the Worker reads them, so `" "` counts
+as empty. The `REVOLUT_GATE` binding and its migration stay mandatory
 either way (they cost nothing and keep adding Revolut later a settings-only change). Skip every
 "Revolut" row and section below if you do not use Revolut; add it later by doing them then.
 
@@ -47,7 +50,7 @@ database id, hostname).
 | 11  | Revolut account owner (Revolut only) | Have a **Revolut Business** account with API access, and a **sandbox** Revolut Business account for staging. Creating the sandbox account: Revolut's developer docs / Business sandbox sign-up (**UNVERIFIED**: where the sign-up lives and whether it needs a separate email). Production API access may need a plan that includes the Business API and an owner or admin role (**UNVERIFIED**). | Revolut Business web app; developer.revolut.com        | Step 10 (Revolut) |
 | 12  | Admin (Revolut only)    | Generate the **API key pair** and public certificate with the commands in "Revolut: key, certificate and registration" below. Keep the private key in the password manager; it becomes the secret `REVOLUT_PRIVATE_KEY`. One pair per Revolut environment (sandbox for staging, production for production) is recommended. | Terminal, password manager                            | Step 5        |
 | 13  | Revolut account owner (Revolut only) | In Revolut Business, Settings, APIs: add an API certificate, upload the public certificate (`revolut-public-cert.pem`), enter the OAuth redirect URI `https://<app host>/api/connections/revolut/callback`, and keep the **client ID** it shows. **UNVERIFIED**: the exact menu names, whether the certificate must be `.cer` or PEM, and whether a webhook URL is entered here too (the app registers webhooks itself on confirm). | Revolut Business, Settings, APIs (**UNVERIFIED**)      | Step 4 (Revolut) |
-| 14  | Admin (Revolut only)    | Decide, before connecting: **who creates bank entries in Exact** (this app, or Revolut's own Exact integration; open decision 2) and the **payments mode** (drafts, or pay directly on a Company plan; open decision 1). The Connections card asks for both and does not default them. The environment (production or sandbox) is also chosen explicitly. | Settings, Connections                                  | Step 10 (Revolut) |
+| 14  | Admin (Revolut only)    | Decide, before connecting: **who creates bank entries in Exact** (this app, or Revolut's own Exact integration; open decision 2) and the **payments mode** (drafts, or pay directly on a Company plan; open decision 1). The Connections card does not default who creates bank entries, nor the environment (production or sandbox); the payments mode starts on drafts, the safe choice. | Settings, Connections                                  | Step 10 (Revolut) |
 | 15  | Admin (Revolut only)    | Leave **IP allow-listing off** on the Revolut API certificate. Workers have no fixed outgoing IP address, so an allow-list would block the app. It is optional on Revolut's side (CLAUDE.md section 3); **UNVERIFIED** whether your Revolut plan offers or requires it. | Revolut Business, Settings, APIs (**UNVERIFIED**)      | Step 10 (Revolut) |
 
 Order dependency: the app hostname (item 2) is needed to register the redirect URIs (items 6, 7 and
@@ -90,7 +93,9 @@ openssl pkey -in revolut-private-pkcs8.pem -pubout | openssl md5
   `openssl x509 -in revolut-public-cert.pem -outform der -out revolut-public-cert.cer`.
 - `revolut-private-pkcs8.pem` goes into the Worker secret `REVOLUT_PRIVATE_KEY` (step 5) and the
   password manager, then delete the file. An old-style `BEGIN RSA PRIVATE KEY` (PKCS#1) key is
-  refused by the Worker with a convert message; convert with
+  refused: the Revolut routes answer `server_misconfigured` and the log names
+  `REVOLUT_PRIVATE_KEY(pkcs8)`. A key under 2048 bits is refused when the first assertion is
+  signed. Convert a PKCS#1 key with
   `openssl pkcs8 -topk8 -nocrypt -in old.pem -out revolut-private-pkcs8.pem`.
 - **Redirect URI.** Register `https://<app host>/api/connections/revolut/callback` on the
   certificate. It must be https, on the same origin as the app, at exactly that path. The same
@@ -196,8 +201,9 @@ left:
 | `JOBS_QUEUE` producer, consumer, `dead_letter_queue` | leave as is (names from step 3)                                                                        | producer, consumer or dead-letter queue missing                 |
 
 All three Revolut rows empty (as committed) is a valid configuration: the guard prints the notice
-"Revolut is not configured: ..." and moves on; the Revolut routes then answer `500
-server_misconfigured` and the Revolut jobs stay off. The `REVOLUT_PRIVATE_KEY` secret is not
+"Revolut is not configured: ..." and moves on (see the top of this document for what the app does
+then). Staging and production are checked on their own: one may use Revolut while the other does
+not, but they may not share `REVOLUT_CLIENT_ID` or `REVOLUT_REDIRECT_URI`. The `REVOLUT_PRIVATE_KEY` secret is not
 checked by the guard (secrets are not visible to it); a missing or malformed key shows up at
 runtime as `server_misconfigured` on the Revolut routes (names of the missing settings in the log,
 never values).
@@ -578,9 +584,9 @@ are still **off**.
 **A. Connect (ADR 0030/0031).** Settings, Connections, Revolut Business card, as an admin with a
 fresh sign-in:
 
-1. The card has no preselected environment and Connect stays disabled until you choose
-   Environment (Sandbox for staging), who creates bank entries, and the payments mode. Choose and
-   press Connect. Check the browser goes to the **consent URL**
+1. The card has no preselected environment and Connect stays disabled until you choose the
+   environment (Sandbox for staging) and who creates bank entries; check the payments mode (it
+   starts on drafts). Choose and press Connect. Check the browser goes to the **consent URL**
    `https://sandbox-business.revolut.com/app-confirm?client_id=...&redirect_uri=...&response_type=code&state=...`
    (production: `business.revolut.com`). Record the real path and parameters if different.
 2. Approve in Revolut. Check the redirect back to `/api/connections/revolut/callback` carries
@@ -789,19 +795,19 @@ each deploy and when Settings, Schedules shows repeated failures.
 
 - `TOKEN_ENC_KEY` covers **everything the app encrypts**: the Exact tokens, the Revolut access and
   refresh tokens **and the Revolut webhook signing secrets**. Procedure (**verify on staging
-  first**; the automatic re-encryption of Revolut tokens and webhook secrets is being added by
-  task Q2 and has not been run on a real deployment):
+  first**; nothing here has been run on a real deployment):
   1. Put the old value in `TOKEN_ENC_KEY_PREVIOUS` and the new one in `TOKEN_ENC_KEY`
      (`secret put` for both), then deploy.
-  2. Wait for a refresh cycle (Exact and Revolut tokens are rewritten with the current key when
-     they refresh, within about an hour while the connections are used; a Revolut access token
-     lives about 40 minutes) **and** for one webhook delivery to be processed (a webhook signing
-     secret is re-encrypted when it is next used). Test deliveries count: send a EUR 0.01 sandbox
-     payment.
-  3. Check there is nothing left on the old key before deleting it: the Connections screen shows
-     both connections as Connected with no error, and `webhook_events` has a recent `processed`
-     row. Where the build provides a count of values still under the previous key, use it
-     (**UNVERIFIED** whether one exists).
+  2. Wait for a refresh cycle: Exact and Revolut tokens are rewritten with the current key when
+     they refresh, within about an hour while the connections are used (a Revolut access token
+     lives about 40 minutes). The Revolut webhook signing secrets move to the current key at the
+     Revolut gate's token refresh and when a delivery uses them (review S3, task Q2; **if Q2 has not
+     been merged into the build you deploy, they are only readable while the previous key exists**:
+     then keep `TOKEN_ENC_KEY_PREVIOUS` and re-register the webhook, Settings, Connections,
+     "Register webhook", before step 4). Send a EUR 0.01 sandbox payment to have a delivery.
+  3. Check before deleting: the Connections screen shows both connections as Connected with no
+     error and does not report the Revolut webhook secret as unreadable, and `webhook_events` has a
+     recent `processed` row.
   4. Only then `pnpm exec wrangler secret delete TOKEN_ENC_KEY_PREVIOUS`.
   Deleting the previous key too early makes a token or webhook secret unreadable: Exact and Revolut
   then need reconnecting, and a webhook secret that cannot be decrypted makes every delivery fail

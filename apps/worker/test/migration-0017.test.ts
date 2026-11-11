@@ -126,6 +126,26 @@ describe("migration 0017 on a populated database", () => {
     ).results.map((r) => r.name);
     expect(triggersAfter).toEqual(triggersBefore);
 
+    // No schema object that mentions open_items still names the old column (SQLite rewrote the
+    // table, index, trigger and view definitions), and the table definition names the new one.
+    const objects = (
+      await mdb
+        .prepare("SELECT type, name, sql FROM sqlite_master WHERE sql LIKE '%open_items%'")
+        .all<{ type: string; name: string; sql: string }>()
+    ).results;
+    const table = objects.find((o) => o.type === "table" && o.name === "open_items");
+    expect(table?.sql).toMatch(/\bstored_minor\b/);
+    expect(table?.sql).not.toMatch(/\bamount_minor\b/);
+    for (const o of objects) {
+      if (o.type === "table" && o.name !== "open_items") continue; // other tables keep theirs
+      expect(o.sql, `${o.type} ${o.name}`).not.toMatch(/\bamount_minor\b/);
+    }
+    // The other tables' amount_minor definitions are untouched.
+    const bt = await mdb
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'bank_transactions'")
+      .first<{ sql: string }>();
+    expect(bt?.sql).toMatch(/\bamount_minor\b/);
+
     // The status trigger still fires and the new column still works in writes and upserts.
     const bad = await mdb
       .prepare(

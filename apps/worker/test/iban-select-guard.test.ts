@@ -1,16 +1,25 @@
-import { describe, expect, it } from "vitest";
+import { env } from "cloudflare:test";
+import { beforeAll, describe, expect, it } from "vitest";
 
 /**
  * Review N10: full IBANs are read only where they are needed, and read routes only ever return
- * masked ones. A source scan (no database):
- *  1. the IBAN column names `counterparty_iban`, `relation_iban`, `beneficiary_iban` appear only in
- *     the allow-list below;
- *  2. a SELECT list that names a bare `iban` column (or `*` from a table that holds IBANs) appears
- *     only in the allow-list;
- *  3. every file under src/read/ that selects an IBAN column uses `maskIban(`, and every IBAN
- *     field it puts in a response is named `...Masked`.
+ * masked ones. A source scan of apps/worker/src (no database writes):
+ *  1. the IBAN-holding columns and tables are read from the MIGRATED schema (every column named
+ *     `iban` or `<something>_iban`), so a new table or column from a later migration is covered
+ *     without editing this file;
+ *  2. the prefixed column names (`counterparty_iban`, `relation_iban`, ...) appear only in files
+ *     on the allow-list;
+ *  3. a SELECT list or RETURNING clause that names a bare `iban` column (also qualified `x.iban`,
+ *     quoted `"iban"`, any case), or a `*` / `t.*` select whose FROM / JOIN part names a table
+ *     that holds IBANs, appears only in allow-listed files;
+ *  4. every file under src/read/ that selects an IBAN column calls `maskIban(`, and every
+ *     IBAN-named field it puts in an object is named `...Masked`.
  *
- * To add a reader (matching, a gate lookup) add its file here WITH the reason, in a reviewed diff.
+ * Limits (a source scan, not a SQL parser): a column or table name built at run time
+ * (`"ib" + "an"`, `${col}`), a SELECT list or FROM part held in a separate constant and joined in
+ * with `${...}`, or SQL read from a file is not seen. Those patterns are not used for IBAN reads;
+ * reviewers must reject them. To add a reader (matching, a gate lookup) add its file here WITH the
+ * reason, in a reviewed diff.
  */
 const files = (
   import.meta as unknown as {
@@ -26,24 +35,80 @@ const ALLOWED_COLUMN_NAMES: Record<string, string> = {
 };
 const ALLOWED_SELECT_IBAN: Record<string, string> = {
   "../src/exact/sync.ts":
-    "reconciles relation and relation_ibans rows (never returned to a client)",
+    "reconciles relation and relation_bank_accounts rows (never returned to a client)",
   "../src/read/bank-routes.ts": "reads bank_accounts.iban only to mask it (ibanMasked)",
 };
 
-const COLUMN_NAME = /\b(?:counterparty_iban|relation_iban|beneficiary_iban)\b/;
-const IBAN_TABLES = "bank_transactions|bank_accounts|relations|relation_ibans|payments";
+/** A column that holds a full IBAN: `iban` or `<prefix>_iban` (not `iban_changed_at`). */
+const IBAN_COLUMN = /^(?:\w+_)?iban$/i;
 
-/** Text of every `SELECT ... FROM` list in the source. */
-function selectLists(src: string): string[] {
-  return [...src.matchAll(/\bSELECT\b([\s\S]*?)\bFROM\b/g)].map((m) => m[1] ?? "");
+interface Schema {
+  tables: string[];
+  prefixedColumns: string[];
 }
 
-/** True when a SELECT list names a bare iban column or selects `*` from a table that holds IBANs. */
-function selectsIban(src: string): boolean {
-  if (selectLists(src).some((l) => /(?:^|[\s,.(])iban\b/i.test(l) || COLUMN_NAME.test(l))) {
-    return true;
+async function ibanSchema(): Promise<Schema> {
+  const tables = (
+    await env.DB.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name NOT LIKE 'd1_%'",
+    ).all<{ name: string }>()
+  ).results.map((r) => r.name);
+  const out: Schema = { tables: [], prefixedColumns: [] };
+  for (const t of tables) {
+    const cols = (
+      await env.DB.prepare(`PRAGMA table_info("${t.replace(/"/g, '""')}")`).all<{
+        name: string;
+      }>()
+    ).results
+      .map((c) => c.name)
+      .filter((c) => IBAN_COLUMN.test(c));
+    if (cols.length === 0) continue;
+    out.tables.push(t);
+    for (const c of cols) {
+      if (c.toLowerCase() !== "iban" && !out.prefixedColumns.includes(c)) {
+        out.prefixedColumns.push(c);
+      }
+    }
   }
-  return new RegExp(`\\bSELECT\\s+(?:\\w+\\.)?\\*\\s+FROM\\s+(?:${IBAN_TABLES})\\b`).test(src);
+  out.tables.sort();
+  out.prefixedColumns.sort();
+  return out;
+}
+
+const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** The detectors for one schema. Exported shape kept small so the self-tests can drive them. */
+function detectors(schema: Schema) {
+  const columnName = new RegExp(`\\b(?:${schema.prefixedColumns.map(escape).join("|")})\\b`, "i");
+  const tableName = new RegExp(`\\b(?:${schema.tables.map(escape).join("|")})\\b`, "i");
+  /** A bare iban column in a select list: start, after a comma, a dot, a paren or a quote. */
+  const bareIban = /(?:^|[\s,.(["`'])iban\b/i;
+  const namesIban = (list: string) => bareIban.test(list) || columnName.test(list);
+  /** A star select (`*`, `t.*`), not COUNT(*). */
+  const isStar = (list: string) => /(?:^|[\s,.])\*/.test(list.replace(/\(\s*\*\s*\)/g, ""));
+
+  /** `SELECT <list> FROM <tables up to WHERE/GROUP/ORDER/LIMIT/end of the string>`. */
+  function selects(src: string): { list: string; from: string }[] {
+    return [
+      ...src.matchAll(
+        /\bSELECT\b([\s\S]*?)\bFROM\b([\s\S]*?)(?=\bWHERE\b|\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b|\bUNION\b|;|`|$)/gi,
+      ),
+    ].map((m) => ({ list: m[1] ?? "", from: m[2] ?? "" }));
+  }
+
+  function selectsIban(src: string): boolean {
+    for (const { list, from } of selects(src)) {
+      if (namesIban(list)) return true;
+      if (isStar(list) && tableName.test(from)) return true;
+    }
+    for (const m of src.matchAll(/\bRETURNING\b([^;`]*)/gi)) {
+      const list = m[1] ?? "";
+      if (namesIban(list) || isStar(list)) return true;
+    }
+    return false;
+  }
+
+  return { columnName, selectsIban };
 }
 
 /** IBAN-named fields put into an object (not row type declarations such as `iban: string | null`). */
@@ -51,20 +116,73 @@ function ibanFields(src: string): string[] {
   return [...src.matchAll(/\b(\w*[iI]ban\w*)\s*:\s*(?!\s|string\b)/g)].map((m) => m[1] ?? "");
 }
 
+let schema: Schema;
+let d: ReturnType<typeof detectors>;
+beforeAll(async () => {
+  schema = await ibanSchema();
+  d = detectors(schema);
+});
+
+describe("the IBAN schema read from the migrations", () => {
+  it("holds the known IBAN tables and columns", () => {
+    for (const t of [
+      "bank_accounts",
+      "bank_transactions",
+      "open_items",
+      "payments",
+      "relation_bank_accounts",
+      "relations",
+    ]) {
+      expect(schema.tables, t).toContain(t);
+    }
+    for (const c of ["beneficiary_iban", "counterparty_iban", "relation_iban"]) {
+      expect(schema.prefixedColumns, c).toContain(c);
+    }
+    // Flags about an IBAN are not IBANs.
+    expect(schema.prefixedColumns).not.toContain("iban_changed_at");
+    expect(schema.prefixedColumns).not.toContain("iban_added_at");
+  });
+});
+
 describe("the detectors", () => {
-  it("see column names and select lists", () => {
-    expect(COLUMN_NAME.test("SELECT counterparty_iban FROM bank_transactions")).toBe(true);
-    expect(selectsIban("SELECT id, name, iban, is_active FROM bank_accounts")).toBe(true);
-    expect(selectsIban("SELECT r.iban FROM relations r")).toBe(true);
-    expect(selectsIban("SELECT * FROM relations WHERE id = 1")).toBe(true);
-    expect(selectsIban("SELECT t.* FROM bank_transactions t")).toBe(true);
-    expect(selectsIban("SELECT COUNT(*) FROM bank_accounts")).toBe(false);
+  it("see column names and select lists, in any case and with quotes or aliases", () => {
+    expect(d.columnName.test("SELECT counterparty_iban FROM bank_transactions")).toBe(true);
+    expect(d.columnName.test("select COUNTERPARTY_IBAN from x")).toBe(true);
+    expect(d.selectsIban("SELECT id, name, iban, is_active FROM bank_accounts")).toBe(true);
+    expect(d.selectsIban("SELECT r.iban FROM relations r")).toBe(true);
+    expect(d.selectsIban("select r.IBAN as x from relations r")).toBe(true);
+    expect(d.selectsIban('SELECT "iban" FROM bank_accounts')).toBe(true);
+    expect(d.selectsIban("SELECT `iban` FROM bank_accounts")).toBe(true);
+    expect(d.selectsIban("SELECT [iban] FROM bank_accounts")).toBe(true);
+    expect(d.selectsIban("SELECT a, (SELECT iban FROM relations) AS b FROM x")).toBe(true);
+    expect(d.selectsIban("const q = `SELECT\n  id,\n  iban\nFROM bank_accounts`;")).toBe(true);
   });
 
-  it("ignore IBANs in WHERE clauses and other tables", () => {
-    expect(selectsIban("SELECT id FROM bank_accounts WHERE iban IS NULL")).toBe(false);
-    expect(selectsIban("SELECT * FROM jobs")).toBe(false);
-    expect(selectsIban("SELECT ibanish_flag FROM x")).toBe(false);
+  it("see star selects on every IBAN table, including joins and lower case", () => {
+    expect(d.selectsIban("SELECT * FROM relations WHERE id = 1")).toBe(true);
+    expect(d.selectsIban("SELECT t.* FROM bank_transactions t")).toBe(true);
+    expect(d.selectsIban("select * from relation_bank_accounts")).toBe(true);
+    expect(d.selectsIban("SELECT x.id, r.* FROM jobs x JOIN relations r ON r.id = x.id")).toBe(
+      true,
+    );
+    expect(d.selectsIban("SELECT oi.* FROM open_items oi")).toBe(true);
+    expect(d.selectsIban("SELECT *\n  FROM payments")).toBe(true);
+  });
+
+  it("see RETURNING clauses", () => {
+    expect(d.selectsIban("UPDATE relations SET x = 1 RETURNING id, iban")).toBe(true);
+    expect(d.selectsIban("INSERT INTO payments (a) VALUES (1) RETURNING *")).toBe(true);
+    expect(d.selectsIban("UPDATE jobs SET x = 1 RETURNING id")).toBe(false);
+  });
+
+  it("ignore IBANs in WHERE clauses, other tables and look-alike names", () => {
+    expect(d.selectsIban("SELECT id FROM bank_accounts WHERE iban IS NULL")).toBe(false);
+    expect(d.selectsIban("SELECT id FROM bank_accounts ORDER BY iban")).toBe(false);
+    expect(d.selectsIban("SELECT * FROM jobs")).toBe(false);
+    expect(d.selectsIban("SELECT r.* FROM job_runs r")).toBe(false);
+    expect(d.selectsIban("SELECT COUNT(*) FROM bank_accounts")).toBe(false);
+    expect(d.selectsIban("SELECT ibanish_flag FROM x")).toBe(false);
+    expect(d.selectsIban("SELECT iban_changed_at FROM relations")).toBe(false);
   });
 
   it("find IBAN fields in objects but not row types", () => {
@@ -81,10 +199,10 @@ describe("IBAN columns are read only where they are allowed (review N10)", () =>
     }
   });
 
-  it("the IBAN column names appear only in the allow-list", () => {
+  it("the prefixed IBAN column names appear only in the allow-list", () => {
     const offenders = Object.entries(files)
       .filter(([name]) => !(name in ALLOWED_COLUMN_NAMES))
-      .filter(([, text]) => COLUMN_NAME.test(text))
+      .filter(([, text]) => d.columnName.test(text))
       .map(([name]) => name);
     expect(offenders).toEqual([]);
   });
@@ -92,7 +210,7 @@ describe("IBAN columns are read only where they are allowed (review N10)", () =>
   it("no SELECT of an IBAN column (or select star on an IBAN table) outside the allow-list", () => {
     const offenders = Object.entries(files)
       .filter(([name]) => !(name in ALLOWED_SELECT_IBAN) && !(name in ALLOWED_COLUMN_NAMES))
-      .filter(([, text]) => selectsIban(text))
+      .filter(([, text]) => d.selectsIban(text))
       .map(([name]) => name);
     expect(offenders).toEqual([]);
   });
@@ -102,7 +220,7 @@ describe("IBAN columns are read only where they are allowed (review N10)", () =>
     expect(readFiles.length).toBeGreaterThan(3);
     let checked = 0;
     for (const [name, text] of readFiles) {
-      if (!selectsIban(text) && !COLUMN_NAME.test(text)) continue;
+      if (!d.selectsIban(text) && !d.columnName.test(text)) continue;
       checked += 1;
       expect(text, `${name} selects an IBAN but never calls maskIban(`).toMatch(/\bmaskIban\(/);
     }

@@ -172,11 +172,13 @@ route and the Bank screen are R3.
 ## Revolut is optional as a whole (review S5)
 
 A deployment may leave `REVOLUT_CLIENT_ID`, `REVOLUT_REDIRECT_URI` and `REVOLUT_ISSUER` all empty.
-The deploy guard then passes with the notice "Revolut is not configured: the Revolut routes will
-answer server_misconfigured and the Revolut jobs stay off"; with only some of the three set it
-fails and names the empty ones. The `RevolutGate` binding, migration `v3` and the refusal of a
-private key in `wrangler.toml` stay mandatory. At runtime the Revolut routes answer `500
-server_misconfigured`, `GET /api/connections` reports `revolutConfigured: false` (the card says
+The deploy guard then passes with a notice ("Revolut is not configured: ..."); with only some of
+the three set (compared after trimming, as the Worker reads them; a non-string value counts as set
+and is refused) it fails and names them. Staging and production are judged separately and may not
+share `REVOLUT_CLIENT_ID` or `REVOLUT_REDIRECT_URI`. The `RevolutGate` binding, migration `v3` and the refusal of a
+private key in `wrangler.toml` stay mandatory. At runtime the Revolut connect routes answer `500
+server_misconfigured` (disconnect stays a working no-op), the webhook endpoint answers its uniform
+401 (no connection), the bank API answers `available: false`, `GET /api/connections` reports `revolutConfigured: false` (the card says
 "Revolut is not configured on this deployment" and offers no Connect button), and the Revolut jobs
 skip with `revolut_not_configured` before they touch the database or the network. The environment
 (production or sandbox) on the connect card is no longer preselected (review N6).

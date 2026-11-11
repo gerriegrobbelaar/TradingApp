@@ -38,8 +38,9 @@ export type RevolutConfigResult =
 /** Fails closed; reports names of missing settings only, never values. */
 export function loadRevolutConfig(env: Partial<Env>, appOrigin: string): RevolutConfigResult {
   const missing: string[] = [];
-  const need = (name: string, v: string | undefined): string => {
-    const t = (v ?? "").trim();
+  const need = (name: string, v: unknown): string => {
+    // A non-string (a [vars] value written as a number or a table) is missing, never a crash.
+    const t = typeof v === "string" ? v.trim() : "";
     if (t === "") missing.push(name);
     return t;
   };

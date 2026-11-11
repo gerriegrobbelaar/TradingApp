@@ -146,21 +146,37 @@ const isPlaceholderId = (id) => !id || /^[0-]+$/.test(id);
 /** The three public Revolut settings. All empty means Revolut is not used on this deployment. */
 const REVOLUT_VARS = ["REVOLUT_CLIENT_ID", "REVOLUT_REDIRECT_URI", "REVOLUT_ISSUER"];
 
+/**
+ * A Revolut setting counts as unset only when it is absent or a string that is empty after
+ * trimming (the Worker trims the same way, src/revolut/config.ts). A non-string value (a number,
+ * an inline table, an array) is "set" and refused, so it can never pass as "Revolut unconfigured".
+ */
+const revolutValue = (vars, k) => (typeof vars[k] === "string" ? vars[k].trim() : "");
+const revolutUnset = (vars, k) =>
+  vars[k] === undefined || (typeof vars[k] === "string" && vars[k].trim() === "");
+
 /** True when none of the Revolut settings is set (Revolut is optional as a whole, review S5). */
 export function revolutUnconfigured(config) {
   const vars = isObject(config.vars) ? config.vars : {};
-  return REVOLUT_VARS.every((k) => (str(vars[k]) ?? "").trim() === "");
+  return REVOLUT_VARS.every((k) => revolutUnset(vars, k));
 }
 
 /**
  * Revolut is optional as a whole: with all three settings empty there is nothing to check (the
- * Revolut routes answer server_misconfigured and the Revolut jobs stay off). With any one set,
- * every missing one is named. The Durable Object binding and migration checks stay mandatory.
+ * Revolut connect routes answer server_misconfigured, the webhook endpoint its uniform 401 and the
+ * Revolut jobs skip). With any one set, every missing one is named. Values are compared trimmed,
+ * as the Worker reads them. The Durable Object binding and migration checks stay mandatory.
  */
 function revolutProblems(vars, appRedirect) {
-  const v = (k) => str(vars[k]) ?? "";
-  if (REVOLUT_VARS.every((k) => v(k).trim() === "")) return [];
   const problems = [];
+  for (const k of REVOLUT_VARS) {
+    if (vars[k] !== undefined && typeof vars[k] !== "string") {
+      problems.push(`${k} must be a string`);
+    }
+  }
+  if (problems.length > 0) return problems;
+  const v = (k) => revolutValue(vars, k);
+  if (REVOLUT_VARS.every((k) => v(k) === "")) return [];
   if (!v("REVOLUT_CLIENT_ID")) problems.push("REVOLUT_CLIENT_ID is empty");
   else if (/^test-/i.test(v("REVOLUT_CLIENT_ID"))) {
     problems.push("REVOLUT_CLIENT_ID is a test value");
@@ -401,8 +417,16 @@ function isolationProblems(a, aName, b, bName) {
   }
   const varOf = (c, k) => (isObject(c.vars) ? str(c.vars[k]) : null);
   for (const k of ["OAUTH_REDIRECT_URI", "EXACT_REDIRECT_URI", "REVOLUT_REDIRECT_URI"]) {
-    const x = varOf(a, k);
-    if (x && x === varOf(b, k)) share(k, x);
+    const x = varOf(a, k)?.trim();
+    if (x && x === varOf(b, k)?.trim()) share(k, x);
+  }
+  // A Revolut API certificate has one redirect URI (and one environment): two deployments with
+  // the same client ID would share a certificate, and staging would talk to production Revolut.
+  const rc = varOf(a, "REVOLUT_CLIENT_ID")?.trim();
+  if (rc && rc === varOf(b, "REVOLUT_CLIENT_ID")?.trim()) {
+    problems.push(
+      `${aName} shares REVOLUT_CLIENT_ID with ${bName}: give it its own certificate (staging uses a sandbox one)`,
+    );
   }
   return problems;
 }
@@ -459,7 +483,7 @@ export function deployConfigNotices(toml, env = "production") {
   const { config } = resolveEnvironment(parsed.raw, env);
   return revolutUnconfigured(config)
     ? [
-        "Revolut is not configured: the Revolut routes will answer server_misconfigured and the Revolut jobs stay off",
+        "Revolut is not configured: Settings, Connections says so, the Revolut connect routes answer server_misconfigured, the webhook endpoint answers 401 and the Revolut jobs skip (revolut_not_configured)",
       ]
     : [];
 }

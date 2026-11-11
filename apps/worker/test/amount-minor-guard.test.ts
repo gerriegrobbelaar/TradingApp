@@ -38,6 +38,9 @@ describe("open_items.stored_minor stays inside its allow-list", () => {
     expect(files["../src/read/queries.ts"] ?? "").not.toMatch(NAME);
   });
 
+  // The exact line counts below are deliberate: a new use inside an allowed file (a second query
+  // in routes.ts, say) must fail here and be reviewed. Reformatting that moves the name to another
+  // line also fails; update the expected lines in the same diff.
   it("sync.ts names it only in the upsert (column list and conflict assignment)", () => {
     const lines = (files["../src/exact/sync.ts"] ?? "").split("\n").filter((l) => NAME.test(l));
     expect(lines).toHaveLength(2);
@@ -51,6 +54,28 @@ describe("open_items.stored_minor stays inside its allow-list", () => {
     expect(lines[0]).toMatch(/^\s*stored_minor: number;$/);
     expect(lines[1]).toMatch(/oi\.stored_minor/);
     expect(lines[2]).toMatch(/^\s*storedMinor: row\.stored_minor,$/);
+  });
+
+  // A star select would carry the column without naming it, so the name scan would not see it.
+  const starFromOpenItems = (s: string) =>
+    /\bSELECT\b(?:(?!\bFROM\b)[\s\S])*?(?:^|[\s,.])\*(?:(?!\bFROM\b)[\s\S])*?\bFROM\s+open_items\b/i.test(
+      s.replace(/\(\s*\*\s*\)/g, "()"),
+    );
+
+  it("no source file selects * (or oi.*) from open_items", () => {
+    const offenders = Object.entries(files)
+      .filter(([, text]) => starFromOpenItems(text))
+      .map(([name]) => name);
+    expect(offenders).toEqual([]);
+  });
+
+  it("the star check itself works", () => {
+    const hit = starFromOpenItems;
+    expect(hit("SELECT * FROM open_items")).toBe(true);
+    expect(hit("select oi.* from open_items oi")).toBe(true);
+    expect(hit("SELECT id,\n  oi.*\nFROM open_items oi")).toBe(true);
+    expect(hit("SELECT COUNT(*) FROM open_items")).toBe(false);
+    expect(hit("SELECT * FROM jobs; SELECT id FROM open_items")).toBe(false);
   });
 
   it("the name check itself works", () => {
