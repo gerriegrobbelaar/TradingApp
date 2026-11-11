@@ -730,6 +730,25 @@ Proposed by the Phase 4 final review. Follow it on staging, then on production.
 
 ## Operations
 
+### ECB exchange rates (the one job that is on by default)
+
+`ecb.fx_import` is switched **on** after a fresh install, unlike the Exact and Revolut jobs. It reads
+the public ECB reference rates (`data-api.ecb.europa.eu`, no credentials, read-only) on TARGET
+working days at 16:15 Amsterdam and retries every 10 minutes until 17:30 (ADR 0036). Nothing needs
+configuring. A database seeded before this job existed keeps it off: switch it on in Settings,
+Schedules.
+
+- A fresh install has no rates until the first slot (up to about three days over a weekend). Press
+  **Import now** on Settings, FX rates, or Run now on the job, once after the first deploy.
+- To turn it off: Settings, Schedules, switch the job off, or
+  `pnpm exec wrangler d1 execute <database> --remote --command "UPDATE jobs SET enabled = 0 WHERE name = 'ecb.fx_import'"`.
+- First-live checks (**unverified**, the sandbox cannot reach the ECB): the response is accepted as
+  `text/csv`; the 400-day first import stays under 5 MiB and contains about 30 currencies; three
+  rates compared by hand with the ECB website; Settings, FX rates shows the import as OK; one
+  `fx.import` audit row exists.
+- The rates are for information only. Whether your accountant accepts them for revaluation is open
+  decision 4.
+
 ### Emergency stop of all jobs
 
 Pick the first that works:

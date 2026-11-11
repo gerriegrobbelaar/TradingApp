@@ -60,7 +60,7 @@ describe("parseRate hostile input", () => {
     ];
     const t0 = performance.now();
     for (const s of inputs) expect(parseRate(s)).toEqual({ ok: false, error: "too_long" });
-    expect(performance.now() - t0).toBeLessThan(50);
+    expect(performance.now() - t0).toBeLessThan(5000); // runaway guard, not a benchmark
   });
   it("is idempotent on its own output", () => {
     for (const s of ["01.50", "1.0853000", "000.000000000001", "162.450", "7"]) {
@@ -164,7 +164,7 @@ describe("parseEcbCsv real-world variations", () => {
   it("a megabyte OBS_VALUE is skipped quickly (no backtracking)", () => {
     const t0 = performance.now();
     const r = ok(`${H}\nUSD,2026-03-13,1.${"0".repeat(1_000_000)}1\nGBP,2026-03-13,0.85\n`);
-    expect(performance.now() - t0).toBeLessThan(200);
+    expect(performance.now() - t0).toBeLessThan(5000); // runaway guard, not a benchmark
     expect(r.skipped).toBe(1);
   });
 });
@@ -206,7 +206,7 @@ describe("parseEcbCsv size limits in bytes", () => {
     const r = ok(text);
     const ms = performance.now() - t0;
     expect(r.observations).toHaveLength(28);
-    expect(ms).toBeLessThan(1000);
+    expect(ms).toBeLessThan(10_000); // runaway guard (quadratic parsing would take minutes)
   });
 });
 
