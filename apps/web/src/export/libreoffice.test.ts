@@ -10,7 +10,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildXlsx, type Cell, type SheetSpec } from "./xlsx";
 import { formatBps, minorToDecimal } from "../lib/format";
 import { ageingExport, balanceSheetExport, profitLossExport } from "./report-workbooks";
@@ -105,6 +105,8 @@ function convert(name: string, sheets: SheetSpec[]): Record<string, string[][]> 
 describe.skipIf(VERSION === null)(
   `LibreOffice reads the exports (${VERSION ?? "not installed"})`,
   () => {
+    // Each test starts a real office process; the 5 s default fails on a busy machine.
+    vi.setConfig({ testTimeout: 120_000 });
     it("ageing: one sheet per currency, amounts as numbers in the right format, formulas inert", () => {
       const r = ageingResponse(
         [
