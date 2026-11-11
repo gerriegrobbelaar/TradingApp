@@ -46,6 +46,8 @@ export function accounts(
 ): BankAccountsResponse {
   const sums = new Map<string, { balanceMinor: number; accounts: number }>();
   for (const a of list) {
+    // like the server: active accounts with a known balance only
+    if (!a.isActive || a.balanceMinor === null) continue;
     const t = sums.get(a.currency) ?? { balanceMinor: 0, accounts: 0 };
     sums.set(a.currency, {
       balanceMinor: t.balanceMinor + (a.balanceMinor ?? 0),
@@ -63,9 +65,11 @@ export function accounts(
 }
 
 export function tx(over: Partial<BankTransactionDto> = {}): BankTransactionDto {
+  const id = over.id ?? 1;
   return {
-    id: 1,
-    externalId: "tx-1",
+    id,
+    // one Revolut transaction per row unless a test groups legs on purpose
+    externalId: `tx-${id}`,
     legId: "leg-1",
     accountId: 1,
     accountName: "Main EUR",

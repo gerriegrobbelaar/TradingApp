@@ -9,7 +9,7 @@ import { AppShell } from "./App";
 import { ADMIN, VIEWER, mockFetch, renderApp, type Call } from "./test-utils";
 import { BANK_NEVER, BANK_STALE, account, accounts, tx, txDetail, txs } from "./test-fixtures-bank";
 import { legNotes } from "./lib/bank";
-import { maskIban } from "./components/BankParts";
+import { amountWords, maskIban } from "./components/BankParts";
 
 const axe = configureAxe({ rules: { "color-contrast": { enabled: false } } });
 const params = (c: Call | undefined) => new URL(c?.url ?? "", "http://x").searchParams;
@@ -60,7 +60,7 @@ describe("Bank: populated", () => {
     expect(off.textContent).toContain("Inactive");
     expect(off.className).toContain("off");
     const totals = screen.getByRole("region", { name: "Balance by currency" });
-    expect(norm(totals.textContent)).toContain("€ 12.345,67 EUR across 1 account");
+    expect(norm(totals.textContent)).toContain("€ 12.345,67 EUR across 1 active account");
     expect(totals.textContent).toContain("never added together");
     await table();
     expect(screen.getByRole("main").textContent).not.toContain("!");
@@ -188,12 +188,21 @@ describe("Bank: populated", () => {
     renderApp("/treasury/bank");
     const t = await table();
     const foot = t.querySelectorAll("tfoot tr");
-    expect(foot).toHaveLength(2);
-    expect(norm(foot[0]?.textContent)).toContain("Total EUR, 20 transactions matching");
-    expect(norm(foot[0]?.textContent)).toContain("Received +€ 1.000,00");
-    expect(norm(foot[0]?.textContent)).toContain("Paid \u2212€ 400,00");
-    expect(norm(foot[1]?.textContent)).toContain("Total GBP, 10 transactions matching");
-    expect(norm(foot[1]?.textContent)).toContain("Paid \u2212£ 25,00");
+    expect(foot).toHaveLength(3);
+    expect(norm(foot[0]?.textContent)).toContain(
+      "EUR, pending and completed: 20 transactions for these filters",
+    );
+    expect(norm(foot[0]?.textContent)).toContain("In +€ 1.000,00");
+    expect(norm(foot[0]?.textContent)).toContain("Out \u2212€ 400,00");
+    expect(norm(foot[1]?.textContent)).toContain(
+      "GBP, pending and completed: 10 transactions for these filters",
+    );
+    expect(norm(foot[1]?.textContent)).toContain("Out \u2212£ 25,00");
+    expect(foot[2]?.textContent).toContain(
+      "Declined, failed and reverted ones are listed but not counted",
+    );
+    // the totals never claim money was received or paid: they include pending rows
+    expect(t.querySelector("tfoot")?.textContent).not.toMatch(/received|paid/i);
   });
 });
 
@@ -221,7 +230,7 @@ describe("Bank: filters and the address", () => {
     expect(params(txCalls(calls)[0]).has("direction")).toBe(false);
 
     await user.click(screen.getByRole("button", { name: "Pending" }));
-    await user.click(screen.getByRole("button", { name: "Received" }));
+    await user.click(screen.getByRole("button", { name: "Money in" }));
     await user.click(await screen.findByRole("button", { name: /Main EUR/ }));
     await waitFor(() => {
       const last = params(txCalls(calls).at(-1));
@@ -412,7 +421,7 @@ describe("Bank: empty, error and stale states", () => {
     );
     const { container } = renderApp("/treasury/bank");
     expect(await screen.findByText("Waiting for the first sync.")).toBeTruthy();
-    expect(screen.getByText(/sync job is switched off until/)).toBeTruthy();
+    expect(screen.getByText(/first complete run of the Revolut sync job/)).toBeTruthy();
     expect(screen.getByRole("link", { name: "Open schedules" }).getAttribute("href")).toBe(
       "/settings/schedules",
     );
@@ -517,7 +526,78 @@ describe("Bank: empty, error and stale states", () => {
       }),
     );
     renderApp("/treasury/bank");
-    expect(await screen.findByText(/connection is not active/)).toBeTruthy();
+    expect(await screen.findByText(/connection needs to be renewed/)).toBeTruthy();
+    expect(screen.getByText(/from the last sync and may be out of date/)).toBeTruthy();
+    expect(screen.getByRole("list", { name: "Accounts" })).toBeTruthy();
+  });
+
+  it("a staged (pending) connection that was never read asks for confirmation, not a sync", async () => {
+    const calls = mockFetch(
+      base({
+        "GET /api/bank/accounts": () => ({
+          body: accounts([], {
+            connection: {
+              id: 1,
+              status: "pending",
+              createsBankEntries: null,
+              paymentsMode: "drafts",
+            },
+            available: false,
+            freshness: BANK_NEVER,
+          }),
+        }),
+      }),
+    );
+    renderApp("/treasury/bank");
+    expect(
+      await screen.findByText("The Revolut connection is waiting for confirmation."),
+    ).toBeTruthy();
+    expect(screen.queryByText("Waiting for the first sync.")).toBeNull();
+    expect(screen.getByRole("link", { name: "Open connections" }).getAttribute("href")).toBe(
+      "/settings/connections",
+    );
+    expect(txCalls(calls)).toHaveLength(0);
+  });
+
+  for (const [status, words] of [
+    ["needs_reauth", "needs to be renewed"],
+    ["expired", "needs to be renewed"],
+    ["disabled", "is switched off"],
+    ["weird", "is not active"],
+  ] as const) {
+    it(`never-read ${status} connection: its own words, no link for a viewer`, async () => {
+      mockFetch(
+        base({
+          "GET /api/auth/me": () => ({ body: VIEWER }),
+          "GET /api/bank/accounts": () => ({
+            body: accounts([], {
+              connection: { id: 1, status, createsBankEntries: false, paymentsMode: "drafts" },
+              available: false,
+              freshness: BANK_NEVER,
+            }),
+          }),
+        }),
+      );
+      renderApp("/treasury/bank");
+      expect(await screen.findByText(new RegExp(`connection ${words}`))).toBeTruthy();
+      expect(screen.queryByText("Waiting for the first sync.")).toBeNull();
+      expect(screen.queryByRole("link", { name: /connections|schedules/i })).toBeNull();
+    });
+  }
+
+  it("waiting for the first sync: a viewer gets the words without the schedules link", async () => {
+    mockFetch(
+      base({
+        "GET /api/auth/me": () => ({ body: VIEWER }),
+        "GET /api/bank/accounts": () => ({
+          body: accounts([], { available: false, freshness: BANK_NEVER }),
+        }),
+      }),
+    );
+    renderApp("/treasury/bank");
+    expect(await screen.findByText("Waiting for the first sync.")).toBeTruthy();
+    expect(screen.queryByRole("link", { name: "Open schedules" })).toBeNull();
+    expect(screen.queryByRole("link", { name: "Check connections" })).toBeNull();
   });
 });
 
@@ -540,19 +620,56 @@ describe("Bank: multi-leg and the transaction sheet", () => {
     counterpartyName: "Own EUR",
   });
 
-  it("legNotes counts legs per transaction id", () => {
-    const n = legNotes([legA, tx({ id: 12, externalId: "solo" }), legB]);
-    expect(n.get(10)).toEqual({ index: 1, count: 2 });
-    expect(n.get(11)).toEqual({ index: 2, count: 2 });
+  it("legNotes counts loaded legs per transaction id, as a lower bound unless complete", () => {
+    const rows = [legA, tx({ id: 12, externalId: "solo" }), legB];
+    expect(legNotes(rows, true).get(10)).toEqual({ count: 2, atLeast: false });
+    expect(legNotes(rows, true).get(11)).toEqual({ count: 2, atLeast: false });
+    expect(legNotes(rows, true).has(12)).toBe(false);
+    expect(legNotes(rows, false).get(10)).toEqual({ count: 2, atLeast: true });
+  });
+
+  it("legNotes prefers the server's legCount, also for a leg whose sibling is not loaded", () => {
+    const n = legNotes(
+      [
+        { ...legA, legCount: 3 },
+        tx({ id: 12, externalId: "solo", legCount: 1 }),
+        tx({ id: 13, externalId: "bad", legCount: -2 }),
+      ],
+      false,
+    );
+    expect(n.get(10)).toEqual({ count: 3, atLeast: false });
     expect(n.has(12)).toBe(false);
+    expect(n.has(13)).toBe(false);
   });
 
   it("shows each leg as its own row with a leg note", async () => {
     mockFetch(base({ "GET /api/bank/transactions": () => ({ body: txs([legA, legB]) }) }));
     renderApp("/treasury/bank");
     const t = await table();
-    expect(within(t).getByText("Leg 1 of 2, see details")).toBeTruthy();
-    expect(within(t).getByText("Leg 2 of 2, see details")).toBeTruthy();
+    expect(within(t).getAllByText("One of 2 legs, see details")).toHaveLength(2);
+    expect(t.textContent).not.toMatch(/Leg \d of/);
+  });
+
+  it("a filtered or partial list says 'at least' for legs counted from loaded rows", async () => {
+    mockFetch(
+      base({
+        "GET /api/bank/transactions": () => ({ body: txs([legA, legB], { nextCursor: "c2" }) }),
+      }),
+    );
+    renderApp("/treasury/bank");
+    const t = await table();
+    expect(within(t).getAllByText("One of at least 2 legs, see details")).toHaveLength(2);
+  });
+
+  it("an account filter that hides the other leg still shows the server's leg count", async () => {
+    mockFetch(
+      base({
+        "GET /api/bank/transactions": () => ({ body: txs([{ ...legA, legCount: 2 }]) }),
+      }),
+    );
+    renderApp("/treasury/bank?account=1");
+    const t = await table();
+    expect(within(t).getByText("One of 2 legs, see details")).toBeTruthy();
   });
 
   it("opens the sheet with all fields, the legs, a masked IBAN and plain-word source", async () => {
@@ -667,8 +784,241 @@ describe("Bank: helpers", () => {
   it("masks anything to the last four characters", () => {
     expect(maskIban("NL91ABNA0417164300")).toBe("•••• 4300");
     expect(maskIban("NL••••••••••1234")).toBe("•••• 1234");
-    expect(maskIban(null)).toBeNull();
+    expect(maskIban("NL91****4300")).toBe("•••• 4300"); // core maskIban, what R3a sends
+    expect(maskIban("****")).toBe("••••");
+    expect(maskIban("nl91 abna 0417 1643 0x")).toBe("•••• 430X");
+    expect(maskIban("  ")).toBeNull();
+    expect(maskIban("")).toBeNull();
+    expect(maskIban(undefined)).toBeNull();
+    expect(maskIban("12")).toBe("•••• 12");
+    expect(maskIban("acct 12345678 / ref")).toBe("•••• 8REF");
     expect(maskIban("••")).toBe("••••");
+  });
+
+  it("amount words: only completed is received or paid; a negative amount is never received", () => {
+    const states = ["completed", "pending", "declined", "failed", "reverted", "unknown", "x"];
+    for (const st of states) {
+      expect(amountWords(-1, st)).not.toMatch(/received|incoming/i);
+      expect(amountWords(1, st)).not.toMatch(/paid|outgoing/i);
+      if (st !== "completed") {
+        expect(amountWords(-1, st)).not.toMatch(/paid/i);
+        expect(amountWords(1, st)).not.toMatch(/received/i);
+      }
+    }
+    expect(amountWords(-1, "completed")).toBe("Paid");
+    expect(amountWords(1, "completed")).toBe("Received");
+    expect(amountWords(1, "pending")).toBe("Incoming, not final");
+    expect(amountWords(-1, "declined")).toBe("Outgoing, did not go through");
+  });
+});
+
+describe("Bank: review R3b, money, states, PII and dates", () => {
+  const rowOf = (t: HTMLElement, n: string) =>
+    within(t)
+      .getAllByRole("row")
+      .find((r) => within(r).queryByRole("button", { name: n })) as HTMLElement;
+
+  it("a negative amount never renders as received, in any state; only completed is received or paid", async () => {
+    const states = ["completed", "pending", "declined", "failed", "reverted", "unknown"] as const;
+    const rows = states.flatMap((st, i) => [
+      tx({
+        id: i * 2 + 1,
+        state: st,
+        isFinal: st !== "pending" && st !== "unknown",
+        amountMinor: -500,
+        counterpartyName: `out-${st}`,
+      }),
+      tx({
+        id: i * 2 + 2,
+        state: st,
+        isFinal: st !== "pending" && st !== "unknown",
+        amountMinor: 500,
+        counterpartyName: `in-${st}`,
+      }),
+    ]);
+    mockFetch(base({ "GET /api/bank/transactions": () => ({ body: txs(rows) }) }));
+    renderApp("/treasury/bank");
+    const t = await table();
+    for (const st of states) {
+      const out = norm(rowOf(t, `out-${st}`).textContent);
+      const inn = norm(rowOf(t, `in-${st}`).textContent);
+      expect(out).not.toMatch(/received|incoming/i);
+      expect(out).toContain("\u2212€ 5,00");
+      expect(inn).not.toMatch(/paid|outgoing/i);
+      expect(inn).toContain("+€ 5,00");
+      if (st !== "completed") {
+        expect(out).not.toMatch(/paid/i);
+        expect(inn).not.toMatch(/received/i);
+      }
+    }
+    expect(norm(rowOf(t, "in-pending").textContent)).toContain("Incoming, not final +€ 5,00");
+    expect(norm(rowOf(t, "out-declined").textContent)).toContain("Did not go through");
+    expect(norm(rowOf(t, "in-reverted").textContent)).toContain("Reversed by Revolut");
+    // colour: only completed money in is green; the void states are muted
+    expect(rowOf(t, "in-completed").querySelector(".tx-in")).toBeTruthy();
+    expect(rowOf(t, "in-pending").querySelector(".tx-in")).toBeNull();
+    expect(rowOf(t, "in-failed").querySelector(".tx-void")).toBeTruthy();
+  });
+
+  it("zero, the largest safe amount and an unsafe one", async () => {
+    mockFetch(
+      base({
+        "GET /api/bank/transactions": () => ({
+          body: txs([
+            tx({ id: 1, amountMinor: 0, counterpartyName: "Zero" }),
+            tx({ id: 2, amountMinor: -Number.MAX_SAFE_INTEGER, counterpartyName: "Huge" }),
+            tx({ id: 3, amountMinor: 2 ** 60, counterpartyName: "Unsafe" }),
+            tx({ id: 4, amountMinor: -1234, currency: "KWD", counterpartyName: "Dinar" }),
+          ]),
+        }),
+      }),
+    );
+    renderApp("/treasury/bank");
+    const t = await table();
+    const zero = norm(rowOf(t, "Zero").textContent);
+    expect(zero).toContain("€ 0,00");
+    expect(zero).not.toMatch(/[+\u2212]€|received|paid/i);
+    expect(norm(rowOf(t, "Huge").textContent)).toContain("\u2212€ 90.071.992.547.409,91");
+    expect(rowOf(t, "Unsafe").textContent).toContain("—");
+    expect(rowOf(t, "Unsafe").textContent).not.toMatch(/received/i);
+    expect(norm(rowOf(t, "Dinar").textContent)).toContain("Paid \u2212KWD 1,234");
+    expect(t.textContent).not.toMatch(/legs/);
+  });
+
+  it("the date column is the Amsterdam creation day (what From / To filter on), across DST", async () => {
+    mockFetch(
+      base({
+        "GET /api/bank/transactions": () => ({
+          body: txs([
+            // 00:30 in Amsterdam on 1 Nov (CET); completed two days later
+            tx({
+              id: 1,
+              createdAt: "2026-10-31T23:30:00.000Z",
+              completedAt: "2026-11-02T10:00:00.000Z",
+              counterpartyName: "Midnight",
+            }),
+            // 00:30 CEST on 25 Oct, the night summer time ends
+            tx({ id: 2, createdAt: "2026-10-24T22:30:00.000Z", counterpartyName: "Dst end" }),
+            // 00:30 CET on 29 Mar, the night summer time starts
+            tx({ id: 3, createdAt: "2026-03-28T23:30:00.000Z", counterpartyName: "Dst start" }),
+          ]),
+        }),
+      }),
+    );
+    renderApp("/treasury/bank");
+    const t = await table();
+    expect(rowOf(t, "Midnight").textContent).toContain("1 Nov 2026");
+    expect(rowOf(t, "Midnight").textContent).not.toContain("2 Nov 2026");
+    expect(rowOf(t, "Dst end").textContent).toContain("25 Oct 2026");
+    expect(rowOf(t, "Dst start").textContent).toContain("29 Mar 2026");
+  });
+
+  it("drops dates far in the past or future and bounds the date pickers", async () => {
+    const calls = mockFetch(base());
+    const loc = renderWithLocation("/treasury/bank?from=1899-12-31&to=2300-01-01");
+    await table();
+    for (const c of txCalls(calls)) {
+      expect(params(c).has("from")).toBe(false);
+      expect(params(c).has("to")).toBe(false);
+    }
+    expect(loc.search).toBe("");
+    const from = screen.getByLabelText("From") as HTMLInputElement;
+    expect(from.min).toBe("2000-01-01");
+    expect(from.max).toBe("2099-12-31");
+  });
+
+  it("a full IBAN from the server never reaches text, attributes, storage or the address", async () => {
+    const full = "NL91ABNA0417164300";
+    const spaced = "nl91 abna 0417 1643 00";
+    sessionStorage.clear();
+    localStorage.clear();
+    mockFetch(
+      base({
+        "GET /api/bank/accounts": () => ({
+          body: accounts([account({ ibanMasked: full }), account({ id: 2, ibanMasked: spaced })]),
+        }),
+        "GET /api/bank/transactions": () => ({
+          body: txs([tx({ counterpartyIbanMasked: full })]),
+        }),
+        "GET /api/bank/transactions/1": () => ({
+          body: txDetail(tx({ counterpartyIbanMasked: spaced }), {
+            legs: [tx({ counterpartyIbanMasked: full })],
+          }),
+        }),
+      }),
+    );
+    const user = userEvent.setup();
+    const loc = renderWithLocation("/treasury/bank");
+    await table();
+    await user.click(screen.getByRole("button", { name: "Paper Co" }));
+    const dialog = await screen.findByRole("dialog");
+    await within(dialog).findByText(/Revolut notified us/);
+    const html = document.documentElement.outerHTML.replace(/\s+/g, "").toUpperCase();
+    expect(html).not.toContain(full);
+    expect(html).not.toContain("ABNA0417");
+    expect(html).not.toContain("NL91");
+    expect(JSON.stringify({ ...localStorage })).not.toMatch(/ABNA|0417/i);
+    expect(JSON.stringify({ ...sessionStorage })).not.toMatch(/ABNA|0417/i);
+    expect(loc.search).not.toMatch(/ABNA|0417/i);
+    expect(JSON.stringify(window.history.state ?? null)).not.toMatch(/ABNA|0417/i);
+    expect(dialog.textContent).toContain("4300");
+  });
+
+  it("counterparty names are text, not markup", async () => {
+    mockFetch(
+      base({
+        "GET /api/bank/transactions": () => ({
+          body: txs([tx({ counterpartyName: '<img src=x onerror="alert(1)">Evil' })]),
+        }),
+      }),
+    );
+    renderApp("/treasury/bank");
+    const t = await table();
+    expect(t.querySelector("img")).toBeNull();
+    expect(t.textContent).toContain('<img src=x onerror="alert(1)">Evil');
+  });
+
+  it("a failed-only filter has no totals and says why", async () => {
+    mockFetch(
+      base({
+        "GET /api/bank/transactions": () => ({
+          body: txs([tx({ state: "failed" })], { totalsByCurrency: [] }),
+        }),
+      }),
+    );
+    renderApp("/treasury/bank?state=failed");
+    const t = await table();
+    expect(t.querySelector("tfoot")?.textContent).toContain(
+      "No pending or completed transactions for these filters",
+    );
+  });
+
+  it("a quiet refresh while the sheet is open keeps the sheet and its focus", async () => {
+    const calls = mockFetch(
+      base({ "GET /api/bank/transactions/1": () => ({ body: txDetail(tx()) }) }),
+    );
+    const user = userEvent.setup();
+    renderApp("/treasury/bank");
+    await table();
+    await user.click(screen.getByRole("button", { name: "Paper Co" }));
+    const dialog = await screen.findByRole("dialog");
+    await within(dialog).findByText(/Revolut notified us/);
+    const focused = document.activeElement;
+    const count = () => calls.filter((c) => c.url.startsWith("/api/bank/accounts")).length;
+    const before = count();
+    const realNow = Date.now;
+    Date.now = () => realNow() + 60_000;
+    try {
+      act(() => {
+        window.dispatchEvent(new Event("focus"));
+      });
+      await waitFor(() => expect(count()).toBeGreaterThan(before));
+    } finally {
+      Date.now = realNow;
+    }
+    expect(screen.getByRole("dialog")).toBe(dialog);
+    expect(within(dialog).getByText(/Revolut notified us/)).toBeTruthy();
+    expect(document.activeElement).toBe(focused);
   });
 });
 
@@ -683,7 +1033,9 @@ describe("Bank: read-only, sheet included", () => {
       expect(name, `${where}: button "${name}"`).not.toMatch(ACTION);
     }
     expect(
-      root.querySelectorAll("form, textarea, input[type=checkbox], input[type=radio]"),
+      root.querySelectorAll(
+        "form, textarea, select, input[type=checkbox], input[type=radio], input[type=submit], button[type=submit], [contenteditable=true]",
+      ),
     ).toHaveLength(0);
     expect(within(root).queryAllByRole("link", { name: ACTION })).toHaveLength(0);
   }

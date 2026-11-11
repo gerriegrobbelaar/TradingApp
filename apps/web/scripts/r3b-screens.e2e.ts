@@ -189,7 +189,6 @@ function api(path: string, state: State): unknown {
         totalsByCurrency: [
           { currency: "EUR", balanceMinor: 1234567, accounts: 1 },
           { currency: "GBP", balanceMinor: 50025, accounts: 1 },
-          { currency: "USD", balanceMinor: 0, accounts: 1 },
         ],
         freshness: FRESH,
         available: true,

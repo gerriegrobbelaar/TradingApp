@@ -10,20 +10,60 @@ import { NO_VALUE, formatDateTime, formatMoney } from "../lib/format";
 const MINUS = "\u2212";
 
 /**
- * One transaction amount. Received (positive) shows "+" and is announced as "Received", paid
- * (negative) shows a minus sign and is announced as "Paid"; the sign goes before the currency
- * symbol and the figure comes from formatMoney. Colour is a second signal only. Not the shared
- * Money component: its "credit" wording is for invoices and would read a payment out as a credit.
+ * Words announced before an amount. Only a COMPLETED transaction is "Received" or "Paid"; a pending
+ * or unknown one is "Incoming" / "Outgoing" and not final; declined, failed and reverted ones say
+ * that the money did not move (stayed moved). Exported for tests.
  */
-export function BankAmount({ minor, currency }: { minor: number; currency: string }) {
+export function amountWords(minor: number, state: string): string {
+  const s = normaliseState(state);
+  const inbound = minor > 0;
+  switch (s) {
+    case "completed":
+      return inbound ? "Received" : "Paid";
+    case "pending":
+    case "unknown":
+      return inbound ? "Incoming, not final" : "Outgoing, not final";
+    case "reverted":
+      return inbound ? "Incoming, reverted" : "Outgoing, reverted";
+    case "declined":
+    case "failed":
+      return inbound ? "Incoming, did not go through" : "Outgoing, did not go through";
+  }
+}
+
+/**
+ * One transaction amount. The sign goes before the currency symbol ("+" in, minus sign out) and
+ * the figure comes from formatMoney; the direction and state are announced in words (see
+ * amountWords), so colour is a second signal only: completed money in is green, completed money
+ * out and anything not final is ink, declined / failed / reverted is muted. Not the shared Money
+ * component: its "credit" wording is for invoices and would read a payment out as a credit.
+ */
+export function BankAmount({
+  minor,
+  currency,
+  state,
+}: {
+  minor: number;
+  currency: string;
+  state: string;
+}) {
   if (minor === 0) return <span className="num money">{formatMoney(0, currency)}</span>;
   const text = formatMoney(Math.abs(minor), currency);
   if (text === NO_VALUE) return <span className="num money">{text}</span>;
-  const received = minor > 0;
+  const s = normaliseState(state);
+  const inbound = minor > 0;
+  const tone =
+    s === "completed"
+      ? inbound
+        ? "tx-in"
+        : "tx-out"
+      : s === "declined" || s === "failed" || s === "reverted"
+        ? "tx-void"
+        : "tx-out";
   return (
-    <span className={`num money tx-amt ${received ? "tx-in" : "tx-out"}`}>
-      <span className="sr-only">{received ? "Received " : "Paid "}</span>
-      {received ? "+" : MINUS}
+    <span className={`num money tx-amt ${tone}`}>
+      <span className="sr-only">{amountWords(minor, s)} </span>
+      {inbound ? "+" : MINUS}
       {text}
     </span>
   );
@@ -56,9 +96,25 @@ export function BankTotal({
  * full IBAN cannot reach the page even if an answer carried one.
  */
 export function maskIban(raw: string | null | undefined): string | null {
-  if (!raw) return null;
-  const tail = raw.replace(/[^A-Za-z0-9]/g, "").slice(-4);
+  if (typeof raw !== "string" || raw.trim() === "") return null;
+  const tail = raw
+    .replace(/[^A-Za-z0-9]/g, "")
+    .slice(-4)
+    .toUpperCase();
   return tail ? `•••• ${tail}` : "••••";
+}
+
+/** The masked account number ("•••• 1234") with the dots hidden from screen readers. */
+export function MaskedIban({ value }: { value: string }) {
+  const tail = value.replace(/^•+\s?/, "");
+  if (tail === "") return <span className="num">Account number hidden</span>;
+  return (
+    <span className="num">
+      <span className="sr-only">Account number ending </span>
+      <span aria-hidden="true">•••• </span>
+      {tail}
+    </span>
+  );
 }
 
 // ---- state chips -------------------------------------------------------------------------------
@@ -88,6 +144,8 @@ export function normaliseState(s: string): BankTxState {
 
 export const NOT_FINAL_NOTE = "Not final — not used for matching";
 export const UNKNOWN_NOTE = "Status not recognised — not used for matching";
+export const NOT_THROUGH_NOTE = "Did not go through — not counted in totals";
+export const REVERTED_NOTE = "Reversed by Revolut — not counted in totals";
 
 export function StateChip({ state }: { state: string }) {
   const s = normaliseState(state);
@@ -99,6 +157,8 @@ export function stateNote(tx: Pick<BankTransactionDto, "state" | "isFinal">): st
   const s = normaliseState(tx.state);
   if (s === "unknown") return UNKNOWN_NOTE;
   if (s === "pending" || !tx.isFinal) return NOT_FINAL_NOTE;
+  if (s === "declined" || s === "failed") return NOT_THROUGH_NOTE;
+  if (s === "reverted") return REVERTED_NOTE;
   return null;
 }
 
@@ -192,9 +252,8 @@ export function AccountCard({
           : "Balance not read yet"}
       </span>
       {iban && (
-        <span className="cap num">
-          <span className="sr-only">Account number ending </span>
-          {iban}
+        <span className="cap">
+          <MaskedIban value={iban} />
         </span>
       )}
     </button>

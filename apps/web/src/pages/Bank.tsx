@@ -25,6 +25,7 @@ import {
   DIRECTION_FILTERS,
   STATE_FILTERS,
   describeBankError,
+  legNoteText,
   legNotes,
   type BankDirectionFilter,
   type BankStateFilter,
@@ -42,13 +43,68 @@ const isState = (v: string | null): v is BankStateFilter =>
   v !== null && (STATE_FILTERS as readonly string[]).includes(v);
 const isDirection = (v: string | null): v is BankDirectionFilter =>
   v !== null && (DIRECTION_FILTERS as readonly string[]).includes(v);
-/** A real calendar day in YYYY-MM-DD (formatDate shows a dash for 2026-02-31). */
+/** Bounds for a typed or hand-edited date: Revolut Business has no data outside them. */
+export const MIN_DAY = "2000-01-01";
+export const MAX_DAY = "2099-12-31";
+/** A real calendar day in YYYY-MM-DD within the bounds (formatDate shows a dash for 2026-02-31). */
 const isDay = (v: string | null): v is string =>
-  v !== null && /^\d{4}-\d{2}-\d{2}$/.test(v) && formatDate(v) !== NO_VALUE;
+  v !== null &&
+  /^\d{4}-\d{2}-\d{2}$/.test(v) &&
+  v >= MIN_DAY &&
+  v <= MAX_DAY &&
+  formatDate(v) !== NO_VALUE;
 
 const OWN = ["account", "state", "direction", "from", "to"] as const;
 
-/** Copy for the three ways the page can have nothing to show. */
+/** What a connection that is not active means, in words; null when it is active. */
+function connectionProblem(status: string): { title: string; body: string } | null {
+  switch (status) {
+    case "active":
+      return null;
+    case "pending":
+      return {
+        title: "The Revolut connection is waiting for confirmation.",
+        body: "An administrator must confirm the connected accounts in Settings → Connections before anything is read from Revolut.",
+      };
+    case "needs_reauth":
+    case "expired":
+      return {
+        title: "The Revolut connection needs to be renewed.",
+        body: "Revolut no longer accepts the app's sign-in, so nothing new is read. An administrator can reconnect in Settings → Connections.",
+      };
+    case "disabled":
+      return {
+        title: "The Revolut connection is switched off.",
+        body: "Nothing new is read from Revolut while it is off. An administrator can switch it on in Settings → Connections.",
+      };
+    default:
+      return {
+        title: "The Revolut connection is not active.",
+        body: "Nothing new is read from Revolut until it is active again. Check Settings → Connections.",
+      };
+  }
+}
+
+function ConnectionProblem({ status, admin }: { status: string; admin: boolean }) {
+  const p = connectionProblem(status);
+  if (!p) return null;
+  return (
+    <EmptyState
+      title={p.title}
+      action={
+        admin ? (
+          <Link className="btn" to="/settings/connections">
+            Open connections
+          </Link>
+        ) : undefined
+      }
+    >
+      {p.body}
+    </EmptyState>
+  );
+}
+
+/** Copy for the ways the page can have nothing to show. */
 function NotConnected({ admin }: { admin: boolean }) {
   return (
     <EmptyState
@@ -79,9 +135,9 @@ function WaitingForSync({ admin }: { admin: boolean }) {
         ) : undefined
       }
     >
-      Nothing has been read from Revolut yet. The Revolut sync job is switched off until the
-      connection has been verified, so accounts and transactions appear after an administrator
-      switches it on in Settings → Schedules.
+      Nothing has been read from Revolut yet. Accounts and transactions appear after the first
+      complete run of the Revolut sync job. The job starts switched off, so an administrator may
+      need to switch it on in Settings → Schedules.
     </EmptyState>
   );
 }
@@ -95,7 +151,7 @@ function Totals({ data }: { data: BankAccountsResponse }) {
           <li key={t.currency}>
             <span className="num money">{formatMoney(t.balanceMinor, t.currency)}</span>{" "}
             <span className="cap">
-              {t.currency} across {formatCount(t.accounts, "account", "accounts")}
+              {t.currency} across {formatCount(t.accounts, "active account", "active accounts")}
             </span>
           </li>
         ))}
@@ -189,10 +245,22 @@ export function Bank() {
     rowId,
   );
 
-  const notes = useMemo(() => legNotes(list.items), [list.items]);
+  const filtered =
+    account !== "" ||
+    state !== "all" ||
+    direction !== "all" ||
+    from !== "" ||
+    to !== "" ||
+    q.trim() !== "";
+  // Every leg is loaded only when no filter can hide one and no page is left.
+  const notes = useMemo(
+    () => legNotes(list.items, !filtered && !list.hasMore),
+    [list.items, filtered, list.hasMore],
+  );
   const columns: Column<BankTransactionDto>[] = useMemo(
     () => [
-      { key: "date", header: "Date", render: (r) => formatDate(r.completedAt ?? r.createdAt) },
+      // The creation day: the list is sorted by it and From / To filter on it (ADR 0032).
+      { key: "date", header: "Date", render: (r) => formatDate(r.createdAt) },
       {
         key: "who",
         header: "Counterparty",
@@ -211,13 +279,7 @@ export function Bank() {
             <span className="tx-state">
               <StateChip state={r.state} />
               {note && <span className="cap">{note}</span>}
-              {leg && (
-                <span className="cap">
-                  {list.hasMore
-                    ? `Leg ${leg.index} of ${leg.count} so far, see details`
-                    : `Leg ${leg.index} of ${leg.count}, see details`}
-                </span>
-              )}
+              {leg && <span className="cap">{legNoteText(leg)}</span>}
             </span>
           );
         },
@@ -226,19 +288,12 @@ export function Bank() {
         key: "amount",
         header: "Amount",
         align: "right",
-        render: (r) => <BankAmount minor={r.amountMinor} currency={r.currency} />,
+        render: (r) => <BankAmount minor={r.amountMinor} currency={r.currency} state={r.state} />,
       },
     ],
-    [notes, list.hasMore],
+    [notes],
   );
 
-  const filtered =
-    account !== "" ||
-    state !== "all" ||
-    direction !== "all" ||
-    from !== "" ||
-    to !== "" ||
-    q.trim() !== "";
   const accountName = accountsData?.accounts.find((a) => String(a.id) === account)?.name;
   const totals = list.first?.totalsByCurrency ?? [];
   const txWaiting = list.first !== null && !list.first.available;
@@ -259,7 +314,14 @@ export function Bank() {
       );
     }
     if (!connected) return <NotConnected admin={admin} />;
-    if (!accountsData.available) return <WaitingForSync admin={admin} />;
+    const connStatus = accountsData.connection?.status ?? "active";
+    if (!accountsData.available) {
+      return connectionProblem(connStatus) ? (
+        <ConnectionProblem status={connStatus} admin={admin} />
+      ) : (
+        <WaitingForSync admin={admin} />
+      );
+    }
     if (accountsData.accounts.length === 0) {
       return (
         <EmptyState title="No bank accounts found.">
@@ -270,9 +332,10 @@ export function Bank() {
     }
     return (
       <>
-        {accountsData.connection && accountsData.connection.status !== "active" && (
+        {connectionProblem(connStatus) && (
           <p className="notice warn" role="status">
-            The Revolut connection is not active, so these figures may be out of date.
+            {connectionProblem(connStatus)?.title} The figures below are from the last sync and may
+            be out of date.
             {admin && (
               <>
                 {" "}
@@ -311,7 +374,7 @@ export function Bank() {
       />
       <Card>{accountsBlock}</Card>
       {available && (
-        <Card>
+        <Card className="bank-tx">
           <h2 className="h2" id="tx-heading">
             Transactions
           </h2>
@@ -341,8 +404,8 @@ export function Bank() {
               value={direction}
               options={[
                 { value: "all", label: "All" },
-                { value: "in", label: "Received" },
-                { value: "out", label: "Paid" },
+                { value: "in", label: "Money in" },
+                { value: "out", label: "Money out" },
               ]}
               onChange={(v) => setParam({ direction: v === "all" ? null : v })}
             />
@@ -352,7 +415,8 @@ export function Bank() {
                 type="date"
                 className="input"
                 value={from}
-                {...(to ? { max: to } : {})}
+                min={MIN_DAY}
+                max={to || MAX_DAY}
                 aria-invalid={rangeBad}
                 {...(rangeBad ? { "aria-describedby": "range-err" } : {})}
                 onChange={(e) => setParam({ from: e.target.value })}
@@ -364,7 +428,8 @@ export function Bank() {
                 type="date"
                 className="input"
                 value={to}
-                {...(from ? { min: from } : {})}
+                min={from || MIN_DAY}
+                max={MAX_DAY}
                 aria-invalid={rangeBad}
                 {...(rangeBad ? { "aria-describedby": "range-err" } : {})}
                 onChange={(e) => setParam({ to: e.target.value })}
@@ -408,26 +473,43 @@ export function Bank() {
                     </EmptyState>
                   )
                 }
-                footer={totals.map((t) => (
-                  <tr key={t.currency} className="totals-row">
-                    <th scope="row" colSpan={5}>
-                      Total {t.currency}, {formatCount(t.count, "transaction", "transactions")}{" "}
-                      matching
-                    </th>
-                    <td className="r">
-                      <span className="tx-total">
-                        <span>
-                          <span className="cap">Received </span>
-                          <BankTotal minor={t.inMinor} currency={t.currency} direction="in" />
-                        </span>
-                        <span>
-                          <span className="cap">Paid </span>
-                          <BankTotal minor={t.outMinor} currency={t.currency} direction="out" />
-                        </span>
-                      </span>
-                    </td>
-                  </tr>
-                ))}
+                footer={
+                  list.items.length === 0 ? undefined : (
+                    <>
+                      {totals.map((t) => (
+                        <tr key={t.currency} className="totals-row">
+                          <th scope="row" colSpan={5}>
+                            {t.currency}, pending and completed:{" "}
+                            {formatCount(t.count, "transaction", "transactions")} for these filters
+                          </th>
+                          <td className="r">
+                            <span className="tx-total">
+                              <span>
+                                <span className="cap">In </span>
+                                <BankTotal minor={t.inMinor} currency={t.currency} direction="in" />
+                              </span>
+                              <span>
+                                <span className="cap">Out </span>
+                                <BankTotal
+                                  minor={t.outMinor}
+                                  currency={t.currency}
+                                  direction="out"
+                                />
+                              </span>
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                      <tr className="totals-note">
+                        <td colSpan={6} className="cap">
+                          {totals.length === 0
+                            ? "No pending or completed transactions for these filters, so there is nothing to total."
+                            : "Totals count pending and completed transactions only. Declined, failed and reverted ones are listed but not counted."}
+                        </td>
+                      </tr>
+                    </>
+                  )
+                }
               />
               <LoadMore
                 shown={list.items.length}

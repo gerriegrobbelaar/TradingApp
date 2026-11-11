@@ -99,3 +99,30 @@
 .app .drill .chip {
   align-self: flex-start;
 }
+/* Declined, failed and reverted amounts: no money moved (stayed moved); words say so too. */
+.app .tx-void {
+  color: var(--muted);
+}
+.app .totals-note td {
+  text-align: left;
+}
+/* Footer lines wrap instead of being cut off at phone width. */
+.app .bank-tx tfoot th,
+.app .bank-tx tfoot td {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 560px) {
+  .app .bank-tx tfoot th,
+  .app .bank-tx tfoot td {
+    display: block;
+    min-width: 0;
+    max-width: 100%;
+    padding: 0;
+    border: 0;
+    text-align: left;
+  }
+  .app .bank-tx .tx-total {
+    justify-content: flex-start;
+  }
+}

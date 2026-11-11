@@ -470,15 +470,25 @@ export interface ApprovalDetail {
   };
 }
 
-// ---- Bank (Revolut) screen, Phase 5 (R3a owns the worker side; identical shapes) ---------------
+// ---- Bank (Revolut) screen, Phase 5 (R3a owns the worker side, R3b the screen; ADR 0032) -------
+//
+// Contract (review R3b):
+// - Amounts are integer minor units in the leg's own currency at its real exponent (JPY 0,
+//   KWD 3). `amountMinor` is SIGNED: positive = money in, negative = money out, 0 = neither.
+// - IBANs are masked by the server (core `maskIban`: "NL91****4300"; short values "****"); a
+//   full IBAN or a provider counterparty id never leaves the server. The screen renders only the
+//   last four characters of whatever it gets.
+// - Currencies are never summed together; every total is per currency.
 
 export interface BankAccountDto {
   id: number;
   name: string;
   currency: string;
+  /** Signed minor units; null until Revolut reported a balance. */
   balanceMinor: number | null;
   balanceAt: string | null;
   state: string | null;
+  /** Masked by the server; never a full IBAN. */
   ibanMasked: string | null;
   isActive: boolean;
 }
@@ -486,47 +496,78 @@ export interface BankAccountDto {
 export type BankTxState = "pending" | "completed" | "declined" | "failed" | "reverted" | "unknown";
 
 export interface BankTransactionDto {
+  /** Row id (one per leg); stable, unique. */
   id: number;
+  /** Revolut transaction id; several legs (rows) can share it. */
   externalId: string;
   legId: string;
   accountId: number | null;
   accountName: string | null;
   type: string | null;
+  /** A stored state the server does not recognise is reported as 'unknown', never 'completed'. */
   state: BankTxState;
+  /** True only for completed / declined / failed / reverted (CLAUDE.md §3: book final only). */
   isFinal: boolean;
+  /** UTC ISO. Lists are ordered by it (desc) and `from` / `to` filter on it. */
   createdAt: string;
   completedAt: string | null;
+  /** SIGNED: positive = in, negative = out. */
   amountMinor: number;
   currency: string;
   reference: string | null;
   description: string | null;
   counterpartyName: string | null;
+  /** Masked by the server; never a full IBAN. */
   counterpartyIbanMasked: string | null;
+  /**
+   * Optional (to agree with R3a): number of legs stored for `externalId`, whatever the filter or
+   * page. When absent the screen counts the legs it has loaded and says "at least" when the list
+   * is filtered or more pages remain.
+   */
+  legCount?: number;
 }
 
 export interface BankAccountsResponse {
   connection: {
     id: number;
+    /** connections.status: 'pending' | 'active' | 'expired' | 'disabled' | 'needs_reauth'. */
     status: string;
     createsBankEntries: boolean | null;
     paymentsMode: string;
   } | null;
   accounts: BankAccountDto[];
+  /** Per currency, ACTIVE accounts with a known balance only; `accounts` counts those. */
   totalsByCurrency: { currency: string; balanceMinor: number; accounts: number }[];
   freshness: Freshness;
+  /** False until the first successful sync. */
   available: boolean;
 }
 
+/**
+ * GET /api/bank/transactions?account=&state=&direction=&from=&to=&q=&limit=&cursor=
+ * - `state`: ONE of pending | completed | declined | failed | reverted (or absent / 'all').
+ * - `direction`: in (amount > 0) | out (amount < 0) | all.
+ * - `from` / `to`: Amsterdam calendar days (YYYY-MM-DD), both inclusive, on `createdAt`.
+ * - `q`: case-insensitive text in reference, description and counterparty name (never the IBAN).
+ */
 export interface BankTransactionsResponse {
   items: BankTransactionDto[];
   nextCursor: string | null;
+  /** All rows matching the filter, every state. */
   total: number;
+  /**
+   * Per currency over the whole filter (not the page), PENDING AND COMPLETED rows only: declined,
+   * failed, reverted and unknown rows are listed but never summed. `inMinor` and `outMinor` are
+   * both POSITIVE magnitudes (out is the sum of -amountMinor of negative rows); `count` is the
+   * number of pending and completed rows in that currency.
+   */
   totalsByCurrency: { currency: string; inMinor: number; outMinor: number; count: number }[];
   freshness: Freshness;
   available: boolean;
 }
 
 export interface BankTransactionDetail extends BankTransactionDto {
+  /** Every leg of the same Revolut transaction id (including this one), by leg id. */
   legs: BankTransactionDto[];
   firstSeenAt: string | null;
   lastEventAt: string | null;

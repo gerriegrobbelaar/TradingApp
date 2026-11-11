@@ -72,6 +72,8 @@ describe("bank account cards and amounts keep their contrast", () => {
     const flat = bankCss.replace(/\s+/g, " ");
     expect(flat).toContain(".app .tx-in { color: var(--accent-text); }");
     expect(flat).toContain(".app .tx-out { color: var(--ink); }");
+    // --muted on rows (plain and hovered) is checked in contrast.test.ts.
+    expect(flat).toContain(".app .tx-void { color: var(--muted); }");
     expect(flat).toContain(
       ".app .acct.off .acct-name, .app .acct.off .acct-bal { color: var(--muted); }",
     );

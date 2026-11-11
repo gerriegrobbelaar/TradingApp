@@ -7,6 +7,7 @@ import { NO_VALUE, formatDateTime } from "../lib/format";
 import { useResource } from "../lib/useResource";
 import {
   BankAmount,
+  MaskedIban,
   STATE_LABEL,
   StateChip,
   maskIban,
@@ -46,7 +47,7 @@ function Body({ detail }: { detail: BankTransactionDetail }) {
   return (
     <div className="detail">
       <p className="lede">
-        <BankAmount minor={detail.amountMinor} currency={detail.currency} />{" "}
+        <BankAmount minor={detail.amountMinor} currency={detail.currency} state={detail.state} />{" "}
         <StateChip state={detail.state} />
       </p>
       {note && (
@@ -56,16 +57,7 @@ function Body({ detail }: { detail: BankTransactionDetail }) {
       )}
       <dl className="dl">
         <Row label="Counterparty">{detail.counterpartyName ?? NO_VALUE}</Row>
-        <Row label="Counterparty account">
-          {iban ? (
-            <span className="num">
-              <span className="sr-only">Account number ending </span>
-              {iban}
-            </span>
-          ) : (
-            NO_VALUE
-          )}
-        </Row>
+        <Row label="Counterparty account">{iban ? <MaskedIban value={iban} /> : NO_VALUE}</Row>
         <Row label="Reference">
           {detail.reference ? <span className="copyable">{detail.reference}</span> : NO_VALUE}
         </Row>
@@ -128,7 +120,7 @@ function Body({ detail }: { detail: BankTransactionDetail }) {
                     <span className="cell-label" aria-hidden="true">
                       Amount
                     </span>
-                    <BankAmount minor={l.amountMinor} currency={l.currency} />
+                    <BankAmount minor={l.amountMinor} currency={l.currency} state={l.state} />
                   </td>
                 </tr>
               ))}

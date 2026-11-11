@@ -22,24 +22,38 @@ export const STATE_FILTERS: readonly BankStateFilter[] = [
 ];
 export const DIRECTION_FILTERS: readonly BankDirectionFilter[] = ["all", "in", "out"];
 
+export interface LegNote {
+  /** Legs of this Revolut transaction: exact, or a lower bound when `atLeast`. */
+  count: number;
+  atLeast: boolean;
+}
+
 /**
- * For each row, "leg n of m" when other rows with the same Revolut transaction id are loaded.
- * Counted over the rows loaded, in the order shown: while more pages remain, a leg may still be on
- * a later page, so the page words it as "so far".
+ * For each row that is one leg of a multi-leg Revolut transaction, how many legs it has. The
+ * server's `legCount` is used when present. Without it the legs are counted over the rows loaded,
+ * which is a lower bound while more pages remain or a filter (account, direction, state, dates,
+ * search) can hide the other legs, so the note then says "at least". No leg index is shown: the
+ * load order is not the leg order the sheet lists.
  */
 export function legNotes(
   rows: readonly BankTransactionDto[],
-): Map<number, { index: number; count: number }> {
-  const groups = new Map<string, number[]>();
+  complete: boolean,
+): Map<number, LegNote> {
+  const groups = new Map<string, number>();
+  for (const r of rows) groups.set(r.externalId, (groups.get(r.externalId) ?? 0) + 1);
+  const out = new Map<number, LegNote>();
   for (const r of rows) {
-    const g = groups.get(r.externalId);
-    if (g) g.push(r.id);
-    else groups.set(r.externalId, [r.id]);
-  }
-  const out = new Map<number, { index: number; count: number }>();
-  for (const ids of groups.values()) {
-    if (ids.length < 2) continue;
-    ids.forEach((id, i) => out.set(id, { index: i + 1, count: ids.length }));
+    const server = r.legCount;
+    if (typeof server === "number" && Number.isSafeInteger(server) && server >= 1) {
+      if (server > 1) out.set(r.id, { count: server, atLeast: false });
+      continue;
+    }
+    const loaded = groups.get(r.externalId) ?? 1;
+    if (loaded > 1) out.set(r.id, { count: loaded, atLeast: !complete });
   }
   return out;
+}
+
+export function legNoteText(n: LegNote): string {
+  return `${n.atLeast ? "One of at least" : "One of"} ${n.count} legs, see details`;
 }
