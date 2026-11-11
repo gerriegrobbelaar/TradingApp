@@ -9,8 +9,8 @@ Orchestrator log. Update after every merge and every direct (trivial) edit.
 | 2 | Exact connection | Code complete (E1-E3, G1-G3 merged, reviews done). NOT verified against real Exact: see docs/DEPLOY.md step 10 |
 | 3 | Scheduler | Done: H1, H2, J1 (review fixes), J2 (DEPLOY runbook; docs only, not separately reviewed). Not run on real Cloudflare Queues/DOs. Exact jobs ship disabled |
 | 4 | Read-only screens | Done (K1-K4, K3a, K3b; review fixes M1 infra/staging/EU queues, M2 truthfulness + payment-safety gate merged). NOT verified against real Exact. Phase 9 must not enable Pay until the approval mapping is verified live (ADR 0025) |
-| 5 | Revolut connection | Built and merged (R1 client, R2 gate + connect + confirm step, R3a webhooks/ingest/sync/backfill/bank API, R3b Bank screen); final review done, no blockers; review fixes in progress (Q1-Q3). Revolut is optional per deployment. Nothing verified against real Revolut. Jobs revolut.sync and revolut.backfill ship DISABLED |
-| 6 | ECB FX | Not started |
+| 5 | Revolut connection | Done (R1-R3b, review fixes Q1-Q3 merged). NOT verified against real Revolut. Jobs revolut.sync / revolut.backfill ship DISABLED. Revolut is optional for a first deploy |
+| 6 | ECB FX | In progress: F1 (decimal FX maths, ECB parser) and F2 (import job, rates API, staleness) merged; F3 (EUR amounts on screens, rates view) next. Job ecb.fx_import is ON by default (public source). Decision 4 (accountant approves ECB for revaluation) still open |
 | 7 | Matching | Not started |
 | 8 | Data quality | Not started. Also owns the `exact.bank_balances` job (ING/Rabobank balances from Exact, needed for the rule 'Exact balance differs from bank balance'; review S12). Its handler is not built; the job stays off |
 | 9 | Payments | Not started |
