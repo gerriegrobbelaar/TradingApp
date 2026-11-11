@@ -13,7 +13,7 @@
  * refused (409). A NEW ECB value for the same date is a new conflict (the importer's upsert is
  * keyed on (currency, date, ECB value)); the same value is not re-opened after it was resolved.
  */
-import type { FxConflictDto } from "@camelthorn/core";
+import { parseRate, type FxConflictDto } from "@camelthorn/core";
 import { auditStatement } from "../db/audit";
 
 export interface ConflictRow {
@@ -83,7 +83,9 @@ export type ResolveOutcome =
   /** Resolved the other way already. */
   | { kind: "conflicting_resolution"; conflict: ConflictRow }
   /** The stored rate is not the one in the conflict any more (or changed during the request). */
-  | { kind: "stale"; conflict: ConflictRow };
+  | { kind: "stale"; conflict: ConflictRow }
+  /** The conflict's ECB value is not a plain positive decimal (a malformed backfilled row). */
+  | { kind: "bad_rate"; conflict: ConflictRow };
 
 const byId = (db: D1Database, id: number) =>
   db
@@ -105,6 +107,12 @@ export async function resolveConflict(
       ? { kind: "already_resolved", conflict: c }
       : { kind: "conflicting_resolution", conflict: c };
   }
+  // The value written on 'accepted' comes from the stored conflict row (never from the request),
+  // and only in core parseRate's canonical form: a row the migration copied from a malformed
+  // audit entry can be kept but never accepted.
+  const ecb = parseRate(c.ecb_rate);
+  if (resolution === "accepted" && !ecb.ok) return { kind: "bad_rate", conflict: c };
+  const ecbRate = ecb.ok ? ecb.rate : c.ecb_rate;
   const stored = await db
     .prepare("SELECT rate FROM fx_rates WHERE currency = ?1 AND rate_date = ?2")
     .bind(c.currency, c.rate_date)
@@ -131,9 +139,9 @@ export async function resolveConflict(
         entityId,
         before: { rate: stored.rate },
         after: {
-          rate: resolution === "accepted" ? c.ecb_rate : stored.rate,
+          rate: resolution === "accepted" ? ecbRate : stored.rate,
           resolution,
-          ecb: c.ecb_rate,
+          ecb: ecbRate,
           conflictId: id,
         },
       },
@@ -148,7 +156,7 @@ export async function resolveConflict(
            WHERE currency = ?1 AND rate_date = ?2 AND rate = ?3
              AND EXISTS (SELECT 1 FROM fx_rate_conflicts WHERE id = ?6 AND resolved_at IS NULL)`,
         )
-        .bind(c.currency, c.rate_date, stored.rate, c.ecb_rate, nowIso, id),
+        .bind(c.currency, c.rate_date, stored.rate, ecbRate, nowIso, id),
     );
   }
   statements.push(
@@ -166,7 +174,7 @@ export async function resolveConflict(
         resolution,
         c.currency,
         c.rate_date,
-        c.ecb_rate,
+        ecbRate,
       ),
   );
   const results = await db.batch(statements);

@@ -3,6 +3,13 @@
  * strict loader for month-end booking (Phase 12) and the "currencies without a rate" helper
  * (Phase 8). Fixed dates only.
  */
+import {
+  addDaysIso,
+  buildRateTable,
+  ECB_MAX_RATE_AGE_TARGET_DAYS,
+  isTargetWorkingDay,
+  previousTargetWorkingDay,
+} from "@camelthorn/core";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   currenciesWithoutRate,
@@ -185,5 +192,76 @@ describe("currenciesWithoutRate", () => {
     expect(await currenciesWithoutRate(db, [], "2026-11-10")).toEqual([]);
     // before any rate exists everything foreign is missing, EUR never is
     expect(await currenciesWithoutRate(db, ["USD", "EUR"], "2026-11-09")).toEqual(["USD"]);
+  });
+});
+
+describe("the loader answers exactly as the rates API did before the refactor (review of T1)", () => {
+  /** The pre-refactor body of GET /api/fx/rates (fx-routes.ts at 3d47044), verbatim in logic. */
+  async function oldTable(date: string) {
+    const newestOnDate = (
+      await db
+        .prepare("SELECT MAX(rate_date) AS d FROM fx_rates WHERE rate_date <= ?1")
+        .bind(date)
+        .first<{ d: string | null }>()
+    )?.d;
+    if (newestOnDate == null) return { table: null, newest: null };
+    let cutoff = newestOnDate;
+    for (let k = 0; k < ECB_MAX_RATE_AGE_TARGET_DAYS; k += 1) {
+      cutoff = previousTargetWorkingDay(cutoff);
+    }
+    const rows = (
+      await db
+        .prepare(
+          "SELECT currency, rate_date, rate FROM fx_rates WHERE rate_date >= ?1 AND rate_date <= ?2",
+        )
+        .bind(cutoff, newestOnDate)
+        .all<{ currency: string; rate: string; rate_date: string }>()
+    ).results;
+    return {
+      table: buildRateTable(
+        rows.map((r) => ({ currency: r.currency, rateDate: r.rate_date, rate: r.rate })),
+        date,
+      ),
+      newest: newestOnDate,
+    };
+  }
+
+  it("on a seeded history with gaps, holidays and a discontinued currency, for every day", async () => {
+    // 2026-09-01 .. 2026-11-10 on TARGET days; HRK stops on 2026-10-01; GBP misses some days;
+    // JPY rates written in non-canonical spellings.
+    let x = 7;
+    const rnd = (k: number) => {
+      x = (Math.imul(x, 1103515245) + 12345) >>> 0;
+      return (x >>> 16) % k;
+    };
+    const rows: [string, string, string][] = [];
+    for (let d = "2026-09-01"; d <= "2026-11-10"; d = addDaysIso(d, 1)) {
+      if (!isTargetWorkingDay(d)) continue;
+      rows.push(["USD", d, `1.${1000 + rnd(900)}`]);
+      if (rnd(4) !== 0) rows.push(["GBP", d, `0.8${rnd(10)}${rnd(10)}0`]);
+      if (d < "2026-10-01") rows.push(["HRK", d, "7.5345"]);
+      rows.push(["JPY", d, `16${rnd(10)}.${rnd(10)}0`]);
+    }
+    for (let i = 0; i < rows.length; i += 50) {
+      await db.batch(
+        rows
+          .slice(i, i + 50)
+          .map(([c, d, r]) =>
+            db
+              .prepare("INSERT INTO fx_rates (currency, rate_date, rate) VALUES (?1, ?2, ?3)")
+              .bind(c, d, r),
+          ),
+      );
+    }
+    let compared = 0;
+    for (let d = "2026-08-25"; d <= "2026-11-15"; d = addDaysIso(d, 1)) {
+      const before = await oldTable(d);
+      const now = await loadRateTableWithNewest(db, d);
+      expect(now.table, d).toEqual(before.table);
+      expect(now.newestDate, d).toBe(before.newest);
+      expect(await loadRateTable(db, d), d).toEqual(before.table);
+      compared += 1;
+    }
+    expect(compared).toBe(83);
   });
 });

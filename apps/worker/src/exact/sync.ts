@@ -493,6 +493,19 @@ function relationStmt(
     );
 }
 
+/** Rank of a booked-amount source (migration 0020): Exact's sync read > list fields > computed. */
+const dcRank = (col: string): string =>
+  `CASE ${col} WHEN 'sync' THEN 3 WHEN 'list' THEN 2 WHEN 'computed' THEN 1 ELSE 0 END`;
+/**
+ * Keep the stored booked amount (ADR 0038): same currency, same open amount, a stored amount, and
+ * this read has none or a worse one. Evaluated against the OLD row (`open_items.`) in DO UPDATE.
+ */
+const KEEP_DC = `(open_items.currency = excluded.currency
+     AND open_items.open_minor = excluded.open_minor
+     AND open_items.open_dc_minor IS NOT NULL
+     AND (excluded.open_dc_minor IS NULL
+          OR ${dcRank("open_items.dc_source")} > ${dcRank("excluded.dc_source")}))`;
+
 function openItemStmt(
   db: D1Database,
   divisionId: number,
@@ -500,15 +513,22 @@ function openItemStmt(
   runSeq: number,
   nowIso: string,
   source: "list" | "sync",
+  /** The booked amount was computed by the worker (ADR 0038 option 3), not read from Exact. */
+  computedDc = false,
 ): D1PreparedStatement {
   const closed = item.amount.minor === 0;
   // Amount model (migration 0005, ADR 0017): open_minor is the open balance in the item
   // currency; original_minor the invoice total when known. Original amount and rate describe the
   // booked invoice and are kept when a later read (the bulk list) does not carry them, unless the
-  // currency changed. open_dc_minor is a snapshot of the open balance: a read that carries it
-  // replaces it; a read that does not (the nightly list) keeps it only while the open amount and
-  // the currency are unchanged, and clears it otherwise (a part payment changes the open amount,
-  // and the division-currency value of the remainder is unknown until a read gives it; ADR 0038).
+  // currency changed. open_dc_minor (with dc_currency and dc_source, migration 0020) is a
+  // snapshot of the open balance, decided in ONE statement from the old row and the new values:
+  //  - the stored amount is kept when the currency and the open amount are unchanged AND either
+  //    this read carries no amount or the stored one comes from a better source (sync > list >
+  //    computed: a value read from Exact always beats a computed one for the same balance);
+  //  - otherwise this read's amount is taken, which is NULL when it carries none: a changed open
+  //    amount (part payment, credit, reopened item) or currency never keeps a stale amount.
+  // In SQLite's DO UPDATE every unqualified/`open_items.` column is the OLD row and `excluded.` the
+  // new one, also in SET expressions after `open_minor = ...` (SET reads the pre-update row).
   // A closed item we have never seen is not inserted (the sync endpoints return the whole paid
   // history from cursor 0); a closed item we do know is updated.
   // The DO UPDATE only applies when this run is not older than the run that last saw the row, so
@@ -521,9 +541,9 @@ function openItemStmt(
       `INSERT INTO open_items (division_id, exact_id, kind, relation_id, relation_name,
          invoice_number, reference, currency, stored_minor, open_minor, invoice_date, due_date,
          status, closed_at, synced_at, entry_number, last_seen_sync_id, original_minor,
-         open_dc_minor, dc_currency, rate, source, search_text)
+         open_dc_minor, dc_currency, rate, source, search_text, dc_source)
        SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?17, ?9), ?9, ?10, ?11, ?12, ?13, ?14,
-         ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+         ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
        WHERE ?12 = 'open'
           OR EXISTS (SELECT 1 FROM open_items WHERE division_id = ?1 AND exact_id = ?2)
        ON CONFLICT (division_id, exact_id) DO UPDATE SET
@@ -541,14 +561,11 @@ function openItemStmt(
                      WHEN open_items.currency = excluded.currency THEN open_items.rate
                      ELSE NULL END,
          currency = excluded.currency, open_minor = excluded.open_minor,
-         open_dc_minor = CASE WHEN excluded.open_dc_minor IS NOT NULL THEN excluded.open_dc_minor
-                              WHEN open_items.currency = excluded.currency
-                               AND open_items.open_minor = excluded.open_minor
-                              THEN open_items.open_dc_minor ELSE NULL END,
-         dc_currency = CASE WHEN excluded.open_dc_minor IS NOT NULL THEN excluded.dc_currency
-                            WHEN open_items.currency = excluded.currency
-                             AND open_items.open_minor = excluded.open_minor
-                            THEN open_items.dc_currency ELSE NULL END,
+         open_dc_minor = CASE WHEN ${KEEP_DC} THEN open_items.open_dc_minor
+                              ELSE excluded.open_dc_minor END,
+         dc_currency = CASE WHEN ${KEEP_DC} THEN open_items.dc_currency
+                            ELSE excluded.dc_currency END,
+         dc_source = CASE WHEN ${KEEP_DC} THEN open_items.dc_source ELSE excluded.dc_source END,
          invoice_date = excluded.invoice_date, due_date = excluded.due_date,
          status = excluded.status,
          closed_at = CASE WHEN excluded.status = 'closed'
@@ -587,6 +604,7 @@ function openItemStmt(
         item.accountName,
         item.description,
       ]),
+      dc === null ? null : computedDc ? "computed" : source,
     );
 }
 
@@ -1427,6 +1445,10 @@ async function syncOpenItemsFull(
   // Booked division-currency amount (ADR 0038): the optional list fields (option 1) and/or the
   // rate computation (option 3), both admin settings that are OFF by default. One D1 read.
   const opts = await readBookedOptions(ctx);
+  // A remembered refusal (sync_state.unavailable_until of THIS entity's row: receivables and
+  // payables have their own rows, the budget and purchase reads use other entities) skips the
+  // fields until it expires; a `restart` run tries them again.
+  let remembered = st?.unavailable_until != null;
   let dcFields =
     opts.listDcFields &&
     !(
@@ -1445,18 +1467,26 @@ async function syncOpenItemsFull(
     let page;
     try {
       page = await read(dcFields);
+      if (dcFields && chunk === 0 && remembered) {
+        // The fields were accepted again (a restart run or an expired memory): forget the 400.
+        await markListDc(ctx, entity, null);
+        remembered = false;
+      }
     } catch (e) {
-      // Exact's own refusal of the extended $select (not our gate's 400s): degrade to the plain
-      // read ONCE, remember it for a week instead of failing every night (ADR 0038).
+      // Exact's own 400 on the extended $select (not our gate's 400s): repeat the read ONCE
+      // without the fields. Only when that plain read works was the 400 about the fields; then
+      // it is remembered for a week instead of failing every night (ADR 0038). If the plain read
+      // fails too, its error is the run's error and nothing is remembered.
       if (!dcFields || !isSelectRefusal(e)) throw e;
       dcFields = false;
-      await markListDcUnavailable(ctx, entity);
       page = await read(false);
+      await markListDc(ctx, entity, new Date(ctx.nowMs() + LIST_DC_UNAVAILABLE_MS).toISOString());
+      remembered = true;
     }
     readTotal += page.items.length;
     const items = await withComputedBooked(ctx, page.items, opts.rateDirection);
-    const units: D1PreparedStatement[][] = items.map((it) => [
-      openItemStmt(ctx.db, ctx.division.id, it, ctx.runSeq, nowIso, "list"),
+    const units: D1PreparedStatement[][] = items.map(({ item, computed }) => [
+      openItemStmt(ctx.db, ctx.division.id, item, ctx.runSeq, nowIso, "list", computed),
     ]);
     units.push([
       passStmt(
@@ -1536,10 +1566,15 @@ function isSelectRefusal(e: unknown): boolean {
 }
 
 /**
- * Remembers on the entity's own sync_state row that the extended `$select` was refused. The
- * stateStmt upserts at the end of a run never touch unavailable_until, so it survives.
+ * Remembers on the entity's own sync_state row that the extended `$select` was refused until
+ * `until` (null forgets it). The stateStmt upserts at the end of a run never touch
+ * unavailable_until, so it survives.
  */
-async function markListDcUnavailable(ctx: Ctx, entity: "receivables" | "payables"): Promise<void> {
+async function markListDc(
+  ctx: Ctx,
+  entity: "receivables" | "payables",
+  until: string | null,
+): Promise<void> {
   assertSyncEntity(entity);
   await runBatches(ctx.db, ctx.meter, [
     [
@@ -1551,14 +1586,7 @@ async function markListDcUnavailable(ctx: Ctx, entity: "receivables" | "payables
              unavailable_until = excluded.unavailable_until
            WHERE ${leaseHeld("?5", "?6")}`,
         )
-        .bind(
-          ctx.division.id,
-          entity,
-          ctx.startedAt,
-          new Date(ctx.nowMs() + LIST_DC_UNAVAILABLE_MS).toISOString(),
-          ctx.lease.holder,
-          ctx.lease.runSeq,
-        ),
+        .bind(ctx.division.id, entity, ctx.startedAt, until, ctx.lease.holder, ctx.lease.runSeq),
     ],
   ]);
 }
@@ -1567,43 +1595,41 @@ async function markListDcUnavailable(ctx: Ctx, entity: "receivables" | "payables
  * Option 3 (ADR 0038): for foreign-currency items of a list chunk that carry no division-currency
  * amount, compute it as open amount x booked rate, but ONLY when an admin set the rate direction
  * after checking it against Exact. The rate is the one the list read carried, else the one stored
- * from an earlier sync read for the same currency. Anything missing leaves the item as it is
- * (the upsert then keeps or clears the stored amount).
+ * from an earlier read for the same currency. Anything missing leaves the item as it is (the
+ * upsert then keeps or clears the stored amount). A computed amount is marked `computed`
+ * (dc_source): the upsert never lets it replace an amount read from Exact for the same open
+ * balance, and a change of the direction setting clears exactly these.
  */
 async function withComputedBooked(
   ctx: Ctx,
   items: OpenItem[],
   direction: RateDirection | null,
-): Promise<OpenItem[]> {
-  if (direction === null) return items;
-  const wanted = items.filter((i) => i.amountDc === null && i.amount.currency !== ctx.currency);
-  if (wanted.length === 0) return items;
-  interface Stored {
-    currency: string;
-    rate: string | null;
-    open_minor: number;
-    open_dc_minor: number | null;
-  }
-  const stored = new Map<string, Stored>();
+): Promise<{ item: OpenItem; computed: boolean }[]> {
+  const plain = items.map((item) => ({ item, computed: false }));
+  if (direction === null) return plain;
+  const wanted = items.filter(
+    (i) => i.amountDc === null && i.amount.currency !== ctx.currency && i.amount.minor !== 0,
+  );
+  if (wanted.length === 0) return plain;
+  const stored = new Map<string, { currency: string; rate: string | null }>();
   ctx.meter.used += 1;
   const rows = await ctx.db
     .prepare(
-      `SELECT exact_id, currency, rate, open_minor, open_dc_minor FROM open_items
+      `SELECT exact_id, currency, rate FROM open_items
        WHERE division_id = ?1 AND exact_id IN (SELECT value FROM json_each(?2))`,
     )
     .bind(ctx.division.id, JSON.stringify(wanted.map((i) => i.id.toLowerCase())))
-    .all<Stored & { exact_id: string }>();
+    .all<{ exact_id: string; currency: string; rate: string | null }>();
   for (const r of rows.results) stored.set(r.exact_id, r);
   const limit = BigInt(Number.MAX_SAFE_INTEGER);
   return items.map((it) => {
-    if (it.amountDc !== null || it.amount.currency === ctx.currency) return it;
+    if (it.amountDc !== null || it.amount.currency === ctx.currency || it.amount.minor === 0) {
+      return { item: it, computed: false };
+    }
     const s = stored.get(it.id.toLowerCase());
-    const same = s !== undefined && s.currency === it.amount.currency;
-    // A stored amount for this very open balance (read from Exact earlier) is kept by the upsert
-    // and is better than a computed one.
-    if (same && s.open_minor === it.amount.minor && s.open_dc_minor !== null) return it;
-    const rate = it.rate ?? (same ? s.rate : null);
-    if (rate === null) return it;
+    // A stored rate describes the booked invoice only while the currency is unchanged.
+    const rate = it.rate ?? (s !== undefined && s.currency === it.amount.currency ? s.rate : null);
+    if (rate === null) return { item: it, computed: false };
     const dc = bookedAtRate({
       openMinor: it.amount.minor,
       currency: it.amount.currency,
@@ -1611,8 +1637,11 @@ async function withComputedBooked(
       rate,
       direction,
     });
-    if (dc === null || dc > limit || dc < -limit) return it;
-    return { ...it, amountDc: { minor: Number(dc), currency: ctx.currency } };
+    if (dc === null || dc > limit || dc < -limit) return { item: it, computed: false };
+    return {
+      item: { ...it, amountDc: { minor: Number(dc), currency: ctx.currency } },
+      computed: true,
+    };
   });
 }
 

@@ -33,9 +33,12 @@ SELECT substr(entity_id, 1, 3), substr(entity_id, 5, 10),
        json_extract(after_json, '$.stored'), json_extract(after_json, '$.ecb'), MIN(at)
 FROM audit_log
 WHERE action = 'fx.rate_conflict' AND entity = 'fx_rate'
-  AND length(entity_id) = 14 AND substr(entity_id, 4, 1) = '@' AND entity_id = upper(entity_id)
+  AND length(entity_id) = 14 AND substr(entity_id, 4, 1) = '@'
+  AND substr(entity_id, 1, 3) NOT GLOB '*[^A-Z]*'
   AND substr(entity_id, 5, 10) NOT GLOB '*[^0-9-]*'
-  AND json_valid(after_json)
-  AND json_extract(after_json, '$.stored') IS NOT NULL
-  AND json_extract(after_json, '$.ecb') IS NOT NULL
+  -- Only well-formed rows; json_type is reached only for valid JSON (CASE, not AND, so the
+  -- planner cannot evaluate it on malformed text and fail the migration).
+  AND CASE WHEN json_valid(after_json)
+           THEN json_type(after_json, '$.stored') = 'text' AND json_type(after_json, '$.ecb') = 'text'
+           ELSE 0 END
 GROUP BY substr(entity_id, 1, 3), substr(entity_id, 5, 10), json_extract(after_json, '$.ecb');

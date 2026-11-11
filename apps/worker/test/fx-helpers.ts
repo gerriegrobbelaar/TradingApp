@@ -29,7 +29,7 @@ export interface FakeEcb {
   /** key `${currency}|${date}` -> rate */
   data: Map<string, string>;
   calls: EcbCall[];
-  /** Overrides the answer (default: the data filtered by startPeriod, as text/csv). */
+  /** Overrides the answer (default: the data filtered by startPeriod/endPeriod, as text/csv). */
   respond: ((call: EcbCall) => Response | Promise<Response>) | null;
   restore: () => void;
   set: (currency: string, date: string, rate: string) => void;
@@ -63,12 +63,13 @@ export function stubEcb(): FakeEcb {
     fake.calls.push(call);
     if (fake.respond) return fake.respond(call);
     const start = call.url.searchParams.get("startPeriod") ?? "0000-00-00";
+    const end = call.url.searchParams.get("endPeriod") ?? "9999-99-99";
     const rows = [...fake.data.entries()]
       .map(([k, rate]) => {
         const [currency, date] = k.split("|") as [string, string];
         return { currency, date, rate };
       })
-      .filter((r) => r.date >= start)
+      .filter((r) => r.date >= start && r.date <= end)
       .sort((a, b) => (a.currency + a.date).localeCompare(b.currency + b.date));
     return new Response(csvOf(rows), {
       status: 200,
@@ -92,7 +93,8 @@ export async function resetFx(): Promise<void> {
     db.prepare("DELETE FROM fx_rates"),
     db.prepare(
       `UPDATE fx_import_state SET last_attempt_at = NULL, last_success_at = NULL, last_status = NULL,
-         last_error_code = NULL, newest_rate_date = NULL, rows_inserted = 0`,
+         last_error_code = NULL, newest_rate_date = NULL, rows_inserted = 0,
+         backfill_target = NULL, backfill_cursor = NULL`,
     ),
   ]);
 }

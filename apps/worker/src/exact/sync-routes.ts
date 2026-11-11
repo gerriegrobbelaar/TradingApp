@@ -19,15 +19,19 @@
  *                                 returned is enabled by default; the others are listed but off.
  *                                 Sync (manual and scheduled) only handles enabled divisions.
  *  GET  /api/sync/settings        any signed-in role: `{ incrementalOpenItems,
- *                                 priorYearNightlyUntilMonth, listDcFields, rateDirection }`
- *  PUT  /api/sync/settings        admin (no step-up): `{ incrementalOpenItems?: boolean,
+ *                                 priorYearNightlyUntilMonth, listDcFields, rateDirection,
+ *                                 listDcFieldsUnavailableUntil }`
+ *  PUT  /api/sync/settings        admin (step-up only when listDcFields or rateDirection is in
+ *                                 the body): `{ incrementalOpenItems?: boolean,
  *                                 priorYearNightlyUntilMonth?: integer 0..12,
  *                                 listDcFields?: boolean,
  *                                 rateDirection?: 'base_per_foreign' | 'foreign_per_base' | null }`
  *                                 (at least one key; unknown keys are refused). `listDcFields`
  *                                 and `rateDirection` are the booked-amount switches of ADR 0038
  *                                 (both off/unset by default, set after live verification;
- *                                 changing listDcFields forgets a remembered 400). `exact.incremental_open_items`
+ *                                 changing listDcFields forgets a remembered 400, switching it off
+ *                                 clears amounts read from the list; changing rateDirection
+ *                                 clears every computed amount). `exact.incremental_open_items`
  *                                 is OFF until the same-ID assumption of ADR 0017 is verified.
  *                                 `exact.prior_year_nightly_until_month` (default 4): while the
  *                                 Amsterdam month is at most this, last year's balances are read
@@ -38,6 +42,7 @@
  * whose connection is disabled is not offered and cannot be selected or synced.
  */
 import { isRateDirection, type RateDirection } from "@camelthorn/core";
+import { isStepUpFresh } from "../auth/session";
 import { auditStatement } from "../db/audit";
 import { json, type Ctx, type Router } from "../router";
 import { PRIOR_YEAR_NIGHTLY_UNTIL_MONTH_KEY, readPriorYearNightlyUntilMonth } from "./ledger-sync";
@@ -245,6 +250,18 @@ export function registerSyncRoutes(router: Router): void {
       listDcFields: b.listDcFields,
       rateDirection: b.rateDirection,
     }))),
+    // Until when Exact's 400 on the extended list $select is remembered (ADR 0038), the latest
+    // of the receivables and payables rows of any division; null when nothing is remembered.
+    // Shown so an admin sees that listDcFields is on but not in use.
+    listDcFieldsUnavailableUntil:
+      (
+        await db
+          .prepare(
+            `SELECT MAX(unavailable_until) AS u FROM sync_state
+             WHERE entity IN ('receivables', 'payables') AND unavailable_until IS NOT NULL`,
+          )
+          .first<{ u: string | null }>()
+      )?.u ?? null,
   });
 
   router.add("GET", "/api/sync/settings", ANY_ROLE, async (ctx) => {
@@ -277,6 +294,11 @@ export function registerSyncRoutes(router: Router): void {
         (typeof month !== "number" || !Number.isInteger(month) || month < 0 || month > 12))
     ) {
       return json({ error: "bad_request" }, 400);
+    }
+    // The two booked-amount switches decide which money the item sheets and lists show (ADR
+    // 0038): like other sensitive admin acts they need a Google sign-in from the last 15 minutes.
+    if ((listDc !== undefined || direction !== undefined) && !isStepUpFresh(session, ctx.nowMs)) {
+      return json({ error: "step_up_required" }, 401);
     }
     const db = ctx.env.DB;
     const before = await readSettings(db);
@@ -356,6 +378,16 @@ export function registerSyncRoutes(router: Router): void {
              AND ?1 <> COALESCE((SELECT value_json FROM settings WHERE key = ?2), 'false')`,
           )
           .bind(JSON.stringify(listDc), LIST_DC_FIELDS_KEY),
+        // Switching the list fields off withdraws trust in what they gave: amounts read from them
+        // are cleared (sync and computed amounts stay). Before the upsert, so the guard still
+        // sees the old value. The next sync read or computation fills them again.
+        db
+          .prepare(
+            `UPDATE open_items SET open_dc_minor = NULL, dc_currency = NULL, dc_source = NULL
+             WHERE dc_source = 'list' AND ?1 = 'false'
+               AND COALESCE((SELECT value_json FROM settings WHERE key = ?2), 'false') <> ?1`,
+          )
+          .bind(JSON.stringify(listDc), LIST_DC_FIELDS_KEY),
         upsert(LIST_DC_FIELDS_KEY, listDc),
       );
     }
@@ -377,6 +409,17 @@ export function registerSyncRoutes(router: Router): void {
             binds: [RATE_DIRECTION_KEY, want === null ? "x" : JSON.stringify(want)],
           },
         ),
+        // A changed (or unset) direction makes every computed booked amount suspect: clear them
+        // all in the same batch, before the setting changes (the guard reads the old value).
+        // Amounts read from Exact (dc_source 'sync' / 'list') are untouched. The next full sync
+        // computes them again with the new direction (ADR 0038).
+        db
+          .prepare(
+            `UPDATE open_items SET open_dc_minor = NULL, dc_currency = NULL, dc_source = NULL
+             WHERE dc_source = 'computed'
+               AND COALESCE((SELECT value_json FROM settings WHERE key = ?1), 'x') <> ?2`,
+          )
+          .bind(RATE_DIRECTION_KEY, want === null ? "x" : JSON.stringify(want)),
         want === null
           ? db.prepare("DELETE FROM settings WHERE key = ?1").bind(RATE_DIRECTION_KEY)
           : upsert(RATE_DIRECTION_KEY, want),

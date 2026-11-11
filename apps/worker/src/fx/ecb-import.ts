@@ -47,10 +47,14 @@ export const ECB_RETRY_MARGIN_MS = 3 * 60_000;
 export const FIRST_IMPORT_DAYS = 400;
 /**
  * Shorter windows tried, in this order, when the first import's answer is `response_too_large`
- * (the 5 MiB cap): the same run asks again with 120 days, then 30. Nothing is remembered; the
- * next run's window starts from the newest stored date as usual (review N2, ADR 0036 addendum).
+ * (the 5 MiB cap): the same run asks again with 120 days, then 30. When one of them is used, the
+ * older history (back to the 400-day floor) is fetched afterwards in steps of BACKFILL_STEP_DAYS,
+ * one extra request per later run (fx_import_state.backfill_*, migration 0021; review N2, ADR
+ * 0036 addendum).
  */
 export const FIRST_IMPORT_FALLBACK_DAYS = [120, 30] as const;
+/** Days per backfill step (about 60 x 30 currencies: far below the 5 MiB cap). */
+export const BACKFILL_STEP_DAYS = 60;
 export const INCREMENTAL_DAYS = 10;
 /** Back from the newest stored date, so a publication that came after 17:30 is picked up later. */
 export const OVERLAP_DAYS = 3;
@@ -353,6 +357,91 @@ export function retryFits(ctx: JobContext, delaySeconds: number): boolean {
   );
 }
 
+interface Backfill {
+  target: string;
+  cursor: string;
+}
+
+/** The pending backfill (migration 0021), or null when there is none. Unreadable = none. */
+async function readBackfill(db: D1Database): Promise<Backfill | null> {
+  const r = await db
+    .prepare("SELECT backfill_target AS t, backfill_cursor AS c FROM fx_import_state WHERE id = 1")
+    .first<{ t: string | null; c: string | null }>()
+    .catch(() => null);
+  if (r?.t == null || r.c == null || !ISO.test(r.t) || !ISO.test(r.c)) return null;
+  return { target: r.t, cursor: r.c };
+}
+
+/**
+ * One backfill step (review N2): the BACKFILL_STEP_DAYS before the cursor, never before the
+ * target. Stored like any import (never overwriting, conflicts recorded). The cursor moves only
+ * when the step's answer was usable (an empty answer is usable: the ECB has nothing there), so a
+ * failed step is repeated by the next run; the step's failure never fails the run. Done when the
+ * cursor reaches the target: both columns are cleared.
+ */
+async function backfillStep(
+  ctx: JobContext,
+  b: Backfill,
+  today: string,
+  nowIso: string,
+): Promise<{ inserted: number; conflicts: number; summary: Record<string, string | number> }> {
+  const db = ctx.env.DB;
+  const none = { inserted: 0, conflicts: 0 };
+  if (b.cursor <= b.target) {
+    await db
+      .prepare(
+        "UPDATE fx_import_state SET backfill_target = NULL, backfill_cursor = NULL WHERE id = 1",
+      )
+      .run();
+    return { ...none, summary: {} };
+  }
+  const end = addDaysIso(b.cursor, -1);
+  const stepFrom = addDaysIso(b.cursor, -BACKFILL_STEP_DAYS);
+  const from = stepFrom < b.target ? b.target : stepFrom;
+  try {
+    const fetched = await fetchEcb(
+      ecbRequestUrl({ startDate: from, endDate: end }),
+      ctx.signal,
+      ctx.now,
+    );
+    if (fetched.kind !== "ok") return { ...none, summary: { backfillError: fetched.code } };
+    let observations: EcbObservation[] = [];
+    if (!fetched.empty) {
+      const parsed = parseEcbCsv(fetched.text);
+      if (parsed.ok) observations = parsed.observations;
+      else if (parsed.error !== "no_observations" || hasDataRows(fetched.text)) {
+        return { ...none, summary: { backfillError: "bad_response" } };
+      }
+    }
+    const inWindow = observations.filter((o) => o.rateDate >= from && o.rateDate <= end);
+    const res = await storeObservations(db, inWindow, from, today, nowIso);
+    const done = from <= b.target;
+    await db
+      .prepare(
+        `UPDATE fx_import_state SET
+           backfill_cursor = CASE WHEN ?2 = 1 THEN NULL ELSE ?1 END,
+           backfill_target = CASE WHEN ?2 = 1 THEN NULL ELSE backfill_target END
+         WHERE id = 1 AND backfill_cursor = ?3`,
+      )
+      .bind(from, done ? 1 : 0, b.cursor)
+      .run();
+    return {
+      inserted: res.inserted,
+      conflicts: res.conflicts,
+      summary: {
+        backfillFrom: from,
+        backfillInserted: res.inserted,
+        ...(done ? {} : { backfillPending: 1 }),
+      },
+    };
+  } catch (e) {
+    if (ctx.signal.aborted) throw e;
+    // A D1 hiccup in the extra step must not fail the import that already succeeded.
+    console.error("ecb backfill step failed", e instanceof Error ? e.name : "unknown");
+    return { ...none, summary: { backfillError: "internal_error" } };
+  }
+}
+
 export async function runEcbImport(ctx: JobContext): Promise<HandlerResult> {
   try {
     return await importOnce(ctx);
@@ -395,6 +484,9 @@ async function importOnce(ctx: JobContext): Promise<HandlerResult> {
   const window = await importWindow(db, today);
   const first = window.first;
   let start = window.start;
+  // Any backfill step is decided BEFORE this run's own fetch, so a first import that falls back
+  // in this run does not also take a step (at most three requests in one run).
+  const pendingBackfill = first ? null : await readBackfill(db);
   let fetched = await fetchEcb(ecbRequestUrl({ startDate: start }), ctx.signal, ctx.now);
   // The first import is all-or-nothing at the size cap: ask again with a shorter window.
   for (const days of FIRST_IMPORT_FALLBACK_DAYS) {
@@ -443,7 +535,7 @@ async function importOnce(ctx: JobContext): Promise<HandlerResult> {
   const res = await storeObservations(db, observations, start, today, nowIso);
   const todayCount = await currenciesOn(db, slotDate);
   const expected = await expectedCurrencies(db, slotDate);
-  const summary = {
+  const summary: Record<string, string | number | boolean> = {
     firstImport: first,
     windowDays: Math.round((Date.parse(today) - Date.parse(start)) / 86_400_000),
     received: observations.length,
@@ -453,6 +545,21 @@ async function importOnce(ctx: JobContext): Promise<HandlerResult> {
     currenciesToday: todayCount,
     ...(todayCount > 0 && todayCount < expected ? { missingToday: expected - todayCount } : {}),
   };
+  // N2: a first import that fell back to a shorter window leaves the older history to later
+  // runs; a later run takes one bounded step towards the 400-day floor.
+  if (first && start !== window.start && res.inserted > 0) {
+    await db
+      .prepare("UPDATE fx_import_state SET backfill_target = ?1, backfill_cursor = ?2 WHERE id = 1")
+      .bind(window.start, start)
+      .run();
+    summary.backfillPending = 1;
+  }
+  if (pendingBackfill !== null) {
+    const step = await backfillStep(ctx, pendingBackfill, today, nowIso);
+    Object.assign(summary, step.summary);
+    res.inserted += step.inserted;
+    res.conflicts += step.conflicts;
+  }
   const extra = { inserted: res.inserted, conflicts: res.conflicts };
 
   if (!scheduled && observations.length === 0) {

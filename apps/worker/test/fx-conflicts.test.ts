@@ -401,6 +401,80 @@ describe("POST /api/fx/conflicts/:id/resolve", () => {
   });
 });
 
+describe("resolve: review of T1 (races, rate canonical and from the stored row only)", () => {
+  let id: number;
+  beforeEach(async () => {
+    await put("USD", "2026-11-09", "1.09");
+    await seen([{ currency: "USD", date: "2026-11-09", ecb: "1.1" }]);
+    id = ((await conflicts())[0] as ConflictDb).id;
+  });
+
+  it("two admins deciding differently at the same time: one wins, the other gets 409", async () => {
+    const second = await addSession(await addUser("admin2@camelthorncapital.com", ["admin"]));
+    const [a, b] = await Promise.all([
+      post(id, { resolution: "accepted", confirm: true }),
+      authed(`/api/fx/conflicts/${id}/resolve`, second, {
+        method: "POST",
+        json: { resolution: "kept", confirm: true },
+      }),
+    ]);
+    const statuses = [a.status, b.status].sort();
+    expect(statuses).toEqual([200, 409]);
+    const [c] = await conflicts();
+    expect(await newAudits()).toHaveLength(1);
+    // the rate is what the winner decided
+    expect((await fxRows())[0]?.rate).toBe(c?.resolution === "accepted" ? "1.1" : "1.09");
+  });
+
+  it("the accepted value is the stored conflict's, in canonical form; the body cannot carry one", async () => {
+    const res = await post(id, { resolution: "accepted", confirm: true, rate: "9.99" });
+    expect(res.status).toBe(400);
+    await db
+      .prepare("UPDATE fx_rate_conflicts SET ecb_rate = '1.1000' WHERE id = ?1")
+      .bind(id)
+      .run();
+    expect((await post(id, { resolution: "accepted", confirm: true })).status).toBe(200);
+    expect((await fxRows())[0]?.rate).toBe("1.1");
+    const [audit] = await newAudits();
+    expect(JSON.parse(audit?.after_json ?? "{}")).toMatchObject({ rate: "1.1", ecb: "1.1" });
+  });
+
+  it("a malformed ECB value (an old audit row copied by the migration) can be kept, never accepted", async () => {
+    await db.prepare("UPDATE fx_rate_conflicts SET ecb_rate = '1e3' WHERE id = ?1").bind(id).run();
+    const res = await post(id, { resolution: "accepted", confirm: true });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "bad_conflict_rate" });
+    expect((await fxRows())[0]?.rate).toBe("1.09");
+    expect(await newAudits()).toEqual([]);
+    expect((await post(id, { resolution: "kept", confirm: true })).status).toBe(200);
+    expect((await fxRows())[0]?.rate).toBe("1.09");
+  });
+
+  it("two ECB values for one date: accepting one, then the other, each against the rate then stored", async () => {
+    await seen([{ currency: "USD", date: "2026-11-09", ecb: "1.2" }]);
+    const [first, other] = await conflicts();
+    expect(
+      (await post(first?.id as number, { resolution: "accepted", confirm: true })).status,
+    ).toBe(200);
+    expect((await fxRows())[0]?.rate).toBe("1.1");
+    expect(
+      (await post(other?.id as number, { resolution: "accepted", confirm: true })).status,
+    ).toBe(200);
+    expect((await fxRows())[0]?.rate).toBe("1.2");
+    const befores = (
+      await db
+        .prepare(
+          "SELECT before_json FROM audit_log WHERE action = 'fx.rate_conflict_resolved' ORDER BY id",
+        )
+        .all<{ before_json: string }>()
+    ).results.slice(auditBase);
+    expect(befores.map((a) => JSON.parse(a.before_json))).toEqual([
+      { rate: "1.09" },
+      { rate: "1.1" },
+    ]);
+  });
+});
+
 describe("the strict rate table follows the conflicts", () => {
   it("refuses the date until the conflict is resolved, then serves the resolved rate", async () => {
     await put("USD", "2026-10-30", "1.1650");

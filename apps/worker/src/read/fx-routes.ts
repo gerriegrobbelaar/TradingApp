@@ -11,7 +11,8 @@
  *  POST /api/fx/conflicts/:id/resolve      admin + step-up: {resolution:'kept'|'accepted',
  *                                          confirm:true}; 'accepted' replaces the stored rate
  *                                          (audited before/after, one batch); 404, 409
- *                                          already_resolved_differently / stale_conflict
+ *                                          already_resolved_differently / stale_conflict /
+ *                                          bad_conflict_rate
  *
  * Any signed-in role may read; responses are no-store. Rates are public data, so nothing is
  * masked. `stale` follows fx/staleness.ts and describes the newest stored rate (the feed), not
@@ -212,6 +213,8 @@ async function resolveHandler(ctx: Ctx): Promise<Response> {
       return json({ error: "already_resolved_differently" }, 409);
     case "stale":
       return json({ error: "stale_conflict" }, 409);
+    case "bad_rate":
+      return json({ error: "bad_conflict_rate" }, 409);
     case "resolved":
     case "already_resolved": {
       const res: FxConflictResolveResponse = {

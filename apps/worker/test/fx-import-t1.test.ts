@@ -211,3 +211,108 @@ describe("first import falls back to a shorter window when the answer is too lar
     expect(ecb.calls).toHaveLength(1);
   });
 });
+
+describe("after a shortened first import, older history is backfilled in bounded steps (N2)", () => {
+  const today = "2026-11-10";
+  const startOf = (call: { url: URL }) => call.url.searchParams.get("startPeriod") as string;
+  const endOf = (call: { url: URL }) => call.url.searchParams.get("endPeriod");
+  const days = (a: string, b: string) => Math.round((Date.parse(b) - Date.parse(a)) / 86_400_000);
+  const backfillState = () =>
+    db
+      .prepare(
+        "SELECT backfill_target AS t, backfill_cursor AS c FROM fx_import_state WHERE id = 1",
+      )
+      .first<{ t: string | null; c: string | null }>();
+
+  /** The answer is too large when the window spans more than 120 days, whatever its start. */
+  const sizeLimited = () => {
+    ecb.fill(CURRENCIES, addDaysIso(today, -420), today);
+    ecb.respond = (call) => {
+      const end = endOf(call) ?? today;
+      if (days(startOf(call), end) > 120) {
+        return new Response("x", {
+          status: 200,
+          headers: { "content-type": "text/csv", "content-length": String(ECB_MAX_BYTES + 1) },
+        });
+      }
+      const rows = [...ecb.data.entries()]
+        .map(([k, rate]) => {
+          const [currency, date] = k.split("|") as [string, string];
+          return { currency, date, rate };
+        })
+        .filter((r) => r.date >= startOf(call) && r.date <= end);
+      return csvResponse(csvOf(rows));
+    };
+  };
+  const manualAt = (hoursLater: number) =>
+    runEcbImport(
+      ctxAt(TUE_SLOT, { trigger: "manual", now: Date.parse(TUE_SLOT) + hoursLater * 3600_000 }),
+    );
+
+  it("records the target and walks back 60 days per run until the 400-day floor, then stops", async () => {
+    sizeLimited();
+    const first = await manualAt(0);
+    expect(first).toMatchObject({ status: "ok", summary: { windowDays: 120, backfillPending: 1 } });
+    expect(await backfillState()).toEqual({
+      t: addDaysIso(today, -400),
+      c: addDaysIso(today, -120),
+    });
+
+    const steps: string[] = [];
+    for (let run = 1; run <= 8; run++) {
+      ecb.calls.length = 0;
+      const r = await manualAt(run);
+      expect(r.status, `run ${run}`).toBe("ok");
+      const extra = ecb.calls.filter((c) => endOf(c) !== null);
+      // at most ONE extra request per run
+      expect(extra.length, `run ${run}`).toBeLessThanOrEqual(1);
+      for (const c of extra) {
+        steps.push(`${startOf(c)}..${endOf(c)}`);
+        expect(days(startOf(c), endOf(c) as string)).toBeLessThan(60);
+      }
+    }
+    expect(steps).toEqual([
+      `${addDaysIso(today, -180)}..${addDaysIso(today, -121)}`,
+      `${addDaysIso(today, -240)}..${addDaysIso(today, -181)}`,
+      `${addDaysIso(today, -300)}..${addDaysIso(today, -241)}`,
+      `${addDaysIso(today, -360)}..${addDaysIso(today, -301)}`,
+      `${addDaysIso(today, -400)}..${addDaysIso(today, -361)}`,
+    ]);
+    expect(await backfillState()).toEqual({ t: null, c: null });
+    // every date the fake holds from the floor on is stored now, nothing older
+    const stored = new Set((await fxRows()).map((x) => `${x.currency}|${x.rate_date}`));
+    const want = [...ecb.data.keys()].filter(
+      (k) => (k.split("|")[1] as string) >= addDaysIso(today, -400),
+    );
+    expect(want.every((k) => stored.has(k))).toBe(true);
+    expect([...stored].every((k) => (k.split("|")[1] as string) >= addDaysIso(today, -400))).toBe(
+      true,
+    );
+  });
+
+  it("a failed step does not fail the run and is repeated by the next one", async () => {
+    sizeLimited();
+    await manualAt(0);
+    const normal = ecb.respond;
+    ecb.respond = (call) =>
+      endOf(call) !== null
+        ? new Response("busy", { status: 503 })
+        : (normal as NonNullable<typeof normal>)(call);
+    const r = await manualAt(1);
+    expect(r).toMatchObject({ status: "ok" });
+    expect(r.summary).toMatchObject({ backfillError: expect.any(String) });
+    expect(await backfillState()).toMatchObject({ c: addDaysIso(today, -120) });
+    ecb.respond = normal;
+    await manualAt(2);
+    expect(await backfillState()).toMatchObject({ c: addDaysIso(today, -180) });
+  });
+
+  it("a first import that fits needs no backfill", async () => {
+    ecb.fill(CURRENCIES, addDaysIso(today, -30), today);
+    await manualAt(0);
+    expect(await backfillState()).toEqual({ t: null, c: null });
+    ecb.calls.length = 0;
+    await manualAt(1);
+    expect(ecb.calls).toHaveLength(1);
+  });
+});

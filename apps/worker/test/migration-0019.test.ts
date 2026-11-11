@@ -33,6 +33,12 @@ describe("migration 0019 on a populated database", () => {
       audit("usd@2026-10-30", '{"stored":"1","ecb":"2"}', "2026-11-03T16:00:00.000Z"),
       audit("GBP@2026-10-30", '{"stored":"1"}', "2026-11-03T16:00:00.000Z"),
       audit("GBP@2026-10-30", null, "2026-11-03T16:00:00.000Z"),
+      // numbers instead of decimal text, a null, an array, a non-letter code: ignored, and the
+      // migration does not fail on them (audit_log's own CHECK keeps after_json valid JSON)
+      audit("GBP@2026-10-30", '{"stored":1.1,"ecb":1.2}', "2026-11-03T16:00:00.000Z"),
+      audit("GBP@2026-10-30", '{"stored":"1.1","ecb":null}', "2026-11-03T16:00:00.000Z"),
+      audit("GBP@2026-10-30", '["1.1","1.2"]', "2026-11-03T16:00:00.000Z"),
+      audit("U1D@2026-10-30", '{"stored":"1","ecb":"2"}', "2026-11-03T16:00:00.000Z"),
     ]);
     const rates = (await mdb.prepare("SELECT * FROM fx_rates ORDER BY currency").all()).results;
 

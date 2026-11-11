@@ -565,26 +565,35 @@ sync panel on the test division.
 17. **Booked amount of a foreign-currency invoice (Phase 6 review B1; before relying on the
     "Booked" and difference lines on Overview, Invoices and Payables; ADR 0038).** The unrealised
     difference needs `open_items.open_dc_minor`, the open amount in the administration currency
-    at the booked rate. Nothing sets it from the nightly list by default, so **a USD invoice
-    shows no "Booked" line and no difference until this is done**. After the first full sync:
+    at the booked rate (`dc_source` says where it came from: `sync`, `list` or `computed`).
+    Nothing sets it from the nightly list by default, so **a USD invoice shows no "Booked" line
+    and no difference until this is done**. Both switches below are admin only, need a Google
+    sign-in from the last 15 minutes (else 401 `step_up_required`: sign in again) and are audited.
+    After the first full sync:
     - Find one open USD (or other foreign) invoice that has a part payment in Exact and one that
       has none. In Exact note the open amount in USD and in EUR, and the rate.
-    - Option 3, the one that works without guessing field names: the incremental open-item read
-      (Settings, Connections, "Read open receivables and payables in the hourly sync", item 9) fills
-      `open_dc_minor` and `rate` from the sync endpoint. Compare them with Exact. If `rate` is
-      right, decide its direction from the invoice you noted (0.92 EUR per USD is
-      `base_per_foreign`, 1.087 USD per EUR is `foreign_per_base`) and, as admin,
-      `PUT /api/sync/settings` with `{"rateDirection":"base_per_foreign"}` (or `foreign_per_base`;
-      `null` unsets). From then on the nightly list computes the booked amount of the remainder
-      as open amount times the booked rate. Do not set it before you have checked one invoice
-      both ways: a wrong direction books wrong money. It is audited
-      (`settings.exact_rate_direction`).
-    - Option 1, only if you want to test it: `PUT /api/sync/settings` with
-      `{"listDcFields":true}` makes the nightly list ask for `AmountDC` and `RateFC` as well. The
-      names are a guess. If Exact answers 400, the sync repeats the read without them, remembers it
-      for 7 days (`sync_state.unavailable_until` on the receivables and payables rows) and carries
-      on; nothing fails. If it answers 200, compare `open_dc_minor` of the part-paid invoice with
-      Exact's EUR figure; a total instead of an open amount is the likely mistake.
+    - Turn on the incremental open-item read (Settings, Connections, "Read open receivables and
+      payables in the hourly sync", item 9) and wait for an hourly sync. It fills
+      `open_dc_minor` (`dc_source` = `sync`) and `rate` from the sync endpoint. Compare both with
+      Exact for the two invoices: `open_dc_minor` must be Exact's EUR open amount (for the
+      part-paid one: the remainder, not the total).
+    - Option 3, the one that needs no guessed field names: if `rate` is right, decide its direction
+      from the invoice you noted (0.92 EUR per USD is `base_per_foreign`, 1.087 USD per EUR is
+      `foreign_per_base`) and `PUT /api/sync/settings` with `{"rateDirection":"base_per_foreign"}`
+      (or `foreign_per_base`; `null` unsets). From then on the nightly list computes the booked
+      amount of an item whose open amount changed as open amount times its stored rate
+      (`dc_source` = `computed`); an item never seen by the sync read has no rate and stays
+      without a booked amount. Do not set it before you have checked one invoice both ways: a
+      wrong direction shows wrong money. Changing or unsetting it clears every computed amount at
+      once; the next full sync computes them again. Amounts read from Exact are never touched.
+    - Option 1, only if you want to test it: `PUT /api/sync/settings` with `{"listDcFields":true}`
+      makes the nightly list ask for `AmountDC` and `RateFC` as well. The names are a guess. If
+      Exact answers 400 and the same read without them works, the sync carries on without them
+      and remembers it for 7 days (`listDcFieldsUnavailableUntil` in `GET /api/sync/settings`);
+      nothing fails. If it answers 200, compare `open_dc_minor` (`dc_source` = `list`) of the
+      part-paid invoice with Exact's EUR open amount; a total instead of an open amount is the
+      likely mistake, and then switch it off again (`{"listDcFields":false}` clears every amount
+      it gave).
     - **Done when:** the morning after a full sync, a USD invoice shows "Booked" and the difference
       in the item sheet and the Invoices list, for a part-paid one too (its booked amount is the
       remainder, not the invoice total). A part payment seen only by the nightly list clears the
@@ -773,8 +782,9 @@ Schedules.
   `pnpm exec wrangler d1 execute <database> --remote --command "UPDATE jobs SET enabled = 0 WHERE name = 'ecb.fx_import'"`.
 - First-live checks (**unverified**, the sandbox cannot reach the ECB): the response is accepted as
   `text/csv`; the 400-day first import stays under 5 MiB and contains about 30 currencies (if it
-  does not, the same run asks again for 120 and then 30 days, ADR 0036; the summary's `windowDays`
-  says which one was used); three rates compared by hand with the ECB website; Settings, FX rates
+  does not, the same run asks again for 120 and then 30 days and later runs fetch the older history
+  60 days at a time until 400 days are covered, ADR 0036; the summary's `windowDays` says which
+  window was used and `backfillFrom` / `backfillPending` show the steps); three rates compared by hand with the ECB website; Settings, FX rates
   shows the import as OK; one `fx.import` audit row exists.
 - A rate the ECB later changes is never overwritten. It shows as a conflict in
   `GET /api/fx/conflicts` (admin, finance) and in `unresolvedConflicts` of `GET /api/fx/rates`; an
