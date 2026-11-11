@@ -36,6 +36,9 @@ import {
   txStatus,
   resetWorld,
   enableAuto,
+  setSetting,
+  SETTING_AUTO,
+  SETTING_CONFIG,
   type World,
 } from "./matching-helpers";
 
@@ -1130,6 +1133,186 @@ describe("configuration", () => {
   });
 });
 
+describe("configuration while automatic matching is on (S3)", () => {
+  const PHRASE = "ENABLE AUTOMATIC MATCHING";
+  const put = (body: unknown) =>
+    send<MatchConfigResponse>("admin", "PUT", "/api/matching/config", body);
+  const gapOf = async (): Promise<number> =>
+    (await get<MatchConfigResponse>("admin", "/api/matching/config")).body.config.autoMatchMinGap;
+
+  it("loosening needs the phrase again, tightening and unrelated changes do not", async () => {
+    await put({ config: { autoMatchMinGap: 30 } });
+    await put({ autoEnabled: true, confirm: PHRASE });
+    const loosening: Record<string, unknown>[] = [
+      { autoMatchMinGap: 29 },
+      { blockAutoOnRecentIbanChangeDays: 60 },
+      { autoLedgerPatterns: true },
+      { autoIncomingUnknownIban: true },
+      { amountToleranceMinor: 1 },
+      { autoTxTypes: ["transfer", "topup", "card_payment", "atm"] },
+    ];
+    for (const config of loosening) {
+      const r = await put({ config });
+      expect([r.status, err(r)], JSON.stringify(config)).toEqual([422, "confirmation_required"]);
+    }
+    expect(await gapOf()).toBe(30);
+    const wrong = await put({ config: { autoMatchMinGap: 25 }, confirm: "yes" });
+    expect(err(wrong)).toBe("confirmation_required");
+    const ok = await put({ config: { autoMatchMinGap: 25 }, confirm: PHRASE });
+    expect(ok.status).toBe(200);
+    expect(await gapOf()).toBe(25);
+    // Tightening and an unrelated change: no phrase.
+    expect((await put({ config: { autoMatchMinGap: 40 } })).status).toBe(200);
+    expect((await put({ config: { maxCandidates: 7 } })).status).toBe(200);
+    expect((await put({ config: { autoIncomingUnknownIban: false } })).status).toBe(200);
+    // Turning auto off in the same request lets a loosening through.
+    const both = await put({ autoEnabled: false, config: { autoMatchMinGap: 12 } });
+    expect([both.status, both.body.autoEnabled]).toEqual([200, false]);
+  });
+
+  it("with automatic matching off, loosening needs no phrase", async () => {
+    const r = await put({ config: { autoMatchMinGap: 11, autoIncomingUnknownIban: true } });
+    expect(r.status).toBe(200);
+    expect(r.body.config.autoIncomingUnknownIban).toBe(true);
+  });
+
+  it("a stored config below the floors is invalid, and repairing it while auto is on needs the phrase", async () => {
+    await setSetting(SETTING_CONFIG, { autoMatchMinGap: 5 });
+    await setSetting(SETTING_AUTO, true);
+    const r = await get<MatchConfigResponse>("admin", "/api/matching/config");
+    expect(r.body.configErrors.length).toBeGreaterThan(0);
+    const no = await put({ config: { autoMatchMinGap: 20 } });
+    expect(err(no)).toBe("confirmation_required");
+    expect((await put({ config: { autoMatchMinGap: 20 }, confirm: PHRASE })).status).toBe(200);
+  });
+
+  it("removing a no-match type or an own-account type while auto is on needs the phrase", async () => {
+    await put({ autoEnabled: true, confirm: PHRASE });
+    for (const config of [{ noMatchTxTypes: [] }, { internalAccountTypes: [] }]) {
+      const r = await put({ config });
+      expect([r.status, err(r)], JSON.stringify(config)).toEqual([422, "confirmation_required"]);
+    }
+    // Adding to them tightens.
+    expect((await put({ config: { noMatchTxTypes: ["exchange", "fee"] } })).status).toBe(200);
+  });
+
+  it("switching auto ON and loosening in one request: the enable phrase covers both", async () => {
+    const no = await put({ autoEnabled: true, config: { autoMatchMinGap: 10 } });
+    expect(err(no)).toBe("confirmation_required");
+    expect(await gapOf()).toBe(20);
+    const ok = await put({ autoEnabled: true, config: { autoMatchMinGap: 10 }, confirm: PHRASE });
+    expect([ok.status, ok.body.autoEnabled, ok.body.config.autoMatchMinGap]).toEqual([
+      200,
+      true,
+      10,
+    ]);
+  });
+
+  it("the API refuses values below the floors whatever the phrase", async () => {
+    for (const config of [{ autoMatchMinGap: 9 }, { blockAutoOnRecentIbanChangeDays: 29 }]) {
+      const r = await put({ config, confirm: PHRASE });
+      expect([r.status, err(r)]).toEqual([422, "bad_config"]);
+    }
+  });
+
+  it("rev: a stale client gets 409 and nothing is written; the current rev works", async () => {
+    const first = await get<MatchConfigResponse>("admin", "/api/matching/config");
+    expect(first.body.rev).toBeNull();
+    const a = await put({ config: { autoMatchMinGap: 30 }, rev: null });
+    expect(a.status).toBe(200);
+    expect(typeof a.body.rev).toBe("string");
+    const stale = await put({ config: { autoMatchMinGap: 40 }, rev: null });
+    expect([stale.status, err(stale)]).toEqual([409, "conflict"]);
+    expect(await gapOf()).toBe(30);
+    const ok = await put({ config: { autoMatchMinGap: 40 }, rev: a.body.rev });
+    expect(ok.status).toBe(200);
+    expect(ok.body.rev).not.toBe(a.body.rev);
+    expect((await put({ config: {}, rev: 5 })).status).toBe(400);
+    // Switching auto off (the safe direction) also moves the rev.
+    await put({ autoEnabled: true, confirm: PHRASE });
+    const before = (await get<MatchConfigResponse>("admin", "/api/matching/config")).body.rev;
+    await send("admin", "POST", "/api/matching/auto/disable", {});
+    const after = (await get<MatchConfigResponse>("admin", "/api/matching/config")).body.rev;
+    expect(after).not.toBe(before);
+  });
+
+  it("race: a loosening checked while auto was off cannot land after auto went on", async () => {
+    // Request L (auto off, loosening, no phrase needed) reads the settings; request E switches
+    // auto on before L writes. Simulated by changing the rev between L's read and its batch.
+    await put({ config: { autoMatchMinGap: 30 } });
+    const realBatch = db.batch.bind(db);
+    let raced = false;
+    (db as { batch: typeof db.batch }).batch = async (stmts) => {
+      if (!raced) {
+        raced = true;
+        await realBatch([
+          db.prepare("UPDATE settings SET value_json = '\"other\"' WHERE key = 'matching.rev'"),
+          db.prepare(
+            `INSERT INTO settings (key, value_json, updated_at) VALUES ('matching.auto_enabled', 'true', 'x')
+               ON CONFLICT (key) DO UPDATE SET value_json = 'true'`,
+          ),
+        ]);
+      }
+      return realBatch(stmts);
+    };
+    let r: { status: number; body: unknown };
+    const auditsBefore = (await auditRows("matching.config_changed")).length;
+    try {
+      r = await put({ config: { autoMatchMinGap: 10 } });
+    } finally {
+      (db as { batch: typeof db.batch }).batch = realBatch;
+    }
+    expect([r.status, err(r)]).toEqual([409, "conflict"]);
+    expect(await gapOf()).toBe(30);
+    expect((await auditRows("matching.config_changed")).length).toBe(auditsBefore);
+  });
+});
+
+describe("ledger patterns while automatic ledger matching is on (S3)", () => {
+  const PHRASE = "ENABLE AUTOMATIC MATCHING";
+  const pattern = {
+    name: "Bank fees",
+    ledgerAccountCode: "4510",
+    counterpartyNameRegex: "^revolut",
+    type: "fee",
+    direction: "out",
+    maxAmountMinor: 5_000,
+  };
+  const post = (body: unknown) => send("admin", "POST", "/api/matching/patterns", body);
+
+  it("a new or changed enabled pattern needs the phrase; renaming, disabling and deleting do not", async () => {
+    // Auto on, ledger patterns off: no phrase.
+    await send("admin", "PUT", "/api/matching/config", { autoEnabled: true, confirm: PHRASE });
+    const p0 = await post(pattern);
+    expect(p0.status).toBe(201);
+    await send("admin", "PUT", "/api/matching/config", {
+      config: { autoLedgerPatterns: true },
+      confirm: PHRASE,
+    });
+    const no = await post({ ...pattern, name: "Card fees" });
+    expect([no.status, err(no)]).toEqual([422, "confirmation_required"]);
+    expect((await post({ ...pattern, name: "Card fees", enabled: false })).status).toBe(201);
+    expect((await post({ ...pattern, name: "Card fees", confirm: PHRASE })).status).toBe(201);
+    const id = (p0.body as { pattern: MatchPatternDto }).pattern.id;
+    const put = (body: unknown) => send("admin", "PUT", `/api/matching/patterns/${id}`, body);
+    expect((await put({ ...pattern, name: "Renamed" })).status).toBe(200);
+    const wider = await put({ ...pattern, counterpartyNameRegex: "revolut" });
+    expect([wider.status, err(wider)]).toEqual([422, "confirmation_required"]);
+    const bigger = await put({ ...pattern, maxAmountMinor: 50_000 });
+    expect(err(bigger)).toBe("confirmation_required");
+    expect((await put({ ...pattern, enabled: false })).status).toBe(200);
+    // Re-enabling a disabled pattern is a new automatic rule.
+    expect(err(await put({ ...pattern }))).toBe("confirmation_required");
+    expect((await put({ ...pattern, confirm: PHRASE })).status).toBe(200);
+    expect((await send("admin", "DELETE", `/api/matching/patterns/${id}`)).status).toBe(200);
+  });
+
+  it("with automatic matching off nothing needs the phrase", async () => {
+    await send("admin", "PUT", "/api/matching/config", { config: { autoLedgerPatterns: true } });
+    expect((await post(pattern)).status).toBe(201);
+  });
+});
+
 describe("account map", () => {
   it("shows accounts with their mapping and the administrations to choose from", async () => {
     const r = await get<MatchAccountMapResponse>("admin", "/api/matching/account-map");
@@ -1485,6 +1668,7 @@ describe("response shapes", () => {
       "matchesNeedingReview",
       "oldestUnmatchedAt",
       "oldestUnmatchedDays",
+      "staleSettlements",
       "suggested",
       "unmappedAccounts",
       "unmatched",
@@ -1497,6 +1681,7 @@ describe("response shapes", () => {
       "configErrors",
       "defaults",
       "enabled",
+      "rev",
       "updatedAt",
       "updatedBy",
     ]);

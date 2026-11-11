@@ -19,6 +19,7 @@
  */
 import {
   compileSafeRegex,
+  isLoosening,
   likePatterns,
   maskIban,
   normalizeIban,
@@ -48,6 +49,7 @@ import { ANY_ROLE, BadRequest, guarded, positiveIntParam } from "../read/routes"
 import { clearStateConflict } from "../revolut/conflicts";
 import { json, type Ctx, type Router } from "../router";
 import { loadMappings } from "./assemble";
+import { staleSettlements } from "./settlement";
 import {
   AUTO_CONFIRM_PHRASE,
   buildMatchConfig,
@@ -58,6 +60,7 @@ import {
   SETTING_AUTO,
   SETTING_CONFIG,
   SETTING_ENABLED,
+  SETTING_REV,
   toLedgerPattern,
   type Tunables,
 } from "./config";
@@ -429,6 +432,7 @@ async function statsHandler(ctx: Ctx): Promise<Response> {
     enabled: settings.enabled,
     autoEnabled: settings.autoEnabled,
     unmappedAccounts,
+    staleSettlements: await staleSettlements(db, new Date(ctx.nowMs).toISOString()),
     booking: await bookingHealth(db),
   };
   return json(body);
@@ -748,7 +752,10 @@ async function disableAutoHandler(ctx: Ctx): Promise<Response> {
   const cur = await loadMatchingSettings(db);
   if (cur.autoEnabled) {
     const nowIso = new Date(ctx.nowMs).toISOString();
+    // Unconditional (the safe direction never fails); the new revision makes a PUT that read the
+    // old state fail with 409 instead of acting on it.
     await db.batch([
+      revBump(db, actor, nowIso, JSON.stringify(crypto.randomUUID()), null),
       db
         .prepare(
           `INSERT INTO settings (key, value_json, updated_by, updated_at) VALUES (?1, 'false', ?2, ?3)
@@ -769,6 +776,43 @@ async function disableAutoHandler(ctx: Ctx): Promise<Response> {
   return json(await configResponse(db));
 }
 
+/**
+ * Replaces the settings revision. With `expected` (the raw value read, or the string "absent"
+ * for no row) only when it is still that value; null = unconditionally.
+ */
+function revBump(
+  db: D1Database,
+  actor: string,
+  nowIso: string,
+  next: string,
+  expected: string | null,
+): D1PreparedStatement {
+  if (expected === null) {
+    return db
+      .prepare(
+        `INSERT INTO settings (key, value_json, updated_by, updated_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json,
+           updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+      )
+      .bind(SETTING_REV, next, actor, nowIso);
+  }
+  if (expected === REV_ABSENT) {
+    return db
+      .prepare(
+        `INSERT INTO settings (key, value_json, updated_by, updated_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (key) DO NOTHING`,
+      )
+      .bind(SETTING_REV, next, actor, nowIso);
+  }
+  return db
+    .prepare(
+      `UPDATE settings SET value_json = ?2, updated_by = ?3, updated_at = ?4
+       WHERE key = ?1 AND value_json = ?5`,
+    )
+    .bind(SETTING_REV, next, actor, nowIso, expected);
+}
+const REV_ABSENT = "\u0000absent";
+
 // ---- config -------------------------------------------------------------------------------------
 
 const toTunablesDto = (t: Tunables): MatchTunablesDto => ({ ...t });
@@ -784,6 +828,7 @@ async function configResponse(db: D1Database): Promise<MatchConfigResponse> {
     updatedAt: s.configUpdatedAt,
     updatedBy: s.configUpdatedBy,
     autoConfirmPhrase: AUTO_CONFIRM_PHRASE,
+    rev: s.rev,
   };
 }
 
@@ -794,27 +839,36 @@ async function getConfigHandler(ctx: Ctx): Promise<Response> {
 async function putConfigHandler(ctx: Ctx): Promise<Response> {
   const db = ctx.env.DB;
   const actor = email(ctx);
-  const b = await readBody(ctx, ["enabled", "autoEnabled", "config", "confirm"]);
+  const b = await readBody(ctx, ["enabled", "autoEnabled", "config", "confirm", "rev"]);
   const cur = await loadMatchingSettings(db);
+  // Optimistic concurrency (review U2): a client that sends the `rev` it was shown gets 409 when
+  // somebody saved in between. Without `rev` the server still writes only on the state it read.
+  if (b["rev"] !== undefined) {
+    if (b["rev"] !== null && typeof b["rev"] !== "string") throw new ApiError("bad_rev");
+    if (b["rev"] !== cur.rev) return json({ error: "conflict" }, 409);
+  }
   const nowIso = new Date(ctx.nowMs).toISOString();
+  const nextRev = JSON.stringify(crypto.randomUUID());
+  const holds = {
+    sql: "(SELECT value_json FROM settings WHERE key = ?7) = ?8",
+    binds: [SETTING_REV, nextRev],
+  };
   const statements: D1PreparedStatement[] = [];
   const upsert = (key: string, value: unknown, before: unknown, action: string): void => {
     statements.push(
       db
         .prepare(
-          `INSERT INTO settings (key, value_json, updated_by, updated_at) VALUES (?1, ?2, ?3, ?4)
+          `INSERT INTO settings (key, value_json, updated_by, updated_at)
+           SELECT ?1, ?2, ?3, ?4 WHERE (SELECT value_json FROM settings WHERE key = ?5) = ?6
            ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json,
              updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
         )
-        .bind(key, JSON.stringify(value), actor, nowIso),
-      auditStatement(db, {
-        actorEmail: actor,
-        action,
-        entity: "setting",
-        entityId: key,
-        before,
-        after: value,
-      }),
+        .bind(key, JSON.stringify(value), actor, nowIso, SETTING_REV, nextRev),
+      auditStatement(
+        db,
+        { actorEmail: actor, action, entity: "setting", entityId: key, before, after: value },
+        holds,
+      ),
     );
   };
 
@@ -837,9 +891,26 @@ async function putConfigHandler(ctx: Ctx): Promise<Response> {
   if (b["config"] !== undefined) {
     const parsed = parseTunables(b["config"], cur.tunables ?? DEFAULT_TUNABLES);
     if (!parsed.ok) return json({ error: "bad_config", problems: parsed.errors.slice(0, 10) }, 422);
+    // Phase 7 review S3: while automatic matching is on (and stays on), a change that lets it do
+    // more needs the typed phrase again. A stored config that is invalid counts as "unknown":
+    // any change then needs it. Tightening never does. Switching auto on in the same request
+    // needs the phrase anyway (above); switching it off lets any valid change through.
+    const autoStaysOn = cur.autoEnabled && b["autoEnabled"] !== false;
+    if (autoStaysOn && b["confirm"] !== AUTO_CONFIRM_PHRASE) {
+      const loosens = cur.tunables === null ? true : isLoosening(cur.tunables, parsed.value);
+      if (loosens) throw new ApiError("confirmation_required", 422);
+    }
     upsert(SETTING_CONFIG, parsed.value, cur.tunables, "matching.config_changed");
   }
-  if (statements.length > 0) await db.batch(statements);
+  if (statements.length > 0) {
+    const out = await db.batch([
+      revBump(db, actor, nowIso, nextRev, cur.rev ?? REV_ABSENT),
+      ...statements,
+    ]);
+    // A concurrent write replaced the revision between our read and this batch: nothing of ours
+    // was written (every statement is conditional on our new revision).
+    if ((out[0]?.meta.changes ?? 0) !== 1) return json({ error: "conflict" }, 409);
+  }
   return json(await configResponse(db));
 }
 
@@ -1182,6 +1253,45 @@ function parsePattern(b: Record<string, unknown>): PatternInput {
   return input;
 }
 
+const toProbe = (input: PatternInput): PatternSqlRow => ({
+  id: 0,
+  name: input.name,
+  ledger_account_code: input.ledgerAccountCode,
+  counterparty_name_regex: input.counterpartyNameRegex,
+  reference_regex: input.referenceRegex,
+  type: input.type,
+  direction: input.direction,
+  max_amount_minor: input.maxAmountMinor,
+  enabled: input.enabled ? 1 : 0,
+  created_by: "",
+  updated_at: "",
+});
+
+/**
+ * Review U2 (S3 for patterns): while automatic matching AND automatic ledger patterns are on, a new
+ * enabled pattern, or a change to the match fields of one, lets automatic matching book more lines
+ * to a ledger account; it needs the typed phrase. Disabling, deleting and renaming never do.
+ */
+async function requirePatternPhrase(
+  db: D1Database,
+  before: PatternSqlRow | null,
+  input: PatternInput,
+  confirm: unknown,
+): Promise<void> {
+  if (confirm === AUTO_CONFIRM_PHRASE) return;
+  const s = await loadMatchingSettings(db);
+  if (!s.autoEnabled) return;
+  const asList = (r: PatternSqlRow | null) =>
+    r !== null && r.enabled === 1 ? [toLedgerPattern(r)] : [];
+  const loosens =
+    s.tunables === null ||
+    isLoosening(
+      { ...s.tunables, patterns: asList(before) },
+      { ...s.tunables, patterns: asList(toProbe(input)) },
+    );
+  if (loosens) throw new ApiError("confirmation_required", 422);
+}
+
 async function listPatternsHandler(ctx: Ctx): Promise<Response> {
   const rows = (await ctx.env.DB.prepare(`${PATTERN_SELECT} ORDER BY id`).all<PatternSqlRow>())
     .results;
@@ -1192,7 +1302,9 @@ async function listPatternsHandler(ctx: Ctx): Promise<Response> {
 async function createPatternHandler(ctx: Ctx): Promise<Response> {
   const db = ctx.env.DB;
   const actor = email(ctx);
-  const input = parsePattern(await readBody(ctx, PATTERN_KEYS));
+  const body = await readBody(ctx, [...PATTERN_KEYS, "confirm"]);
+  const input = parsePattern(body);
+  await requirePatternPhrase(db, null, input, body["confirm"]);
   const count =
     (await db.prepare("SELECT COUNT(*) AS n FROM ledger_patterns").first<{ n: number }>())?.n ?? 0;
   if (count >= MAX_PATTERNS) throw new ApiError("too_many_patterns", 422);
@@ -1236,12 +1348,14 @@ async function updatePatternHandler(ctx: Ctx): Promise<Response> {
   const db = ctx.env.DB;
   const actor = email(ctx);
   const id = idParam(ctx);
-  const input = parsePattern(await readBody(ctx, PATTERN_KEYS));
+  const body = await readBody(ctx, [...PATTERN_KEYS, "confirm"]);
+  const input = parsePattern(body);
   const before = await db
     .prepare(`${PATTERN_SELECT} WHERE id = ?1`)
     .bind(id)
     .first<PatternSqlRow>();
   if (!before) throw new ApiError("not_found", 404);
+  await requirePatternPhrase(db, before, input, body["confirm"]);
   await db.batch([
     auditStatement(db, {
       actorEmail: actor,

@@ -154,10 +154,15 @@ BEGIN
     AND NOT (OLD.status = 'sending' AND NEW.status = 'pending' AND NEW.attempts = OLD.attempts - 1);
   SELECT RAISE(ABORT, 'booking_err:sent_facts')
   WHERE OLD.exact_ref IS NOT NULL AND NEW.exact_ref IS NOT OLD.exact_ref AND NEW.exact_ref IS NULL;
+  -- (The retention redaction of a FINISHED row, migration 0025, may still replace it; the finished
+  -- row is never deletable nor undoable, and outbox_guard_update keeps every other column.)
   SELECT RAISE(ABORT, 'booking_err:sent_facts')
   WHERE NEW.payload_json IS NOT OLD.payload_json
     AND ((json_valid(NEW.payload_json) AND json_extract(NEW.payload_json, '$.stage') = 'none')
-      OR (json_valid(OLD.payload_json) AND json_extract(OLD.payload_json, '$.stage') = 'none'));
+      OR (json_valid(OLD.payload_json) AND json_extract(OLD.payload_json, '$.stage') = 'none'
+          AND NOT (OLD.status IN ('verified', 'resolved_manually', 'given_up')
+                   AND json_valid(NEW.payload_json)
+                   AND json_extract(NEW.payload_json, '$.stage') = 'redacted')));
   -- Back from sending to pending only when the POST provably did not leave (the attempt is given
   -- back) or with a probe before any new send (429).
   SELECT RAISE(ABORT, 'booking_err:sent_facts')

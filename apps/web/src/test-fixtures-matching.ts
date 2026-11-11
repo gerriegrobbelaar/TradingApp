@@ -125,6 +125,7 @@ export function stats(over: Partial<MatchStatsResponse> = {}): MatchStatsRespons
     enabled: true,
     autoEnabled: false,
     unmappedAccounts: 0,
+    staleSettlements: 0,
     ...over,
   };
 }

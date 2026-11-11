@@ -867,6 +867,8 @@ export interface MatchTunablesDto {
   maxCandidates: number;
   amountToleranceMinor: number;
   blockAutoOnRecentIbanChangeDays: number;
+  /** Always present in responses; optional in the web form until it has a switch for it. */
+  autoIncomingUnknownIban?: boolean;
   autoLedgerPatterns: boolean;
   autoTxTypes: string[];
   noMatchTxTypes: string[];
@@ -885,14 +887,24 @@ export interface MatchConfigResponse {
   updatedBy: string | null;
   /** The text that must be typed to switch automatic matching on. */
   autoConfirmPhrase: string;
+  /**
+   * Revision of the matching settings (opaque; null before the first save). Send it back as `rev`
+   * in the PUT to get 409 `conflict` instead of overwriting somebody else's change.
+   */
+  rev?: string | null;
 }
 
-/** PUT /api/matching/config (admin, step-up): every field optional; `confirm` only to switch auto on. */
+/**
+ * PUT /api/matching/config (admin, step-up): every field optional. `confirm` (the typed phrase) to
+ * switch auto on, and again for a config change that loosens automatic matching while it is on
+ * (422 `confirmation_required`). `rev`: optional optimistic-concurrency check (409 `conflict`).
+ */
 export interface MatchConfigRequest {
   enabled?: boolean;
   autoEnabled?: boolean;
   config?: Partial<MatchTunablesDto>;
   confirm?: string;
+  rev?: string | null;
 }
 
 export interface MatchAccountMapDto {
@@ -1007,6 +1019,11 @@ export interface MatchStatsResponse {
   autoEnabled: boolean;
   /** Active Revolut accounts without an Exact administration mapping. */
   unmappedAccounts: number;
+  /**
+   * Allocations of matches booked in Exact more than 48 hours ago that still count against their
+   * item because Exact has not shown the payment (Phase 8 data-quality signal; never auto-released).
+   */
+  staleSettlements: number;
   /**
    * Booking health (U1, review S10/N6). Always present from the server; optional here so older
    * fixtures keep compiling. Counts of live matches by booking trouble.

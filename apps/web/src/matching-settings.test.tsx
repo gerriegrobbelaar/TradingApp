@@ -263,20 +263,20 @@ describe("thresholds", () => {
     await user.type(score, "97");
     const gap = within(c).getByLabelText(/Gap to the next candidate/);
     await user.clear(gap);
-    await user.type(gap, "0");
+    await user.type(gap, "9");
     expect(
-      within(c).getAllByText(/Gap to the next candidate must be a whole number from 1 to 100/)
+      within(c).getAllByText(/Gap to the next candidate must be a whole number from 10 to 100/)
         .length,
     ).toBeGreaterThan(0);
     await user.clear(gap);
-    await user.type(gap, "1");
+    await user.type(gap, "30");
     expect((save as HTMLButtonElement).disabled).toBe(false);
     await user.click(save);
     await waitFor(() => expect(of(calls, "/api/matching/config", "PUT")).toHaveLength(1));
     expect(of(calls, "/api/matching/config", "PUT")[0]?.body).toEqual({
       config: {
         autoMatchMinScore: 97,
-        autoMatchMinGap: 1,
+        autoMatchMinGap: 30,
         suggestMinScore: 50,
         maxCandidates: 5,
         amountToleranceMinor: 0,

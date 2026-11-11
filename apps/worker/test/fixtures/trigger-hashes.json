@@ -1,0 +1,31 @@
+{
+  "_readme": "Pinned trigger names and sha-256 of each normalised body after ALL migrations (whitespace collapsed). Rule: any migration that rebuilds a guarded table must recreate its triggers, and this file is updated deliberately with `pnpm --filter @camelthorn/worker run triggers:update`, reviewing the diff. A trigger that is dropped or weakened fails test/migrations-all.test.ts until then.",
+  "triggers": {
+    "audit_log_no_delete": "1623c24532eaa33747f15d6d7074b369b54d023e69d0762a9f17c56d7d0e09ae",
+    "audit_log_no_update": "70dd941a3c641d51f2c88924b91228c4b315a98f3d16d50682b7012ad5509df6",
+    "bank_account_map_guard_delete": "b34cf54fec8835ec1081e5a5ba3583e0e323ee4f0dd04c5b2b3e591804b74942",
+    "bank_account_map_guard_update": "c0f5d3b1e12310394e0202ccd5a5f5bbe30102ebed1eb60516625fe2b187c8ff",
+    "bank_transactions_guard_matched": "3cb94e3f60fbbfc82ae59590c65beadfa0c5889815fe870933f0b20c4a50f15f",
+    "bank_transactions_guard_status": "2ef6e7483ab449653c7c195a99a6d328e7ddbfdbcf7d0b1f817d3a1ab47c098e",
+    "batch_guard_match_out_of_step": "5e01d2a4784b6d4486e865b3428cc4d238e1f48aa19906aa1f5869794877f639",
+    "batch_guard_other": "14f0dc14891a30e596a19c8aef5ff6568d5a20ed6b1e8908efec031ad40e3a05",
+    "match_allocations_guard": "508f6979c634fb43cc7c3bd05d641c1d4ac79b24adc8e4e818337009812841c1",
+    "match_allocations_guard_open_before": "d5503ede46c5296403c196fbc5519e273b6d75d23c8cb91611cafb48ef16ed87",
+    "match_allocations_guard_update": "8412660955055286727f7da1fe7e3787cace99c51fe3982c8475e5eb4a8193f8",
+    "matches_guard_booked_at": "241e6ec48212f7460985c5ccf57433e2949b784eb96a25d9cb8e3b0c0a0b158e",
+    "matches_guard_exact_state": "9fd701586c2ea44a836c4b72ef774b25cdacf8370555933443639f507a29c413",
+    "matches_guard_immutable": "9397814fab2dabfa68e2b3a9f9bc7d77b3b7a05ccbdb9e0f9b6844e6e359c7a6",
+    "matches_guard_insert": "93aae57d13bbee00661afce00ecc0c050ed67f98e444742edcd796b9fcaa73ac",
+    "matches_guard_manually_booked": "7a3bf3b8ff56c88d9cfbf97c500aa67c5273e6cd30de3de7e8c6e2fe457a958e",
+    "matches_guard_undo_claimed": "090f0deaa7c12b6a0d3f75ce021d49fd82cfceab5b859497808087ed82fb28a4",
+    "matches_guard_update": "96ddaa6b5cddfa908db697e643611ff2c642210173d37580a58e7d9e8fc9d77c",
+    "matches_settlement_baseline": "afb01c8903068803e52fcf12bb40528f8b76c3bfe3e08211f37eef0b314b7de6",
+    "open_items_status_insert": "1a85c0107b3a0362fc1cb2f6d38c97b5f1e48b99b74c6c2a8f6da7cfc0b8be30",
+    "open_items_status_update": "f165c19bcb2b7aaddca7b50d046e8af8f77b5253e3b1cb4d466c3321acd757e9",
+    "outbox_guard_delete": "3dff13824bd3598315bdf101ca83654b4ebd8c30ccb99cfe09b27000c2cf4a26",
+    "outbox_guard_insert": "fc391d9006f31e95717db2b2c8dd7a426cd9f0cba374f037f72ad69f58ffb0cb",
+    "outbox_guard_sent_facts": "54dc12f47d35c25cb5f86b43a43947a480f297928a8acddec6608484df6bd9df",
+    "outbox_guard_status": "c1b1eb7b7a70282e52d7681df599044792d2be10ffca086feac11381c5b5776b",
+    "outbox_guard_update": "47ec3d92c932d829694595303a95892941643471d3ff11efa4cd11ab41928633"
+  }
+}

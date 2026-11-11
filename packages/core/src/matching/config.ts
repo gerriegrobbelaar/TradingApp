@@ -23,6 +23,7 @@ export const DEFAULT_MATCH_CONFIG: MatchConfig = {
   maxCandidates: 5,
   amountToleranceMinor: 0n,
   blockAutoOnRecentIbanChangeDays: 90,
+  autoIncomingUnknownIban: false,
   autoLedgerPatterns: false,
   patterns: [],
   autoTxTypes: ["transfer", "topup", "card_payment"],
@@ -61,6 +62,102 @@ export type RegexProblemCode = (typeof REGEX_PROBLEM_CODES)[number];
 /** CLAUDE.md 4.2: auto-match only when the top score is at least 95. */
 export const MIN_AUTO_SCORE = 95;
 export const MAX_TOLERANCE_MINOR = 100n;
+/**
+ * Floors (phase 7 review S3). CLAUDE.md 4.2 wants "the next candidate far behind": a gap below 10
+ * points is not far, and a supplier IBAN changed less than 30 days ago is still inside the usual
+ * window of invoice-redirection fraud. A configuration below a floor is invalid.
+ */
+export const MIN_AUTO_GAP = 10;
+export const MIN_RECENT_IBAN_DAYS = 30;
+
+/**
+ * Every MatchConfig field, classified by what a change can do to AUTOMATIC matching (review U2).
+ * The Record type makes a new field a compile error until it is classified here; a test derives
+ * the keys from DEFAULT_MATCH_CONFIG as well.
+ *   auto_safety  a change in one direction lets automatic matching do more: isLoosening checks it.
+ *   neutral      cannot make a match automatic (display only, or applied after the decision).
+ */
+export const MATCH_CONFIG_FIELD_SAFETY: Record<keyof MatchConfig, "auto_safety" | "neutral"> = {
+  autoMatchMinScore: "auto_safety", // lower = looser
+  autoMatchMinGap: "auto_safety", // lower = looser
+  // Neutral: the engine takes the runner-up for the gap from every candidate, shown or not.
+  suggestMinScore: "neutral",
+  // Neutral: the list is cut after the decision.
+  maxCandidates: "neutral",
+  amountToleranceMinor: "auto_safety", // higher = looser
+  blockAutoOnRecentIbanChangeDays: "auto_safety", // fewer days = looser
+  autoIncomingUnknownIban: "auto_safety", // false -> true = looser
+  autoLedgerPatterns: "auto_safety", // false -> true = looser
+  patterns: "auto_safety", // while ledger auto is on: any new or changed pattern
+  autoTxTypes: "auto_safety", // a type added = looser
+  noMatchTxTypes: "auto_safety", // a type removed = those lines become matchable
+  internalAccountTypes: "auto_safety", // a type removed = own-account transfers matchable
+  ownIbans: "auto_safety", // an IBAN removed = transfers from it matchable
+};
+
+/** A ledger pattern as isLoosening compares it (bigint or number amounts). */
+type PatternLike = Omit<LedgerPattern, "test"> & {
+  test: Omit<LedgerPattern["test"], "maxAmountMinor"> & { maxAmountMinor?: bigint | number };
+};
+
+/** The settings that decide how much an automatic match may do. */
+export interface AutoSafetyFields {
+  autoMatchMinScore: number;
+  autoMatchMinGap: number;
+  blockAutoOnRecentIbanChangeDays: number;
+  autoLedgerPatterns: boolean;
+  autoIncomingUnknownIban: boolean;
+  /** Minor units; number (stored JSON) or bigint (engine config). */
+  amountToleranceMinor: number | bigint;
+  autoTxTypes?: readonly string[];
+  noMatchTxTypes?: readonly string[];
+  internalAccountTypes?: readonly string[];
+  ownIbans?: readonly string[];
+  /** Enabled ledger patterns; omitted when the caller does not change them. */
+  patterns?: readonly PatternLike[];
+}
+
+const patternKey = (p: PatternLike): string =>
+  JSON.stringify([
+    p.ledgerAccountCode,
+    p.test.counterpartyNameRegex ?? null,
+    p.test.referenceRegex ?? null,
+    p.test.type ?? null,
+    p.test.direction ?? null,
+    p.test.maxAmountMinor === undefined ? null : String(p.test.maxAmountMinor),
+  ]);
+
+/**
+ * True when `next` lets automatic matching do MORE than `prev`: a lower score or gap, fewer days of
+ * recent-IBAN protection, ledger patterns or unknown-IBAN incoming payments switched on, a larger
+ * amount tolerance, a new transaction type that may be automatic, a no-match type, own-account
+ * type or own IBAN removed, or (while ledger patterns may be automatic) a pattern that was not
+ * there before in exactly this form. Tightening and neutral changes are not loosening. Pure.
+ */
+export function isLoosening(prev: AutoSafetyFields, next: AutoSafetyFields): boolean {
+  if (next.autoMatchMinScore < prev.autoMatchMinScore) return true;
+  if (next.autoMatchMinGap < prev.autoMatchMinGap) return true;
+  if (next.blockAutoOnRecentIbanChangeDays < prev.blockAutoOnRecentIbanChangeDays) return true;
+  if (next.autoLedgerPatterns && !prev.autoLedgerPatterns) return true;
+  if (next.autoIncomingUnknownIban && !prev.autoIncomingUnknownIban) return true;
+  if (BigInt(next.amountToleranceMinor) > BigInt(prev.amountToleranceMinor)) return true;
+  const added = (a: readonly string[] | undefined, b: readonly string[] | undefined): boolean => {
+    const before = new Set(a ?? []);
+    return (b ?? []).some((t) => !before.has(t));
+  };
+  if (added(prev.autoTxTypes, next.autoTxTypes)) return true;
+  // Removed from a "never match" list = added to what may match.
+  if (added(next.noMatchTxTypes, prev.noMatchTxTypes)) return true;
+  if (added(next.internalAccountTypes, prev.internalAccountTypes)) return true;
+  const norm = (l: readonly string[] | undefined) =>
+    (l ?? []).map((i) => i.replace(/\s+/g, "").toUpperCase());
+  if (added(norm(next.ownIbans), norm(prev.ownIbans))) return true;
+  if (next.autoLedgerPatterns && next.patterns !== undefined) {
+    const before = new Set((prev.patterns ?? []).map(patternKey));
+    if (next.patterns.some((p) => !before.has(patternKey(p)))) return true;
+  }
+  return false;
+}
 
 /** Reason the regex is outside the safe subset, or null when it is acceptable. */
 export function unsafeRegexReason(src: string): RegexProblemCode | null {
@@ -258,8 +355,8 @@ export function validateMatchConfig(cfg: MatchConfig): string[] {
   if (!isInt(cfg.autoMatchMinScore, MIN_AUTO_SCORE, 100)) {
     out.push(`autoMatchMinScore must be an integer from ${MIN_AUTO_SCORE} to 100`);
   }
-  if (!isInt(cfg.autoMatchMinGap, 1, 100))
-    out.push("autoMatchMinGap must be an integer from 1 to 100");
+  if (!isInt(cfg.autoMatchMinGap, MIN_AUTO_GAP, 100))
+    out.push(`autoMatchMinGap must be an integer from ${MIN_AUTO_GAP} to 100`);
   if (!isInt(cfg.suggestMinScore, 1, 100) || cfg.suggestMinScore > cfg.autoMatchMinScore) {
     out.push("suggestMinScore must be an integer from 1 to autoMatchMinScore");
   }
@@ -271,8 +368,13 @@ export function validateMatchConfig(cfg: MatchConfig): string[] {
   ) {
     out.push(`amountToleranceMinor must be from 0 to ${MAX_TOLERANCE_MINOR}`);
   }
-  if (!isInt(cfg.blockAutoOnRecentIbanChangeDays, 0, 3650)) {
-    out.push("blockAutoOnRecentIbanChangeDays must be an integer from 0 to 3650");
+  if (!isInt(cfg.blockAutoOnRecentIbanChangeDays, MIN_RECENT_IBAN_DAYS, 3650)) {
+    out.push(
+      `blockAutoOnRecentIbanChangeDays must be an integer from ${MIN_RECENT_IBAN_DAYS} to 3650`,
+    );
+  }
+  if (typeof cfg.autoIncomingUnknownIban !== "boolean") {
+    out.push("autoIncomingUnknownIban must be true or false");
   }
   const ids = new Set<string>();
   cfg.patterns.forEach((p, i) => {

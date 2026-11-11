@@ -37,12 +37,39 @@ export async function resetWorld(opts: { mapped?: boolean } = {}): Promise<World
     .run();
   const accountId = acc.meta.last_row_id;
   if (opts.mapped !== false) await mapAccount(accountId, div.id);
+  // Fresh open items by default (S4); tests of staleness overwrite this.
+  await markOpenItemsSynced(div.id, new Date(NOW - 3_600_000).toISOString());
   return {
     divisionId: div.id,
     exactConnectionId: div.connectionId,
     revolutConnectionId,
     accountId,
   };
+}
+
+/** Stamps the last complete open-items pass of a division (null = never completed). */
+export async function markOpenItemsSynced(
+  divisionId: number,
+  receivablesAt: string | null,
+  payablesAt: string | null = receivablesAt,
+): Promise<void> {
+  for (const [entity, at] of [
+    ["receivables", receivablesAt],
+    ["payables", payablesAt],
+  ] as const) {
+    await db
+      .prepare("DELETE FROM sync_state WHERE division_id = ?1 AND entity = ?2")
+      .bind(divisionId, entity)
+      .run();
+    if (at === null) continue;
+    await db
+      .prepare(
+        `INSERT INTO sync_state (division_id, entity, last_completed_at, last_finished_at, last_status)
+         VALUES (?1, ?2, ?3, ?3, 'ok')`,
+      )
+      .bind(divisionId, entity, at)
+      .run();
+  }
 }
 
 export async function mapAccount(accountId: number, divisionId: number): Promise<void> {

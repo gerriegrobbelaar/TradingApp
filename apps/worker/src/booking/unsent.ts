@@ -79,7 +79,7 @@ export async function undoUnsentClaim(
       .prepare(`DELETE FROM match_suggestions WHERE bank_transaction_id = ?4 AND ${done}`)
       .bind(matchId, nowIso, actor, m.bank_transaction_id),
   ]);
-  return (out[1]?.meta.changes ?? 0) === 1 ? { kind: "done" } : { kind: "not_unsent" };
+  return (out[1]?.meta.changes ?? 0) >= 1 ? { kind: "done" } : { kind: "not_unsent" };
 }
 
 /**
@@ -120,5 +120,5 @@ export async function retryUnsentClaim(
       )
       .bind(matchId),
   ]);
-  return (out[2]?.meta.changes ?? 0) === 1 ? { kind: "done" } : { kind: "not_unsent" };
+  return (out[2]?.meta.changes ?? 0) >= 1 ? { kind: "done" } : { kind: "not_unsent" };
 }

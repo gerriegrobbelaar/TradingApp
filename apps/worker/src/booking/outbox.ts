@@ -143,7 +143,11 @@ export async function claimAndEnqueue(db: D1Database, r: NewOutboxRow): Promise<
       )
       .bind(`exact.write.${r.kind}`, r.idempotencyKey),
   ]);
-  return (out[0]?.meta.changes ?? 0) === 1 ? "claimed" : "lost";
+  // `>= 1`, not `=== 1`: the claim also refreshes the settlement baseline of the match's
+  // allocations (trigger matches_settlement_baseline, migration 0025) and D1 counts those trigger
+  // rows in meta.changes. The UPDATE targets one id, so any change at all means this caller won.
+  // (The batch's GUARD uses SQL changes(), which counts the claimed row only.)
+  return (out[0]?.meta.changes ?? 0) >= 1 ? "claimed" : "lost";
 }
 
 /**

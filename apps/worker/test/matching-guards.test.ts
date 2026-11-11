@@ -7,7 +7,7 @@ import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { amsterdamDay, assembleTransactions, toMatchTx } from "../src/matching/assemble";
 import { checkMatchingInvariants } from "../src/matching/invariants";
-import { autoInputGap, dropFalseClaim, runMatching } from "../src/matching/run";
+import { autoInputGap, dropFalseClaim, openItemsFreshness, runMatching } from "../src/matching/run";
 import {
   applyMatch,
   claimMatchForBooking,
@@ -26,6 +26,7 @@ import {
   enableAuto,
   jobContext,
   liveMatches,
+  markOpenItemsSynced,
   NOW,
   resetWorld,
   SETTING_AUTO,
@@ -961,8 +962,8 @@ describe("run budget", () => {
     const ms = Date.now() - t0;
     expect(r.status).toBe("ok");
     expect(r.summary).toMatchObject({ evaluated: 500, capped: true });
-    // Reads: config (3), mappings (2), lines, items, IBANs, ceil(500/90) hash lookups, review flags.
-    expect(counted.reads()).toBeLessThanOrEqual(16);
+    // Reads: config (3), mappings (2), lines, items, freshness, IBANs, ceil(500/90) hash lookups, review flags.
+    expect(counted.reads()).toBeLessThanOrEqual(17);
     expect(ms).toBeLessThan(25_000);
     await consistent();
     // The next run takes the 20 lines that waited (round robin), not the same 500 again.
@@ -973,4 +974,111 @@ describe("run budget", () => {
     );
     expect(never).toBe(0);
   }, 120_000);
+});
+
+// ---- (5) open-item freshness (phase 7 review S4) -----------------------------------------------
+
+describe("auto-match needs fresh open items", () => {
+  const H = 3_600_000;
+  const at = (agoMs: number): string => new Date(NOW - agoMs).toISOString();
+  const stale = { skipped_by_reason: { open_items_stale: 1 }, auto_matched: 0 };
+
+  it("26 hours exactly is stale, one millisecond younger is fresh", async () => {
+    await perfect();
+    await enableAuto();
+    await markOpenItemsSynced(w.divisionId, at(26 * H));
+    expect((await runMatching(jobContext())).summary).toMatchObject(stale);
+    expect(await liveMatches()).toBe(0);
+    await markOpenItemsSynced(w.divisionId, at(26 * H - 1));
+    expect((await runMatching(jobContext())).summary).toMatchObject({ auto_matched: 1 });
+    await consistent();
+  });
+
+  it("never synced (jobs off): review only, the candidate is still suggested", async () => {
+    const { txId } = await perfect();
+    await enableAuto();
+    await markOpenItemsSynced(w.divisionId, null);
+    const r = await runMatching(jobContext());
+    expect(r.summary).toMatchObject(stale);
+    expect(await txStatus(txId)).toBe("suggested");
+    expect(await count("SELECT COUNT(*) AS n FROM match_suggestions")).toBeGreaterThan(0);
+  });
+
+  it("a pass that did not complete (last_completed_at missing) does not count", async () => {
+    await perfect();
+    await enableAuto();
+    await db
+      .prepare(
+        "UPDATE sync_state SET last_completed_at = NULL, last_status = 'partial' WHERE division_id = ?1",
+      )
+      .bind(w.divisionId)
+      .run();
+    expect((await runMatching(jobContext())).summary).toMatchObject(stale);
+  });
+
+  it("an unreadable stamp is stale", async () => {
+    await perfect();
+    await enableAuto();
+    await markOpenItemsSynced(w.divisionId, "yesterday");
+    expect((await runMatching(jobContext())).summary).toMatchObject(stale);
+  });
+
+  it("both kinds must be fresh, whatever the candidate settles (competitors and credit notes)", async () => {
+    await perfect();
+    await enableAuto();
+    await markOpenItemsSynced(w.divisionId, at(30 * H), at(H));
+    expect((await runMatching(jobContext())).summary).toMatchObject(stale);
+    // A stale payables list blocks a receivable too: money in can also settle a supplier credit
+    // note the stale list does not show.
+    await markOpenItemsSynced(w.divisionId, at(H), at(30 * H));
+    expect((await runMatching(jobContext())).summary).toMatchObject(stale);
+    await markOpenItemsSynced(w.divisionId, at(H), at(H));
+    expect((await runMatching(jobContext())).summary).toMatchObject({ auto_matched: 1 });
+  });
+
+  it("freshness reader: per division and per kind", async () => {
+    await markOpenItemsSynced(w.divisionId, at(H), at(27 * H));
+    expect(await openItemsFreshness(db, w.divisionId, NOW)).toEqual({
+      receivable: true,
+      payable: false,
+    });
+    const other = await addDivision();
+    expect(await openItemsFreshness(db, other.id, NOW)).toEqual({
+      receivable: false,
+      payable: false,
+    });
+  });
+
+  it("autoInputGap pure: missing freshness info means no extra condition, stale kind blocks", () => {
+    const base = toMatchTx({
+      id: 1,
+      connection_id: 1,
+      bank_account_id: 1,
+      amount_minor: 100,
+      currency: "EUR",
+      completed_at: "2026-07-14T08:00:00Z",
+      created_at: "2026-07-14T08:00:00Z",
+      booked_at: "2026-07-14T08:00:00Z",
+      reference: null,
+      description: null,
+      counterparty_name: null,
+      counterparty_iban: null,
+      counterparty_ref: null,
+      type: "transfer",
+      counterparty_account_type: "external",
+      is_final: 1,
+      state: "completed",
+      request_id: null,
+      state_conflict: 0,
+      match_status: "unmatched",
+      live: 0,
+    });
+    const f = { receivable: true, payable: false };
+    expect(autoInputGap(base, { kinds: ["receivable"], fresh: f })).toBeNull();
+    expect(autoInputGap(base, { kinds: ["payable"], fresh: f })).toBe("open_items_stale");
+    expect(autoInputGap(base, { kinds: ["receivable", "payable"], fresh: f })).toBe(
+      "open_items_stale",
+    );
+    expect(autoInputGap(base, { kinds: [], fresh: f })).toBeNull();
+  });
 });

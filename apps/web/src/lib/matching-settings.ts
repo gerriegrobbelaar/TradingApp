@@ -33,7 +33,7 @@ export const NUMBER_FIELDS: readonly { key: TunableNumberKey; label: string; hin
   {
     key: "autoMatchMinGap",
     label: "Gap to the next candidate",
-    hint: "From 1 to 100. The runner-up must score at least this far behind.",
+    hint: "From 10 to 100. The runner-up must score at least this far behind.",
   },
   {
     key: "suggestMinScore",
@@ -49,7 +49,7 @@ export const NUMBER_FIELDS: readonly { key: TunableNumberKey; label: string; hin
   {
     key: "blockAutoOnRecentIbanChangeDays",
     label: "Days after a supplier account change",
-    hint: "From 0 to 3650. Payments to a recently changed account are never automatic.",
+    hint: "From 30 to 3650. Payments to a recently changed account are never automatic.",
   },
 ];
 

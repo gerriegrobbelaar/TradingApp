@@ -81,6 +81,13 @@ export interface MatchConfig {
   amountToleranceMinor: bigint;
   /** Payables whose supplier IBAN was added or changed within N days are never auto-matched. */
   blockAutoOnRecentIbanChangeDays: number;
+  /**
+   * Policy for an INCOMING payment matched to a receivable (ADR 0041 addendum, phase 7 review).
+   * False (default): when the counterparty IBAN is missing or is not one of the customer's known
+   * IBANs the match is never automatic (`iban_unknown_for_customer`), it stays a review
+   * candidate. True: the IBAN does not matter for incoming payments.
+   */
+  autoIncomingUnknownIban: boolean;
   /** Opt in to auto-matching ledger patterns (their score becomes 95). Default false. */
   autoLedgerPatterns: boolean;
   patterns: LedgerPattern[];

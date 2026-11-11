@@ -7,6 +7,7 @@
     "typecheck": "tsc -p .",
     "test": "vitest run",
     "dev": "wrangler dev",
+    "triggers:update": "node scripts/trigger-hashes.mjs",
     "check:deploy": "node scripts/check-deploy-config.mjs",
     "check:deploy:staging": "node scripts/check-deploy-config.mjs --env staging",
     "deploy": "node scripts/check-deploy-config.mjs && wrangler deploy --env=\"\"",
