@@ -281,16 +281,17 @@ describe("DST transitions (Europe/Amsterdam)", () => {
       expect(local(second).endsWith("02:30")).toBe(true);
       expect(local(second).startsWith(fall)).toBe(false);
     });
-    it("fall back: hourly job fires once for the repeated hour", () => {
+    it("fall back: hourly job fires at every real hour, the repeated hour twice", () => {
       const fires: number[] = [];
       let cur = t(`${fall}T00:00:00Z`) - 2 * 3_600_000;
       for (let i = 0; i < 6; i++) {
         cur = nextRun(cron("0 * * * *"), cur) as number;
         fires.push(cur);
       }
+      for (let i = 1; i < fires.length; i++)
+        expect((fires[i] as number) - (fires[i - 1] as number)).toBe(3_600_000);
       const twoAm = fires.filter((f) => local(f) === `${fall} 02:00`);
-      expect(twoAm).toHaveLength(1);
-      expect(iso(twoAm[0] as number)).toBe(`${fall}T00:00:00.000Z`);
+      expect(twoAm.map(iso)).toEqual([`${fall}T00:00:00.000Z`, `${fall}T01:00:00.000Z`]);
     });
     it("fall back: */10 fires at every real mark, the repeated hour twice", () => {
       let cur = t(`${fall}T00:00:00Z`) - 1;
@@ -488,11 +489,11 @@ describe("describeSchedule", () => {
     [cron("0 9 * * *"), "Daily at 09:00"],
     [{ kind: "last_working_day", time: "16:30" }, "Last working day of the month at 16:30"],
     [cron("*/7 * * * *"), "Custom schedule (*/7 * * * *) in Amsterdam time"],
-    [
-      cron("0 9 * * 1-5", true),
-      "Custom schedule (0 9 * * 1-5) in Amsterdam time, working days only",
-    ],
-    [cron("bad"), "Custom schedule (bad) in Amsterdam time"],
+    [cron("0 9 1 * *", true), "Custom schedule (0 9 1 * *) in Amsterdam time, working days only"],
+    [cron("bad"), "Invalid schedule (bad)"],
+    [cron("15 16 * * 1-5", true), "Working days at 16:15"],
+    [cron("0 9 * * mon-fri"), "Weekdays at 09:00"],
+    [cron("*/10 * * * 1-5"), "Every 10 minutes on weekdays"],
     [cron("0,30 9 * * *"), "Custom schedule (0,30 9 * * *) in Amsterdam time"],
   ];
   it.each(cases)("%j", (s, want) => {

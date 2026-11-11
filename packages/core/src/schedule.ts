@@ -1,19 +1,22 @@
 /**
- * Schedule logic for the job scheduler (CLAUDE.md 4.1). Pure: no I/O.
+ * Schedule logic for the job scheduler (CLAUDE.md 4.1). Pure: no I/O, no clock reads.
  *
  * All times are evaluated in Europe/Amsterdam local time; results are epoch ms UTC.
+ * See docs/decisions/0020-schedule-semantics.md.
  *
- * DST decisions (documented and tested):
- * - Spring forward (local 02:00-02:59 does not exist): a job whose hour field is restricted
- *   (for example `30 2 * * *`, or last_working_day at 02:30) fires ONCE at the first valid
- *   instant after the gap, 03:00 local. A job whose hour field is a wildcard (`*`, or `*` with a
- *   step) simply has no fires in the missing hour; its other marks stay on real clock marks.
- * - Fall back (local 02:00-02:59 occurs twice): a job restricted to an hour, or one that fires at
- *   most once per hour (a single minute value, e.g. hourly `0 * * * *`), fires ONCE, at the first
- *   (summer time) occurrence. A wildcard-hour job with several minutes (e.g. every 10 minutes)
- *   fires at every real mark, so the repeated hour has its marks twice, 10 real minutes apart.
+ * DST rules (one rule per transition, decided only by the hour field):
+ * - Hour field is a wildcard (`*`, `*\/1` or every hour 0-23): the job fires at every real clock
+ *   mark. In spring the missing hour simply has no fires; in autumn the repeated hour fires twice
+ *   (once in summer time, once in winter time). So `0 * * * *` fires 23 times on the spring day
+ *   and 25 times on the autumn day, always one real hour apart, and `*\/10` stays 10 minutes apart.
+ * - Hour field is restricted (for example `30 2 * * *`, `0 *\/2 * * *`, or last_working_day at
+ *   02:30): in spring a wall time inside the missing hour (02:00-02:59) fires ONCE at 03:00 local,
+ *   the first instant after the gap; in autumn a wall time inside the repeated hour fires ONCE, at
+ *   the first (summer time) occurrence.
  * - Day-of-month / day-of-week follow the standard cron rule: when both are restricted (first
  *   character not `*`) either may match, otherwise both must.
+ * - `workingDaysOnly` additionally requires the Amsterdam local date to be a TARGET working day.
+ * - nextRun looks at most 5 years (5 x 366 days) ahead and returns null beyond that.
  */
 import { amsterdamParts } from "./local-time";
 import {
@@ -31,7 +34,11 @@ const MIN_MS = 60_000;
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
 const HORIZON_DAYS = 5 * 366 + 2;
-const HORIZON_MONTHS = 61;
+/** Inputs outside this range return null (Intl and Date cannot represent far-off instants). */
+const MIN_INPUT_MS = Date.UTC(1970, 0, 1);
+const MAX_INPUT_MS = Date.UTC(9000, 0, 1);
+/** Fixed reference used by validateSchedule to reject schedules that never fire. */
+const VALIDATION_REF_MS = Date.UTC(2025, 0, 1);
 
 // ---------------------------------------------------------------------------------------------
 // Cron parsing
@@ -199,7 +206,7 @@ function dayInstants(date: string, hours: readonly number[], minutes: readonly n
       } else if (inWindow) {
         // Fall back: 02:00-02:59 occurs twice (summer time first).
         out.add(wall - o1 * MIN_MS);
-        if (!hourRestricted && minutes.length > 1) out.add(wall - o2 * MIN_MS);
+        if (!hourRestricted) out.add(wall - o2 * MIN_MS);
       } else {
         out.add(wall - (wallMin < 120 ? o1 : o2) * MIN_MS);
       }
@@ -228,13 +235,14 @@ export function validateSchedule(
     const parsed = parseCron(expr);
     if (typeof parsed === "string") return { ok: false, error: parsed };
     const clean = expr.trim().split(/\s+/).join(" ");
-    return {
-      ok: true,
-      schedule:
-        wdo === undefined
-          ? { kind: "cron", expr: clean }
-          : { kind: "cron", expr: clean, workingDaysOnly: wdo },
-    };
+    const schedule: Schedule =
+      wdo === undefined
+        ? { kind: "cron", expr: clean }
+        : { kind: "cron", expr: clean, workingDaysOnly: wdo };
+    // For example 25 December on working days only: always a TARGET holiday.
+    if (nextRun(schedule, VALIDATION_REF_MS) === null)
+      return { ok: false, error: "Schedule never fires within 5 years" };
+    return { ok: true, schedule };
   }
   if (rec["kind"] === "last_working_day") {
     const time = rec["time"];
@@ -257,7 +265,7 @@ function dayMatches(p: ParsedCron, date: string, workingDaysOnly: boolean): bool
 
 /** Next fire strictly after `afterMs` (epoch ms UTC), or null if none within 5 years. */
 export function nextRun(s: Schedule, afterMs: number): number | null {
-  if (!Number.isFinite(afterMs)) return null;
+  if (!Number.isFinite(afterMs) || afterMs < MIN_INPUT_MS || afterMs > MAX_INPUT_MS) return null;
   const limit = afterMs + 5 * 366 * DAY_MS;
   if (s.kind === "cron") {
     const p = parseCron(s.expr);
@@ -277,24 +285,26 @@ export function nextRun(s: Schedule, afterMs: number): number | null {
   const h = Number(m[1]);
   const mi = Number(m[2]);
   const startDate = amsterdamParts(afterMs).date;
-  let year = Number(startDate.slice(0, 4));
-  let month = Number(startDate.slice(5, 7));
-  for (let i = 0; i < HORIZON_MONTHS; i++) {
-    const date = lastTargetWorkingDay(year, month);
-    // A single-entry hour list counts as restricted: a gap time moves to 03:00, a repeated time fires once.
-    for (const t of dayInstants(date, [h], [mi])) if (t > afterMs) return t <= limit ? t : null;
-    month++;
-    if (month > 12) {
-      month = 1;
-      year++;
-    }
-  }
-  return null;
+  const year = Number(startDate.slice(0, 4));
+  const month = Number(startDate.slice(5, 7));
+  // A single-entry hour list counts as restricted: a gap time moves to 03:00, a repeated time fires once.
+  // This month's fire may already be past; next month's is then always later than afterMs.
+  const fireIn = (y: number, mo: number): number =>
+    dayInstants(lastTargetWorkingDay(y, mo), [h], [mi])[0] as number;
+  const thisMonth = fireIn(year, month);
+  if (thisMonth > afterMs) return thisMonth;
+  return month === 12 ? fireIn(year + 1, 1) : fireIn(year, month + 1);
 }
 
 /**
  * True if a fire time exists in (lastRunMs ?? createdMs, nowMs]. Catches up at most one missed run:
  * the caller runs once and records lastRunMs = now, so a long outage never replays every missed fire.
+ *
+ * Clock going backwards: if the reference (lastRunMs ?? createdMs) is up to one day in the future,
+ * the job waits for the first fire after the reference, so a job that already ran never runs twice
+ * for the same slot. A reference more than one day in the future is treated as corrupt: the job then
+ * runs on its normal schedule (a fire in the minute ending at nowMs) instead of stalling for good,
+ * and recording lastRunMs = now afterwards returns it to normal.
  */
 export function isDue(
   s: Schedule,
@@ -302,7 +312,10 @@ export function isDue(
   nowMs: number,
   createdMs: number,
 ): boolean {
-  const next = nextRun(s, lastRunMs ?? createdMs);
+  if (!Number.isFinite(nowMs)) return false;
+  const ref = lastRunMs ?? createdMs;
+  const base = Number.isFinite(ref) && ref - nowMs > DAY_MS ? nowMs - MIN_MS : ref;
+  const next = nextRun(s, base);
   return next !== null && next <= nowMs;
 }
 
@@ -313,12 +326,16 @@ function two(n: number): string {
 /** Sentence-case English description. */
 export function describeSchedule(s: Schedule): string {
   if (s.kind === "last_working_day") return `Last working day of the month at ${s.time}`;
+  if (typeof parseCron(s.expr) === "string")
+    return `Invalid schedule (${s.expr.trim().slice(0, 60)})`;
   const fields = s.expr.trim().split(/\s+/);
   const wd = s.workingDaysOnly === true;
   const [fMin = "", fHour = "", fDom = "", fMon = "", fDow = ""] = fields;
   const fallback = `Custom schedule (${s.expr.trim()}) in Amsterdam time${wd ? ", working days only" : ""}`;
-  if (fields.length !== 5 || fDom !== "*" || fMon !== "*" || fDow !== "*") return fallback;
-  const suffix = wd ? " on working days" : "";
+  const weekdays = /^(1-5|mon-fri)$/i.test(fDow);
+  if (fDom !== "*" || fMon !== "*" || (fDow !== "*" && !weekdays)) return fallback;
+  // Working days are a subset of Monday to Friday, so "1-5" adds nothing when the flag is on.
+  const suffix = wd ? " on working days" : weekdays ? " on weekdays" : "";
   const step = /^\*\/(\d+)$/.exec(fMin);
   if (fHour === "*" && (fMin === "*" || (step && 60 % Number(step[1]) === 0))) {
     const n = fMin === "*" ? 1 : Number(step?.[1]);
@@ -332,7 +349,7 @@ export function describeSchedule(s: Schedule): string {
   }
   if (/^\d{1,2}$/.test(fMin) && /^\d{1,2}$/.test(fHour)) {
     const t = `${two(Number(fHour))}:${two(Number(fMin))}`;
-    return wd ? `Working days at ${t}` : `Daily at ${t}`;
+    return wd ? `Working days at ${t}` : weekdays ? `Weekdays at ${t}` : `Daily at ${t}`;
   }
   return fallback;
 }
