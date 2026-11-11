@@ -7,4 +7,6 @@ export * from "./client";
 export * from "./rate-limit";
 export * from "./redact";
 export * from "./xml";
+export * from "./write-payloads";
+export * from "./writer";
 export { parseExactDate, parseJsonRawNumbers } from "./json";
