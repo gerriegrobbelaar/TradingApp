@@ -1,3 +1,4 @@
+import { DcLine } from "../components/DcLine";
 import { useCallback, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import {
@@ -304,16 +305,13 @@ function CurrencySection({
         </table>
       </ScrollRegion>
       <MixLegend />
-      {foreign && totals.count > 0 && (
-        <p className="cap">
-          {totals.dcComplete
-            ? `${formatMoney(totals.dcMinor, dcCurrency)} in ${dcCurrency} as stored in Exact.`
-            : totals.dcMinor === 0
-              ? // "at least € 0,00" says nothing: say what is missing instead
-                `Not every item has an amount in ${dcCurrency} in Exact yet, so there is no ${dcCurrency} total.`
-              : `At least ${formatMoney(totals.dcMinor, dcCurrency)} in ${dcCurrency} as stored in Exact. Some items have no amount in ${dcCurrency} yet.`}
-        </p>
-      )}
+      <DcLine
+        currency={currency}
+        dcCurrency={dcCurrency}
+        dcMinor={totals.dcMinor}
+        dcComplete={totals.dcComplete}
+        count={totals.count}
+      />
     </Card>
   );
 }

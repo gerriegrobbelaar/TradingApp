@@ -4,6 +4,10 @@
  *  GET /api/approvals?division=&status=pending_approval|approved|rejected|all&q=&limit=&cursor=
  *  GET /api/approvals/:id
  *  GET /api/approvals/status-codes?division=   (admin only)
+ *  PUT /api/approvals/mapping-verified         (admin + step-up, audited) body
+ *      `{ confirmation: APPROVAL_MAPPING_CONFIRMATION, adrRef: string }`: records that the status
+ *      mapping was verified against Exact (review S2). DELETE revokes it (same rules). Until set,
+ *      `mappingVerified` is false everywhere and isInvoiceApprovedForPayment is always false.
  *
  * Any signed-in role may read. Same division rules, error codes and `no-store` as the other read
  * routes (routes.ts): `?division=` is our divisions.id (400 bad, 404 unknown or disabled), default
@@ -16,9 +20,13 @@
  * write: no CSRF or audit concern. No IBAN or email is stored in the table, so none is returned.
  */
 import {
+  APPROVAL_MAPPING_CONFIRMATION,
+  APPROVAL_MAPPING_VERIFIED_SETTING,
   APPROVAL_STATUSES,
   approvalAgeDays,
   approvalStatusFromCode,
+  parseApprovalMappingVerified,
+  type ApprovalMappingVerified,
   PURCHASE_ENTRY_STATUS_TABLE,
   type ApprovalDetail,
   type ApprovalStatusCodesResponse,
@@ -26,6 +34,7 @@ import {
   type ApprovalStatus,
   type ApprovalsResponse,
 } from "@camelthorn/core";
+import { auditStatement } from "../db/audit";
 import { json, type Ctx, type Router } from "../router";
 import {
   ANY_ROLE,
@@ -177,6 +186,15 @@ function mapRow(r: Row, todayDate: string): ApprovalItemDto {
   };
 }
 
+/** The stored "mapping verified" marker, null (= not verified) when absent or malformed. */
+export async function readMappingVerified(db: D1Database): Promise<ApprovalMappingVerified | null> {
+  const row = await db
+    .prepare("SELECT value_json FROM settings WHERE key = ?1")
+    .bind(APPROVAL_MAPPING_VERIFIED_SETTING)
+    .first<{ value_json: string }>();
+  return parseApprovalMappingVerified(row?.value_json ?? null);
+}
+
 const zeroCounts = (): Record<ApprovalStatus, number> => ({
   pending_approval: 0,
   approved: 0,
@@ -208,7 +226,11 @@ async function listHandler(ctx: Ctx): Promise<Response> {
   const available = state.some(
     (r) => r.entity === "purchase_entries" && r.last_completed_at !== null,
   );
-  const base = { division: { id: division.id, name: division.name }, freshness: fresh };
+  const base = {
+    division: { id: division.id, name: division.name },
+    freshness: fresh,
+    mappingVerified: (await readMappingVerified(db)) !== null,
+  };
   if (!available) {
     const empty: ApprovalsResponse = {
       ...base,
@@ -321,6 +343,7 @@ async function statusCodesHandler(ctx: Ctx): Promise<Response> {
   ).results;
   const body: ApprovalStatusCodesResponse = {
     division: { id: division.id, name: division.name },
+    mappingVerified: await readMappingVerified(db),
     table: Object.entries(PURCHASE_ENTRY_STATUS_TABLE)
       .map(([code, status]) => ({ statusCode: Number(code), status }))
       .sort((a, b) => a.statusCode - b.statusCode),
@@ -335,6 +358,88 @@ async function statusCodesHandler(ctx: Ctx): Promise<Response> {
   return json(body);
 }
 
+const ADMIN_STEP_UP = { roles: ["admin"], stepUp: true } as const;
+
+async function readBody(request: Request): Promise<Record<string, unknown> | null> {
+  try {
+    const v: unknown = await request.json();
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Records (PUT) or revokes (DELETE) the "mapping verified" marker. One D1 batch: the setting and
+ * its audit row (ADR 0013). The marker is the only thing that lets isInvoiceApprovedForPayment
+ * return true, so both directions are admin + step-up and audited. Revoke after any table change.
+ */
+async function setVerifiedHandler(ctx: Ctx): Promise<Response> {
+  const session = ctx.session;
+  if (!session) return json({ error: "unauthenticated" }, 401);
+  const db = ctx.env.DB;
+  const before = await readMappingVerified(db);
+  if (ctx.request.method === "DELETE") {
+    await db.batch([
+      auditStatement(
+        db,
+        {
+          actorEmail: session.email,
+          action: "settings.approval_mapping_unverified",
+          entity: "settings",
+          entityId: APPROVAL_MAPPING_VERIFIED_SETTING,
+          before: before ?? { verified: false },
+          after: { verified: false },
+        },
+        {
+          sql: "EXISTS (SELECT 1 FROM settings WHERE key = ?7)",
+          binds: [APPROVAL_MAPPING_VERIFIED_SETTING],
+        },
+      ),
+      db.prepare("DELETE FROM settings WHERE key = ?1").bind(APPROVAL_MAPPING_VERIFIED_SETTING),
+    ]);
+    return json({ mappingVerified: null });
+  }
+  const body = await readBody(ctx.request);
+  const adrRef = body?.["adrRef"];
+  if (
+    body?.["confirmation"] !== APPROVAL_MAPPING_CONFIRMATION ||
+    typeof adrRef !== "string" ||
+    adrRef.trim() === "" ||
+    adrRef.length > 100
+  ) {
+    return json({ error: "bad_request" }, 400);
+  }
+  const marker: ApprovalMappingVerified = {
+    verifiedAt: new Date(ctx.nowMs).toISOString(),
+    verifiedBy: session.email,
+    adrRef: adrRef.trim(),
+  };
+  await db.batch([
+    auditStatement(db, {
+      actorEmail: session.email,
+      action: "settings.approval_mapping_verified",
+      entity: "settings",
+      entityId: APPROVAL_MAPPING_VERIFIED_SETTING,
+      before: before ?? { verified: false },
+      after: marker,
+    }),
+    db
+      .prepare(
+        `INSERT INTO settings (key, value_json, updated_by, updated_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json,
+           updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+      )
+      .bind(
+        APPROVAL_MAPPING_VERIFIED_SETTING,
+        JSON.stringify(marker),
+        session.email,
+        marker.verifiedAt,
+      ),
+  ]);
+  return json({ mappingVerified: marker });
+}
+
 export function registerApprovalsRoutes(router: Router): void {
   router.add("GET", "/api/approvals", ANY_ROLE, guarded(listHandler));
   // Before /:id (the router takes the first match).
@@ -344,5 +449,7 @@ export function registerApprovalsRoutes(router: Router): void {
     { roles: ["admin"] },
     guarded(statusCodesHandler),
   );
+  router.add("PUT", "/api/approvals/mapping-verified", ADMIN_STEP_UP, setVerifiedHandler);
+  router.add("DELETE", "/api/approvals/mapping-verified", ADMIN_STEP_UP, setVerifiedHandler);
   router.add("GET", "/api/approvals/:id", ANY_ROLE, guarded(detailHandler));
 }

@@ -3,6 +3,7 @@
 import {
   safeReturnTo,
   type AgeingReportResponse,
+  type ApprovalStatusCodesResponse,
   type ApprovalsResponse,
   type BalanceSheetResponse,
   type LedgerAccountBalancesResponse,
@@ -446,6 +447,16 @@ export const listApprovals = (params: QueryParams, signal?: AbortSignal) =>
   request<ApprovalsResponse>(`/api/approvals${queryString(params)}`, {
     ...(signal ? { signal } : {}),
   });
+
+export const getApprovalStatusCodes = (division: number, signal?: AbortSignal) =>
+  request<ApprovalStatusCodesResponse>(`/api/approvals/status-codes${queryString({ division })}`, {
+    ...(signal ? { signal } : {}),
+  });
+/** Admin + recent sign-in: records that the status mapping was checked against Exact. */
+export const verifyApprovalMapping = (body: { confirmation: string; adrRef: string }) =>
+  request<unknown>("/api/approvals/mapping-verified", { method: "PUT", body });
+export const revokeApprovalMapping = () =>
+  request<unknown>("/api/approvals/mapping-verified", { method: "DELETE" });
 
 // ---- reports (Phase 4, K3b) -------------------------------------------------------------------
 

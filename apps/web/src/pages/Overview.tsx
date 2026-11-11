@@ -1,3 +1,4 @@
+import { DcLine } from "../components/DcLine";
 import { useState } from "react";
 import { Link } from "react-router";
 import type {
@@ -60,7 +61,6 @@ function Figure({
   tone?: "bad";
   onOpen: () => void;
 }) {
-  const foreign = currency !== dcCurrency;
   return (
     <div className="figcell">
       <button type="button" className="fig col" onClick={onOpen}>
@@ -75,15 +75,13 @@ function Figure({
           Show items
         </span>
       </button>
-      {foreign && amount.count > 0 && (
-        <p className="cap">
-          {amount.dcComplete ? "" : "At least "}
-          {formatMoney(amount.dcMinor, dcCurrency)} in {dcCurrency}
-        </p>
-      )}
-      {foreign && amount.count > 0 && !amount.dcComplete && (
-        <p className="cap">Some items have no amount in {dcCurrency} yet.</p>
-      )}
+      <DcLine
+        currency={currency}
+        dcCurrency={dcCurrency}
+        dcMinor={amount.dcMinor}
+        dcComplete={amount.dcComplete}
+        count={amount.count}
+      />
     </div>
   );
 }

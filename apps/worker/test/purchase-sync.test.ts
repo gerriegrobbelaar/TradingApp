@@ -722,7 +722,7 @@ describe("status changes reach the cache (review K4)", () => {
           lastSeenAt: r.synced_at,
           missedCycles: r.missed_cycles,
         },
-        { nowMs },
+        { nowMs, mappingVerified: true },
       );
     };
     expect(await asPayment(clock)).toBe(true);

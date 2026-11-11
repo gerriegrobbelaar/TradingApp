@@ -394,9 +394,7 @@ describe.each([
     const jpy = await screen.findByRole("region", { name: `${title} in JPY` });
     const card = jpy.closest(".card") as HTMLElement;
     expect(norm(card.textContent)).not.toContain("At least");
-    expect(norm(card.textContent)).toContain(
-      "Not every item has an amount in EUR in Exact yet, so there is no EUR total.",
-    );
+    expect(norm(card.textContent)).toContain("Not known yet.");
   });
 
   it("aborts the old request when the administration changes and shows only the new data", async () => {

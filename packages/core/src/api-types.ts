@@ -412,6 +412,12 @@ export interface ApprovalsResponse {
   countsByStatus: Record<ApprovalStatus, number>;
   freshness: Freshness;
   available: boolean;
+  /**
+   * True once an admin has recorded that the status mapping was verified against Exact (review S2,
+   * ADR 0025). While false the screen shows a non-dismissable notice and nothing may rely on the
+   * statuses for a payment.
+   */
+  mappingVerified: boolean;
 }
 
 /**
@@ -423,6 +429,8 @@ export interface ApprovalsResponse {
 export interface ApprovalStatusCodesResponse {
   division: { id: number; name: string };
   table: { statusCode: number; status: ApprovalStatus }[];
+  /** The stored marker, null while the mapping is not verified. */
+  mappingVerified: { verifiedAt: string; verifiedBy: string; adrRef: string } | null;
   codes: {
     statusCode: number | null;
     storedStatus: ApprovalStatus;

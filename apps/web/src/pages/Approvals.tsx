@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import type { ApprovalItemDto, ApprovalStatus, ApprovalsResponse } from "@camelthorn/core";
-import { Card, Chip, type ChipTone } from "@camelthorn/ui";
+import { Button, Card, Chip, type ChipTone } from "@camelthorn/ui";
 import { listApprovals } from "../api";
 import { useMe } from "../auth";
 import { useDivision } from "../division";
@@ -9,6 +9,7 @@ import { DataTable, KeyboardHint, LoadMore, type Column } from "../components/Da
 import { DrillSheet } from "../components/DrillSheet";
 import { EmptyState } from "../components/EmptyState";
 import { FilterBar } from "../components/FilterBar";
+import { MAPPING_NOTICE, MappingVerifySheet } from "../components/MappingVerifySheet";
 import { FreshnessStamp } from "../components/FreshnessStamp";
 import { Money } from "../components/Money";
 import { PageHeader } from "../components/PageHeader";
@@ -161,6 +162,8 @@ export function Approvals() {
     [],
   );
 
+  const [verifyOpen, setVerifyOpen] = useState(false);
+  const notVerified = list.first !== null && !list.first.mappingVerified;
   const unavailable = list.status === "ready" && list.first !== null && !list.first.available;
   const status = list.status === "ready" ? "ready" : list.status === "error" ? "error" : "loading";
 
@@ -172,6 +175,24 @@ export function Approvals() {
         lede="Supplier bills and where they are in sign-off. This screen only shows status; approving happens in Exact."
         tools={<FreshnessStamp freshness={list.first?.freshness ?? null} what="Approval status" />}
       />
+      {notVerified && (
+        <div role="status" className="notice warn">
+          <p>{MAPPING_NOTICE}</p>
+          {admin && (
+            <Button size="sm" onClick={() => setVerifyOpen(true)}>
+              Check and verify the mapping
+            </Button>
+          )}
+        </div>
+      )}
+      {admin && (
+        <MappingVerifySheet
+          open={verifyOpen}
+          divisionId={divisionId}
+          onClose={() => setVerifyOpen(false)}
+          onChanged={list.reload}
+        />
+      )}
       <Card>
         <FilterBar
           search={{

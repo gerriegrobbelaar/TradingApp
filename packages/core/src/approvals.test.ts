@@ -5,6 +5,7 @@ import {
   type ApprovalForPayment,
   approvalStatusFromCode,
   isInvoiceApprovedForPayment,
+  parseApprovalMappingVerified,
   pendingStatusCodes,
   purchaseWindowStart,
   PURCHASE_ENTRY_STATUS_TABLE,
@@ -54,8 +55,36 @@ describe("isInvoiceApprovedForPayment", () => {
   const ok = (e: ApprovalForPayment, maxAgeMs?: number): boolean =>
     isInvoiceApprovedForPayment(
       e,
-      maxAgeMs === undefined ? { nowMs: NOW } : { nowMs: NOW, maxAgeMs },
+      maxAgeMs === undefined
+        ? { nowMs: NOW, mappingVerified: true }
+        : { nowMs: NOW, maxAgeMs, mappingVerified: true },
     );
+
+  it("is false unless the mapping is verified, and true only with every condition", () => {
+    const e = fresh();
+    expect(isInvoiceApprovedForPayment(e, { nowMs: NOW })).toBe(false);
+    expect(isInvoiceApprovedForPayment(e, { nowMs: NOW, mappingVerified: false })).toBe(false);
+    expect(
+      isInvoiceApprovedForPayment(e, { nowMs: NOW, mappingVerified: "true" as unknown as boolean }),
+    ).toBe(false);
+    expect(isInvoiceApprovedForPayment(e, { nowMs: NOW, mappingVerified: true })).toBe(true);
+    // verified, but each of the other conditions still applies
+    const v = { nowMs: NOW, mappingVerified: true };
+    expect(isInvoiceApprovedForPayment(fresh({ missedCycles: 1 }), v)).toBe(false);
+    expect(isInvoiceApprovedForPayment(fresh({ statusCode: 999 }), v)).toBe(false);
+    expect(
+      isInvoiceApprovedForPayment(fresh({ lastSeenAt: new Date(NOW - 40 * HOUR).toISOString() }), v),
+    ).toBe(false);
+  });
+
+  it("parses the stored marker strictly", () => {
+    const good = { verifiedAt: "2026-11-11T10:00:00.000Z", verifiedBy: "a@b.c", adrRef: "0025" };
+    expect(parseApprovalMappingVerified(JSON.stringify(good))).toEqual(good);
+    for (const bad of [null, "", "x", "[]", "null", JSON.stringify({ ...good, adrRef: "" }),
+      JSON.stringify({ ...good, verifiedAt: "soon" }), JSON.stringify({ verifiedAt: good.verifiedAt })]) {
+      expect(parseApprovalMappingVerified(bad)).toBeNull();
+    }
+  });
 
   it("is true only for approved", () => {
     const all: ApprovalStatus[] = ["pending_approval", "approved", "rejected", "unknown"];

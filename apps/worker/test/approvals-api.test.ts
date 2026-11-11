@@ -6,6 +6,8 @@ import {
   type ApprovalDetail,
   type ApprovalItemDto,
   type ApprovalStatus,
+  APPROVAL_MAPPING_CONFIRMATION,
+  APPROVAL_MAPPING_VERIFIED_SETTING,
   type ApprovalStatusCodesResponse,
   type ApprovalsResponse,
   type Freshness,
@@ -509,6 +511,7 @@ describe("response shapes", () => {
     "countsByStatus",
     "freshness",
     "available",
+    "mappingVerified",
   ]);
   const DETAIL = keysOf<ApprovalDetail>()([
     "division",
@@ -616,5 +619,113 @@ describe("status codes for verifying the mapping (review K4)", () => {
     for (const leak of ["Supplier", "NL91", "@", "10001"]) expect(text).not.toContain(leak);
     expect((await get(`/api/approvals/status-codes?division=${divOff}`)).status).toBe(404);
     expect((await get(`/api/approvals/status-codes?division=abc`)).status).toBe(400);
+  });
+});
+
+describe("mapping verified gate (review S2)", () => {
+  const put = (who: string, json: unknown, method = "PUT"): Promise<Response> =>
+    authed("/api/approvals/mapping-verified", tokens[who] as string, { method, json });
+  const ok = { confirmation: APPROVAL_MAPPING_CONFIRMATION, adrRef: "ADR 0025 live check" };
+  const stored = async (): Promise<string | null> =>
+    (
+      await db
+        .prepare("SELECT value_json FROM settings WHERE key = ?1")
+        .bind(APPROVAL_MAPPING_VERIFIED_SETTING)
+        .first<{ value_json: string }>()
+    )?.value_json ?? null;
+  const audits = async (): Promise<string[]> =>
+    (
+      await db
+        .prepare(
+          "SELECT action FROM audit_log WHERE action LIKE 'settings.approval_mapping%' AND id > ?1 ORDER BY id",
+        )
+        .bind(auditBase)
+        .all<{ action: string }>()
+    ).results.map((r) => r.action);
+  let auditBase = 0;
+  beforeEach(async () => {
+    auditBase =
+      (await db.prepare("SELECT COALESCE(MAX(id), 0) AS m FROM audit_log").first<{ m: number }>())
+        ?.m ?? 0;
+  });
+  const listVerified = async (div: number): Promise<boolean> =>
+    (await get<ApprovalsResponse>(`/api/approvals?division=${div}`)).body.mappingVerified;
+
+  it("is not verified by default, in the list and in the status-codes view", async () => {
+    await markSynced(divA);
+    expect(await listVerified(divA)).toBe(false);
+    expect(await listVerified(divB)).toBe(false);
+    const sc = await get<ApprovalStatusCodesResponse>(
+      `/api/approvals/status-codes?division=${divA}`,
+    );
+    expect(sc.body.mappingVerified).toBeNull();
+  });
+
+  it("is admin only and needs a fresh sign-in", async () => {
+    for (const who of ["finance", "viewer", "approver"]) {
+      expect((await put(who, ok)).status, who).toBe(403);
+    }
+    expect(
+      (
+        await call("/api/approvals/mapping-verified", {
+          method: "PUT",
+          headers: { "x-requested-with": "fetch" },
+        })
+      ).status,
+    ).toBe(401);
+    const stale = await addSession(await addUser("old@camelthorncapital.com", ["admin"]), {
+      lastAuthAgoMs: 20 * 60 * 1000,
+    });
+    const res = await authed("/api/approvals/mapping-verified", stale, { method: "PUT", json: ok });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "step_up_required" });
+    expect(await stored()).toBeNull();
+  });
+
+  it("needs the confirmation text and a reference", async () => {
+    for (const body of [
+      {},
+      { adrRef: "x" },
+      { confirmation: "yes", adrRef: "x" },
+      { confirmation: APPROVAL_MAPPING_CONFIRMATION },
+      { confirmation: APPROVAL_MAPPING_CONFIRMATION, adrRef: "  " },
+      { confirmation: APPROVAL_MAPPING_CONFIRMATION, adrRef: "x".repeat(101) },
+      { confirmation: APPROVAL_MAPPING_CONFIRMATION, adrRef: 5 },
+    ]) {
+      expect((await put("admin", body)).status, JSON.stringify(body)).toBe(400);
+    }
+    expect(await stored()).toBeNull();
+    expect(await audits()).toEqual([]);
+  });
+
+  it("records who and when, audits in the same batch, and shows in both views", async () => {
+    await markSynced(divA);
+    expect((await put("admin", ok)).status).toBe(200);
+    const marker = JSON.parse((await stored()) as string) as Record<string, string>;
+    expect(marker["verifiedBy"]).toBe("gerrie.grobbelaar@camelthorncapital.com");
+    expect(marker["adrRef"]).toBe("ADR 0025 live check");
+    expect(Date.parse(marker["verifiedAt"] as string)).toBeGreaterThan(Date.now() - 60_000);
+    expect(await audits()).toEqual(["settings.approval_mapping_verified"]);
+    expect(await listVerified(divA)).toBe(true);
+    const sc = await get<ApprovalStatusCodesResponse>(
+      `/api/approvals/status-codes?division=${divA}`,
+    );
+    expect(sc.body.mappingVerified?.verifiedBy).toBe("gerrie.grobbelaar@camelthorncapital.com");
+  });
+
+  it("a malformed marker counts as not verified; revoking is audited once and idempotent", async () => {
+    await markSynced(divA);
+    await db
+      .prepare(
+        "INSERT INTO settings (key, value_json, updated_by) VALUES (?1, '{\"verifiedAt\":1}', 'x')",
+      )
+      .bind(APPROVAL_MAPPING_VERIFIED_SETTING)
+      .run();
+    expect(await listVerified(divA)).toBe(false);
+    expect((await put("admin", {}, "DELETE")).status).toBe(200);
+    expect(await stored()).toBeNull();
+    expect((await put("admin", {}, "DELETE")).status).toBe(200);
+    expect(await audits()).toEqual(["settings.approval_mapping_unverified"]);
+    expect((await put("finance", {}, "DELETE")).status).toBe(403);
   });
 });

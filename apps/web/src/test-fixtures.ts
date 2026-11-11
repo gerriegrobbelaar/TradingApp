@@ -226,6 +226,7 @@ export function approvals(
     countsByStatus: { pending_approval: items.length, approved: 4, rejected: 1, unknown: 0 },
     freshness: FRESH,
     available: true,
+    mappingVerified: true,
     ...over,
   };
 }

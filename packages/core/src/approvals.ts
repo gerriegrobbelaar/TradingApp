@@ -71,6 +71,48 @@ export const APPROVAL_MAX_AGE_MS = 36 * 60 * 60 * 1000;
 /** A last-seen stamp further in the future than this is not trusted (clock or data fault). */
 const APPROVAL_FUTURE_TOLERANCE_MS = 5 * 60 * 1000;
 
+/**
+ * `settings.key` of the "mapping verified" gate (review S2, ADR 0025). Value JSON:
+ * `{ verifiedAt, verifiedBy, adrRef }`. Absent (the default) means NOT verified, and then no
+ * entry counts as approved for payment, whatever the table says.
+ */
+export const APPROVAL_MAPPING_VERIFIED_SETTING = "exact.approval_mapping_verified";
+
+/** The exact text an admin must send to record the verification (a deliberate, typed act). */
+export const APPROVAL_MAPPING_CONFIRMATION =
+  "I verified the approval status mapping against Exact";
+
+/** What the stored "verified" marker looks like (all three are required). */
+export interface ApprovalMappingVerified {
+  verifiedAt: string;
+  verifiedBy: string;
+  adrRef: string;
+}
+
+/** Parses the stored setting; null (= not verified) for anything that is not complete. */
+export function parseApprovalMappingVerified(valueJson: string | null): ApprovalMappingVerified | null {
+  if (valueJson === null) return null;
+  try {
+    const v: unknown = JSON.parse(valueJson);
+    if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+    const o = v as Record<string, unknown>;
+    const { verifiedAt, verifiedBy, adrRef } = o;
+    if (
+      typeof verifiedAt !== "string" ||
+      Number.isNaN(Date.parse(verifiedAt)) ||
+      typeof verifiedBy !== "string" ||
+      verifiedBy === "" ||
+      typeof adrRef !== "string" ||
+      adrRef === ""
+    ) {
+      return null;
+    }
+    return { verifiedAt, verifiedBy, adrRef };
+  } catch {
+    return null;
+  }
+}
+
 /** What the payment pre-check needs of a cached purchase entry (purchase_entries row). */
 export interface ApprovalForPayment {
   /** Stored, derived status. */
@@ -90,14 +132,16 @@ export interface ApprovalForPayment {
  *    (a stale derivation, a hand-edited row or a code removed from the table is not approved);
  *  - the row was seen by a read within `maxAgeMs` (default and upper bound APPROVAL_MAX_AGE_MS)
  *    and not in the future;
- *  - the last complete read saw it (`missedCycles` is 0).
- * The mapping itself is UNVERIFIED (ADR 0025): Phase 9 must not enable paying until it has been
- * checked on a real division, and must re-read the entry from Exact before it sends a payment.
+ *  - the last complete read saw it (`missedCycles` is 0);
+ *  - the status mapping has been verified on a real division (`opts.mappingVerified === true`,
+ *    from the `exact.approval_mapping_verified` setting; default false, review S2).
+ * Phase 9 must also re-read the entry from Exact before it sends a payment.
  */
 export function isInvoiceApprovedForPayment(
   entry: ApprovalForPayment,
-  opts: { nowMs: number; maxAgeMs?: number },
+  opts: { nowMs: number; maxAgeMs?: number; mappingVerified?: boolean },
 ): boolean {
+  if (opts.mappingVerified !== true) return false;
   if (entry.status !== "approved") return false;
   if (approvalStatusFromCode(entry.statusCode) !== "approved") return false;
   if (!Number.isSafeInteger(entry.missedCycles) || entry.missedCycles !== 0) return false;
