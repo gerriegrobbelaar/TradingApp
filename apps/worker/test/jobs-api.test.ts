@@ -102,13 +102,16 @@ describe("GET /api/jobs", () => {
       "fx.revaluation",
     ]);
     const full = byName(body, "exact.full_sync");
+    // The Exact jobs ship switched off until the first live connection has been checked (S6).
     expect(full).toMatchObject({
-      enabled: true,
+      enabled: false,
       implemented: true,
       usesExact: true,
       exactBudget: 240,
+      defaultEnabled: false,
+      disabledReason: "awaiting_live_verification",
+      nextRunAt: null,
     });
-    expect(full.nextRunAt).toBeTruthy();
     expect(full.scheduleText).toBeTruthy();
     const later = byName(body, "revolut.sync");
     expect(later).toMatchObject({ enabled: false, implemented: false, nextRunAt: null });
@@ -337,7 +340,10 @@ describe("PATCH /api/jobs/:id", () => {
     const id = await jobId("exact.incremental_sync");
     // Baseline two hours ago: the :30 slot after it is in the past and due on the next tick.
     const base = new Date(Date.now() - 2 * 3_600_000).toISOString();
-    await db.prepare("UPDATE jobs SET last_scheduled_at = ?2 WHERE id = ?1").bind(id, base).run();
+    await db
+      .prepare("UPDATE jobs SET last_scheduled_at = ?2, enabled = 1 WHERE id = ?1")
+      .bind(id, base)
+      .run();
     expect((await patch("admin", id, { exactBudget: 50 })).status).toBe(200);
     const row = await db
       .prepare("SELECT last_scheduled_at, next_run_at FROM jobs WHERE id = ?1")

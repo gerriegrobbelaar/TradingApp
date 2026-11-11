@@ -1,6 +1,11 @@
 /** Shared types of the job runner (CLAUDE.md 4.1). */
+import type { ScheduleRules } from "@camelthorn/core";
+import type { Role } from "../auth/session";
 import type { Env } from "../env";
 import type { SyncDeps } from "../exact/sync";
+
+/** Roles that may start a job by hand unless the handler says otherwise. */
+export const DEFAULT_RUN_ROLES: readonly Role[] = ["admin", "finance"];
 
 /** The queue message. Only ids: the row in job_runs is the source of truth. */
 export interface JobMessage {
@@ -52,6 +57,31 @@ export interface HandlerResult {
   retry?: { delaySeconds: number };
 }
 
+/**
+ * HANDLER CONTRACT (review S1, ADR 0021). Every handler must obey it; the contract test
+ * (apps/worker/test/jobs-contract.test.ts) runs each implemented handler twice.
+ *
+ *  1. At-least-once, rarely concurrent. A run may execute more than once (queue redelivery, a
+ *     takeover after a stale heartbeat, a retry) and may briefly overlap a zombie executor whose
+ *     lock lease expired. Handlers must be safe to repeat.
+ *  2. Idempotency keys come from the BUSINESS object (invoice id, payment id, month), never from
+ *     `run.id` or `run.attempt`: those differ between two executions of the same work. Claim the key
+ *     (idempotency_keys) before an external write and skip the write if it is already claimed.
+ *  3. Derive periods from `run.scheduledFor` (see jobs/period.ts), never from the clock. A late or
+ *     retried run of the 31 October slot still works on October.
+ *  4. Lateness: a scheduled run that starts later than the handler's `maxLatenessMs` after its slot
+ *     is recorded `skipped` / `too_late` by the runner; the next slot proceeds as normal. Manual
+ *     runs are never too late.
+ *  5. Check `ctx.signal` between items and stop starting new work once it is aborted (deadline or
+ *     lost lease). JavaScript cannot kill a promise; cooperation is the only way to stop a zombie.
+ *  6. Retry ONLY by returning `partial` or `skipped` with `retry`. Never throw to get a retry
+ *     (apart from transient failures `sync.ts` classifies), never loop on your own.
+ *  7. Audit every external write (who, what, when, before/after; CLAUDE.md section 5).
+ *  8. The result summary holds counts and codes only: no names, IBANs, e-mail addresses, tokens
+ *     or bodies. It is masked and capped at 4,000 characters when stored.
+ *  9. Who may start it by hand: `runRoles` (default admin and finance) and, for jobs that move
+ *     money or send mail, `stepUp` (a Google sign-in within 15 minutes).
+ */
 export interface HandlerDef {
   title: string;
   description: string;
@@ -61,6 +91,17 @@ export interface HandlerDef {
   phase: string | null;
   /** Total attempts including the first; retries only apply to scheduled runs. */
   maxAttempts: number;
+  /** Roles that may use "Run now" (any of them). Default: admin and finance. */
+  runRoles?: readonly Role[];
+  /** "Run now" needs a Google sign-in within the last 15 minutes. Default false. */
+  stepUp?: boolean;
+  /**
+   * A scheduled (or retry) run that starts more than this long after its slot is recorded
+   * `skipped` / `too_late`. Undefined = no limit. Never applies to manual runs.
+   */
+  maxLatenessMs?: number;
+  /** What an admin may set as the schedule (checked in PATCH /api/jobs, shown in the editor). */
+  scheduleRules?: ScheduleRules;
   /** Undefined = not implemented yet: runs are recorded as skipped with code not_implemented. */
   run?: (ctx: JobContext) => Promise<HandlerResult>;
 }

@@ -12,18 +12,7 @@ import {
   tickScheduler,
 } from "../src/jobs/runner";
 import type { HandlerResult } from "../src/jobs/types";
-import {
-  FakeQueue,
-  addJob,
-  addRun,
-  db,
-  def,
-  envWith,
-  ok,
-  runById,
-  runsOf,
-  sleep,
-} from "./job-helpers";
+import { FakeQueue, addJob, addRun, db, def, envWith, ok, runById, runsOf } from "./job-helpers";
 
 const T0 = Date.parse("2026-03-10T10:00:30Z"); // a Tuesday, 11:00:30 Amsterdam
 const minute = (n: number) => T0 + n * 60_000;
@@ -275,10 +264,13 @@ describe("executeRun", () => {
     const b = await addRun(id, { scheduledFor: "2026-03-10T10:01:00.000Z" });
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
+    let started!: () => void;
+    const hasStarted = new Promise<void>((r) => (started = r));
     let running = 0;
     let maxRunning = 0;
     const handlers = {
       h: def(async () => {
+        started();
         running++;
         maxRunning = Math.max(maxRunning, running);
         await gate;
@@ -287,7 +279,7 @@ describe("executeRun", () => {
       }),
     };
     const first = executeRun(e, a, { handlers });
-    await sleep(100); // let the first take the lock
+    await hasStarted; // the first holds the lock now
     const second = await executeRun(e, b, { handlers });
     expect(second).toEqual({ kind: "ack", reason: "skipped" });
     release();
@@ -307,7 +299,7 @@ describe("executeRun", () => {
     const y = await addJob({ name: "jy", handler: "h" });
     const rx = await addRun(x);
     const ry = await addRun(y);
-    const handlers = { h: def(async () => (await sleep(50), ok())) };
+    const handlers = { h: def(async () => (await Promise.resolve(), ok())) };
     await Promise.all([executeRun(e, rx, { handlers }), executeRun(e, ry, { handlers })]);
     expect([(await runById(rx)).status, (await runById(ry)).status]).toEqual(["ok", "ok"]);
   });
@@ -421,15 +413,20 @@ describe("executeRun", () => {
     let firstAborted = false;
     let secondRan = false;
     let calls = 0;
+    let firstStarted!: () => void;
+    const firstIsRunning = new Promise<void>((r) => (firstStarted = r));
+    let finishFirst!: () => void;
+    const firstMayFinish = new Promise<void>((r) => (finishFirst = r));
     const handlers = {
       h: def(async (ctx) => {
         if (++calls === 1) {
           // The first executor: its lease (50 ms) lapses before its first beat (at 200 ms).
+          firstStarted();
           return new Promise<HandlerResult>((resolve) => {
             ctx.signal.addEventListener("abort", () => {
               firstAborted = true;
               // It finishes AFTER the takeover finished.
-              void sleep(30).then(() => resolve(ok({ who: "first" })));
+              void firstMayFinish.then(() => resolve(ok({ who: "first" })));
             });
           });
         }
@@ -438,9 +435,12 @@ describe("executeRun", () => {
       }),
     };
     const first = executeRun(e, run, { handlers, lockTtlMs: 50, heartbeatMs: 200 });
-    await sleep(100);
+    await firstIsRunning;
+    // Its 50 ms lease lapses (the lock object's own clock); wait for that, not for a fixed time.
+    await vi.waitFor(async () => expect(await lockOf("slow").peek()).toBeNull());
     // A redelivery (sweep resend) treats the run as stale and takes it over with a fresh lease.
     const second = await executeRun(e, run, { handlers, staleMs: 0, lockTtlMs: 5000 });
+    finishFirst();
     expect(second).toEqual({ kind: "ack", reason: "ok" });
     expect(secondRan).toBe(true);
     expect(await first).toEqual({ kind: "ack", reason: "taken_over" });
@@ -872,13 +872,17 @@ describe("heartbeat and entry points", () => {
     const handlers = {
       h: def(async () => {
         const first = (await runById(run)).id;
-        await sleep(120);
-        const row = await db
-          .prepare("SELECT heartbeat_at, started_at FROM job_runs WHERE id = ?1")
-          .bind(first)
-          .first<{ heartbeat_at: string; started_at: string }>();
-        beats = Date.parse(row?.heartbeat_at ?? "") > Date.parse(row?.started_at ?? "") ? 1 : 0;
-        // Past the original 60 ms lease, so the heartbeat must have extended it.
+        const initial = (await lockOf("hb").peek())?.until ?? 0;
+        // Wait until a beat has extended the lease and written the heartbeat (not a fixed time).
+        await vi.waitFor(async () => {
+          expect((await lockOf("hb").peek())?.until ?? 0).toBeGreaterThan(initial);
+          const row = await db
+            .prepare("SELECT heartbeat_at, started_at FROM job_runs WHERE id = ?1")
+            .bind(first)
+            .first<{ heartbeat_at: string; started_at: string }>();
+          beats = Date.parse(row?.heartbeat_at ?? "") > Date.parse(row?.started_at ?? "") ? 1 : 0;
+          expect(beats).toBe(1);
+        });
         const stolen = await lockOf("hb").acquire("intruder", 1000);
         return ok({ stolen: stolen.ok });
       }),
@@ -901,8 +905,9 @@ describe("heartbeat and entry points", () => {
               resolve({ status: "partial", summary: {}, code: "aborted" });
             });
             // The lease expires (60 ms TTL, first beat at 150 ms) and another run takes the lock.
-            void sleep(90).then(async () => {
-              await lockOf("hb").acquire("thief", 5000);
+            void vi.waitFor(async () => {
+              const got = await lockOf("hb").acquire("thief", 5000);
+              if (!got.ok) throw new Error("still held");
             });
           }),
       ),
@@ -954,7 +959,7 @@ describe("JobLock", () => {
   it("an expired lease (dead holder) can be taken over, and the dead holder cannot extend it", async () => {
     const lock = lockOf("lock-2");
     expect(await lock.acquire("dead", 20)).toMatchObject({ ok: true });
-    await sleep(60);
+    await vi.waitFor(async () => expect(await lock.peek()).toBeNull()); // the 20 ms lease lapses
     expect(await lock.acquire("alive", 5000)).toMatchObject({ ok: true });
     expect(await lock.heartbeat("dead", 5000)).toBe(false);
     expect((await lock.peek())?.holder).toBe("alive");

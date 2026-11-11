@@ -7,6 +7,8 @@
  *  - a release that adds a default job bumps DEFAULT_JOBS_VERSION and ships the new entry; the
  *    next start inserts just that job.
  * Jobs whose phase is not built yet start disabled (their handler would only record "skipped").
+ * The two Exact sync jobs ship disabled too (review S6) until the first live connection has been
+ * checked; an admin switches them on afterwards. Existing rows are never flipped.
  */
 import { nextRun, type Schedule } from "@camelthorn/core";
 import { auditStatement } from "../db/audit";
@@ -21,7 +23,15 @@ export interface DefaultJob {
   schedule: Schedule;
   enabled: boolean;
   exactBudget: number;
+  /** Why a default job ships switched off, as a stable code (shown to admins by GET /api/jobs). */
+  disabledReason?: typeof AWAITING_LIVE_VERIFICATION;
 }
+
+/** The Exact jobs wait for the first live connection checks (docs/DEPLOY.md). */
+export const AWAITING_LIVE_VERIFICATION = "awaiting_live_verification";
+
+export const defaultJobFor = (name: string): DefaultJob | undefined =>
+  DEFAULT_JOBS.find((j) => j.name === name);
 
 export const DEFAULT_JOBS: readonly DefaultJob[] = [
   {
@@ -64,7 +74,8 @@ export const DEFAULT_JOBS: readonly DefaultJob[] = [
     name: "exact.full_sync",
     handler: "exact.full_sync",
     schedule: { kind: "cron", expr: "0 2 * * *" },
-    enabled: true,
+    enabled: false,
+    disabledReason: AWAITING_LIVE_VERIFICATION,
     exactBudget: FULL_SYNC_BUDGET,
   },
   {
@@ -72,7 +83,8 @@ export const DEFAULT_JOBS: readonly DefaultJob[] = [
     handler: "exact.incremental_sync",
     // Half past the hour, so it does not meet the nightly full sync at 02:00 (they share a lease).
     schedule: { kind: "cron", expr: "30 * * * *" },
-    enabled: true,
+    enabled: false,
+    disabledReason: AWAITING_LIVE_VERIFICATION,
     exactBudget: INCREMENTAL_SYNC_BUDGET,
   },
   {

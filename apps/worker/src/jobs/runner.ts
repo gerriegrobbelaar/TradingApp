@@ -23,12 +23,20 @@
  * A sweep in every tick re-sends messages that were lost (a crash between the insert and the
  * send, a dropped dead-letter) and finally marks runs that never completed as errors.
  */
-import { amsterdamParts, isDue, nextRun, validateSchedule, type Schedule } from "@camelthorn/core";
+import {
+  amsterdamParts,
+  dueSlot,
+  nextRun,
+  validateSchedule,
+  type Schedule,
+} from "@camelthorn/core";
 import { auditStatement, maskDeep } from "../db/audit";
 import type { Env } from "../env";
 import { getEuObject } from "../eu-object";
 import { isTransientFailure, type SyncDeps } from "../exact/sync";
 import { handlerFor } from "./handlers";
+import { HEARTBEAT_MS } from "./overhead";
+import { latenessMs } from "./period";
 import {
   TERMINAL,
   type HandlerDef,
@@ -42,7 +50,7 @@ import {
 
 /** Lease lifetime; the heartbeat renews it, a dead isolate loses it after this long. */
 export const LOCK_TTL_MS = 90_000;
-export const HEARTBEAT_MS = 30_000;
+export { HEARTBEAT_MS };
 /** A 'running' run whose heartbeat is older than this is stuck and may be taken over. */
 export const STALE_MS = 2 * 60_000;
 /** The sweep re-sends a message for a run untouched this long. */
@@ -181,8 +189,8 @@ async function claimIfDue(env: Env, job: JobRow, nowMs: number): Promise<number 
   }
   const lastMs = parseMs(job.last_scheduled_at);
   const createdMs = parseMs(job.created_at) ?? nowMs;
-  if (!isDue(schedule, lastMs, nowMs, createdMs)) return null;
-  const slot = nextRun(schedule, lastMs ?? createdMs);
+  // One rule for "is it due" and "which slot" (core dueSlot), so the two cannot diverge.
+  const slot = dueSlot(schedule, lastMs, nowMs, createdMs);
   if (slot === null) return null;
 
   const token = crypto.randomUUID();
@@ -203,7 +211,18 @@ async function claimIfDue(env: Env, job: JobRow, nowMs: number): Promise<number 
     ).bind(job.id, iso(slot), iso(nowMs), next === null ? null : iso(next), token),
   ]);
   const row = ins?.results?.[0] as { id: number } | undefined;
-  if (!row) return null; // another tick or isolate claimed this slot
+  if (!row) {
+    // A row for this slot already exists: another tick or isolate claimed it (and has moved the
+    // baseline), or a manual run took the very same millisecond. Either way do not come back for
+    // this slot on every tick: move the baseline past it, but only if nobody else did already.
+    await env.DB.prepare(
+      `UPDATE jobs SET last_scheduled_at = ?3, next_run_at = ?4
+       WHERE id = ?1 AND last_scheduled_at IS ?2`,
+    )
+      .bind(job.id, job.last_scheduled_at, iso(nowMs), next === null ? null : iso(next))
+      .run();
+    return null;
+  }
   await enqueueRun(env, row.id, job.id);
   return row.id;
 }
@@ -469,6 +488,23 @@ export async function executeRun(
     });
   }
 
+  // Too late to be useful (handler.maxLatenessMs): scheduled and retry runs only, measured from
+  // the slot (a retry keeps its slot's scheduled_for, so retries stop at slot + limit). The next
+  // slot proceeds as normal; a manual run is a person asking now and is never too late. Checked
+  // only once we hold the lease: a takeover of a run whose executor is still alive was handed
+  // back above, so a live run is never recorded too_late while it is working.
+  if (def.maxLatenessMs !== undefined && row.trigger !== "manual") {
+    const late = latenessMs({ run: { scheduledFor: row.scheduled_for } }, startMs);
+    if (late > def.maxLatenessMs) {
+      await lock.release(token).catch(() => undefined);
+      return finish({
+        status: "skipped",
+        code: "too_late",
+        summary: { lateMinutes: Math.floor(late / 60_000) },
+      });
+    }
+  }
+
   const ac = new AbortController();
   const timeoutMs = deps.timeoutMs ?? RUN_TIMEOUT_MS;
   const graceMs = deps.graceMs ?? ABORT_GRACE_MS;
@@ -496,6 +532,7 @@ export async function executeRun(
     ...(deps.syncDeps ? { syncDeps: deps.syncDeps } : {}),
   };
 
+  let lockLost = false;
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   const beat = setInterval(() => {
     void (async () => {
@@ -503,6 +540,7 @@ export async function executeRun(
         const alive = await lock.heartbeat(token, ttl);
         if (!alive) {
           console.error("job lock lost", row.job_name);
+          lockLost = true;
           ac.abort();
           return;
         }
@@ -533,7 +571,21 @@ export async function executeRun(
     // Release in finally; if this fails the lease simply expires.
     await lock.release(token).catch(() => undefined);
   }
+  if (lockLost) result = withLockLost(result);
   return finish(result);
+}
+
+/**
+ * The lease was lost while the handler worked (the lock heartbeat failed for a whole lease): a
+ * zombie's outcome is labelled as such. A clean ok stays ok (the work was done); a timeout, a
+ * crash or a code-less outcome becomes `lock_lost` so the cause is visible.
+ */
+function withLockLost(r: HandlerResult): HandlerResult {
+  if (r.status === "ok") return r;
+  if (r.code === undefined || r.code === "timeout" || r.code === "handler_error") {
+    return { ...r, code: "lock_lost" };
+  }
+  return r;
 }
 
 function failureResult(e: unknown): HandlerResult {
@@ -572,7 +624,13 @@ async function finishRun(
     result,
     retry ? { retry: { attempt: row.attempt + 1, inSeconds: retry.delaySeconds } } : {},
   );
-  const [upd] = await db.batch([
+  const retryAt = iso(nowMs + boundedDelay(retry?.delaySeconds ?? 0) * 1000);
+  // ONE atomic batch: this run's result, the job's last_* columns and (when asked) attempt n+1. The
+  // retry row is guarded by runner_token like the other two, so only the executor that really
+  // finishes the run can create it. If any statement fails the whole batch rolls back: the run
+  // stays 'running' under its token and a redelivery takes it over once its heartbeat is stale, so
+  // neither the result nor the retry is half-recorded or lost (review S2).
+  const results = await db.batch([
     db
       .prepare(
         `UPDATE job_runs SET status = ?2, finished_at = ?3, result_json = ?4, error_code = ?5,
@@ -595,33 +653,39 @@ async function finishRun(
                                    AND finished_at = ?3 AND status = ?2)`,
       )
       .bind(row.id, result.status, finished, resultJson, row.job_id, token),
-  ]);
-  if (upd?.meta.changes !== 1) {
-    // Taken over by another consumer while we worked; its result stands.
-    console.error("job run was taken over", row.job_name);
-    return ack("taken_over");
-  }
-  if (retry) {
-    const ins = await db
+    // enqueued_at is when the delayed message becomes visible, so the sweep (which re-sends runs
+    // untouched for SWEEP_AFTER_MS) does not race the delayed delivery with a duplicate.
+    db
       .prepare(
         `INSERT INTO job_runs (job_id, scheduled_for, attempt, status, trigger, requested_by,
                                queued_at, enqueued_at, claim_token)
-         VALUES (?1, ?2, ?3, 'queued', 'retry', 'system', ?4, ?5, ?6)
+         SELECT ?1, ?2, ?3, 'queued', 'retry', 'system', ?4, ?5, ?6
+         WHERE ?7 = 1 AND EXISTS (SELECT 1 FROM job_runs WHERE id = ?8 AND runner_token = ?9
+                                  AND finished_at = ?4 AND status = ?10)
          ON CONFLICT (job_id, scheduled_for, attempt) DO NOTHING
          RETURNING id`,
       )
-      // enqueued_at is when the delayed message becomes visible, so the sweep (which re-sends runs
-      // untouched for SWEEP_AFTER_MS) does not race the delayed delivery with a duplicate.
       .bind(
         row.job_id,
         row.scheduled_for,
         row.attempt + 1,
         finished,
-        iso(nowMs + boundedDelay(retry.delaySeconds) * 1000),
+        retryAt,
         crypto.randomUUID(),
-      )
-      .first<{ id: number }>();
-    if (ins) await enqueueRun(env, ins.id, row.job_id, boundedDelay(retry.delaySeconds));
+        retry ? 1 : 0,
+        row.id,
+        token,
+        result.status,
+      ),
+  ]);
+  if (results[0]?.meta.changes !== 1) {
+    // Taken over by another consumer while we worked; its result stands.
+    console.error("job run was taken over", row.job_name);
+    return ack("taken_over");
+  }
+  const inserted = results[2]?.results?.[0] as { id: number } | undefined;
+  if (retry && inserted) {
+    await enqueueRun(env, inserted.id, row.job_id, boundedDelay(retry.delaySeconds));
   }
   return ack(result.status);
 }

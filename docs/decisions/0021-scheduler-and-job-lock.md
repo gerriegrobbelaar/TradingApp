@@ -35,3 +35,59 @@ CLAUDE.md 4.1: jobs with a schedule in Europe/Amsterdam, `job_runs` history, no 
 
 ## Verify on first deploy
 Queue and dead-letter queue exist; Settings, Schedules shows no warning within 2 minutes; "Run now" on the incremental sync ends `OK`; `JobLock` objects appear under the EU jurisdiction.
+
+## Phase 3 review fixes (task J1)
+- **Handler contract (S1).** Written out in `apps/worker/src/jobs/types.ts` (above `HandlerDef`) and enforced where it can be:
+  1. Runs are at-least-once and may briefly overlap a zombie executor; handlers must be safe to repeat.
+  2. Every external write claims an idempotency key derived from the BUSINESS object (invoice id, payment id, month), never from `run.id` or `run.attempt`.
+  3. Periods come from `run.scheduledFor` (`jobs/period.ts`: `scheduledForMs`, `scheduledDate`, `scheduledMonth`, `latenessMs`), never from the clock.
+  4. `maxLatenessMs`: a scheduled or retry run that starts later than this after its slot is recorded `skipped` / `too_late` and the next slot proceeds; manual runs are never too late.
+  5. Check `ctx.signal` between items; JavaScript cannot kill a promise.
+  6. Retry only by returning `partial` or `skipped` with `retry`.
+  7. Audit every external write.
+  8. Summaries hold counts and codes only.
+  9. `runRoles` (default admin and finance) and `stepUp` (default false) say who may use Run now; the route lets every signed-in role in and `runNow` applies them (403 `forbidden`, 401 `step_up_required`). `GET /api/jobs` returns `runRoles`, `stepUpToRun`, `maxLatenessMinutes`, `scheduleRules`.
+  `apps/worker/test/jobs-contract.test.ts` runs every handler that has a `run` twice with the same context against a recording fake of the Exact boundary and the idempotency table, and fails when a new implemented handler has no fixture. The two Exact handlers only read from Exact and write to D1: the second run adds no external write and no rows, and the stored result has only counts and short codes (no IBAN, e-mail or URL patterns).
+- **Finish is one atomic batch (S2).** The result of the run, the job's `last_*` columns and the retry attempt n+1 are in the same `db.batch`, the retry insert guarded by `runner_token` like the other two. If any statement fails the batch rolls back, the run stays `running` under its token, and the redelivery takes it over once the heartbeat is stale: no half-recorded finish and no lost attempt. If the attempt row already exists nothing is duplicated or re-sent.
+- **Schedule limits (S3).** `packages/core/src/schedule-rules.ts`: no job may run more often than every 5 minutes (`GLOBAL_MIN_INTERVAL_MINUTES`); `HandlerDef.scheduleRules` adds `minIntervalMinutes`, `allowedIntervalMinutes` (Revolut: 5 to 15, all day) and `workingDaysOnly` (ECB import). PATCH answers 400 `schedule_not_allowed` with a sentence; the editor runs the same check live. The check uses `analyseSchedule`, which lists the real fire instants (same engine as `nextRun`: daylight saving, TARGET working days) over 2026-01-01 to early 2030 (see the J1 review below), so the 25-hour autumn day counts as 25 hours. Projected Exact calls per administration and day = for every ENABLED Exact job: most fires on one Amsterdam day x `exact_budget` x `maxAttempts`; the sum must not exceed 3,000 (`MAX_PROJECTED_EXACT_CALLS_PER_DAY`) unless the change lowers it, else 400 `budget_cap_exceeded` with `projected`. Default full + incremental = 4 x 240 + 25 x 40 = 1,960; with the later default Exact jobs 2,560. A disabled job does not count until it is switched on (the check then runs on the enabling PATCH).
+- **Roll-up (S4).** In the Exact full-sync roll-up an administration skipped as `failed_today` or `retries_used` counts as a failure: the job ends `partial` with code `administration_failed` (all administrations failed in this run still ends `error`), so `jobs.last_status` no longer shows OK while an administration did not complete today.
+- **Exact jobs ship disabled (S6).** `exact.full_sync` and `exact.incremental_sync` are `enabled: false` with `disabledReason: awaiting_live_verification` in `defaults.ts`. Only new installs are affected (seeding never touches an existing row, so nothing is flipped on a running system). `GET /api/jobs` returns `defaultEnabled` and, while the job is off, `disabledReason`; the Schedules screen tells admins "Switch on after the first live connection checks."
+- **Runner overhead on the sync meter (S7).** `runExactSync` pre-charges `runnerOverhead(window)` (`jobs/overhead.ts`): 3 before the handler (load, claim, lock), 2 per heartbeat (Durable Object plus D1) over the handler's window plus one beat, and 3 after (release, finish batch, retry enqueue). For the 12-minute window that is 56 of the assumed 1,000 per invocation (corrected in the J1 review). The 1,000 limit is an ASSUMPTION for the paid plan and must be verified on the account (Cloudflare dashboard, Workers limits) before the first live sync.
+- **One `dueSlot` (N1).** `packages/core` `dueSlot(schedule, last, now, created)` returns the slot that is due; `isDue` is `dueSlot() !== null` and `claimIfDue` uses `dueSlot`, so they cannot diverge (before, a baseline more than a day in the future made `isDue` true while the claim computed a slot in the future). When the slot insert finds a row already there (another tick, or a manual run in the same millisecond) the tick advances `last_scheduled_at` and `next_run_at` to now, but only if the baseline is still the one it read, instead of coming back to the same slot on every tick.
+- **`lock_lost` (N2).** If the lock heartbeat finds the lease gone, the run is recorded with code `lock_lost` (a clean `ok` stays `ok`; a timeout or code-less result becomes `lock_lost`).
+- **Tests (N5).** The runner tests no longer sleep for fixed times: they wait for the handler to have started, for a lease to lapse or for a heartbeat to land (`vi.waitFor` on the observable condition) and use the `now` seam for lateness.
+
+## J1 review (reviewer changes)
+- **Lateness after the lease.** The `too_late` check now runs after the JobLock is acquired (and
+  the lease is released before the result is written). Before, a redelivery that took over a run
+  whose executor was alive but whose D1 heartbeats failed recorded `too_late` while it was working,
+  the same mistake the H2 review fixed for `already_running`.
+- **Catch-up claims the latest missed slot** (ADR 0020). With the first missed slot, any outage
+  longer than a job's lateness limit turned the one catch-up run into `too_late` even when a fresh
+  slot had just passed.
+- **Lateness per job.** `ecb.fx_import` 75 minutes: retries keep the 16:15 slot, so they stop at
+  17:30 whatever the attempt number (a test drives a drifting chain of attempts and sees attempt 8
+  at 17:32 recorded `too_late`). `fx.revaluation` has **no** limit: the month comes from the slot
+  and the catch-up slot is the latest month-end, so a revaluation that starts days late (an outage
+  over the month-end) still drafts the month that just ended, once (Phase 12 keys it per month); a
+  limit would silently skip that month until the next month-end.
+- **Schedule rules.** `analyseSchedule` now covers 2026-01-01 to early 2030 (four DST pairs, a leap
+  day, four Easters) so a cron that only fires on 29 February is counted instead of projecting 0
+  Exact calls; ordinary days reuse one precomputed pattern (checked against stepping `nextRun`), so
+  an every-minute cron is analysed in about 20 ms. A valid schedule with no fire in the window is
+  refused. Switching a job on re-checks its stored schedule against the rules. The editor's rule
+  sentence comes from `describeScheduleRules` in `packages/core`, next to the check itself.
+  Added limits: `ecb.fx_import` and `reminders.send` at most hourly, `fx.revaluation` at most every
+  12 hours (a whole day cannot be the minimum: the spring day is 23 hours).
+- **Projected calls cap.** A change that lowers the projected load is always accepted, so an
+  installation already over 3,000 can be brought down step by step; a change that raises it above
+  3,000 is refused. Known gap: two admins switching on two different Exact jobs at the same moment
+  can both pass the check (each PATCH reads the others first); the gate's own 5,000 per day still
+  holds.
+- **Runner overhead counted once.** `runnerOverhead(window)` = 3 before the handler (load, claim,
+  lock) + (ceil(window / 30 s) + 1) beats x 2 + 3 after (release, finish batch, retry enqueue); the
+  Exact handler passes its own 12-minute window without an extra grace beat: 56, plus its two reads.
+- **Run now step-up in the screen.** A 401 `step_up_required` opens the same "Confirm it's you"
+  sheet as Users, with a "Sign in again" button, instead of a toast with no way forward.
+- **S8.** Decided in ADR 0023 (both manual sync paths stay; the Data sync card states the
+  differences and links to Schedules).

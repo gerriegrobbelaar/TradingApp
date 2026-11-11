@@ -13,11 +13,14 @@ import {
 } from "../src/jobs/exact-handlers";
 import { DEFAULT_JOBS } from "../src/jobs/defaults";
 import { HANDLERS } from "../src/jobs/handlers";
+import { runnerOverhead } from "../src/jobs/overhead";
 import { callExact, divisionsOf } from "./job-helpers";
 import { FakeExact, addDivision, db, fakeGate, resetSync } from "./sync-helpers";
 
 const at = (iso: string) => Date.parse(iso);
 const NIGHT = at("2026-07-15T00:00:00Z"); // 02:00 CEST
+/** What runExactSync pre-charges for the runner (before, heartbeats to the 12-minute deadline, after). */
+const RUNNER = runnerOverhead(12 * 60_000);
 
 async function addSecondDivision(a: { connectionId: number; exactDivision: number }, name = "B") {
   const r = await db
@@ -120,7 +123,7 @@ describe("exact.full_sync / exact.incremental_sync handlers", () => {
     await addSecondDivision(a);
     const fx = new FakeExact(a.exactDivision);
     fx.divisions = [];
-    const meter = newMeter(SUBREQUEST_RESERVE * 2 + 15);
+    const meter = newMeter(SUBREQUEST_RESERVE * 2 + RUNNER + 15);
     const r = await callExact(
       "incremental",
       at("2026-07-15T12:00:00Z"),
@@ -141,7 +144,7 @@ describe("exact.full_sync / exact.incremental_sync handlers", () => {
       "full",
       NIGHT,
       { transport: fx2.transport, gate: fakeGate() },
-      { meter: newMeter(SUBREQUEST_RESERVE * 2 + 300) },
+      { meter: newMeter(SUBREQUEST_RESERVE * 2 + RUNNER + 300) },
     );
     if (full.status === "partial") expect(full.retry?.delaySeconds).toBeGreaterThan(0);
   });
@@ -171,7 +174,7 @@ describe("exact.full_sync / exact.incremental_sync handlers", () => {
     const gate = fakeGate();
     let clock = at("2026-07-15T12:00:00Z");
     const deps = { transport: fx.transport, gate, now: () => clock };
-    const one = () => newMeter(SUBREQUEST_RESERVE * 2 + 15); // room for one administration only
+    const one = () => newMeter(SUBREQUEST_RESERVE * 2 + RUNNER + 15); // room for one administration only
     const order: number[] = [];
     for (let i = 0; i < 4; i++) {
       clock += 3_600_000;
@@ -269,11 +272,113 @@ describe("exact.full_sync / exact.incremental_sync handlers", () => {
       const first = await callExact("full", NIGHT, deps);
       expect(first.status).toBe("error");
       const again = await callExact("full", NIGHT + 3_600_000, deps, { trigger: "retry" });
-      expect(again).toMatchObject({ status: "skipped", code: "nothing_to_do" });
+      // It did not complete OK today: the roll-up says so (review S4).
+      expect(again).toMatchObject({ status: "partial", code: "administration_failed" });
+      expect(again.retry).toBeUndefined();
       expect(divisionsOf(again)[0]?.why).toBe("failed_today");
       // The next night tries again.
       const tomorrow = await callExact("full", NIGHT + 24 * 3_600_000, deps);
       expect(tomorrow.status).toBe("error");
+    });
+
+    describe("roll-up counts administrations that did not complete today (S4)", () => {
+      const seed = (divisionId: number, mode: string, status: string, o: { retry?: number } = {}) =>
+        db
+          .prepare(
+            `INSERT INTO sync_state (division_id, entity, mode, last_status, last_started_at,
+                                     last_full_completed_at, last_completed_at, retry_count, retry_day)
+             VALUES (?1, 'run', ?2, ?3, ?4, ?5, ?5, ?6, '2026-07-15')`,
+          )
+          .bind(
+            divisionId,
+            mode,
+            status,
+            new Date(NIGHT - 60_000).toISOString(),
+            status === "ok" ? new Date(NIGHT - 60_000).toISOString() : null,
+            o.retry ?? 0,
+          )
+          .run();
+
+      it("A: one administration partial earlier and ok on the retry, the other done today: ok", async () => {
+        const a = await addDivision();
+        const b = await addSecondDivision(a);
+        const fx = new FakeExact(a.exactDivision);
+        fx.divisions = [];
+        await seed(b, "full", "ok");
+        const r = await callExact(
+          "full",
+          NIGHT,
+          { transport: fx.transport, gate: fakeGate() },
+          { trigger: "retry" },
+        );
+        expect(r.status).toBe("ok");
+        expect(r.code).toBeUndefined();
+      });
+
+      it("B: one administration ok, the other failed earlier today and is skipped: partial with administration_failed", async () => {
+        const a = await addDivision();
+        const b = await addSecondDivision(a);
+        const fx = new FakeExact(a.exactDivision);
+        fx.divisions = [];
+        await seed(b, "full", "error");
+        const r = await callExact(
+          "full",
+          NIGHT,
+          { transport: fx.transport, gate: fakeGate() },
+          { trigger: "retry" },
+        );
+        expect(r).toMatchObject({ status: "partial", code: "administration_failed" });
+        expect(divisionsOf(r).find((d) => d.id === b)?.why).toBe("failed_today");
+        expect(r.retry).toBeUndefined();
+      });
+
+      it("an administration that used up its retries today counts the same way", async () => {
+        const a = await addDivision();
+        await seed(a.id, "incremental", "partial", { retry: MAX_TRANSIENT_RETRIES + 1 });
+        const r = await callExact("full", NIGHT, {
+          transport: new FakeExact(1).transport,
+          gate: fakeGate(),
+        });
+        expect(divisionsOf(r)[0]?.why).toBe("retries_used");
+        expect(r).toMatchObject({ status: "partial", code: "administration_failed" });
+      });
+
+      it("a manual run ignores earlier failures and reports its own outcome", async () => {
+        const a = await addDivision();
+        const fx = new FakeExact(a.exactDivision);
+        fx.divisions = [];
+        await seed(a.id, "full", "error");
+        const r = await callExact(
+          "full",
+          NIGHT,
+          { transport: fx.transport, gate: fakeGate() },
+          { trigger: "manual" },
+        );
+        expect(r.status).toBe("ok");
+      });
+    });
+
+    it("pre-charges the runner overhead on the subrequest meter", async () => {
+      const div = await addDivision();
+      const fx = new FakeExact(div.exactDivision);
+      fx.divisions = [];
+      const meter = newMeter();
+      await callExact(
+        "incremental",
+        NIGHT,
+        { transport: fx.transport, gate: fakeGate() },
+        { meter },
+      );
+      expect(meter.used).toBeGreaterThanOrEqual(RUNNER + 2);
+    });
+
+    it("pre-charges exactly once: before, 25 beats over the 12-minute window, after, own reads", async () => {
+      const meter = newMeter();
+      const r = await callExact("full", NIGHT, {}, { meter }); // no connection: nothing else spent
+      expect(r.code).toBe("no_connection");
+      // 3 before + (24 + 1) beats x 2 + 3 after = 56, plus the handler's two reads.
+      expect(RUNNER).toBe(56);
+      expect(meter.used).toBe(58);
     });
 
     it("stops retrying after too many transient failures today (the per-day counter)", async () => {

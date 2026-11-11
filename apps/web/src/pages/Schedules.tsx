@@ -11,10 +11,12 @@ import {
 } from "@camelthorn/ui";
 import {
   ApiError,
+  StepUpRequired,
   listJobRuns,
   listJobs,
   patchJob,
   runJobNow,
+  stepUp,
   type JobRunStatus,
   type JobRunView,
   type JobView,
@@ -61,6 +63,9 @@ const CODE_TEXT: Record<string, string> = {
   budget_exhausted: "Used its Exact call budget",
   time_limit: "Ran out of time",
   transient: "Exact was busy or did not answer",
+  too_late: "Started too long after its time, so it was skipped",
+  lock_lost: "Lost its lock while running",
+  administration_failed: "An administration did not sync today",
 };
 
 export const codeText = (code: string | null): string | null =>
@@ -134,6 +139,11 @@ function failureText(e: unknown, title: string): string {
         return `${title} does not use Exact calls.`;
       case "invalid_budget":
         return "Enter a whole number of Exact calls within the allowed range.";
+      case "schedule_not_allowed":
+      case "budget_cap_exceeded":
+        return e.detail ?? "This change is not allowed for this job.";
+      case "step_up_required":
+        return `Sign in again to run ${title}.`;
       case "schedule_invalid":
         return e.detail !== undefined
           ? `This schedule is not valid. ${e.detail}.`.replace(/\.\.$/, ".")
@@ -145,13 +155,18 @@ function failureText(e: unknown, title: string): string {
   return "Could not reach the server. Try again.";
 }
 
-type Dialog = null | { kind: "history"; job: JobView } | { kind: "edit"; job: JobView };
+type Dialog =
+  | null
+  | { kind: "history"; job: JobView }
+  | { kind: "edit"; job: JobView }
+  | { kind: "stepup"; job: JobView };
 
 export function Schedules() {
   const me = useSignedIn();
   const toast = useToast();
   const isAdmin = me.roles.includes("admin");
-  const canRun = isAdmin || me.roles.includes("finance");
+  const mayRun = (j: JobView) =>
+    j.runRoles.some((r) => (me.roles as readonly string[]).includes(r));
 
   const [data, setData] = useState<{ resp: JobsResponse; at: number } | null>(null);
   const [loadError, setLoadError] = useState(false);
@@ -209,6 +224,11 @@ export function Schedules() {
       setNow(Date.now());
       toast.show(`Started ${job.title}.`);
     } catch (e) {
+      if (e instanceof StepUpRequired) {
+        // This job needs a Google sign-in from the last 15 minutes: offer it, never redirect unasked.
+        setDialog({ kind: "stepup", job });
+        return;
+      }
       if (e instanceof ApiError && e.code === "cooldown" && e.retryAfterSeconds !== undefined) {
         const wait = e.retryAfterSeconds;
         setUntil((u) => ({ ...u, [job.id]: Date.now() + wait * 1000 }));
@@ -257,7 +277,7 @@ export function Schedules() {
           Background jobs run on these schedules, in Amsterdam time. Switch a job off to pause it.
           {isAdmin
             ? " Admins can change schedules and switch jobs on or off."
-            : canRun
+            : jobs.some(mayRun)
               ? " Finance users can run a job now."
               : " You can see them but not change them."}
         </p>
@@ -347,6 +367,13 @@ export function Schedules() {
                         ) : (
                           <span>{j.enabled ? "On" : "Off"}</span>
                         )}
+                        {isAdmin &&
+                          !j.enabled &&
+                          j.disabledReason === "awaiting_live_verification" && (
+                            <div className="lede">
+                              Switch on after the first live connection checks.
+                            </div>
+                          )}
                       </td>
                       <td>
                         <span className="cell-label">Last run</span>
@@ -373,7 +400,7 @@ export function Schedules() {
                       <td>
                         <div className="stack">
                           <div className="chips">
-                            {canRun && (
+                            {mayRun(j) && (
                               <Button
                                 size="sm"
                                 variant="primary"
@@ -402,7 +429,7 @@ export function Schedules() {
                               </Button>
                             )}
                           </div>
-                          {canRun && why && (
+                          {mayRun(j) && why && (
                             <p className="stamp" id={whyId}>
                               {why}
                             </p>
@@ -417,6 +444,23 @@ export function Schedules() {
           </div>
         )}
       </Card>
+
+      <Sheet
+        open={dialog?.kind === "stepup"}
+        title="Confirm it's you"
+        onClose={() => setDialog(null)}
+      >
+        <p className="lede">
+          {dialog?.kind === "stepup" ? `Running ${dialog.job.title} by hand` : "This"} needs a
+          Google sign-in from the last 15 minutes. Sign in again, then run it again.
+        </p>
+        <div className="chips">
+          <Button variant="primary" onClick={() => stepUp()}>
+            Sign in again
+          </Button>
+          <Button onClick={() => setDialog(null)}>Cancel</Button>
+        </div>
+      </Sheet>
 
       {dialog?.kind === "history" && (
         <History job={dialog.job} now={now} onClose={() => setDialog(null)} />
@@ -564,6 +608,13 @@ function Edit({
         usesExact={job.usesExact}
         budget={job.exactBudget}
         maxBudget={maxBudget}
+        rules={{
+          minIntervalMinutes: job.scheduleRules.minIntervalMinutes,
+          ...(job.scheduleRules.allowedIntervalMinutes
+            ? { allowedIntervalMinutes: job.scheduleRules.allowedIntervalMinutes }
+            : {}),
+          workingDaysOnly: job.scheduleRules.workingDaysOnly,
+        }}
         busy={busy}
         error={error}
         nowMs={openedAt}

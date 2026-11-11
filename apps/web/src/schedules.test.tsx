@@ -37,6 +37,11 @@ const job = (over: Partial<JobView> = {}): JobView => ({
   scheduleText: "Every day at 02:00",
   enabled: true,
   exactBudget: 240,
+  runRoles: ["admin", "finance"],
+  stepUpToRun: false,
+  maxLatenessMinutes: 360,
+  scheduleRules: { minIntervalMinutes: 60, allowedIntervalMinutes: null, workingDaysOnly: false },
+  defaultEnabled: false,
   rev: "rev-1",
   nextRunAt: new Date(Date.now() + 3_600_000).toISOString(),
   running: false,
@@ -68,6 +73,7 @@ const resp = (jobs: JobView[], over: Partial<JobsResponse["scheduler"]> = {}): J
     ...over,
   },
   maxExactBudget: 1000,
+  maxProjectedExactCallsPerDay: 3000,
   jobs,
 });
 

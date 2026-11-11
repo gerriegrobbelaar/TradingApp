@@ -99,6 +99,9 @@ In `apps/worker/wrangler.toml`:
   with `--test-scheduled`. Settings, Schedules shows a warning when the queue is missing or the tick
   has not run for 10 minutes (the Worker stores the tick time at most every 4 minutes, to save D1
   writes).
+- On a new install the Exact jobs (`exact.full_sync`, `exact.incremental_sync`) start switched off.
+  An admin switches them on in Settings, Schedules once Exact is connected and a "Run now" of the
+  incremental sync has ended OK (ADR 0021, review S6). Upgrades keep the jobs as they were.
 
 Check nothing is left over, then commit:
 
