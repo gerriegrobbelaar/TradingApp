@@ -21,3 +21,5 @@ export { sha256Hex } from "./sha256";
 export * from "./decimal";
 export * from "./fx";
 export * from "./ecb";
+
+export * from "./matching";
