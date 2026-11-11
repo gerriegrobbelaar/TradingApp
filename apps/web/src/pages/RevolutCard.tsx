@@ -196,8 +196,12 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
   async function registerWebhookAgain(replace: boolean) {
     setBusy(true);
     try {
-      await registerRevolutWebhook(replace);
-      toast.show("Webhook registered.");
+      const r = await registerRevolutWebhook(replace);
+      toast.show(
+        r.status === "already_registered"
+          ? "The webhook was already registered."
+          : "Webhook registered.",
+      );
       await onChanged();
     } catch (e) {
       if (e instanceof StepUpRequired) setDialog("stepup");
@@ -386,7 +390,8 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
               <WebhookHealth
                 health={live.webhook}
                 unreadable={isAdmin && live.webhook.secretReadable === false}
-                isAdmin={isAdmin}
+                // The server registers only for an active connection (needs_reauth: reconnect first).
+                canRegister={isAdmin && row?.status === "active"}
                 busy={busy}
                 onRegister={(replace, e) => {
                   remember(e);
@@ -525,13 +530,13 @@ const shortTime = (iso: string): string => formatDateTime(iso);
 function WebhookHealth({
   health,
   unreadable,
-  isAdmin,
+  canRegister,
   busy,
   onRegister,
 }: {
   health: RevolutWebhookHealth;
   unreadable: boolean;
-  isAdmin: boolean;
+  canRegister: boolean;
   busy: boolean;
   onRegister: (replace: boolean, e: { currentTarget: HTMLElement }) => void;
 }) {
@@ -557,7 +562,7 @@ function WebhookHealth({
         </p>
       )}
       {rejected > 0 && <p className="notice warn">{`${rejected} rejected in the last 24 h`}</p>}
-      {isAdmin && (!health.registered || unreadable) && (
+      {canRegister && (!health.registered || unreadable) && (
         <div className="chips">
           <Button disabled={busy} onClick={(e) => onRegister(unreadable, e)}>
             {unreadable ? "Register webhook again" : "Register webhook"}

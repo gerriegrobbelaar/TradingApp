@@ -78,16 +78,19 @@ export async function recordRejection(
   c.lastWriteMs = nowMs;
   try {
     await env.DB.batch([
-      // v1 has one Revolut connection; no row, nothing to count.
+      // v1 has one Revolut connection. Nothing is counted while none is connected (no row, or
+      // pending / disabled): there is no channel to report on, and a flood then writes nothing.
       env.DB.prepare(
         `INSERT INTO webhook_rejections (connection_id, bucket_at, reason_code, count)
-         SELECT id, ?1, ?2, ?3 FROM connections WHERE kind = 'revolut' ORDER BY id LIMIT 1
+         SELECT id, ?1, ?2, ?3 FROM connections
+         WHERE kind = 'revolut' AND status IN ('active', 'needs_reauth', 'expired')
+         ORDER BY id LIMIT 1
          ON CONFLICT (connection_id, bucket_at, reason_code) DO UPDATE SET count = count + ?3`,
       ).bind(minuteStart(nowMs), reason, n),
       env.DB.prepare(
         `UPDATE connections
          SET last_webhook_rejected_at = ?1, webhook_rejected_total = webhook_rejected_total + ?2
-         WHERE kind = 'revolut'`,
+         WHERE kind = 'revolut' AND status IN ('active', 'needs_reauth', 'expired')`,
       ).bind(new Date(nowMs).toISOString(), n),
     ]);
   } catch {
@@ -146,18 +149,27 @@ export function logRejection(nowMs: number, reason: string): void {
 
 // ---- reading --------------------------------------------------------------------------------
 
-/** Rejected deliveries in the last 24 hours (the bucketed counts; a lower bound under a flood). */
+/**
+ * Rejected deliveries in the last 24 hours (the bucketed counts; a lower bound under a flood), and
+ * never from before the connection was made (`connectedAt`), so a reconnect starts at zero.
+ */
 export async function rejectedLast24h(
   db: D1Database,
   connectionId: number,
   nowMs: number,
+  connectedAt: string | null = null,
 ): Promise<number> {
+  const connectedMs = connectedAt ? Date.parse(connectedAt) : NaN;
+  const sinceMs = Math.max(
+    nowMs - 24 * 3_600_000,
+    Number.isFinite(connectedMs) ? connectedMs : Number.NEGATIVE_INFINITY,
+  );
   const r = await db
     .prepare(
       `SELECT COALESCE(SUM(count), 0) AS n FROM webhook_rejections
        WHERE connection_id = ?1 AND bucket_at >= ?2`,
     )
-    .bind(connectionId, minuteStart(nowMs - 24 * 3_600_000))
+    .bind(connectionId, minuteStart(sinceMs))
     .first<{ n: number }>();
   return r?.n ?? 0;
 }

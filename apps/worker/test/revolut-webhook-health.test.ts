@@ -7,18 +7,22 @@
  */
 import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { isEncryptedWith } from "../src/crypto/token-crypto";
+import { verifyRevolutWebhook } from "@camelthorn/revolut";
+import { decryptToken, encryptToken, isEncryptedWith } from "../src/crypto/token-crypto";
 import type { Env } from "../src/env";
 import worker from "../src/index";
 import { tickScheduler } from "../src/jobs/runner";
-import { MAX_REQUEUES } from "../src/revolut/webhook-route";
+import { MAX_REQUEUES, precheckHeaders } from "../src/revolut/webhook-route";
+import { rejectedLast24h } from "../src/revolut/webhook-health";
 import {
   HOUSEKEEPING_BATCH,
   HOUSEKEEPING_EVERY_MS,
+  HOUSEKEEPING_MINUTE,
   housekeepWebhookEvents,
   resetHousekeepingState,
 } from "../src/revolut/webhook-housekeeping";
 import {
+  aad,
   reencryptWebhookSecrets,
   saveWebhookSecret,
   webhookSecretsReadable,
@@ -29,6 +33,7 @@ import {
   refreshOk,
   resetRevolut,
   revolutGate,
+  rotatedOk,
   rreq,
   seedRevolut,
   stubRevolut,
@@ -153,7 +158,11 @@ describe("S3: TOKEN_ENC_KEY rotation keeps the webhook working", () => {
     const b = await blobs();
     expect(await isEncryptedWith(KEY_B, b.cur!)).toBe(true);
     expect(await isEncryptedWith(KEY_B, b.prev!)).toBe(true);
-    expect(await reencryptWebhookSecrets(e, connId)).toEqual({ readable: true, reencrypted: 0 });
+    expect(await reencryptWebhookSecrets(e, connId)).toEqual({
+      readable: true,
+      reencrypted: 0,
+      failed: 0,
+    });
     // dropping A: the new secret and the overlap secret both still verify
     const only = withKeys({ current: KEY_B });
     expect((await deliver({ ...valid("tx-2"), secret: "wsk_old_secret" }, only)).status).toBe(200);
@@ -515,10 +524,63 @@ describe("S4: housekeeping of webhook_events and webhook_rejections", () => {
     expect(s.sql).toHaveLength(3);
   });
 
-  it("is called from the scheduler tick", async () => {
+  it("is called from the scheduler tick, on one tick in ten only", async () => {
     const id = await seedEvent(1, { ageMs: 20 * MIN });
+    // NOW is a whole ten minutes: not the housekeeping minute
     await tickScheduler(e(), NOW);
+    expect(queue.sent).toEqual([]);
+    await tickScheduler(e(), NOW + HOUSEKEEPING_MINUTE * MIN);
     expect(queue.sent).toEqual([{ type: "revolut_event", webhookEventId: id }]);
+  });
+
+  it("an idle tick sends no housekeeping statement; the housekeeping tick at most two", async () => {
+    // The claim is the same upsert on `settings` as the tick heartbeat (the key is a bind), so
+    // count: webhook-table statements + settings upserts beyond the heartbeat's one.
+    const housekeepingStatements = (sql: string[]) =>
+      sql.filter((q) => q.includes("webhook_events") || q.includes("webhook_rejections")).length +
+      sql.filter((q) => q.startsWith("INSERT INTO settings")).length -
+      1;
+    for (let m = 0; m < 10; m++) {
+      if (m === HOUSEKEEPING_MINUTE) continue;
+      resetHousekeepingState(); // as on a fresh isolate
+      const s = spyEnv();
+      await tickScheduler(s.env, NOW + m * MIN);
+      expect(housekeepingStatements(s.sql)).toBe(0);
+    }
+    resetHousekeepingState();
+    const s = spyEnv();
+    await tickScheduler(s.env, NOW + HOUSEKEEPING_MINUTE * MIN);
+    // the claim and the one "anything due" query; nothing is due
+    expect(housekeepingStatements(s.sql)).toBe(2);
+    // a second isolate on the same tick: the claim only, which writes nothing
+    resetHousekeepingState();
+    const s2 = spyEnv();
+    await tickScheduler(s2.env, NOW + HOUSEKEEPING_MINUTE * MIN + 5_000);
+    expect(housekeepingStatements(s2.sql)).toBe(1);
+  });
+
+  it("a failing housekeeping never breaks the tick's job claiming", async () => {
+    await seedEvent(1, { ageMs: 20 * MIN });
+    const s = spyEnv();
+    const broken = Object.create(s.env, {
+      DB: {
+        value: new Proxy(env.DB, {
+          get(target, prop) {
+            if (prop === "prepare") {
+              return (q: string) => {
+                if (q.includes("EXISTS (SELECT 1 FROM webhook_events")) throw new Error("d1 down");
+                return target.prepare(q);
+              };
+            }
+            return Reflect.get(target, prop) as unknown;
+          },
+        }),
+      },
+    }) as Env;
+    const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await expect(tickScheduler(broken, NOW + HOUSEKEEPING_MINUTE * MIN)).resolves.toBeDefined();
+    expect(err.mock.calls.map((c) => c[0])).toContain("webhook housekeeping failed");
+    expect(queue.sent).toEqual([]);
   });
 });
 
@@ -628,3 +690,301 @@ describe("N8: the refresh token expiry is stored when Revolut says it", () => {
     expect(await get()).toBe("2027-02-01T00:00:00.000Z");
   });
 });
+
+describe("S3 (review): rotation A to B end to end, atomicity and AAD binding", () => {
+  /** An env whose D1 fails every UPDATE of a webhook secret column (reads still work). */
+  const failingSecretWrites = (base: Env): Env =>
+    Object.create(base, {
+      DB: {
+        value: new Proxy(base.DB, {
+          get(target, prop) {
+            if (prop === "prepare") {
+              return (q: string) => {
+                if (/UPDATE connections SET webhook_secret(_prev)?_enc = \?3/.test(q)) {
+                  throw new Error("D1_ERROR: write failed");
+                }
+                return target.prepare(q);
+              };
+            }
+            const v = Reflect.get(target, prop) as unknown;
+            return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+          },
+        }),
+        enumerable: true,
+      },
+    }) as Env;
+
+  it("tokens and webhook secrets under A keep working with current=B, previous=A, then A can go", async () => {
+    // Everything was written under A before the rotation.
+    await db
+      .prepare(
+        "UPDATE connections SET access_token_enc = ?2, refresh_token_enc = ?3, expires_at = ?4 WHERE id = ?1",
+      )
+      .bind(
+        connId,
+        await encryptToken(KEY_A, "racc-old", aad(connId, "access")),
+        await encryptToken(KEY_A, "rref-old", aad(connId, "refresh")),
+        new Date(NOW + 1000).toISOString(),
+      )
+      .run();
+    await saveWebhookSecret(underKey(KEY_A) as never, connId, WEBHOOK_ID, WEBHOOK_SECRET, ADMIN);
+
+    // The token authority (bindings: current = B, previous = A) refreshes with the A-encrypted
+    // refresh token and writes everything back under B.
+    (await fakeRevolutClock(connId)).t = NOW;
+    stub.token = (_f, n) => refreshOk(n);
+    expect(unwrap(await revolutGate(connId).call(rreq(connId))).status).toBe(200);
+    expect(stub.tokenCalls[0]?.get("refresh_token")).toBe("rref-old");
+    const row = (await db
+      .prepare(
+        "SELECT access_token_enc AS a, refresh_token_enc AS r, webhook_secret_enc AS w FROM connections WHERE id = ?1",
+      )
+      .bind(connId)
+      .first<{ a: string; r: string; w: string }>())!;
+    for (const blob of [row.a, row.r, row.w]) expect(await isEncryptedWith(KEY_B, blob)).toBe(true);
+    // Readable with B alone: A can be dropped now.
+    expect(await decryptToken([KEY_B], row.r, aad(connId, "refresh"))).toBe("rref-old");
+    expect((await deliver(valid("tx-1"), withKeys({ current: KEY_B }))).status).toBe(200);
+  });
+
+  it("a failed re-encryption write leaves the old ciphertext, still readable, and retries next time", async () => {
+    await saveWebhookSecret(underKey(KEY_A) as never, connId, WEBHOOK_ID, WEBHOOK_SECRET, ADMIN);
+    const before = (await blobs()).cur!;
+    const rotated = withKeys({ current: KEY_B, previous: KEY_A });
+    expect(await reencryptWebhookSecrets(failingSecretWrites(rotated), connId)).toEqual({
+      readable: true,
+      reencrypted: 0,
+      failed: 1,
+    });
+    expect((await blobs()).cur).toBe(before);
+    // the delivery still verifies (and itself re-encrypts, now that writes work)
+    expect((await deliver(valid("tx-1"), rotated)).status).toBe(200);
+    expect(await isEncryptedWith(KEY_B, (await blobs()).cur!)).toBe(true);
+    // a delivery whose re-encryption write fails is still accepted
+    await saveWebhookSecret(underKey(KEY_A) as never, connId, WEBHOOK_ID, WEBHOOK_SECRET, ADMIN);
+    expect((await deliver(valid("tx-2"), failingSecretWrites(rotated))).status).toBe(200);
+  });
+
+  it("two racing re-encryptions: exactly one write wins, the value stays readable", async () => {
+    await saveWebhookSecret(underKey(KEY_A) as never, connId, WEBHOOK_ID, WEBHOOK_SECRET, ADMIN);
+    const rotated = withKeys({ current: KEY_B, previous: KEY_A });
+    const [r1, r2] = await Promise.all([
+      reencryptWebhookSecrets(rotated, connId),
+      reencryptWebhookSecrets(rotated, connId),
+    ]);
+    expect(r1.reencrypted + r2.reencrypted).toBe(1);
+    expect(r1.readable && r2.readable).toBe(true);
+    expect(await decryptToken([KEY_B], (await blobs()).cur!, aad(connId, "webhook_secret"))).toBe(
+      WEBHOOK_SECRET,
+    );
+  });
+
+  it("re-encryption keeps each column's AAD: swapped ciphertexts are unreadable", async () => {
+    await saveWebhookSecret(underKey(KEY_A) as never, connId, WEBHOOK_ID, "wsk_old_secret", ADMIN);
+    await saveWebhookSecret(underKey(KEY_A) as never, connId, WEBHOOK_ID, WEBHOOK_SECRET, ADMIN);
+    await reencryptWebhookSecrets(withKeys({ current: KEY_B, previous: KEY_A }), connId);
+    const b = await blobs();
+    await expect(decryptToken([KEY_B], b.cur!, aad(connId, "webhook_secret_prev"))).rejects.toThrow(
+      "decryption failed",
+    );
+    await expect(decryptToken([KEY_B], b.prev!, aad(connId, "webhook_secret"))).rejects.toThrow(
+      "decryption failed",
+    );
+    // an attacker with D1 write access swaps the columns: the delivery is refused
+    await db
+      .prepare(
+        "UPDATE connections SET webhook_secret_enc = ?2, webhook_secret_prev_enc = ?3 WHERE id = ?1",
+      )
+      .bind(connId, b.prev, b.cur)
+      .run();
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    expect((await deliver(valid("tx-1"))).status).toBe(401);
+    expect(await webhookSecretsReadable(env, connId)).toBe(false);
+  });
+
+  it("registering again keeps a GOOD current secret when decryption fails for a configuration reason", async () => {
+    await saveWebhookSecret(underKey(KEY_A) as never, connId, WEBHOOK_ID, WEBHOOK_SECRET, ADMIN);
+    const before = await blobs();
+    // current = B, previous configured but malformed: not the stored value's fault
+    const misconfigured = withKeys({ current: KEY_B, previous: "not-a-key" });
+    await expect(
+      saveWebhookSecret(misconfigured, connId, WEBHOOK_ID, "wsk_new", ADMIN),
+    ).rejects.toThrow();
+    expect(await blobs()).toEqual(before);
+    // a correctly configured rotation keeps it as the overlap secret
+    await saveWebhookSecret(
+      withKeys({ current: KEY_B, previous: KEY_A }),
+      connId,
+      WEBHOOK_ID,
+      "wsk_new",
+      ADMIN,
+    );
+    expect(
+      await decryptToken([KEY_B], (await blobs()).prev!, aad(connId, "webhook_secret_prev")),
+    ).toBe(WEBHOOK_SECRET);
+  });
+
+  it("an unreadable overlap secret does not block the current one and is retired", async () => {
+    await saveWebhookSecret(underKey(KEY_C) as never, connId, WEBHOOK_ID, "wsk_lost", ADMIN);
+    // current secret written under the current key; the previous one under the lost key C
+    await saveWebhookSecret(underKey(KEY_C) as never, connId, WEBHOOK_ID, WEBHOOK_SECRET, ADMIN);
+    await db
+      .prepare("UPDATE connections SET webhook_secret_enc = ?2 WHERE id = ?1")
+      .bind(connId, await encryptToken(KEY_B, WEBHOOK_SECRET, aad(connId, "webhook_secret")))
+      .run();
+    expect(await webhookSecretsReadable(env, connId)).toBe(false);
+    expect((await deliver(valid("tx-1"))).status).toBe(200);
+    expect((await blobs()).prev).toBeNull();
+    expect(await webhookSecretsReadable(env, connId)).toBe(true);
+  });
+
+  it("readability is 'unknown' (null), not 'unreadable', when D1 fails", async () => {
+    await saveWebhookSecret(env, connId, WEBHOOK_ID, WEBHOOK_SECRET, ADMIN);
+    const down = Object.create(env, {
+      DB: {
+        value: {
+          prepare: () => {
+            throw new Error("D1_ERROR: unavailable");
+          },
+        },
+      },
+    }) as Env;
+    expect(await webhookSecretsReadable(down, connId)).toBeNull();
+  });
+});
+
+describe("N1 (review): the header pre-check never refuses what the verifier accepts", () => {
+  // A small deterministic PRNG so failures reproduce.
+  function rng(seed: number) {
+    let x = seed >>> 0;
+    return () => {
+      x ^= x << 13;
+      x ^= x >>> 17;
+      x ^= x << 5;
+      return (x >>> 0) / 0x1_0000_0000;
+    };
+  }
+  const SECRETS = ["wsk_a_0123456789", "wsk_b_9876543210"];
+
+  it("for 3,000 random header pairs, verifier ok implies pre-check ok, and reasons agree", async () => {
+    const r = rng(20261111);
+    const pick = <T>(xs: readonly T[]): T => xs[Math.floor(r() * xs.length)]!;
+    const hex = (n: number) =>
+      Array.from({ length: n }, () => pick("0123456789abcdefABCDEF".split(""))).join("");
+    let accepted = 0;
+    for (let i = 0; i < 3000; i++) {
+      const body = pick(["{}", '{"event":"TransactionCreated"}', ""]);
+      const offset = pick([0, 1, -1, 299_999, 300_000, 300_001, -300_000, -300_001, 86_400_000]);
+      const tsNum = NOW + offset;
+      const ts = pick([
+        String(tsNum),
+        ` ${tsNum} `,
+        String(Math.floor(tsNum / 1000)),
+        `${tsNum}0`,
+        "",
+        "abc",
+        `+${tsNum}`,
+        `${tsNum}.0`,
+      ]);
+      const signed = async (secret: string) =>
+        `v1=${await hmacHexLocal(secret, `v1.${ts.trim()}.${body}`)}`;
+      const parts: string[] = [];
+      const n = pick([0, 1, 1, 2, 3, 5, 6]);
+      for (let k = 0; k < n; k++) {
+        parts.push(
+          pick([
+            await signed(pick(SECRETS)),
+            `v1=${hex(64)}`,
+            `v0=${hex(64)}`,
+            `v1=${hex(63)}`,
+            ` v1=${hex(64)} `,
+            "garbage",
+            "",
+          ]),
+        );
+      }
+      const sig = pick([parts.join(","), parts.join(", "), parts.join(" ,")]);
+      const headers = new Headers();
+      if (sig !== "" || r() < 0.5) headers.set("revolut-signature", sig);
+      if (ts !== "" || r() < 0.5) headers.set("revolut-request-timestamp", ts);
+      const req = new Request("https://app.test/api/webhooks/revolut", { method: "POST", headers });
+      const pre = precheckHeaders(req, NOW);
+      for (const secret of SECRETS) {
+        const v = await verifyRevolutWebhook({
+          rawBody: body,
+          signatureHeader: req.headers.get("revolut-signature"),
+          timestampHeader: req.headers.get("revolut-request-timestamp"),
+          signingSecret: secret,
+          nowMs: NOW,
+        });
+        if (v.ok) {
+          accepted++;
+          expect(pre).toBeNull();
+        } else if (v.reason !== "bad_signature") {
+          // a header problem: the pre-check reports the very same reason
+          expect(pre).toBe(v.reason);
+        } else {
+          expect(pre).toBeNull();
+        }
+      }
+    }
+    // the generator really produced valid deliveries
+    expect(accepted).toBeGreaterThan(100);
+  });
+});
+
+describe("N8 (review): a rotated refresh token without a stated expiry clears the stored one", () => {
+  it("stores, keeps on a plain refresh, clears on rotation without expiry", async () => {
+    (await fakeRevolutClock(connId)).t = NOW;
+    await db
+      .prepare(
+        "UPDATE connections SET expires_at = ?1, refresh_expires_at = '2027-01-01T00:00:00.000Z'",
+      )
+      .bind(new Date(NOW + 1000).toISOString())
+      .run();
+    stub.token = (_f, n) => rotatedOk(n);
+    await revolutGate(connId).call(rreq(connId));
+    expect(
+      (await db.prepare("SELECT refresh_expires_at AS r FROM connections").first<{ r: unknown }>())!
+        .r,
+    ).toBeNull();
+  });
+});
+
+describe("S4 (review): health counts only for a connected channel", () => {
+  it("rejections while nothing is connected write nothing; a reconnect starts at zero", async () => {
+    await db.prepare("UPDATE connections SET status = 'disabled' WHERE id = ?1").bind(connId).run();
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await deliver({ ...valid("tx-1"), signature: `v1=${"a".repeat(64)}` });
+    expect(await rowsOf("webhook_rejections")).toEqual([]);
+    expect((await rowsOf("connections", `id = ${connId}`))[0]).toMatchObject({
+      webhook_rejected_total: 0,
+      last_webhook_rejected_at: null,
+    });
+    // buckets from before connected_at are not shown
+    await db
+      .prepare(
+        "INSERT INTO webhook_rejections (connection_id, bucket_at, reason_code, count) VALUES (?1, ?2, 'other', 9)",
+      )
+      .bind(connId, new Date(NOW - 3_600_000).toISOString())
+      .run();
+    await db
+      .prepare("UPDATE connections SET status = 'active', connected_at = ?2 WHERE id = ?1")
+      .bind(connId, new Date(NOW - 60_000).toISOString())
+      .run();
+    expect(await rejectedLast24h(db, connId, NOW, new Date(NOW - 60_000).toISOString())).toBe(0);
+    expect(await rejectedLast24h(db, connId, NOW, null)).toBe(9);
+  });
+});
+
+async function hmacHexLocal(secret: string, payload: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}

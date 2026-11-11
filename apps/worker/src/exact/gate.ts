@@ -470,8 +470,10 @@ export class ExactGate extends DurableObject<Env> {
   private async earliestRefreshAt(
     connectionId: number,
     expiresAtIso: string | null,
+    // The caller's clock reading: compared against the result, so it must be the same instant
+    // (a second this.now() here could be a millisecond later and make a token "too young").
+    now: number,
   ): Promise<number> {
-    const now = this.now();
     const parsed = expiresAtIso ? Date.parse(expiresAtIso) : NaN;
     if (!Number.isFinite(parsed)) return now; // no usable expiry: nothing to protect
     let issuedAt: number;
@@ -588,7 +590,7 @@ export class ExactGate extends DurableObject<Env> {
       }
 
       // Never refresh a token younger than the minimum age (B2).
-      const earliest = await this.earliestRefreshAt(row.id, row.expires_at);
+      const earliest = await this.earliestRefreshAt(row.id, row.expires_at, now);
       if (now < earliest) {
         if (forced) {
           // Exact rejected a token we may not refresh yet: the caller waits and retries once.

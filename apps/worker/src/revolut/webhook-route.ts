@@ -26,8 +26,8 @@
  * nothing here calls Revolut.
  */
 import {
+  checkRevolutWebhookHeaders,
   MAX_WEBHOOK_BODY_BYTES,
-  MAX_WEBHOOK_SIGNATURES,
   parseWebhookEvent,
   verifyRevolutWebhook,
 } from "@camelthorn/revolut";
@@ -53,9 +53,6 @@ export const REQUEUE_AFTER_MS = 5 * 60_000;
  * enqueue it (review N2).
  */
 export const UNPARSED_CLAIM_AFTER_MS = 60_000;
-const TIMESTAMP_RE = /^\d{13}$/;
-const SIGNATURE_V1_RE = /^v1=[0-9a-fA-F]{64}$/;
-const WINDOW_MS = 300_000;
 /**
  * How often repeated deliveries may re-enqueue one row (enqueue_failed, never parsed, or stale
  * queued). Revolut retries 3 more times; a replay of a captured delivery inside the 5-minute
@@ -140,29 +137,18 @@ export async function enqueueEvent(
 }
 
 /**
- * The header checks R1's verifier makes first, repeated here so a bad request is refused before
- * the body is read or D1 is asked anything. Returns R1's reason code, or null when the headers
- * look usable (the signature itself is checked later). Must stay in step with the verifier: it
- * may never refuse something the verifier would accept.
+ * The header checks of R1's verifier, run before the body is read or D1 is asked anything. It is
+ * the verifier's own `checkRevolutWebhookHeaders` (same window, 13-digit rule, `v1=` candidates
+ * and their cap), so it can never refuse a delivery the verifier would accept. Returns the
+ * verifier's reason code, or null when the headers are usable (the signature is checked later).
  */
 export function precheckHeaders(request: Request, nowMs: number): string | null {
-  const signature = request.headers.get("revolut-signature");
-  const timestamp = request.headers.get("revolut-request-timestamp");
-  if (
-    signature === null ||
-    signature.trim() === "" ||
-    timestamp === null ||
-    timestamp.trim() === ""
-  ) {
-    return "missing_header";
-  }
-  const ts = timestamp.trim();
-  if (!TIMESTAMP_RE.test(ts)) return "bad_timestamp";
-  if (Math.abs(nowMs - Number(ts)) > WINDOW_MS) return "timestamp_out_of_range";
-  const parts = signature.split(",");
-  if (parts.length > MAX_WEBHOOK_SIGNATURES) return "malformed";
-  if (!parts.some((p) => SIGNATURE_V1_RE.test(p.trim()))) return "malformed";
-  return null;
+  const r = checkRevolutWebhookHeaders({
+    signatureHeader: request.headers.get("revolut-signature"),
+    timestampHeader: request.headers.get("revolut-request-timestamp"),
+    nowMs,
+  });
+  return r.ok ? null : r.reason;
 }
 
 interface EventRow {
@@ -202,7 +188,7 @@ async function webhook(ctx: Ctx): Promise<Response> {
     return reject("connection_unreadable");
   }
   if (!conn || !ACCEPTING.includes(conn.status)) return reject("no_accepting_connection");
-  let secrets: { current: string | null; previous: string | null; stale: boolean };
+  let secrets: Awaited<ReturnType<typeof loadWebhookSecretSet>>;
   try {
     secrets = await loadWebhookSecretSet(env, conn.id);
   } catch {
@@ -244,10 +230,12 @@ async function webhook(ctx: Ctx): Promise<Response> {
   await recordVerified(env, conn.id, ctx.nowMs);
 
   // Rotation: the new secret verified, so the overlap with the previous one is over.
-  if (verifiedWith.current && secrets.previous !== null) {
+  // An overlap secret nobody can read any more (its key was dropped) is retired the same way.
+  if (verifiedWith.current && (secrets.previous !== null || secrets.previousUnreadable)) {
     await retirePreviousWebhookSecret(env.DB, conn.id).catch(() => undefined);
   }
   // A secret still under the previous TOKEN_ENC_KEY is moved to the current key now (review S3).
+  // Never throws; a failed write leaves the old, still readable ciphertext for the next try.
   if (secrets.stale) await reencryptWebhookSecrets(env, conn.id);
 
   const hash = await sha256HexBytes(body);

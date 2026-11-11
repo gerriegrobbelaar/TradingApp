@@ -242,8 +242,11 @@ export interface RevolutSettings {
   webhookRegistered?: boolean;
   /** Health of the webhook channel; never carries a secret. */
   webhook?: RevolutWebhookHealth | null;
-  /** Admins only: false when the stored signing secret cannot be decrypted (register again). */
-  webhookSecretReadable?: boolean;
+  /**
+   * Admins only: false when a stored signing secret cannot be decrypted (register again); null when
+   * it could not be checked just now (never a reason to register again).
+   */
+  webhookSecretReadable?: boolean | null;
 }
 
 export interface RevolutWebhookHealth {
@@ -254,8 +257,8 @@ export interface RevolutWebhookHealth {
   /** Deliveries refused in the last 24 hours (a lower bound under a flood). */
   rejectedLast24h: number;
   rejectedTotal?: number;
-  /** Admins only. */
-  secretReadable?: boolean;
+  /** Admins only (see RevolutSettings.webhookSecretReadable). */
+  secretReadable?: boolean | null;
 }
 
 /** Masked facts about a staged Revolut connection: never a full IBAN, a balance or an id. */

@@ -162,6 +162,43 @@ describe("Revolut card: webhook channel health", () => {
     expect(await screen.findByRole("dialog", { name: "Confirm it's you" })).toBeTruthy();
   });
 
+  it("does not offer to register while the connection needs re-authorisation (server: 409)", async () => {
+    const r = row({ registered: false, lastVerifiedAt: null, rejectedLast24h: 0 });
+    mockFetch({ ...ME_OK(ADMIN), ...list({ ...r, status: "needs_reauth" }) });
+    await open();
+    expect(card().getByText(/The webhook is not registered/)).toBeTruthy();
+    expect(card().queryByRole("button", { name: /Register webhook/ })).toBeNull();
+  });
+
+  it("an unknown readability (null) is not reported as unreadable", async () => {
+    mockFetch({
+      ...ME_OK(ADMIN),
+      ...list(
+        row(
+          { registered: true, lastVerifiedAt: null, rejectedLast24h: 0, secretReadable: null },
+          { webhookSecretReadable: null },
+        ),
+      ),
+    });
+    await open();
+    expect(card().queryByText(/cannot be read/)).toBeNull();
+    expect(card().queryByRole("button", { name: /Register webhook/ })).toBeNull();
+  });
+
+  it("says so when the webhook turned out to be registered already", async () => {
+    mockFetch({
+      ...ME_OK(ADMIN),
+      ...list(row({ registered: false, lastVerifiedAt: null, rejectedLast24h: 0 })),
+      "POST /api/connections/revolut/webhook/register": () => ({
+        body: { ok: true, status: "already_registered" },
+      }),
+    });
+    const user = userEvent.setup();
+    await open();
+    await user.click(card().getByRole("button", { name: "Register webhook" }));
+    expect(await screen.findByText("The webhook was already registered.")).toBeTruthy();
+  });
+
   it("has no accessibility violations in the health states", async () => {
     const states: api.RevolutWebhookHealth[] = [
       { registered: true, lastVerifiedAt: ago(180_000), rejectedLast24h: 0 },

@@ -172,13 +172,19 @@ export function registerExactRoutes(router: Router): void {
     const configured = loadExactConfig(ctx.env, ctx.config.appOrigin).ok;
     const isAdmin = ctx.session?.roles.includes("admin") === true;
     // Webhook channel health of the Revolut connection (Phase 5 review S3 and S4). The secret check
-    // decrypts, so it is admin only: it answers "can the stored signing secret still be read".
+    // decrypts, so it is admin only: it answers "can the stored signing secrets still be read"
+    // (true / false; null = could not be checked right now, which never means "register again").
     const revolutRow = results.find((c) => c.kind === "revolut");
     const health =
       revolutRow === undefined
         ? null
         : {
-            rejectedLast24h: await rejectedLast24h(db, revolutRow.id, ctx.nowMs),
+            rejectedLast24h: await rejectedLast24h(
+              db,
+              revolutRow.id,
+              ctx.nowMs,
+              revolutRow.connected_at,
+            ),
             secretReadable:
               isAdmin && revolutRow.webhook_registered === 1
                 ? await webhookSecretsReadable(ctx.env, revolutRow.id)

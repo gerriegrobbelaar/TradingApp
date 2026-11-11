@@ -39,8 +39,11 @@ Status: accepted for Phase 5 (task R3a). Items under "Assumptions" are **verify 
 ## Channel health and housekeeping (review S4, N1, N2)
 
 - Header-first: both headers must be present, the timestamp 13 digits and inside the 5-minute window, and the
-  signature header well formed (at most 5 entries, one `v1=<64 hex>`) BEFORE the body is read or D1 is asked
-  anything (same rules as R1's verifier, repeated cheaply). The uniform 401 is unchanged.
+  signature header well formed (at most 5 entries, at least one `v1=<64 hex>`) BEFORE the body is read or D1 is
+  asked anything. The route calls R1's own `checkRevolutWebhookHeaders`, which `verifyRevolutWebhook` itself
+  runs first, so the pre-check can never refuse a delivery the verifier accepts (a randomised differential test
+  checks this too). The uniform 401 is unchanged; a well-formed but oversized request is now 413 only after the
+  header check.
 - `connections.last_webhook_verified_at` (stamped at most once a minute), `last_webhook_rejected_at`,
   `webhook_rejected_total` and the table `webhook_rejections` (per UTC minute and reason from a closed list,
   else `other`). The route is public, so writes are bounded: one upsert per reason per minute per isolate, the
@@ -48,8 +51,27 @@ Status: accepted for Phase 5 (task R3a). Items under "Assumptions" are **verify 
   always written). The rejection log line is sampled (10 per minute per isolate, then one "suppressed" line).
   `GET /api/connections` returns `revolut.webhook = { registered, lastVerifiedAt, lastRejectedAt,
   rejectedLast24h, rejectedTotal, secretReadable (admins only) }`; Phase 8's "webhook failures" rule reads these.
-  Disconnecting resets them; registering a new subscription clears `last_webhook_verified_at`.
-- `housekeepWebhookEvents` (scheduler tick, at most every 10 minutes): a `queued` row older than 15 minutes is
+  `secretReadable` is true / false, or null when it could not be checked (a D1 or configuration error is never
+  reported as "register again"). An unreadable PREVIOUS (overlap) secret does not block the current one: it is
+  ignored and retired by the first delivery verified with the current secret. Rejections are counted only while
+  a connection is active / needs_reauth / expired, and `rejectedLast24h` never counts buckets from before
+  `connected_at`, so a reconnect starts at zero. Disconnecting resets the connection counters; registering a new
+  subscription clears `last_webhook_verified_at`.
+- Residual risk (unauthenticated write and read amplification). Per isolate, rejections cost at most one write
+  batch (upsert + counter update) per reason code per minute: 11 codes, so at most 11 batches a minute, and in
+  practice 1 to 3 (an attacker without the secret reaches `missing_header`, `bad_timestamp`,
+  `timestamp_out_of_range`, `malformed` and `bad_signature`). A distributed flood that keeps N isolates busy
+  causes at most about 11 x N batches a minute (for example 300 isolates: about 3,300 a minute, 55 a second),
+  each touching one row of a table bounded to (reasons x minutes) rows. That is bounded but scales with N, and a
+  global guard in D1 cannot help: deciding "already written this minute" is itself a statement per request.
+  More important: a request with well-formed headers (a fresh 13-digit timestamp and any `v1=<64 hex>`) passes
+  the pre-check and costs two D1 reads (connection, secrets) plus one HMAC per request, unbounded by the app;
+  that is inherent (the secret is needed to verify). Mitigation outside the app: a Cloudflare WAF rate-limiting
+  rule on `POST /api/webhooks/revolut` (Revolut sends a handful a minute; for example 60 requests per minute per
+  IP, block for 10 minutes), recommended in docs/DEPLOY.md.
+- `housekeepWebhookEvents` (scheduler tick of minute 3, 13, 23, ... only, so nine idle ticks in ten send no
+  statement; on that tick a `settings` claim lets one isolate win and the winner asks one "anything due" query
+  first; its failure is caught and never affects job claiming): a `queued` row older than 15 minutes is
   re-enqueued (same MAX_REQUEUES budget as redeliveries) and then ends as `error` (`requeue_exhausted`,
   `never_parsed` for a body that was never parsed, `enqueue_failed` when the queue refuses); finished rows are
   deleted after 30 days (ADR 0011).

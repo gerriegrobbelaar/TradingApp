@@ -9,15 +9,18 @@
  *  - `processed`, `ignored` and `error` rows are deleted after 30 days, webhook_rejections after 7,
  *    in bounded batches.
  *
- * Called from the scheduler tick (jobs/runner.ts) through one line. Cheap when idle: an isolate
- * runs it at most once per 10 minutes, a settings stamp lets one isolate per 10 minutes win, and
- * the winner first asks ONE query whether anything is due.
+ * Called from the scheduler tick (jobs/runner.ts) on one tick in ten (HOUSEKEEPING_MINUTE), so
+ * nine idle ticks of ten send no statement. On that tick: an isolate runs it at most once per 10
+ * minutes, a settings stamp (one statement, a write only for the winner) lets one isolate per 10
+ * minutes win, and the winner first asks ONE query whether anything is due.
  */
 import type { Env } from "../env";
 import { enqueueEvent, MAX_REQUEUES, UNPARSED } from "./webhook-route";
 import { REJECTION_RETENTION_DAYS } from "./webhook-health";
 
 export const HOUSEKEEPING_EVERY_MS = 10 * 60_000;
+/** The scheduler tick calls housekeeping only when (minutes since epoch) % 10 equals this. */
+export const HOUSEKEEPING_MINUTE = 3;
 export const STALE_QUEUED_AFTER_MS = 15 * 60_000;
 export const EVENT_RETENTION_DAYS = 30;
 /** Rows handled per statement / per run, so one run stays short whatever the backlog. */

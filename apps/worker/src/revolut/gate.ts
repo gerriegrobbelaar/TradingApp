@@ -325,11 +325,15 @@ export class RevolutGate extends DurableObject<Env> {
     refreshEnc: string,
     expiresAtMs: number,
     refreshExpiresAtMs: number | null = null,
+    // A NEW refresh token without a stated expiry: the stored expiry belonged to the old one, so it
+    // is cleared (unknown) rather than kept. Without rotation it is kept.
+    rotated = false,
   ): Promise<boolean> {
     const r = await this.env.DB.prepare(
       `UPDATE connections
        SET access_token_enc = ?3, refresh_token_enc = ?4, expires_at = ?5, last_error = NULL,
-           refresh_expires_at = COALESCE(?6, refresh_expires_at),
+           refresh_expires_at = CASE WHEN ?6 IS NOT NULL THEN ?6
+                                     WHEN ?7 = 1 THEN NULL ELSE refresh_expires_at END,
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
        WHERE id = ?1 AND kind = 'revolut' AND status = 'active' AND refresh_token_enc = ?2`,
     )
@@ -340,6 +344,7 @@ export class RevolutGate extends DurableObject<Env> {
         refreshEnc,
         new Date(expiresAtMs).toISOString(),
         refreshExpiresAtMs === null ? null : new Date(refreshExpiresAtMs).toISOString(),
+        rotated ? 1 : 0,
       )
       .run();
     return r.meta.changes === 1;
@@ -356,6 +361,7 @@ export class RevolutGate extends DurableObject<Env> {
         pending.refreshEnc,
         pending.expiresAt,
         pending.refreshExpiresAt ?? null,
+        true, // only a rotated pair is ever stashed
       );
     } catch {
       return pending; // D1 still failing: keep it
@@ -566,6 +572,7 @@ export class RevolutGate extends DurableObject<Env> {
               refreshEnc,
               expiresAt,
               refreshExpiresAt,
+              rotated,
             );
           } catch {
             persisted = await this.persistTokens(
@@ -575,6 +582,7 @@ export class RevolutGate extends DurableObject<Env> {
               refreshEnc,
               expiresAt,
               refreshExpiresAt,
+              rotated,
             );
           }
         } catch {

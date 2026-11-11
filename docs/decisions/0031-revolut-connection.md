@@ -55,9 +55,19 @@ route and the Bank screen are R3.
   lazily when a delivery had to be verified with a secret still under the previous key; each rewrite
   is a compare-and-swap on the old ciphertext and is not audited (the plaintext does not change).
   Without this, dropping `TOKEN_ENC_KEY_PREVIOUS` would make every delivery fail verification.
-  A secret that cannot be decrypted with either key is reported to admins as
-  `webhookSecretReadable: false` in `GET /api/connections`; "Register webhook again" replaces it
-  (the unreadable value is discarded instead of kept as the previous secret).
+  A failed rewrite leaves the old ciphertext (still readable while the previous key is configured)
+  and is retried on the next refresh or delivery; the AAD stays the column's own. A secret that
+  cannot be decrypted with either key is reported to admins as `webhookSecretReadable: false` in
+  `GET /api/connections` (null = could not be checked); "Register webhook again" replaces it (the
+  unreadable value is discarded, and audited as `droppedUnreadablePrevious`, instead of kept as the
+  previous secret). Only a genuinely unreadable value is discarded: a malformed configured key or
+  a D1 error makes the registration fail and keeps the stored secret.
+  `TOKEN_ENC_KEY_PREVIOUS` can be removed only after one refresh of each connection AND one
+  verified webhook delivery (or a refresh, which also rewrites the webhook secrets) under the new
+  key (the Revolut access token lives about 40 minutes and the poll job refreshes it, so waiting an
+  hour after the "Last delivery" stamp moved is enough). Afterwards `webhookSecretReadable: true`
+  confirms it; if it shows false, put the old key back as `TOKEN_ENC_KEY_PREVIOUS` (nothing stored
+  was changed by dropping it) and wait for the next refresh.
 - Config: vars `REVOLUT_CLIENT_ID`, `REVOLUT_REDIRECT_URI`, `REVOLUT_ISSUER`; secret
   `REVOLUT_PRIVATE_KEY` (PKCS#8 PEM). `REVOLUT_ISSUER` must be the host of `REVOLUT_REDIRECT_URI` and the
   redirect URI must be on the app origin at `/api/connections/revolut/callback` (checked at runtime
@@ -170,7 +180,8 @@ route and the Bank screen are R3.
 
 `connections.refresh_expires_at` (nullable, migration 0016) is set when a token response carries a
 refresh lifetime (`refresh_token_expires_in`, whole seconds, 1 s to 10 years; anything else is
-ignored) and kept when a later response omits it. `GET /api/connections` returns it as
+ignored) and kept when a later response omits it, unless that response rotated the refresh
+token (a new token's expiry is then unknown: cleared). `needs_reauth` and disconnect clear it. `GET /api/connections` returns it as
 `refreshExpiresAt` (null = unknown) for Phase 8's "expiring connection" rule.
 **Open item:** Revolut's documentation we have names no refresh-token lifetime; the often-quoted
 90-day re-consent for Business API access is unverified. Until a live sandbox connection shows

@@ -141,6 +141,22 @@ export async function isEncryptedWith(keyB64: string, blob: string): Promise<boo
   return parts[1] === (await keyIdOf(keyB64));
 }
 
+/**
+ * True when `e` says the STORED VALUE cannot be read with the configured keys (malformed, under a
+ * key that is no longer configured, wrong key or tampered, including a value moved to another
+ * column or connection: the AAD no longer matches). False for anything else, notably a malformed
+ * configured key (our configuration) or a non-crypto error such as a D1 failure: those say
+ * nothing about the stored value and must never make a caller discard it.
+ */
+export function isUnreadableValue(e: unknown): boolean {
+  return (
+    e instanceof TokenCryptoError &&
+    (e.reason === "bad format" ||
+      e.reason === "decryption failed" ||
+      e.reason === "no matching key")
+  );
+}
+
 /** Keys to try when decrypting, current first. */
 export function keyring(env: {
   TOKEN_ENC_KEY?: string;

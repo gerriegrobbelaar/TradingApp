@@ -505,6 +505,11 @@ describe("M1 review: wrangler's inheritance rules, read with a real TOML parser"
       ["[vars]\n", '[vars]\nTEST_MIGRATIONS = "x"\n'],
       ["[vars]\n", '[vars]\nTOKEN_ENC_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="\n'],
       ["[vars]\n", '[vars]\nSESSION_SECRET = "x"\n'],
+      // the test pool's "old" key (vitest.config.ts) must never become a deployed variable
+      [
+        "[vars]\n",
+        '[vars]\nTOKEN_ENC_KEY_PREVIOUS = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="\n',
+      ],
     ];
     for (const [from, to] of cases) {
       const t = ready.replace(from, to);
