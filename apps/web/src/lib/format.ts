@@ -14,7 +14,8 @@ export const DATE_LOCALE = "en-GB";
 export const TIME_ZONE = "Europe/Amsterdam";
 export const NO_VALUE = "—";
 
-function scaleOf(currency: string): number {
+/** Decimal places of a currency's minor unit (JPY 0, EUR 2, KWD 3); 2 for a code core does not know. */
+export function scaleOf(currency: string): number {
   try {
     return currencyScale(currency);
   } catch {
@@ -217,4 +218,30 @@ export function describeDue(daysOverdue: number | null): string {
 /** "1 item", "12 items". */
 export function formatCount(n: number, one = "item", many = "items"): string {
   return `${n} ${n === 1 ? one : many}`;
+}
+
+const DECIMAL_SEPARATOR =
+  new Intl.NumberFormat(NUMBER_LOCALE, { minimumFractionDigits: 1 })
+    .formatToParts(1.5)
+    .find((p) => p.type === "decimal")?.value ?? ".";
+
+/**
+ * A variance in basis points (1 % = 100 bp) as a percentage with one decimal: 1234 -> "12,3%".
+ * Integer math only (BigInt): the tenth of a percent is rounded half away from zero, so 1235 gives
+ * "12,4%" and -1235 gives "-12,4%". Null (zero or missing base) is an em dash, never "0%". A value
+ * that rounds to zero prints "0,0%" without a minus sign.
+ */
+export function formatBps(bps: number | null | undefined): string {
+  if (bps === null || bps === undefined || !Number.isSafeInteger(bps)) return NO_VALUE;
+  const negative = bps < 0;
+  const abs = BigInt(negative ? -bps : bps);
+  const tenths = (abs + 5n) / 10n; // half up on the magnitude = half away from zero
+  const text = `${(tenths / 10n).toString()}${DECIMAL_SEPARATOR}${(tenths % 10n).toString()}%`;
+  return negative && tenths > 0n ? `-${text}` : text;
+}
+
+const yearFmt = new Intl.DateTimeFormat("en-GB", { year: "numeric", timeZone: TIME_ZONE });
+/** The calendar year in Amsterdam right now (the reporting year, ADR 0024). */
+export function currentAmsterdamYear(now: number = Date.now()): number {
+  return Number(yearFmt.format(now));
 }

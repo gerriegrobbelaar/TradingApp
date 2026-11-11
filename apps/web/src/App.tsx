@@ -16,9 +16,12 @@ import { PLACEHOLDERS } from "./routes";
 import { ToastProvider, useToast } from "./toasts";
 import { ComingSoon, NotFound } from "./pages/Placeholder";
 import { Approvals } from "./pages/Approvals";
+import { CreditorsAgeing, ReceivablesAgeing } from "./pages/AgeingReport";
+import { BalanceSheet } from "./pages/BalanceSheet";
 import { Invoices } from "./pages/Invoices";
 import { Overview } from "./pages/Overview";
 import { Payables } from "./pages/Payables";
+import { ProfitLoss } from "./pages/ProfitLoss";
 import { Settings } from "./pages/Settings";
 import { Checking, SessionError, SignedOut } from "./pages/SignedOut";
 
@@ -86,6 +89,10 @@ function SignedInShell() {
             <Route path="/invoices" element={<Invoices />} />
             <Route path="/purchases/payables" element={<Payables />} />
             <Route path="/purchases/approvals" element={<Approvals />} />
+            <Route path="/reporting/balance-sheet" element={<BalanceSheet />} />
+            <Route path="/reporting/profit-loss" element={<ProfitLoss />} />
+            <Route path="/reporting/creditors-ageing" element={<CreditorsAgeing />} />
+            <Route path="/reporting/receivables-ageing" element={<ReceivablesAgeing />} />
             {PLACEHOLDERS.map((p) => (
               <Route key={p.to} path={p.to} element={<ComingSoon path={p.to} title={p.label} />} />
             ))}

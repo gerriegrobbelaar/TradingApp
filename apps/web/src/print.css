@@ -1,0 +1,222 @@
+/* Print view of the reports (K3b). "Export PDF" opens the browser's print dialog; the user picks
+   "Save as PDF". Always light, black on white, no glass, blur or shadow, whatever the theme.
+   Ageing, profit and loss print on A4 landscape; the balance sheet on A4 portrait. */
+
+@page {
+  size: A4 portrait;
+  margin: 14mm 12mm 16mm;
+  @bottom-right {
+    content: "Page " counter(page) " of " counter(pages);
+    font: 8pt sans-serif;
+    color: #444;
+  }
+}
+@page report-landscape {
+  size: A4 landscape;
+  margin: 12mm 12mm 14mm;
+  @bottom-right {
+    content: "Page " counter(page) " of " counter(pages);
+    font: 8pt sans-serif;
+    color: #444;
+  }
+}
+
+@media print {
+  /* Always light, whatever the theme or the system setting. */
+  :root,
+  :root[data-theme="dark"],
+  :root[data-theme="light"] {
+    color-scheme: light !important;
+    --bg: #fff !important;
+    --ink: #000 !important;
+    --muted: #333 !important;
+    --subtle: #444 !important;
+    --accent: #000 !important;
+    --accent-text: #000 !important;
+    --accent-soft: transparent !important;
+    --warn: #000 !important;
+    --warn-text: #000 !important;
+    --warn-soft: transparent !important;
+    --gold: #000 !important;
+    --gold-soft: transparent !important;
+    --glass-1: transparent !important;
+    --glass-2: transparent !important;
+    --glass-edge: transparent !important;
+    --glass-hi: transparent !important;
+    --shadow: none !important;
+    --sheet: #fff !important;
+    --fill: #f1f1f1 !important;
+    --fill-2: #e6e6e6 !important;
+    --sunken: #f1f1f1 !important;
+    --line: #bbb !important;
+    --hover: transparent !important;
+    --control-line: #666 !important;
+    --sk: #ddd !important;
+  }
+  * {
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
+    box-shadow: none !important;
+    text-shadow: none !important;
+    filter: none !important;
+    animation: none !important;
+    transition: none !important;
+  }
+  html,
+  body,
+  .app,
+  .wrap,
+  .main {
+    background: #fff !important;
+    color: #000 !important;
+    overflow: visible !important;
+    min-height: 0 !important;
+    height: auto !important;
+    max-width: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+  body {
+    font-size: 9pt;
+  }
+
+  /* Not part of a report on paper. */
+  .orb,
+  .skip,
+  .topnav,
+  .foot-line,
+  .no-print,
+  .toast,
+  .scrim,
+  .sheet,
+  [role="dialog"],
+  .eyebrow,
+  .freshness,
+  .mix-col {
+    display: none !important;
+  }
+  .print-only {
+    display: block !important;
+  }
+
+  .card {
+    background: none !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+  .top {
+    display: block;
+    margin: 0 0 4mm;
+  }
+  .h1 {
+    font-size: 18pt;
+    line-height: 22pt;
+  }
+  .h2 {
+    font-size: 11pt;
+  }
+  .lede {
+    display: none;
+  }
+  .print-meta {
+    margin: 0 0 4mm;
+    font-size: 9pt;
+    line-height: 12pt;
+  }
+  .print-meta p {
+    margin: 0;
+  }
+  .asof {
+    margin: 0 0 2mm;
+  }
+  .report {
+    gap: 4mm !important;
+  }
+  .report-landscape {
+    page: report-landscape;
+  }
+  .report-portrait {
+    page: auto;
+  }
+  .report-notices .notice {
+    border: 1px solid #666 !important;
+    background: none !important;
+    color: #000 !important;
+    padding: 2mm !important;
+  }
+
+  /* Tables: whole width, nothing clipped, header repeated, rows never split. */
+  .report-scroll {
+    overflow: visible !important;
+    max-width: none !important;
+    margin: 0 !important;
+  }
+  .report-table,
+  .ageing-table,
+  .pl-table {
+    width: 100% !important;
+    min-width: 0 !important;
+    font-size: 8pt;
+    table-layout: auto;
+  }
+  .report-table th,
+  .report-table td {
+    padding: 1.2mm 1.6mm !important;
+    color: #000 !important;
+    background: transparent !important;
+    position: static !important;
+    min-width: 0 !important;
+    box-shadow: none !important;
+    border-bottom: 0.2mm solid #bbb !important;
+    font-size: 8pt !important;
+  }
+  .report-table thead th {
+    font-weight: 700 !important;
+    border-bottom: 0.4mm solid #000 !important;
+  }
+  .report-table .totals-row th,
+  .report-table .totals-row td {
+    font-weight: 700 !important;
+    border-top: 0.4mm solid #000 !important;
+  }
+  .report-table .section-row th {
+    font-weight: 700 !important;
+    background: #f1f1f1 !important;
+  }
+  .report-table .sticky-note {
+    position: static;
+    width: auto;
+  }
+  .report-table button,
+  .report-table .link {
+    color: #000 !important;
+    text-decoration: none !important;
+    font: inherit !important;
+    padding: 0 !important;
+  }
+  .report-table .money,
+  .report-table .num {
+    white-space: nowrap;
+  }
+  tr,
+  .report-table tr {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  thead {
+    display: table-header-group;
+  }
+  /* Totals once, at the end of the table, not repeated at the foot of every page. */
+  tfoot {
+    display: table-row-group;
+  }
+  .report-card {
+    break-inside: auto;
+  }
+  a {
+    color: #000 !important;
+    text-decoration: none !important;
+  }
+}

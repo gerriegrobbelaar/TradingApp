@@ -1,0 +1,217 @@
+/* Reporting screens (K3b): wide tables scroll inside their own focusable region with a pinned
+   first column, never the page. Print rules live in print.css. */
+.app .report {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+.app .report-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px 16px;
+}
+.app .report-bar .filters {
+  margin-bottom: 0;
+}
+.app .period-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px 12px;
+}
+.app .period-controls .field-inline {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.app .export-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+}
+.app .stamps {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.app .asof {
+  margin: 0;
+  font-size: 13px;
+}
+.app .report-card {
+  min-width: 0;
+}
+.app .report-notices {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.app .report-notices .notice {
+  margin: 0;
+}
+.app .strong-notice {
+  font-size: 15px;
+  line-height: 22px;
+}
+
+/* The scroll region */
+.app .report-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+  margin-top: 8px;
+  border-radius: 12px;
+  -webkit-overflow-scrolling: touch;
+}
+.app .report-scroll:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 2px;
+}
+.app .report-table {
+  min-width: 520px;
+}
+.app .ageing-table {
+  min-width: 940px;
+}
+.app .pl-table {
+  min-width: 860px;
+}
+.app .report-table th,
+.app .report-table td {
+  padding: 9px 10px;
+  vertical-align: middle;
+}
+.app .report-table thead th {
+  white-space: normal;
+  vertical-align: bottom;
+}
+.app .report-table tbody th,
+.app .report-table tfoot th {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--ink);
+  white-space: normal;
+  text-align: left;
+}
+/* Pinned first column: only where the table scrolls sideways (phone and narrow tablet). */
+@media (max-width: 760px) {
+  .app .report-table th:first-child,
+  .app .report-table td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--bg);
+    min-width: 112px;
+    box-shadow: 1px 0 0 var(--line);
+  }
+  .app .report-table thead th:first-child {
+    z-index: 2;
+  }
+}
+.app .report-table .code {
+  color: var(--muted);
+  margin-right: 8px;
+  font-size: 12px;
+}
+.app .report-table .rel-name {
+  display: block;
+}
+.app .report-table .cap {
+  display: block;
+}
+.app .report-table .section-row th,
+.app .report-table .section-row td {
+  font-weight: 600;
+}
+.app .report-table .section-row td {
+  box-shadow: none;
+}
+.app .report-table .note-cell {
+  position: static;
+  box-shadow: none;
+  background: transparent;
+}
+.app .report-table .sticky-note {
+  position: sticky;
+  left: 10px;
+  width: min(560px, calc(100vw - 80px));
+}
+.app .report-table .totals-row th,
+.app .report-table .totals-row td {
+  border-top: 1px solid var(--control-line);
+  font-weight: 600;
+}
+.app .report-table .totals-row.diff-bad th,
+.app .report-table .totals-row.diff-bad td {
+  color: var(--warn-text);
+}
+.app .report-table .strong {
+  font-weight: 600;
+}
+.app .cell-btn {
+  min-height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  text-align: right;
+  cursor: pointer;
+}
+.app .mix-col {
+  width: 150px;
+  min-width: 150px;
+}
+.app .report-table td.mix-col {
+  position: static;
+  box-shadow: none;
+}
+
+/* Ageing bar: the amounts next to it are the real data; the bar is the shape of them. */
+.app .ageing-bar {
+  display: flex;
+  gap: 1px;
+  width: 130px;
+  height: 10px;
+  border-radius: 5px;
+  overflow: hidden;
+  background: var(--fill);
+}
+.app .ageing-bar > span {
+  flex: 0 0 0;
+  min-width: 3px;
+  display: block;
+}
+.app .seg-not_due {
+  background: var(--accent);
+}
+.app .seg-d1_30 {
+  background: var(--gold);
+}
+.app .seg-d31_60 {
+  background: var(--warn);
+}
+.app .seg-d61_90 {
+  background: var(--warn-text);
+}
+.app .seg-d90_plus {
+  background: var(--ink);
+}
+.app .seg-no_due_date {
+  background: var(--subtle);
+}
+
+@media (max-width: 560px) {
+  .app .report-bar {
+    align-items: stretch;
+  }
+  .app .export-actions .btn {
+    flex: 1 1 140px;
+  }
+}
+
+.print-only {
+  display: none;
+}

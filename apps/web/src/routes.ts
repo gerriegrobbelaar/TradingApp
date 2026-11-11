@@ -32,9 +32,9 @@ export const NAV: NavItem[] = [
     label: "Reporting",
     items: [
       { to: "/reporting/balance-sheet", label: "Balance sheet" },
-      { to: "/reporting/profit-and-loss", label: "Profit and loss" },
-      { to: "/reporting/creditors-age", label: "Creditors age analysis" },
-      { to: "/reporting/receivables-age", label: "Receivables age analysis" },
+      { to: "/reporting/profit-loss", label: "Profit and loss" },
+      { to: "/reporting/creditors-ageing", label: "Creditors age analysis" },
+      { to: "/reporting/receivables-ageing", label: "Receivables age analysis" },
     ],
   },
   { to: "/close", label: "Close" },
@@ -50,6 +50,10 @@ export const BUILT_PAGES: readonly string[] = [
   "/invoices",
   "/purchases/payables",
   "/purchases/approvals",
+  "/reporting/balance-sheet",
+  "/reporting/profit-loss",
+  "/reporting/creditors-ageing",
+  "/reporting/receivables-ageing",
 ];
 
 /** Every page without a screen yet, flattened. Titles come from the menu labels. */

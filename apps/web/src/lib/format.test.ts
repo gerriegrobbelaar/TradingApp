@@ -7,7 +7,10 @@ import {
   formatCount,
   formatDate,
   formatDateTime,
+  formatBps,
   formatDays,
+  currentAmsterdamYear,
+  scaleOf,
   formatMoney,
   minorToDecimal,
 } from "./format";
@@ -170,5 +173,50 @@ describe("dates and days", () => {
     expect(describeDue(null)).toBe("No due date");
     expect(formatCount(1)).toBe("1 item");
     expect(formatCount(2)).toBe("2 items");
+  });
+});
+
+describe("formatBps (variance percentage from basis points)", () => {
+  it("shows one decimal with the Dutch decimal comma", () => {
+    expect(formatBps(1234)).toBe("12,3%");
+    expect(formatBps(100)).toBe("1,0%");
+    expect(formatBps(10_000)).toBe("100,0%");
+    expect(formatBps(123_456)).toBe("1234,6%");
+  });
+
+  it("rounds half away from zero, in integer math", () => {
+    // 12.35 % -> 12.4 %, -12.35 % -> -12.4 %
+    expect(formatBps(1235)).toBe("12,4%");
+    expect(formatBps(-1235)).toBe("-12,4%");
+    expect(formatBps(1234)).toBe("12,3%");
+    expect(formatBps(-1234)).toBe("-12,3%");
+    expect(formatBps(5)).toBe("0,1%");
+    expect(formatBps(4)).toBe("0,0%");
+    expect(formatBps(-5)).toBe("-0,1%");
+  });
+
+  it("never prints a minus sign for zero, and is exact for huge values", () => {
+    expect(formatBps(0)).toBe("0,0%");
+    expect(formatBps(-4)).toBe("0,0%");
+    expect(formatBps(Number.MAX_SAFE_INTEGER)).toBe("90071992547409,9%");
+  });
+
+  it("is an em dash without a base (null) and for non-integers, never 0", () => {
+    expect(formatBps(null)).toBe(NO_VALUE);
+    expect(formatBps(undefined)).toBe(NO_VALUE);
+    expect(formatBps(1.5)).toBe(NO_VALUE);
+    expect(formatBps(Number.NaN)).toBe(NO_VALUE);
+  });
+});
+
+describe("report helpers", () => {
+  it("knows the minor-unit decimals of a currency", () => {
+    expect([scaleOf("EUR"), scaleOf("JPY"), scaleOf("KWD")]).toEqual([2, 0, 3]);
+  });
+
+  it("takes the reporting year in Amsterdam, not UTC", () => {
+    // 31 Dec 23:30 UTC is already 1 Jan in Amsterdam.
+    expect(currentAmsterdamYear(Date.parse("2026-12-31T23:30:00Z"))).toBe(2027);
+    expect(currentAmsterdamYear(Date.parse("2026-12-31T22:30:00Z"))).toBe(2026);
   });
 });

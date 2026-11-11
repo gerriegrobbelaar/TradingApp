@@ -2,10 +2,15 @@
 
 import {
   safeReturnTo,
+  type AgeingReportResponse,
   type ApprovalsResponse,
+  type BalanceSheetResponse,
+  type LedgerAccountBalancesResponse,
+  type LedgerAccountsResponse,
   type OpenItemDetail,
   type OpenItemListResponse,
   type OverviewResponse,
+  type ProfitLossResponse,
   type Role,
   type Schedule,
 } from "@camelthorn/core";
@@ -441,3 +446,47 @@ export const listApprovals = (params: QueryParams, signal?: AbortSignal) =>
   request<ApprovalsResponse>(`/api/approvals${queryString(params)}`, {
     ...(signal ? { signal } : {}),
   });
+
+// ---- reports (Phase 4, K3b) -------------------------------------------------------------------
+
+/** Ageing of open invoices (receivable) or bills (payable). `asOf` is never sent: it is today. */
+export const getAgeingReport = (
+  division: number,
+  kind: "receivable" | "payable",
+  signal?: AbortSignal,
+) =>
+  request<AgeingReportResponse>(`/api/reports/ageing${queryString({ division, kind })}`, {
+    ...(signal ? { signal } : {}),
+  });
+
+export const getBalanceSheet = (
+  division: number,
+  params: { year?: number | undefined; period?: number | undefined },
+  signal?: AbortSignal,
+) =>
+  request<BalanceSheetResponse>(
+    `/api/reports/balance-sheet${queryString({ division, year: params.year, period: params.period })}`,
+    { ...(signal ? { signal } : {}) },
+  );
+
+export const getProfitLoss = (
+  division: number,
+  params: { year?: number | undefined; periodTo?: number | undefined },
+  signal?: AbortSignal,
+) =>
+  request<ProfitLossResponse>(
+    `/api/reports/profit-loss${queryString({ division, year: params.year, periodTo: params.periodTo })}`,
+    { ...(signal ? { signal } : {}) },
+  );
+
+/** The chart of accounts of a division (used to find our account id from a report line). */
+export const getLedgerAccounts = (division: number, signal?: AbortSignal) =>
+  request<LedgerAccountsResponse>(`/api/ledger/accounts${queryString({ division })}`, {
+    ...(signal ? { signal } : {}),
+  });
+
+export const getAccountBalances = (accountId: number, year: number, signal?: AbortSignal) =>
+  request<LedgerAccountBalancesResponse>(
+    `/api/ledger/accounts/${accountId}/balances${queryString({ year })}`,
+    { ...(signal ? { signal } : {}) },
+  );
