@@ -49,10 +49,26 @@ Exact connection before deploying (it runs on Cloudflare's network against the r
 Durable Objects of the account, so use a test deployment or a throwaway database, not production
 data).
 
-**Durable Object migration tag.** `wrangler.toml` declares the class once, in `[[migrations]]` with
-`tag = "v1"` and `new_sqlite_classes = ["ExactGate"]`. Never edit or reuse a tag that has been
-deployed: a new Durable Object class or a rename needs a new `[[migrations]]` entry with the next
-tag (`v2`). The deploy check refuses a config without the `ExactGate` binding or its migration.
+**Durable Object migration tags.** `wrangler.toml` declares `ExactGate` in `[[migrations]]` with
+`tag = "v1"` and `JobLock` (the scheduler's per-job no-overlap lease, ADR 0020) with `tag = "v2"`,
+both in `new_sqlite_classes`. Never edit or reuse a tag that has been deployed: a new Durable Object
+class or a rename needs a new `[[migrations]]` entry with the next tag (`v3`). The deploy check
+refuses a config without the `ExactGate` or `JobLock` binding or its migration. `JobLock` objects
+are EU-only the same way (`getEuObject`, one helper for every namespace).
+
+**Queues.** Job runs travel through a Cloudflare Queue (Workers paid plan). Create the queue and its
+dead-letter queue once, before the first deploy; the names must match `wrangler.toml`:
+
+```sh
+pnpm exec wrangler queues create camelthorn-jobs
+pnpm exec wrangler queues create camelthorn-jobs-dlq
+```
+
+The Worker is both producer (the cron tick and "Run now") and consumer (`queue()`), configured in
+`wrangler.toml` under `[[queues.producers]]` and `[[queues.consumers]]` (one run per invocation,
+3 retries, then the dead-letter queue). Messages in the dead-letter queue are runs that could not be
+started; the scheduler marks such a run as failed ("Never started") after about 20 minutes, so you
+only need to look there when a job keeps failing that way.
 
 ## 2. Create the Google OAuth client
 
@@ -75,11 +91,12 @@ In `apps/worker/wrangler.toml`:
 - Uncomment one `routes` line and set your hostname (same host as `OAUTH_REDIRECT_URI`).
   `workers_dev` and `preview_urls` stay `false`.
 
-- `[triggers] crons = ["0 * * * *"]` must stay. It is the only thing that refreshes Exact data
-  (an hourly tick; the handler decides from the Amsterdam clock which tick is the 02:00 full
-  sync, see `apps/worker/src/exact/scheduled.ts`). Cron Triggers run on the deployed Worker only,
-  never in `wrangler dev` unless started with `--test-scheduled`. Phase 3 replaces this stopgap
-  with the jobs table and Queues.
+- `[triggers] crons = ["* * * * *"]` must stay. It is the scheduler tick: every minute the Worker
+  works out from each job's own schedule (Settings, Schedules; Europe/Amsterdam, daylight saving
+  aware) which jobs are due and puts them on the queue. Change a schedule in the app, never the cron
+  expression. Cron Triggers run on the deployed Worker only, never in `wrangler dev` unless started
+  with `--test-scheduled`. Settings, Schedules shows a warning when the queue is missing or the tick
+  has not run for 5 minutes.
 
 Check nothing is left over, then commit:
 
@@ -88,8 +105,9 @@ pnpm run check:deploy
 ```
 
 It fails while the all-zero `database_id`, an empty `GOOGLE_CLIENT_ID` or `EXACT_CLIENT_ID`, an
-`app.example.com` redirect URI (Google or Exact), a missing route, a missing `[triggers]` cron or
-a missing `ExactGate` binding or migration remain.
+`app.example.com` redirect URI (Google or Exact), a missing route, a missing every-minute
+`[triggers]` cron, a missing `ExactGate` or `JobLock` binding or migration, or a missing job queue
+producer, consumer or dead-letter queue remain.
 
 ## 4. Set the secrets
 

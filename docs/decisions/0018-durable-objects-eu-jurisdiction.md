@@ -17,3 +17,6 @@ CLAUDE.md 2 puts D1 and R2 in the EU. Durable Objects hold Exact limiter state, 
 
 ## Verify on first deploy
 After the first deploy check in the dashboard (Workers, Durable Objects, `ExactGate`) that objects are listed with jurisdiction EU, and that a sync's job budget shows up on the same object that served the calls.
+
+## Update (task H2, Phase 3)
+`getEuObject(namespace, name)` in `apps/worker/src/eu-object.ts` is now the one helper for every Durable Object namespace (`ExactGate`, `JobLock`, later ones); `getExactGate` calls it. The test seam moved with it (`setEuNamespaceResolverForTests`, still reachable as `setGateNamespaceResolverForTests`), and the source scan covers every binding: no file under `src/` may call `idFromName`, `newUniqueId`, `idFromString` or `jurisdiction` except the helper, or use either seam.

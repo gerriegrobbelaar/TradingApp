@@ -168,7 +168,29 @@
   }
 }
 
+/* Schedules: cell captions only appear when the table is stacked at phone width. */
+.app .cell-label {
+  display: none;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+}
+.app .fires {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.app .tbl.jobs td {
+  vertical-align: top;
+}
+
 @media (max-width: 560px) {
+  .app .cell-label {
+    display: block;
+  }
   /* Users table becomes stacked rows at phone width: no sideways scrolling. */
   .app .tbl.stacked thead {
     position: absolute;

@@ -1,6 +1,6 @@
 /** Thin typed client for the Worker API. Same-origin; the session cookie does the auth. */
 
-import { safeReturnTo, type Role } from "@camelthorn/core";
+import { safeReturnTo, type Role, type Schedule } from "@camelthorn/core";
 
 export { ROLES, safeReturnTo, type Role } from "@camelthorn/core";
 
@@ -298,3 +298,63 @@ export const setMyDivision = (divisionId: number) =>
   request<{ selectedId: number }>("/api/me/division", { method: "PUT", body: { divisionId } });
 export const runSync = (divisionId: number, mode: "full" | "incremental") =>
   request<SyncResponse>(`/api/divisions/${divisionId}/sync`, { method: "POST", body: { mode } });
+
+export type JobRunStatus = "queued" | "running" | "ok" | "partial" | "error" | "skipped";
+
+export interface JobRunView {
+  id: number;
+  status: JobRunStatus;
+  trigger: "schedule" | "manual" | "retry";
+  attempt: number;
+  requestedBy: string;
+  scheduledFor: string;
+  queuedAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  errorCode: string | null;
+  callsUsed: number;
+  summary: unknown;
+}
+
+export interface JobView {
+  id: number;
+  name: string;
+  title: string;
+  description: string;
+  /** False while the phase that builds it is missing: runs are recorded as skipped. */
+  implemented: boolean;
+  phase: string | null;
+  usesExact: boolean;
+  schedule: Schedule | null;
+  scheduleText: string;
+  enabled: boolean;
+  /** Exact calls per administration and run (Exact jobs only). */
+  exactBudget: number;
+  nextRunAt: string | null;
+  /** A run is queued or running. */
+  running: boolean;
+  lastRun: JobRunView | null;
+}
+
+export interface JobsResponse {
+  scheduler: {
+    /** False when the Worker has no job queue binding. */
+    queueConfigured: boolean;
+    /** When the every-minute cron trigger last ran, or null if it never did. */
+    lastTickAt: string | null;
+    /** The server's clock, to judge lastTickAt without trusting the browser clock. */
+    now: string;
+  };
+  maxExactBudget: number;
+  jobs: JobView[];
+}
+
+export const listJobs = () => request<JobsResponse>("/api/jobs");
+export const listJobRuns = (id: number, limit = 20) =>
+  request<{ jobId: number; runs: JobRunView[] }>(`/api/jobs/${id}/runs?limit=${limit}`);
+export const patchJob = (
+  id: number,
+  body: { enabled?: boolean; schedule?: Schedule; exactBudget?: number },
+) => request<{ id: number; changed: boolean }>(`/api/jobs/${id}`, { method: "PATCH", body });
+export const runJobNow = (id: number) =>
+  request<{ runId: number; status: "queued" }>(`/api/jobs/${id}/run`, { method: "POST" });

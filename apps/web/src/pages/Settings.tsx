@@ -12,6 +12,7 @@ import {
 import { useSignedIn } from "../auth";
 import { PageHeader } from "../components/PageHeader";
 import { Connections } from "./Connections";
+import { Schedules } from "./Schedules";
 import { Users } from "./Users";
 
 type Tab = "appearance" | "users" | "connections" | "schedules";
@@ -50,15 +51,6 @@ export function Appearance() {
   );
 }
 
-function Soon({ what }: { what: string }) {
-  return (
-    <Card>
-      <h2 className="h2">{what}</h2>
-      <p className="lede">This section is not built yet. It arrives in a later phase.</p>
-    </Card>
-  );
-}
-
 export function Settings() {
   const me = useSignedIn();
   const { tab } = useParams();
@@ -92,7 +84,7 @@ export function Settings() {
       {current === "appearance" && <Appearance />}
       {current === "users" && <Users />}
       {current === "connections" && <Connections />}
-      {current === "schedules" && <Soon what="Schedules" />}
+      {current === "schedules" && <Schedules />}
     </>
   );
 }
