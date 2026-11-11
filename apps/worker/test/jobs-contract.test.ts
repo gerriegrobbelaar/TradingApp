@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { HANDLERS } from "../src/jobs/handlers";
 import type { HandlerResult, JobContext } from "../src/jobs/types";
 import { assertCountsAndCodesOnly, MAX_STRING } from "./counts-only";
+import { stubEcb, type FakeEcb } from "./fx-helpers";
 import { resetRevolut, seedRevolut, stubRevolut } from "./revolut-helpers";
 import { cpRecord, rawApi, rawLeg, rawTx } from "./revolut-q1-helpers";
 import { fakeRevolut, simpleTx } from "./revolut-r3-helpers";
@@ -157,12 +158,28 @@ async function revolutFixture(): Promise<{ syncDeps: JobContext["syncDeps"]; eff
   return { syncDeps: undefined, effects };
 }
 
+/**
+ * The ECB boundary is the fetch stub: one plain GET per run, nothing is ever written to the ECB.
+ * It serves rates up to the day before the slot, so a scheduled run ends partial (not yet
+ * published) and a manual run ends ok; both are repeatable.
+ */
+let ecbStub: FakeEcb | null = null;
+async function ecbFixture(): Promise<{ syncDeps: JobContext["syncDeps"]; effects: Effects }> {
+  const stub = stubEcb();
+  ecbStub = stub;
+  stub.fill({ USD: 1.1, GBP: 0.86, JPY: 160 }, "2026-06-01", "2026-07-14");
+  // The stub's own call log doubles as the effects log (only its length is asserted).
+  const effects: Effects = { calls: stub.calls as unknown as Effects["calls"], writes: [] };
+  return { syncDeps: undefined, effects };
+}
+
 /** One entry per implemented handler. */
 const FIXTURES: Record<string, Fixture> = {
   "exact.full_sync": { setup: exactFixture },
   "exact.incremental_sync": { setup: exactFixture },
   "revolut.sync": { setup: revolutFixture, teardown: () => revolutStub?.restore() },
   "revolut.backfill": { setup: revolutFixture, teardown: () => revolutStub?.restore() },
+  "ecb.fx_import": { setup: ecbFixture, teardown: () => ecbStub?.restore() },
 };
 
 function contextFor(

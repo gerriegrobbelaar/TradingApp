@@ -16,3 +16,5 @@ export * from "./approvals";
 export * from "./schedule-rules";
 export * from "./redact";
 export * from "./bank-tx";
+export * from "./fx";
+export * from "./ecb";

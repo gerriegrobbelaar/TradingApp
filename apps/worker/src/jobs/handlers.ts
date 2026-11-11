@@ -3,6 +3,7 @@
  * yet are registered WITHOUT a `run`: the runner records them as `skipped` with code
  * `not_implemented` (never an error, never a silent success), and "Run now" is refused for them.
  */
+import { ECB_MAX_ATTEMPTS, ECB_MAX_LATENESS_MS, runEcbImport } from "../fx/ecb-import";
 import { loadRevolutConfig } from "../revolut/config";
 import { runRevolutBackfill, runRevolutSync } from "../revolut/sync";
 import { FULL_SYNC_MAX_ATTEMPTS, runExactSync } from "./exact-handlers";
@@ -84,16 +85,18 @@ export const HANDLERS: Record<string, HandlerDef> = {
   },
   "ecb.fx_import": {
     title: "ECB exchange rates",
-    description: "Imports the daily ECB reference rates; retries until 17:30 if they are late.",
+    description:
+      "Imports the daily ECB reference rates (public, read-only, no credentials) on TARGET working days at 16:15; retries every 10 minutes until 17:30 if they are late. On by default on new installs. The rates are for information only.",
     usesExact: false,
-    phase: "Phase 6, ECB FX",
+    phase: null,
     // 16:15 plus seven retries ten minutes apart reaches 17:25.
-    maxAttempts: 8,
+    maxAttempts: ECB_MAX_ATTEMPTS,
     // Rates exist on TARGET working days only and are published once a day. Retries carry the
     // 16:15 slot, so 75 minutes of lateness ends them at 17:30 (16:15 + 75 min), whatever the
-    // attempt number; an attempt that would start after 17:30 is recorded too_late.
+    // attempt number; the handler ends the last attempt that fits as rate_not_published.
     scheduleRules: { workingDaysOnly: true, minIntervalMinutes: 60 },
-    maxLatenessMs: 75 * MIN,
+    maxLatenessMs: ECB_MAX_LATENESS_MS,
+    run: runEcbImport,
   },
   "dq.checks": {
     title: "Data quality checks",

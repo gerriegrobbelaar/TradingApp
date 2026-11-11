@@ -6,7 +6,8 @@
  *    existing row, so an admin's edits (schedule, enabled, budget) survive restarts and releases;
  *  - a release that adds a default job bumps DEFAULT_JOBS_VERSION and ships the new entry; the
  *    next start inserts just that job.
- * Jobs whose phase is not built yet start disabled (their handler would only record "skipped").
+ * The ECB import is the exception: it reads a public source without credentials and starts
+ * enabled on a new install. Jobs whose phase is not built yet start disabled (their handler would only record "skipped").
  * The two Exact sync jobs ship disabled too (review S6) until the first live connection has been
  * checked; an admin switches them on afterwards. Existing rows are never flipped.
  */
@@ -64,7 +65,9 @@ export const DEFAULT_JOBS: readonly DefaultJob[] = [
     name: "ecb.fx_import",
     handler: "ecb.fx_import",
     schedule: { kind: "cron", expr: "15 16 * * *", workingDaysOnly: true },
-    enabled: false, // Phase 6
+    // Public, read-only, credential-free source: on by default on NEW installs (ADR 0035).
+    // Existing rows are never flipped by the seeding.
+    enabled: true,
     exactBudget: 0,
   },
   {

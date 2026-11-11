@@ -9,6 +9,7 @@ import { registerSyncRoutes } from "./exact/sync-routes";
 import { registerJobRoutes } from "./jobs/routes";
 import { registerApprovalsRoutes } from "./read/approvals-routes";
 import { registerBankRoutes } from "./read/bank-routes";
+import { registerFxRoutes } from "./read/fx-routes";
 import { registerLedgerRoutes } from "./read/ledger-routes";
 import { registerReadRoutes } from "./read/routes";
 import { registerRevolutRoutes } from "./revolut/routes";
@@ -26,6 +27,7 @@ export function buildRouter(): Router {
   registerSyncRoutes(router);
   registerReadRoutes(router);
   registerLedgerRoutes(router);
+  registerFxRoutes(router);
   registerApprovalsRoutes(router);
   registerJobRoutes(router);
   return router;

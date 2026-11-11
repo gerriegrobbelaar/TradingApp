@@ -74,7 +74,7 @@ describe("default jobs against the schedule rules and the Exact budget cap", () 
   });
 });
 
-describe("S6: the Exact sync jobs ship disabled", () => {
+describe("S6: the Exact sync jobs ship disabled (the public ECB import is the one exception)", () => {
   beforeEach(async () => {
     await db.batch([
       db.prepare("DELETE FROM job_runs"),
@@ -84,12 +84,13 @@ describe("S6: the Exact sync jobs ship disabled", () => {
     resetDefaultJobsMemoForTests();
   });
 
-  it("new installs get them disabled with the reason code, and no default job is enabled", async () => {
+  it("new installs get them disabled with the reason code; only the public, credential-free ECB import is enabled", async () => {
     for (const n of ["exact.full_sync", "exact.incremental_sync"]) {
       const j = DEFAULT_JOBS.find((x) => x.name === n);
       expect(j).toMatchObject({ enabled: false, disabledReason: AWAITING_LIVE_VERIFICATION });
     }
-    expect(DEFAULT_JOBS.some((j) => j.enabled)).toBe(false);
+    expect(DEFAULT_JOBS.filter((j) => j.enabled).map((j) => j.name)).toEqual(["ecb.fx_import"]);
+    expect(DEFAULT_JOBS.find((j) => j.name === "ecb.fx_import")?.exactBudget).toBe(0);
     await seedDefaultJobs(db);
     const rows = await db
       .prepare("SELECT name, enabled, next_run_at FROM jobs WHERE name LIKE 'exact.%sync'")

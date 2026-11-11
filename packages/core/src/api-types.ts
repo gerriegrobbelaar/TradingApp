@@ -589,3 +589,39 @@ export interface BankTransactionDetail extends BankTransactionDto {
   lastEventAt: string | null;
   source: "webhook" | "poll" | "backfill";
 }
+
+// ---- ECB exchange rates (Phase 6, F2) ----------------------------------------------------------
+
+export interface FxRateDto {
+  currency: string;
+  rate: string;
+  rateDate: string;
+  source: "ECB";
+}
+
+/**
+ * GET /api/fx/rates?date=YYYY-MM-DD (default: latest). Units of currency per 1 EUR. For each
+ * currency the newest rate on or before `date`; `rateDate` is that rate's own date (a weekend or
+ * holiday reuses the last rate and shows its date). `stale` / `workingDaysOld` describe the newest
+ * rate returned (`asOf`) against now (ADR 0035), not the last import run.
+ */
+export interface FxRatesResponse {
+  base: "EUR";
+  /** Date of the newest rate returned, or null when there is none. */
+  asOf: string | null;
+  rates: FxRateDto[];
+  stale: boolean;
+  staleReason: "never_imported" | "older_than_one_working_day" | null;
+  workingDaysOld: number | null;
+  lastImportAt: string | null;
+  lastImportStatus: string | null;
+  /** 'ECB reference rates are for information only…' */
+  notice: string;
+}
+
+/** GET /api/fx/history?currency=USD&days=90 (days 1..400, oldest first). */
+export interface FxHistoryResponse {
+  currency: string;
+  base: "EUR";
+  points: { rateDate: string; rate: string }[];
+}

@@ -44,6 +44,8 @@ interface JobView {
   rev: string | null;
   nextRunAt: string | null;
   running: boolean;
+  description?: string;
+  disabledReason?: string;
   lastRun: { status: string; trigger: string } | null;
 }
 interface ListBody {
@@ -127,6 +129,18 @@ describe("GET /api/jobs", () => {
         nextRunAt: null,
       });
     }
+    // The ECB import is public, read-only and credential-free: on by default on a new install.
+    const ecb = byName(body, "ecb.fx_import");
+    expect(ecb).toMatchObject({
+      enabled: true,
+      implemented: true,
+      usesExact: false,
+      defaultEnabled: true,
+      phase: null,
+    });
+    expect(ecb.disabledReason).toBeUndefined();
+    expect(typeof ecb.nextRunAt).toBe("string");
+    expect(ecb.description).toMatch(/on by default/i);
     expect(body.maxExactBudget).toBe(MAX_EXACT_BUDGET);
     expect(body.scheduler.queueConfigured).toBe(true);
     expect(body.scheduler.lastTickAt).toBeNull();
