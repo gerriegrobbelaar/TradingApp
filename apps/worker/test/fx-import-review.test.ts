@@ -137,59 +137,65 @@ describe("retry chain through the real runner: realistic drift, DST, 17:30", () 
     "2026-10-23T14:15:00.000Z", // last Friday of CEST
   ];
 
-  it("ends error / rate_not_published before 17:30 for queue drift 0-2 min and fetch time 0-15 s", async () => {
-    for (const slotIso of SLOTS) {
-      const day = new Date(Date.parse(slotIso)).toISOString().slice(0, 10);
-      ecb.data.clear();
-      ecb.fill(CURRENCIES, "2026-01-01", "2026-12-31");
-      // Nothing on the slot day: the ECB is late.
-      for (const c of Object.keys(CURRENCIES)) ecb.data.delete(`${c}|${day}`);
-      for (const [seed, label] of [
-        [0, "none"],
-        [1, "max"],
-        [7, "random-a"],
-        [12345, "random-b"],
-      ] as const) {
-        await resetFx();
-        const r = lcg(seed);
-        const drift =
-          label === "none"
-            ? () => 0
-            : label === "max"
-              ? () => 2 * MIN
-              : () => Math.round(r() * 2 * MIN);
-        const fetch = label === "none" ? () => 0 : () => Math.round(r() * 15_000);
-        const { rows, startsMin } = await chain(slotIso, drift, fetch);
-        const tag = `${slotIso} ${label}`;
-        const last = rows.at(-1);
-        expect(last, tag).toMatchObject({ status: "error", error_code: "rate_not_published" });
-        expect(
-          rows.some((x) => x.error_code === "too_late"),
-          tag,
-        ).toBe(false);
-        expect(
-          rows
-            .slice(0, -1)
-            .every((x) => x.status === "partial" && x.error_code === "not_yet_published"),
-          tag,
-        ).toBe(true);
-        // Every attempt started by 17:30 local (slot + 75 minutes), and the chain was not cut
-        // short: it ran until the next attempt could no longer be due by 17:27.
-        expect(Math.max(...startsMin), tag).toBeLessThanOrEqual(75);
-        expect(rows.length, tag).toBeGreaterThanOrEqual(6);
-        expect(rows.length, tag).toBeLessThanOrEqual(ECB_MAX_ATTEMPTS);
-        const lastStart = startsMin.at(-1) as number;
-        // The last attempt did not ask for more because 10 more minutes + margin passed 17:30.
-        if (rows.length < ECB_MAX_ATTEMPTS) {
-          expect(lastStart * MIN + 10 * MIN + ECB_RETRY_MARGIN_MS, tag).toBeGreaterThan(75 * MIN);
+  // 3.9 s alone: 4 slots x 4 drift patterns x full chains. Under the parallel suite it crossed the
+  // 5 s default and the leftover chain broke the next two tests, so it gets its own bound.
+  it(
+    "ends error / rate_not_published before 17:30 for queue drift 0-2 min and fetch time 0-15 s",
+    { timeout: 60_000 },
+    async () => {
+      for (const slotIso of SLOTS) {
+        const day = new Date(Date.parse(slotIso)).toISOString().slice(0, 10);
+        ecb.data.clear();
+        ecb.fill(CURRENCIES, "2026-01-01", "2026-12-31");
+        // Nothing on the slot day: the ECB is late.
+        for (const c of Object.keys(CURRENCIES)) ecb.data.delete(`${c}|${day}`);
+        for (const [seed, label] of [
+          [0, "none"],
+          [1, "max"],
+          [7, "random-a"],
+          [12345, "random-b"],
+        ] as const) {
+          await resetFx();
+          const r = lcg(seed);
+          const drift =
+            label === "none"
+              ? () => 0
+              : label === "max"
+                ? () => 2 * MIN
+                : () => Math.round(r() * 2 * MIN);
+          const fetch = label === "none" ? () => 0 : () => Math.round(r() * 15_000);
+          const { rows, startsMin } = await chain(slotIso, drift, fetch);
+          const tag = `${slotIso} ${label}`;
+          const last = rows.at(-1);
+          expect(last, tag).toMatchObject({ status: "error", error_code: "rate_not_published" });
+          expect(
+            rows.some((x) => x.error_code === "too_late"),
+            tag,
+          ).toBe(false);
+          expect(
+            rows
+              .slice(0, -1)
+              .every((x) => x.status === "partial" && x.error_code === "not_yet_published"),
+            tag,
+          ).toBe(true);
+          // Every attempt started by 17:30 local (slot + 75 minutes), and the chain was not cut
+          // short: it ran until the next attempt could no longer be due by 17:27.
+          expect(Math.max(...startsMin), tag).toBeLessThanOrEqual(75);
+          expect(rows.length, tag).toBeGreaterThanOrEqual(6);
+          expect(rows.length, tag).toBeLessThanOrEqual(ECB_MAX_ATTEMPTS);
+          const lastStart = startsMin.at(-1) as number;
+          // The last attempt did not ask for more because 10 more minutes + margin passed 17:30.
+          if (rows.length < ECB_MAX_ATTEMPTS) {
+            expect(lastStart * MIN + 10 * MIN + ECB_RETRY_MARGIN_MS, tag).toBeGreaterThan(75 * MIN);
+          }
+          expect(await stateRow(), tag).toMatchObject({
+            last_status: "error",
+            last_error_code: "rate_not_published",
+          });
         }
-        expect(await stateRow(), tag).toMatchObject({
-          last_status: "error",
-          last_error_code: "rate_not_published",
-        });
       }
-    }
-  });
+    },
+  );
 
   it("drift beyond the margin is recorded error / too_late (an alertable failure), and the state row says so", async () => {
     ecb.fill(CURRENCIES, "2026-11-02", "2026-11-09");

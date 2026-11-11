@@ -1,6 +1,27 @@
 import { useEffect, useId, useRef, type ReactNode } from "react";
 import { ErrorBoundary } from "./ErrorBoundary";
 
+/**
+ * What a sheet shows when its body threw while rendering: no error text, a Close button. When
+ * the broken body took the focus with it, focus goes to Close (still inside the dialog, so Tab
+ * and Escape behave as before).
+ */
+function SheetErrorFallback({ onClose }: { onClose: () => void }) {
+  const button = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const active = document.activeElement;
+    if (!active || active === document.body) button.current?.focus();
+  }, []);
+  return (
+    <div role="alert" className="notice warn">
+      <p>Something went wrong in this panel. Close it and try again.</p>
+      <button ref={button} type="button" className="btn sm" onClick={onClose}>
+        Close
+      </button>
+    </div>
+  );
+}
+
 export interface SheetProps {
   open: boolean;
   title: string;
@@ -72,17 +93,9 @@ export function Sheet({ open, title, onClose, children }: SheetProps) {
         <h2 id={titleId} className="h3">
           {title}
         </h2>
-        {/* A child that throws leaves the sheet (title, Escape, close) and the page working. */}
-        <ErrorBoundary
-          fallback={
-            <div role="alert" className="notice warn">
-              <p>Something went wrong in this panel. Close it and try again.</p>
-              <button type="button" className="btn sm" onClick={onClose}>
-                Close
-              </button>
-            </div>
-          }
-        >
+        {/* A child that throws leaves the sheet (title, Escape, close) and the page working.
+            It resets when the sheet shows something else (a new title), and on close (unmount). */}
+        <ErrorBoundary resetKeys={[title]} fallback={<SheetErrorFallback onClose={onClose} />}>
           {children}
         </ErrorBoundary>
       </div>

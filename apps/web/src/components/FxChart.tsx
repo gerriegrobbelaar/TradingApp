@@ -1,4 +1,4 @@
-import { formatDayMonth, formatRate } from "../lib/format";
+import { formatDayMonth, formatEcbRate } from "../lib/format";
 import { chartGeometry } from "../lib/fx";
 
 const PLOT = { width: 600, height: 160 } as const;
@@ -18,7 +18,7 @@ export function FxChart({
 }) {
   const g = chartGeometry(points, PLOT);
   if (g.points.length === 0) return null;
-  const show = (r: string) => formatRate(r, 4, 4);
+  const show = (r: string) => formatEcbRate(r);
   const dayOf = (p: { rateDate: string } | null) => (p ? formatDayMonth(p.rateDate) : "");
   const summary =
     `${currency} per 1 EUR over ${g.points.length} ECB publication days: ` +

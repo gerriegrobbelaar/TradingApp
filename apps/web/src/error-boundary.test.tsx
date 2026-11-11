@@ -12,6 +12,7 @@ import { Sheet } from "@camelthorn/ui";
 import { nav } from "./api";
 import { PageErrorBoundary } from "./components/PageErrorBoundary";
 import { rootErrorHandlers } from "./lib/root-errors";
+import { useResource } from "./lib/useResource";
 import { ONE_DIVISION, listResponse, row } from "./test-fixtures";
 import { VIEWER, mockFetch, renderApp } from "./test-utils";
 import { fxRates } from "./test-fixtures-fx";
@@ -21,6 +22,18 @@ vi.mock("./pages/Overview", () => ({
     throw new TypeError("secret amount 1234 for NL91ABNA0417164300");
   },
 }));
+
+const shell = vi.hoisted(() => ({ broken: false }));
+vi.mock("./components/TopNav", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./components/TopNav")>();
+  return {
+    ...real,
+    TopNav: () => {
+      if (shell.broken) throw new TypeError("menu detail");
+      return <real.TopNav />;
+    },
+  };
+});
 
 const axe = configureAxe({ rules: { "color-contrast": { enabled: false } } });
 const base = () => ({
@@ -137,5 +150,65 @@ describe("sheet boundary", () => {
       await user.keyboard("{Escape}");
     });
     expect(onClose).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("review of T2: focus, async children, the app-level boundary", () => {
+  it("moves focus to the fallback's h1 (one h1 on the page)", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mockFetch(base());
+    renderApp("/overview");
+    const h1 = await screen.findByRole("heading", { level: 1, name: "Something went wrong" });
+    expect(document.activeElement).toBe(h1);
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+  });
+
+  it("catches a child that throws only once its data has arrived (after an await)", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    function Late() {
+      const r = useResource("k", () => Promise.resolve({ kpis: null as unknown as number[] }));
+      if (r.status !== "ready") return <p>loading</p>;
+      return <p>{(r.data?.kpis as number[]).length}</p>;
+    }
+    render(
+      <PageErrorBoundary path="/late">
+        <Late />
+      </PageErrorBoundary>,
+    );
+    expect(screen.getByText("loading")).toBeTruthy();
+    await screen.findByRole("alert");
+    expect(document.body.textContent).toContain("Something went wrong on this page.");
+  });
+
+  it("a rejected fetch is an error state, not a thrown error (no boundary needed)", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    function Failing() {
+      const r = useResource("k", () => Promise.reject(new TypeError("network")));
+      return <p>{r.status}</p>;
+    }
+    render(
+      <PageErrorBoundary path="/f">
+        <Failing />
+      </PageErrorBoundary>,
+    );
+    await screen.findByText("error");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("something that breaks outside a page (the shell) shows the app fallback, not a blank screen", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    // the menu is outside the page boundary
+    shell.broken = true;
+    mockFetch(base());
+    renderApp("/invoices");
+    const h1 = await screen.findByRole("heading", { level: 1, name: "Something went wrong" });
+    expect(document.body.textContent).toContain("The app stopped working. Reload to try again.");
+    expect(document.activeElement).toBe(h1);
+    expect(document.body.textContent).not.toMatch(/TypeError|menu detail|undefined/);
+    const lines = logged.mock.calls
+      .map((c) => String(c[0]))
+      .filter((l) => l.startsWith("ui render error"));
+    expect(lines).toEqual(["ui render error: TypeError"]);
+    shell.broken = false;
   });
 });

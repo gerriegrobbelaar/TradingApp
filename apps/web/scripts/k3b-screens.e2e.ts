@@ -11,7 +11,8 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { answerApi, takeUnmocked, type MockRoute } from "./api-mock";
 import { strFromU8, unzipSync } from "fflate";
 import { addDays, buildBalanceSheet, type BalanceSheetResponse } from "@camelthorn/core";
 import { ONE_DIVISION, listResponse, row } from "../src/test-fixtures";
@@ -68,9 +69,7 @@ interface Locator {
   click(): Promise<void>;
   waitFor(): Promise<void>;
 }
-interface Route {
-  request(): { url(): string };
-  fulfill(o: { status?: number; contentType?: string; body: string }): Promise<void>;
+interface Route extends MockRoute {
   continue(): Promise<void>;
 }
 interface Browser {
@@ -232,6 +231,11 @@ afterAll(async () => {
   server?.close();
 });
 
+// Every request the screens made was answered by a mock (no 404 for a forgotten path).
+afterEach(() => {
+  expect(takeUnmocked()).toEqual([]);
+});
+
 /** CSP violations and console errors of a page (the CSP of public/_headers is served). */
 const problems = new WeakMap<Page, string[]>();
 
@@ -266,11 +270,7 @@ async function open(
       o.bs && url.pathname === "/api/reports/balance-sheet"
         ? o.bs()
         : api(url.pathname, url.searchParams);
-    await route.fulfill({
-      status: body === null ? 404 : 200,
-      contentType: "application/json",
-      body: JSON.stringify(body ?? { error: "not_found" }),
-    });
+    await answerApi(route, body);
   });
   await page.goto(`${base}${path}`);
   await page.waitForSelector(".report-table", { timeout: 15_000 });
@@ -459,7 +459,7 @@ describe("print stylesheet", () => {
         url.pathname === "/api/reports/ageing"
           ? ageingResponse(ageingItems(90), "receivable")
           : api(url.pathname, url.searchParams);
-      await route.fulfill({ contentType: "application/json", body: JSON.stringify(body ?? {}) });
+      await answerApi(route, body);
     });
     await page.goto(`${base}/reporting/receivables-ageing`);
     await page.waitForSelector(".report-table");
@@ -611,7 +611,7 @@ describe("print: content", () => {
         url.pathname === "/api/reports/ageing"
           ? ageingResponse(ageingItems(90), "receivable")
           : api(url.pathname, url.searchParams);
-      await route.fulfill({ contentType: "application/json", body: JSON.stringify(body ?? {}) });
+      await answerApi(route, body);
     });
     await page.goto(`${base}/reporting/receivables-ageing`);
     await page.waitForSelector(".report-table");

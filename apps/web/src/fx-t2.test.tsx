@@ -178,9 +178,10 @@ describe("S7: Overview, ageing and the item sheet during an outage", () => {
     renderApp("/overview");
     await screen.findByRole("region", { name: "Payables" });
     await waitFor(() => expect(screen.getAllByText(STALE_CHIP)).toHaveLength(1));
-    // the intro says 'latest' rather than 'today's' while the rates are old
+    // the intro names the oldest rate date rather than "today's" while the rates are old
     const recv = screen.getByRole("region", { name: "Receivables" });
-    expect(norm(recv.textContent)).toContain("An estimate at the latest ECB rates");
+    expect(norm(recv.textContent)).toContain("An estimate at the ECB rates of 6 Nov");
+    expect(norm(recv.textContent)).not.toContain("today's");
   });
 
   it("an aggregate difference is labelled an estimate; an item's is not", async () => {
@@ -266,8 +267,9 @@ describe("S11: the item sheet labels its rates", () => {
 
   it("shows Exact's raw rate as stored, the implied rate and the ECB rate, each with a direction", async () => {
     const dialog = await open(usd(), { rate: "0.92" });
+    // a bare number: the direction of Exact's RateFC is not verified, so no "1 USD = ..."
     expect(value(dialog, "Booked rate in Exact")).toBe(
-      "1 USD = € 0,92 (as stored; direction unverified)",
+      "0,92 (as stored in Exact; direction unverified)",
     );
     expect(value(dialog, "Implied booked rate")).toBe(
       "1 USD = € 0,9000 (booked amount divided by open amount)",

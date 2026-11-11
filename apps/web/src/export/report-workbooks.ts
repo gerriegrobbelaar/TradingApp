@@ -111,7 +111,7 @@ function ageingFxSheet(
   heads: string[],
 ): SheetSpec {
   const scale = scaleOf(fx.base);
-  const label = `Total in ${baseLabel(fx.base)} at today's ECB rates`;
+  const label = `Total in ${baseLabel(fx.base)} ${fx.wording ?? "at today's ECB rates"}`;
   const note = `${fx.rateDate ? `ECB rates of ${formatDayMonth(fx.rateDate)}` : "ECB rates"}; for information only`;
   const block = headerBlock(`${title}: ${label}`, ctx, `As of: ${formatDate(r.asOf)}`, [
     `Currency: ${fx.base}`,

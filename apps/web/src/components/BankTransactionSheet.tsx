@@ -55,7 +55,7 @@ function Body({ detail }: { detail: BankTransactionDetail }) {
         currency={detail.currency}
         minor={detail.amountMinor}
         showOriginal={false}
-        note="Today's rate, not the rate on the day."
+        note="The latest ECB rate, not the rate on the day."
       />
       {note && (
         <p className="notice warn" role="status">

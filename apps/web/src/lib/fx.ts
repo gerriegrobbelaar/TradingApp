@@ -12,6 +12,10 @@ import {
   AGEING_BUCKETS,
   convertMinor,
   crossRate,
+  currencyScale,
+  decToString,
+  divDec,
+  normaliseDec,
   parseDecimal,
   unrealisedDifference,
   unrealisedResultMinor,
@@ -20,7 +24,7 @@ import {
   type FxRatesResponse,
   type RateTable,
 } from "@camelthorn/core";
-import { NO_VALUE, formatDayMonth, formatMoney, formatRate } from "./format";
+import { NO_VALUE, formatDayMonth, formatEcbRate, formatMoney, formatRate } from "./format";
 
 /** Fall-back administration currency when none is known (and the screen says so). */
 export const FALLBACK_BASE = "EUR";
@@ -89,7 +93,7 @@ export function toBase(
 export function rateText(table: RateTable, currency: string, base: string): string | null {
   if (base === "EUR") {
     const raw = table.rates[currency];
-    return raw === undefined ? null : `rate ${formatRate(raw)}`;
+    return raw === undefined ? null : `rate ${formatEcbRate(raw)}`;
   }
   const x = crossRate(currency, base, table);
   return x === null ? null : `1 ${currency} = ${formatRate(x)} ${base}`;
@@ -108,7 +112,7 @@ export function rateUnitText(currency: string, base: string): string {
 export function ecbEquation(table: RateTable, currency: string, base: string): string | null {
   if (base === "EUR") {
     const raw = table.rates[currency];
-    return raw === undefined ? null : `1 EUR = ${formatRate(raw)} ${currency}`;
+    return raw === undefined ? null : `1 EUR = ${formatEcbRate(raw)} ${currency}`;
   }
   const x = crossRate(currency, base, table);
   return x === null ? null : `1 ${currency} = ${formatRate(x)} ${base}`;
@@ -153,6 +157,24 @@ export function rateWording(resp: FxRatesResponse | null, rateDate: string | nul
   if (isTodaysRate(resp, rateDate)) return "at today's ECB rate";
   if (rateDate === null) return "at the latest ECB rate";
   return `at the ECB rate of ${formatDayMonth(rateDate)}`;
+}
+
+/**
+ * The wording of a converted TOTAL (many currencies, so "rates"): "at today's ECB rates" only
+ * when the feed is fresh and every rate used is the newest; otherwise the oldest rate date used,
+ * "at the ECB rates of 6 Nov"; "at the latest ECB rates" when no date is known.
+ */
+export function totalsWording(resp: FxRatesResponse | null, rateDate: string | null): string {
+  if (resp !== null && isTodaysRate(resp, rateDate)) return "at today's ECB rates";
+  if (rateDate === null) return "at the latest ECB rates";
+  return `at the ECB rates of ${formatDayMonth(rateDate)}`;
+}
+
+/** The oldest of some rate dates (null ignored). */
+export function oldestDate(dates: readonly (string | null)[]): string | null {
+  let out: string | null = null;
+  for (const d of dates) if (d !== null && (out === null || d < out)) out = d;
+  return out;
 }
 
 export interface ConvertedTotal {
@@ -275,6 +297,11 @@ export interface AgeingFxTotals {
   /** The currencies whose ECB rate is missing (see `ConvertedTotal.noRate`). */
   noRate: string[];
   rateDate: string | null;
+  /**
+   * "at today's ECB rates" or "at the ECB rates of 6 Nov" (see `totalsWording`), set by the
+   * screen that knows the feed's age; the Excel title uses it. Absent means today's.
+   */
+  wording?: string;
 }
 
 /**
@@ -370,6 +397,38 @@ export function ageingTotalsInBase(
     noRate: sorted(noRate),
     rateDate,
   };
+}
+
+/**
+ * The implied booked rate of an item (ADR 0035): booked amount in the division currency divided
+ * by the open amount in the item currency, both in major units, rounded half away from zero to
+ * 12 decimals. So it is division-currency units per 1 unit of the item currency ("1 USD =
+ * € 0,90"), the INVERSE of the ECB direction when the division currency is EUR. It needs no ECB
+ * rate, so it is shown even when the rates are missing or too old. Null when either amount is 0
+ * or not an exact integer, their signs differ, or it rounds to 0. Same rule as core
+ * `unrealisedDifference().impliedBookedRate`.
+ */
+export function impliedBookedRate(args: {
+  openMinor: number | bigint;
+  currency: string;
+  bookedMinor: number | bigint | null;
+  base: string;
+}): string | null {
+  const { openMinor, bookedMinor } = args;
+  if (bookedMinor === null) return null;
+  for (const v of [openMinor, bookedMinor]) {
+    if (typeof v === "number" && !Number.isSafeInteger(v)) return null;
+  }
+  const open = BigInt(openMinor);
+  const booked = BigInt(bookedMinor);
+  if (open === 0n || booked === 0n || open < 0n !== booked < 0n) return null;
+  const abs = (v: bigint) => (v < 0n ? -v : v);
+  const d = divDec(
+    { int: abs(booked), scale: currencyScale(args.base) },
+    { int: abs(open), scale: currencyScale(args.currency) },
+    12,
+  );
+  return d.int > 0n ? decToString(normaliseDec(d)) : null;
 }
 
 export type Difference =

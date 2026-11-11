@@ -14,8 +14,10 @@ The browser suites in `scripts/*.e2e.ts` are NOT part of `pnpm test`. They drive
 build in Chrome with the API mocked, take the screenshots in `docs/design/screens/`, check phone
 width (no sideways page scroll), axe, console and CSP errors, and the print stylesheet. A screen
 that starts a new request (the ECB rates in Phase 6 added `GET /api/fx/rates` to every signed-in
-screen) must add that request to the shared `api()` mock of EVERY script, or the suites fail with
-console 404 errors. Phase 6 shipped with seven failing K3b tests for exactly that reason.
+screen) must add that request to the `api()` mock of EVERY script. Answers go through
+`scripts/api-mock.ts`: a path no mock knows gets a 404 and is recorded, and every suite fails a
+test that hit one ("GET /api/x" in the assertion). Phase 6 shipped with seven failing K3b tests for
+exactly that reason.
 
 ```
 pnpm install --frozen-lockfile

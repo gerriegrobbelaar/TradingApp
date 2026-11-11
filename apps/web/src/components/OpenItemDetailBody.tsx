@@ -12,7 +12,14 @@ import {
   formatDayMonth,
   formatRate,
 } from "../lib/format";
-import { baseLabel, differenceOf, ecbEquation, isTodaysRate, rateDateFor } from "../lib/fx";
+import {
+  baseLabel,
+  ecbEquation,
+  impliedBookedRate,
+  isTodaysRate,
+  rateDateFor,
+  rateWording,
+} from "../lib/fx";
 import { useFxRates } from "../fx";
 import { useResource } from "../lib/useResource";
 import { ErrorNotice } from "./EmptyState";
@@ -49,31 +56,32 @@ const yesNo = (v: boolean) => (v ? "Yes" : "No");
  * The exchange rates of an item, each labelled with what it is and which way it points (review
  * S11), because the three numbers are easy to mix up:
  *  - Booked rate in Exact: Exact's raw RateFC exactly as stored. Its direction is not verified
- *    against a live Exact yet (ADR 0035), so it says so. Only shown when Exact sent one.
- *  - Implied booked rate: booked amount in the administration currency divided by the open
- *    amount, written the same way ("1 USD = € x"), so it can be compared with the line above.
- *  - ECB today: the ECB's own direction ("1 EUR = x USD"), or the dated rate when stale.
+ *    against a live Exact yet (ADR 0035), so it is shown as a bare number, never as "1 USD = ...",
+ *    and says so. Only shown when Exact sent one.
+ *  - Implied booked rate: the booked amount in the administration currency divided by the open
+ *    amount, "1 USD = € 0,9000" (administration currency per 1 unit of the item currency). It
+ *    needs no ECB rate, so it is there even when the rates are missing or too old.
+ *  - ECB: the ECB's own direction, "1 EUR = 1,0853 USD" (a cross rate "1 USD = 0,8035 GBP" in
+ *    another administration currency), "ECB today" when fresh, "ECB rate of 6 Nov" when old, and
+ *    left out when the rates are too old to use (review S7).
  */
 function RateRows({ detail }: { detail: OpenItemDetail }) {
   const fx = useFxRates();
   const { item } = detail;
   const dc = item.dcCurrency;
-  const unit = baseLabel(dc);
   const foreign = item.currency !== dc;
   const open = item.status === "open";
   const raw = detail.rate;
   const table = fx.table;
   const implied =
-    open && foreign && table && item.dcMinor !== null
-      ? differenceOf(table, {
-          kind: item.kind,
+    open && foreign
+      ? impliedBookedRate({
           openMinor: item.openMinor,
           currency: item.currency,
           bookedMinor: item.dcMinor,
           base: dc,
         })
       : null;
-  const impliedRate = implied && implied.ok ? implied.impliedBookedRate : null;
   const ecb = open && foreign && table && !fx.hidden ? ecbEquation(table, item.currency, dc) : null;
   const date = table ? rateDateFor(table, [item.currency, dc]) : null;
   const todays = isTodaysRate(fx.data, date);
@@ -81,12 +89,12 @@ function RateRows({ detail }: { detail: OpenItemDetail }) {
     <>
       {raw !== null && raw !== "" && (
         <Row label="Booked rate in Exact">
-          1 {item.currency} = {unit} {formatRate(raw, 2)} (as stored; direction unverified)
+          {formatRate(raw, 2, 12)} (as stored in Exact; direction unverified)
         </Row>
       )}
-      {impliedRate !== null && (
+      {implied !== null && (
         <Row label="Implied booked rate">
-          1 {item.currency} = {unit} {formatRate(impliedRate)} (booked amount divided by open
+          1 {item.currency} = {baseLabel(dc)} {formatRate(implied)} (booked amount divided by open
           amount)
         </Row>
       )}
@@ -140,7 +148,13 @@ export function OpenItemDetailView({
   const { item, relation, provenance } = detail;
   const dcCur = item.dcCurrency;
   const fxState = useFxRates();
-  const estimateWhen = fxState.data?.stale ? "the latest" : "today's";
+  // "at today's ECB rate" only when the feed is fresh and the item's rate is the newest; else
+  // "at the ECB rate of 6 Nov" (review S7). Without a usable table: "as an estimate".
+  const fxDate =
+    fxState.table && item.currency !== dcCur
+      ? rateDateFor(fxState.table, [item.currency, dcCur])
+      : null;
+  const fxWording = fxState.table ? rateWording(fxState.data, fxDate) : "as an ECB estimate";
   const exactLink = safeExactLink(detail.exactLink);
   return (
     <div className="detail">
@@ -184,7 +198,7 @@ export function OpenItemDetailView({
             NO_VALUE
           )}
         </Row>
-        <Row label={`Open balance in ${dcCur}`}>
+        <Row label={`Open balance in ${dcCur}, booked in Exact`}>
           {item.status !== "open" ? (
             NO_VALUE
           ) : item.dcMinor === null ? (
@@ -194,7 +208,7 @@ export function OpenItemDetailView({
           )}
         </Row>
         {item.status === "open" && item.currency !== dcCur && (
-          <Row label={`Open balance in ${dcCur} at ${estimateWhen} ECB rate`} wide>
+          <Row label={`Open balance in ${dcCur} ${fxWording}`} wide>
             <FxAmount
               currency={item.currency}
               minor={item.openMinor}
@@ -205,7 +219,7 @@ export function OpenItemDetailView({
                 complete: item.dcMinor !== null,
                 kind: item.kind,
               }}
-              note={`An estimate with ${fxState.data?.stale ? "the latest" : "today's"} rate, not the rate on the day. For information only.`}
+              note={`An estimate ${fxWording}, not the rate on the day. For information only.`}
             />
           </Row>
         )}

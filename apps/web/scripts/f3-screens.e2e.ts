@@ -10,7 +10,8 @@ import { createServer, type Server } from "node:http";
 import { createRequire } from "node:module";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { answerApi, takeUnmocked, type MockRoute } from "./api-mock";
 import type { KpiAmountDto } from "@camelthorn/core";
 import { account, accounts, tx, txDetail, txs } from "../src/test-fixtures-bank";
 import {
@@ -48,10 +49,7 @@ interface Page {
   click(sel: string): Promise<void>;
   close(): Promise<void>;
 }
-interface Route {
-  request(): { url(): string };
-  fulfill(o: { status?: number; contentType?: string; body: string }): Promise<void>;
-}
+type Route = MockRoute;
 interface Browser {
   newPage(o: { viewport: { width: number; height: number } }): Promise<Page>;
   close(): Promise<void>;
@@ -271,6 +269,11 @@ afterAll(async () => {
   server?.close();
 });
 
+// Every request the screens made was answered by a mock (no 404 for a forgotten path).
+afterEach(() => {
+  expect(takeUnmocked()).toEqual([]);
+});
+
 async function open(scene: Scene, theme: "light" | "dark", width: number, reduced = false) {
   const page = await browser.newPage({ viewport: { width, height: 1000 } });
   const seen: string[] = [];
@@ -287,11 +290,7 @@ async function open(scene: Scene, theme: "light" | "dark", width: number, reduce
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
     const body = api(url.pathname, scene);
-    await route.fulfill({
-      status: body === null ? 404 : 200,
-      contentType: "application/json",
-      body: JSON.stringify(body ?? { error: "not_found" }),
-    });
+    await answerApi(route, body);
   });
   await page.goto(`${base}${PATH[scene]}`);
   await page.waitForSelector("h1", { timeout: 15_000 });
@@ -368,8 +367,7 @@ describe("F3 FX screens", () => {
             ),
           ).toEqual([]);
           // page-error logs the error NAME once (and nothing else); every other scene is silent
-          const allowed = scene === "page-error" ? /^ui render error: TypeError$/ : /404/;
-          expect(seen.filter((m) => !allowed.test(m))).toEqual([]);
+          expect(seen).toEqual(scene === "page-error" ? ["ui render error: TypeError"] : []);
           if (scene === "page-error") {
             expect(seen).toEqual(["ui render error: TypeError"]);
             // the menu is still there and the fallback has no error text

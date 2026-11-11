@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { fxOutage, fxRates, fxStale } from "../test-fixtures-fx";
-import { formatRate } from "./format";
+import { formatEcbRate, formatRate } from "./format";
 import {
   ecbEquation,
   estimatesHidden,
@@ -42,6 +42,30 @@ describe("formatRate (N1): the number locale, at least four fraction digits, fro
     expect(formatRate("abc")).toBe("abc");
     expect(formatRate("1e3")).toBe("1e3");
     expect(formatRate("")).toBe("");
+  });
+});
+
+describe("formatEcbRate: a published ECB rate, every digit, never rounded (review T2)", () => {
+  it.each([
+    ["1.0853", "1,0853"],
+    ["0.872", "0,8720"],
+    ["0.85305", "0,85305"],
+    ["0.000123", "0,000123"],
+    ["0.123456789012", "0,123456789012"],
+    ["123456789012.123456789012", "123.456.789.012,123456789012"],
+    ["15890.12", "15.890,1200"],
+    ["1000", "1.000,0000"],
+    ["999.5", "999,5000"],
+    ["01.50", "1,5000"],
+    ["00.0853", "0,0853"],
+  ])("%s -> %s", (input, out) => {
+    expect(formatEcbRate(input)).toBe(out);
+  });
+
+  it("formatRate (computed rates) rounds a 12-digit rate to 6 for display, half away from zero", () => {
+    expect(formatRate("0.921404220031")).toBe("0,921404");
+    expect(formatRate("0.0000005")).toBe("0,000001");
+    expect(formatRate("0.0000004")).toBe("0,0000");
   });
 });
 

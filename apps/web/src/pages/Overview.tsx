@@ -25,7 +25,7 @@ import { Money } from "../components/Money";
 import { PageHeader } from "../components/PageHeader";
 import { describeLoadError } from "../lib/errors";
 import { NO_VALUE, formatCount, formatDays, formatMoney } from "../lib/format";
-import { sumInBase } from "../lib/fx";
+import { oldestDate, sumInBase, totalsWording } from "../lib/fx";
 import { useResource } from "../lib/useResource";
 
 type Side = "receivable" | "payable";
@@ -221,7 +221,7 @@ function FxHeadline({
   list: CurrencyKpisDto[];
   baseCurrency: string;
 }) {
-  const { table, base, ready, pending } = useFxRates();
+  const { table, base, ready, pending, data } = useFxRates();
   const L = LABEL[side];
   if (pending && list.some((k) => k.currency !== baseCurrency)) {
     // Keep the block's place while the rates load, so the card does not grow under the reader.
@@ -242,20 +242,25 @@ function FxHeadline({
   if (!ready || !table || base !== baseCurrency || !list.some((k) => k.currency !== base)) {
     return null;
   }
+  const totals = HEADLINE_FIGURES.map((f) =>
+    sumInBase(
+      table,
+      base,
+      list.map((k) => ({ currency: k.currency, minor: k[f].minor })),
+    ),
+  );
+  const rateDate = oldestDate(totals.map((t) => t.rateDate));
+  const title = fxTotalTitle(base, totalsWording(data, rateDate));
   return (
     <section
       className="fx-headline"
-      aria-label={`${fxTotalTitle(base)}, ${side === "receivable" ? "receivables" : "payables"}`}
+      aria-label={`${title}, ${side === "receivable" ? "receivables" : "payables"}`}
     >
-      <h3 className="h2">{fxTotalTitle(base)}</h3>
-      <FxEstimateIntro />
+      <h3 className="h2">{title}</h3>
+      <FxEstimateIntro rateDate={rateDate} />
       <ul className="fx-head-list">
-        {HEADLINE_FIGURES.map((f) => {
-          const total = sumInBase(
-            table,
-            base,
-            list.map((k) => ({ currency: k.currency, minor: k[f].minor })),
-          );
+        {HEADLINE_FIGURES.map((f, i) => {
+          const total = totals[i] as (typeof totals)[number];
           return (
             <li key={f}>
               <span className="fx-head-label">{L[f]}</span>{" "}

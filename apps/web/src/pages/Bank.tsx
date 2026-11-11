@@ -9,7 +9,7 @@ import { Card, Segmented, Skeleton } from "@camelthorn/ui";
 import { getBankAccounts, listBankTransactions } from "../api";
 import { useMe } from "../auth";
 import { useFxRates } from "../fx";
-import { rateWording, sumInBase } from "../lib/fx";
+import { sumInBase, totalsWording } from "../lib/fx";
 import {
   AccountCard,
   BankAmount,
@@ -179,7 +179,7 @@ function FxBankTotal({ data }: { data: BankAccountsResponse }) {
     <div className="fx-bank-total">
       <p>
         <span className="num money">About {formatMoney(total.totalMinor, base)}</span>{" "}
-        <span className="cap">in total {rateWording(fxData, total.rateDate)}</span>
+        <span className="cap">in total {totalsWording(fxData, total.rateDate)}</span>
       </p>
       <p className="cap">
         <ConvertedNote total={total} className="" /> · For information only; each currency is

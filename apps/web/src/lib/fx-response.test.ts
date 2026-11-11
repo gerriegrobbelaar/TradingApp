@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ApiError, getFxRates } from "../api";
 import { fxNever, fxOutage, fxRates, fxStale } from "../test-fixtures-fx";
-import { parseFxRatesResponse } from "./fx-response";
+import { MAX_FX_RATES, parseFxRatesResponse } from "./fx-response";
 
 const clone = (): Record<string, unknown> => JSON.parse(JSON.stringify(fxRates()));
 
@@ -86,5 +86,86 @@ describe("getFxRates (S2)", () => {
     answer(null);
     await expect(getFxRates()).rejects.toMatchObject({ code: "bad_response" });
     vi.restoreAllMocks();
+  });
+});
+
+describe("parseFxRatesResponse, review of T2", () => {
+  const rate0 = (o: Record<string, unknown>) =>
+    (o["rates"] as Record<string, unknown>[])[0] as Record<string, unknown>;
+  const rejects = (fn: (o: Record<string, unknown>) => void) => {
+    const o = clone();
+    fn(o);
+    return parseFxRatesResponse(o);
+  };
+
+  it("tolerates fields it does not know (forward compatible: unresolvedConflicts)", () => {
+    const o = clone();
+    o["unresolvedConflicts"] = 2;
+    o["somethingNew"] = { nested: true };
+    rate0(o)["source"] = "ECB";
+    rate0(o)["extra"] = "x";
+    expect(parseFxRatesResponse(o)).not.toBeNull();
+  });
+
+  it.each([
+    ["trailing zero", "1.0850"],
+    ["leading zero", "01.0853"],
+    ["leading space", " 1.0853"],
+  ])("rejects a rate that is not canonical (%s)", (_n, rate) => {
+    expect(rejects((o) => (rate0(o)["rate"] = rate))).toBeNull();
+  });
+
+  it("rejects a huge rate string without walking it", () => {
+    expect(rejects((o) => (rate0(o)["rate"] = "1".repeat(5_000_000)))).toBeNull();
+    expect(rejects((o) => (rate0(o)["currency"] = "U".repeat(5_000_000)))).toBeNull();
+    expect(rejects((o) => (o["notice"] = "x".repeat(5_000)))).toBeNull();
+    expect(rejects((o) => (o["lastImportStatus"] = "x".repeat(5_000)))).toBeNull();
+  });
+
+  it("rejects more than MAX_FX_RATES entries, accepts exactly that many", () => {
+    const codes: string[] = [];
+    for (let a = 65; a < 91 && codes.length < MAX_FX_RATES + 1; a++) {
+      for (let b = 65; b < 91 && codes.length < MAX_FX_RATES + 1; b++) {
+        const c = `Q${String.fromCharCode(a)}${String.fromCharCode(b)}`;
+        codes.push(c);
+      }
+    }
+    const make = (n: number) =>
+      codes.slice(0, n).map((currency) => ({ currency, rate: "1.5", rateDate: "2026-11-10" }));
+    expect(rejects((o) => (o["rates"] = make(MAX_FX_RATES)))).not.toBeNull();
+    expect(rejects((o) => (o["rates"] = make(MAX_FX_RATES + 1)))).toBeNull();
+  });
+
+  it("rejects a rate dated after asOf, and rates without asOf", () => {
+    expect(rejects((o) => (rate0(o)["rateDate"] = "2026-11-11"))).toBeNull();
+    expect(rejects((o) => (o["asOf"] = null))).toBeNull();
+  });
+
+  it("rejects never_imported with an age or not stale", () => {
+    const never = (): Record<string, unknown> => JSON.parse(JSON.stringify(fxNever()));
+    const a = never();
+    a["workingDaysOld"] = 3;
+    expect(parseFxRatesResponse(a)).toBeNull();
+    const b = never();
+    b["stale"] = false;
+    expect(parseFxRatesResponse(b)).toBeNull();
+  });
+
+  it("rejects an unsafe integer age", () => {
+    expect(rejects((o) => (o["workingDaysOld"] = 2 ** 60))).toBeNull();
+  });
+
+  it("prototype keys do not confuse it and never throw", () => {
+    const hostile = JSON.parse(
+      '{"__proto__":{"base":"EUR"},"constructor":{"prototype":{"x":1}},"rates":[]}',
+    ) as unknown;
+    expect(() => parseFxRatesResponse(hostile)).not.toThrow();
+    expect(parseFxRatesResponse(hostile)).toBeNull();
+    const o = clone();
+    (o["rates"] as unknown[]).push(
+      JSON.parse('{"__proto__":{"currency":"CHF","rate":"0.95","rateDate":"2026-11-10"}}'),
+    );
+    expect(parseFxRatesResponse(o)).toBeNull();
+    expect(({} as Record<string, unknown>)["base"]).toBeUndefined();
   });
 });

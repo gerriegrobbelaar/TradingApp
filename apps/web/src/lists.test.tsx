@@ -376,7 +376,7 @@ describe("Invoices list", () => {
     expect(dl("Country")).toBe("NL");
     expect(dl("Document")).toBe("INV-1");
     expect(norm(dl("Booked rate in Exact") ?? "")).toBe(
-      "1 EUR = € 1,0856 (as stored; direction unverified)",
+      "1,0856 (as stored in Exact; direction unverified)",
     );
     expect(norm(dl("Invoice total") ?? "")).toBe("€ 1.000,00");
     expect(norm(dl("Amount as stored") ?? "")).toBe("€ 1.000,00");

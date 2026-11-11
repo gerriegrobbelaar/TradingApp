@@ -1,5 +1,8 @@
 /* App-level layout helpers on top of @camelthorn/ui styles. Tokens only; no new colours. */
-.app #main:focus {
+.app #main:focus,
+.app #page-error-h:focus,
+.app #app-error-h:focus {
+  /* focused by the app (route change, error fallback) to move screen readers, not by the user */
   outline: none;
 }
 .app .main {

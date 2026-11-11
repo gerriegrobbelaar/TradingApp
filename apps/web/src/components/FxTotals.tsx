@@ -4,12 +4,21 @@ import { AGEING_BUCKETS, type AgeingBucket, type AgeingReportResponse } from "@c
 import { useFxRates } from "../fx";
 import { BUCKET_LABEL } from "../lib/ageing";
 import { NO_VALUE, formatDayMonth, formatMoney } from "../lib/format";
-import { ageingTotalsInBase, baseLabel, notIncludedText, type ConvertedTotal } from "../lib/fx";
+import {
+  ageingTotalsInBase,
+  baseLabel,
+  notIncludedText,
+  totalsWording,
+  type ConvertedTotal,
+} from "../lib/fx";
 import { ScrollRegion } from "./ReportParts";
 
-/** "Total in € at today's ECB rates": the heading every converted total carries. */
-export function fxTotalTitle(base: string): string {
-  return `Total in ${baseLabel(base)} at today's ECB rates`;
+/**
+ * "Total in € at today's ECB rates": the heading every converted total carries. With old rates
+ * (review S7) the wording names the oldest rate date used: "Total in € at the ECB rates of 6 Nov".
+ */
+export function fxTotalTitle(base: string, wording = "at today's ECB rates"): string {
+  return `Total in ${baseLabel(base)} ${wording}`;
 }
 
 /** The converted amount as an estimate ("about € 1.234,00"), or a dash when nothing converted. */
@@ -46,15 +55,21 @@ export function ConvertedNote({
  * amounts are not added together. The stale chip is shown once per page (FxStaleChip at the top
  * of the page), not in every block. Renders nothing when the rates are not there.
  */
-export function FxEstimateIntro({ children }: { children?: ReactNode }) {
+export function FxEstimateIntro({
+  rateDate,
+  children,
+}: {
+  /** Oldest rate date behind the block: decides "today's" or "the ECB rates of <date>". */
+  rateDate: string | null;
+  children?: ReactNode;
+}) {
   const { ready, baseAssumed, base, data } = useFxRates();
   if (!ready) return null;
   return (
     <div className="fx-intro">
       <p className="cap">
-        An estimate at {data?.stale ? "the latest" : "today's"} ECB rates, for information only.
-        Each currency is converted once, then the results are added. The original amounts stay as
-        they are.
+        An estimate {totalsWording(data, rateDate)}, for information only. Each currency is
+        converted once, then the results are added. The original amounts stay as they are.
         {baseAssumed && ` The administration currency is not known yet, so ${base} is assumed.`}
       </p>
       {children}
@@ -81,18 +96,18 @@ const AGEING_COLUMNS: { key: AgeingBucket | "total"; label: string }[] = [
  * switch in progress), or every currency is already the administration currency.
  */
 export function AgeingFxTotalsCard({ data }: { data: AgeingReportResponse }) {
-  const { table, base, ready } = useFxRates();
+  const { table, base, ready, data: fxData } = useFxRates();
   if (!ready || !table || base !== data.division.currency) return null;
   const t = ageingTotalsInBase(table, base, data.currencies);
   if (!t) return null;
-  const title = fxTotalTitle(base);
+  const title = fxTotalTitle(base, totalsWording(fxData, t.rateDate));
   const left = notIncludedText(t);
   return (
     <Card aria-labelledby="ageing-fx" className="report-card fx-ageing">
       <h2 id="ageing-fx" className="h2">
         {title}
       </h2>
-      <FxEstimateIntro>
+      <FxEstimateIntro rateDate={t.rateDate}>
         <p className="cap">
           Each column is converted on its own and the Total is the sum of the columns, so it can
           differ by a few cents from converting each currency&apos;s total once.

@@ -18,7 +18,7 @@ import { FxDcLine, FxPageChip } from "../components/FxAmount";
 import { AgeingFxTotalsCard } from "../components/FxTotals";
 import { Money } from "../components/Money";
 import { useFxRates } from "../fx";
-import { ageingTotalsInBase } from "../lib/fx";
+import { ageingTotalsInBase, totalsWording } from "../lib/fx";
 import { DrillDownSheet, type DrillExpected } from "../components/OpenItemSheets";
 import { PageHeader } from "../components/PageHeader";
 import { ReportSkeleton, useDivisionGate } from "../components/ReportGate";
@@ -381,13 +381,11 @@ export function AgeingReport({ kind }: { kind: AgeingKind }) {
   const fileBase = data ? reportFileBase(copy.slug, administration, data.asOf) : copy.slug;
 
   const fx = useFxRates();
-  const fxTotals = useMemo(
-    () =>
-      data && fx.ready && fx.table && fx.base === data.division.currency
-        ? ageingTotalsInBase(fx.table, fx.base, data.currencies)
-        : null,
-    [data, fx.ready, fx.table, fx.base],
-  );
+  const fxTotals = useMemo(() => {
+    if (!data || !fx.ready || !fx.table || fx.base !== data.division.currency) return null;
+    const t = ageingTotalsInBase(fx.table, fx.base, data.currencies);
+    return t ? { ...t, wording: totalsWording(fx.data, t.rateDate) } : null;
+  }, [data, fx.ready, fx.table, fx.base, fx.data]);
 
   const runExcel = useCallback(async () => {
     if (!data) throw new Error("no data");

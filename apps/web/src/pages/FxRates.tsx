@@ -8,7 +8,13 @@ import { FxChart } from "../components/FxChart";
 import { ScrollRegion } from "../components/ReportParts";
 import { EmptyState, ErrorNotice } from "../components/EmptyState";
 import { useFxRates } from "../fx";
-import { formatAgo, formatDate, formatDateTime, formatDayMonth, formatRate } from "../lib/format";
+import {
+  formatAgo,
+  formatDate,
+  formatDateTime,
+  formatDayMonth,
+  formatEcbRate,
+} from "../lib/format";
 import { staleChipText } from "../lib/fx";
 import { useResource } from "../lib/useResource";
 import { useToast } from "../toasts";
@@ -268,7 +274,7 @@ function History({ currencies }: { currencies: string[] }) {
                 {[...points].reverse().map((p) => (
                   <tr key={p.rateDate}>
                     <th scope="row">{formatDate(p.rateDate)}</th>
-                    <td className="r num">{formatRate(p.rate)}</td>
+                    <td className="r num">{formatEcbRate(p.rate)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -374,7 +380,7 @@ export function FxRates() {
                   return (
                     <tr key={r.currency}>
                       <th scope="row">{r.currency}</th>
-                      <td className="r num">{formatRate(r.rate)}</td>
+                      <td className="r num">{formatEcbRate(r.rate)}</td>
                       <td>
                         {formatDate(r.rateDate)}{" "}
                         {old && (

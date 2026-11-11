@@ -9,7 +9,8 @@ import { createServer, type Server } from "node:http";
 import { createRequire } from "node:module";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { answerApi, takeUnmocked, type MockRoute } from "./api-mock";
 import { fxRates } from "../src/test-fixtures-fx";
 
 const ADMIN = {
@@ -34,10 +35,7 @@ interface Page {
   click(sel: string): Promise<void>;
   close(): Promise<void>;
 }
-interface Route {
-  request(): { url(): string };
-  fulfill(o: { status?: number; contentType?: string; body: string }): Promise<void>;
-}
+type Route = MockRoute;
 interface Browser {
   newPage(o: { viewport: { width: number; height: number } }): Promise<Page>;
   close(): Promise<void>;
@@ -279,6 +277,11 @@ afterAll(async () => {
   server?.close();
 });
 
+// Every request the screens made was answered by a mock (no 404 for a forgotten path).
+afterEach(() => {
+  expect(takeUnmocked()).toEqual([]);
+});
+
 describe("Treasury, Bank", () => {
   for (const state of ["populated", "none", "waiting", "sheet"] as const) {
     for (const theme of ["light", "dark"] as const) {
@@ -298,11 +301,7 @@ describe("Treasury, Bank", () => {
           await page.route("**/api/**", async (route) => {
             const url = new URL(route.request().url());
             const body = api(url.pathname, state);
-            await route.fulfill({
-              status: body === null ? 404 : 200,
-              contentType: "application/json",
-              body: JSON.stringify(body ?? { error: "not_found" }),
-            });
+            await answerApi(route, body);
           });
           await page.goto(`${base}/treasury/bank`);
           await page.waitForSelector("h1", { timeout: 15_000 });
@@ -328,7 +327,7 @@ describe("Treasury, Bank", () => {
               (v) => `${v.id}: ${v.nodes.map((n) => n.target.join(" ")).join(", ")}`,
             ),
           ).toEqual([]);
-          expect(seen.filter((m) => !/404/.test(m))).toEqual([]);
+          expect(seen).toEqual([]);
           await page.screenshot({
             path: join(OUT, `r3b-bank-${state}-${theme}-${width}.png`),
             fullPage: true,

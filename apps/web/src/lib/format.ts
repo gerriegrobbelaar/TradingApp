@@ -275,6 +275,16 @@ export function formatRate(rate: string, minFraction = 4, maxFraction = 6): stri
 }
 
 /**
+ * An ECB rate as published (the API's canonical text, at most 12 fraction digits): every digit
+ * is shown, padded to four ("0,872" -> "0,8720", "0,85305" stays "0,85305"). Never rounded, so the
+ * number on screen is the number used. Computed rates (cross rates, implied booked rates) go
+ * through `formatRate`, which rounds to 6 decimals for display only (ADR 0035, 0037).
+ */
+export function formatEcbRate(rate: string): string {
+  return formatRate(rate, 4, 12);
+}
+
+/**
  * A variance in basis points (1 % = 100 bp) as a percentage with one decimal: 1234 -> "12,3%".
  * Integer math only (BigInt): the tenth of a percent is rounded half away from zero, so 1235 gives
  * "12,4%" and -1235 gives "-12,4%". Null (zero or missing base) is an em dash, never "0%". A value

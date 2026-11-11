@@ -12,7 +12,7 @@ import { logout, nav } from "./api";
 import { AuthProvider, useMe } from "./auth";
 import { DivisionProvider } from "./division";
 import { FxProvider } from "./fx";
-import { PageErrorBoundary } from "./components/PageErrorBoundary";
+import { AppErrorBoundary, PageErrorBoundary } from "./components/PageErrorBoundary";
 import { TopNav } from "./components/TopNav";
 import { PLACEHOLDERS, RENAMED_PATHS } from "./routes";
 import { ToastProvider, useToast } from "./toasts";
@@ -151,11 +151,13 @@ export function AppShell() {
       <a className="skip" href="#main">
         Skip to main content
       </a>
-      <ToastProvider>
-        <AuthProvider>
-          <Gate />
-        </AuthProvider>
-      </ToastProvider>
+      <AppErrorBoundary>
+        <ToastProvider>
+          <AuthProvider>
+            <Gate />
+          </AuthProvider>
+        </ToastProvider>
+      </AppErrorBoundary>
     </div>
   );
 }

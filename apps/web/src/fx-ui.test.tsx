@@ -224,7 +224,8 @@ describe("Overview: total in € at today's ECB rates", () => {
     renderApp("/overview");
     const recv = await recvRegion();
     const head = await within(recv).findByRole("region", {
-      name: "Total in GBP at today's ECB rates, receivables",
+      // the GBP leg is of 6 Nov, older than the newest rates: not "today's" (review S7)
+      name: "Total in GBP at the ECB rates of 6 Nov, receivables",
     });
     // 5.000 + 8.035 (USD 100 via EUR) + 8.720 (EUR 100 * 0.872) pence = £ 217,55
     expect(norm(head.textContent)).toContain("Open receivables about £ 217,55");
@@ -271,7 +272,7 @@ describe("Invoices and payables: rows and the item sheet", () => {
     // an item: "difference" (computed from this one item), with the rate wording
     expect(t).toContain("Booked € 90,00 · difference +€ 2,14 at today's ECB rate");
     expect(t).toContain("You would receive € 2,14 more than booked. (unrealised gain)");
-    expect(t).toContain("An estimate with today's rate, not the rate on the day.");
+    expect(t).toContain("An estimate at today's ECB rate, not the rate on the day.");
     expect(await axe(dialog)).toHaveNoViolations();
   });
 
@@ -450,7 +451,7 @@ describe("Bank: total at today's ECB rates and the transaction sheet", () => {
     // 12.345,67 EUR + 500,25 GBP / 0.872 (573,68 EUR)
     await waitFor(() =>
       expect(norm(strip.textContent)).toContain(
-        "About € 12.919,35 in total at the ECB rate of 6 Nov",
+        "About € 12.919,35 in total at the ECB rates of 6 Nov",
       ),
     );
     expect(norm(strip.textContent)).toContain("Estimate, ECB rates of 6 Nov");
@@ -492,7 +493,7 @@ describe("Bank: total at today's ECB rates and the transaction sheet", () => {
     await waitFor(() =>
       expect(norm(dialog.textContent)).toMatch(/about (€ -113,75|-€ 113,75) at today's ECB rate/),
     );
-    expect(norm(dialog.textContent)).toContain("Today's rate, not the rate on the day.");
+    expect(norm(dialog.textContent)).toContain("The latest ECB rate, not the rate on the day.");
     // no booked amount is claimed for a bank transaction
     expect(norm(dialog.textContent)).not.toContain("Booked");
   });
@@ -519,6 +520,7 @@ describe("FxProvider", () => {
             calls === 1
               ? fxRates()
               : fxRates({
+                  asOf: "2026-11-11",
                   rates: [{ currency: "USD", rate: "1.1", rateDate: "2026-11-11", source: "ECB" }],
                 }),
         };
