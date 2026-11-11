@@ -144,8 +144,11 @@ describe("access rules", () => {
       method: "POST",
       path: "/api/matching/transactions/1/clear-conflict",
       body: {},
-      roles: ["admin", "finance"],
+      roles: ["admin"],
+      stepUp: true,
     },
+    // Switching automatic matching off: admin, no step-up (the safe direction).
+    { method: "POST", path: "/api/matching/auto/disable", body: {}, roles: ["admin"] },
     { method: "GET", path: "/api/matching/config", roles: ["admin"] },
     { method: "PUT", path: "/api/matching/config", body: {}, roles: ["admin"], stepUp: true },
     { method: "GET", path: "/api/matching/account-map", roles: ["admin"] },
@@ -431,6 +434,7 @@ describe("queue, auto list, detail and stats", () => {
       oldestUnmatchedDays: 9,
       unmatchedOverFiveDays: 2,
       liveAutoMatches: 0,
+      matchesNeedingReview: 0,
       enabled: true,
       autoEnabled: false,
       unmappedAccounts: 0,
@@ -967,21 +971,36 @@ describe("ignore and unignore", () => {
     ).toBe("already_matched");
   });
 
-  it("a state conflict is cleared by a person, with an audit row", async () => {
+  it("a state conflict is cleared by an admin with a fresh sign-in and a note, audited", async () => {
     const t = await tx({ amountMinor: 100, stateConflict: true });
-    const r = await send<MatchIgnoreResponse>(
-      "finance",
-      "POST",
-      `/api/matching/transactions/${t}/clear-conflict`,
+    const path = `/api/matching/transactions/${t}/clear-conflict`;
+    // Finance may not clear it; an admin needs a note.
+    expect((await send("finance", "POST", path, { note: "checked" })).status).toBe(403);
+    for (const body of [
       {},
-    );
+      { note: "" },
+      { note: "   " },
+      { note: 5 },
+      { note: "x".repeat(201) },
+    ]) {
+      const r = await send("admin", "POST", path, body);
+      expect([r.status, err(r)], JSON.stringify(body)).toEqual([400, "bad_note"]);
+    }
+    const stale = await send("staleAdmin", "POST", path, { note: "checked" });
+    expect([stale.status, err(stale)]).toEqual([401, "step_up_required"]);
+    const r = await send<MatchIgnoreResponse>("admin", "POST", path, {
+      note: "Revolut confirmed the amount",
+    });
+    expect(r.status).toBe(200);
     expect(r.body.transaction.stateConflict).toBe(false);
-    expect(
-      err(await send("finance", "POST", `/api/matching/transactions/${t}/clear-conflict`, {})),
-    ).toBe("no_conflict");
-    expect((await auditRows("bank_transaction.conflict_cleared", t))[0]?.actor_email).toBe(
-      "finance@camelthorncapital.com",
-    );
+    expect(err(await send("admin", "POST", path, { note: "again" }))).toBe("no_conflict");
+    const audit = await auditRows("bank_transaction.conflict_cleared", t);
+    expect(audit).toHaveLength(1);
+    expect(audit[0]?.actor_email).toBe("admin@camelthorncapital.com");
+    expect(JSON.parse(audit[0]?.after_json ?? "{}")).toEqual({
+      stateConflict: 0,
+      note: "Revolut confirmed the amount",
+    });
   });
 });
 
@@ -1068,6 +1087,31 @@ describe("configuration", () => {
       autoEnabled: false,
     });
     expect(off.body.autoEnabled).toBe(false);
+    // The emergency switch: an admin WITHOUT a fresh sign-in can turn it off (never on), audited.
+    await send("admin", "PUT", "/api/matching/config", {
+      autoEnabled: true,
+      confirm: "ENABLE AUTOMATIC MATCHING",
+    });
+    const staleOn = await send("staleAdmin", "PUT", "/api/matching/config", {
+      autoEnabled: true,
+      confirm: "ENABLE AUTOMATIC MATCHING",
+    });
+    expect([staleOn.status, err(staleOn)]).toEqual([401, "step_up_required"]);
+    const n = (await auditRows("matching.auto_changed")).length;
+    const stop = await send<MatchConfigResponse>(
+      "staleAdmin",
+      "POST",
+      "/api/matching/auto/disable",
+    );
+    expect([stop.status, stop.body.autoEnabled]).toEqual([200, false]);
+    const stopAudit = (await auditRows("matching.auto_changed")).slice(n);
+    expect(stopAudit.map((a) => [a.actor_email, a.before_json, a.after_json])).toEqual([
+      ["stale@camelthorncapital.com", "true", "false"],
+    ]);
+    // Already off: nothing changes, nothing is audited.
+    expect((await send("staleAdmin", "POST", "/api/matching/auto/disable")).status).toBe(200);
+    expect((await auditRows("matching.auto_changed")).length).toBe(n + 1);
+    expect((await send("finance", "POST", "/api/matching/auto/disable")).status).toBe(403);
     // Disabling and enabling suggestions.
     expect(
       (await send<MatchConfigResponse>("admin", "PUT", "/api/matching/config", { enabled: false }))
@@ -1413,6 +1457,7 @@ describe("response shapes", () => {
       "undoneAt",
       "undoReason",
       "exactState",
+      "reviewReason",
       "undoAvailable",
       "allocations",
     ];
@@ -1423,6 +1468,7 @@ describe("response shapes", () => {
       "ignored",
       "liveAutoMatches",
       "matched",
+      "matchesNeedingReview",
       "oldestUnmatchedAt",
       "oldestUnmatchedDays",
       "suggested",
@@ -1450,5 +1496,139 @@ describe("response shapes", () => {
       "items",
       "nextCursor",
     ]);
+  });
+});
+
+describe("manual match: relation check and administration state (review)", () => {
+  async function twoRelations(): Promise<{ ownItem: number; otherItem: number; txId: number }> {
+    const own = await addRelation({
+      divisionId: w.divisionId,
+      ibans: [CUSTOMER_IBAN],
+      name: "Acme",
+    });
+    const other = await addRelation({
+      divisionId: w.divisionId,
+      ibans: [SUPPLIER_IBAN],
+      name: "Beta",
+    });
+    const ownItem = await addItem({
+      divisionId: w.divisionId,
+      openMinor: 500,
+      relationExactId: own.exactId,
+    });
+    const otherItem = await addItem({
+      divisionId: w.divisionId,
+      openMinor: 500,
+      relationExactId: other.exactId,
+    });
+    const txId = await tx({ amountMinor: 500, counterpartyIban: CUSTOMER_IBAN });
+    return { ownItem, otherItem, txId };
+  }
+
+  it("an item of another relation than the IBAN's needs confirmDifferentRelation, audited", async () => {
+    const { otherItem, txId } = await twoRelations();
+    const body = {
+      transactionId: txId,
+      allocations: [{ openItemId: otherItem, allocatedMinor: 500 }],
+    };
+    const r = await send("finance", "POST", "/api/matching/matches", body);
+    expect([r.status, err(r)]).toEqual([409, "different_relation"]);
+    expect(await liveMatches()).toBe(0);
+    const bad = await send("finance", "POST", "/api/matching/matches", {
+      ...body,
+      confirmDifferentRelation: "yes",
+    });
+    expect([bad.status, err(bad)]).toEqual([400, "bad_confirm"]);
+    const ok = await send<MatchCreateResponse>("finance", "POST", "/api/matching/matches", {
+      ...body,
+      confirmDifferentRelation: true,
+    });
+    expect(ok.status).toBe(201);
+    const audit = await auditRows("match.manual", ok.body.match.id);
+    expect(JSON.parse(audit[0]?.after_json ?? "{}")).toMatchObject({
+      differentRelationConfirmed: true,
+    });
+  });
+
+  it("the IBAN's own relation needs no confirmation; an unknown IBAN gives no signal", async () => {
+    const { ownItem, txId } = await twoRelations();
+    const auditBefore = (await auditRows("match.manual")).length;
+    const ok = await send("finance", "POST", "/api/matching/matches", {
+      transactionId: txId,
+      allocations: [{ openItemId: ownItem, allocatedMinor: 500 }],
+    });
+    expect(ok.status).toBe(201);
+    const item = await addItem({ divisionId: w.divisionId, openMinor: 70 });
+    const t2 = await tx({ amountMinor: 70, counterpartyIban: "FR7630006000011234567890189" });
+    const r = await send("finance", "POST", "/api/matching/matches", {
+      transactionId: t2,
+      allocations: [{ openItemId: item, allocatedMinor: 70 }],
+    });
+    expect(r.status).toBe(201);
+    // The audit row of the plain match carries no confirmation flag.
+    const audit = (await auditRows("match.manual")).slice(auditBefore);
+    expect(audit).toHaveLength(2);
+    expect(audit.some((a) => (a.after_json ?? "").includes("differentRelationConfirmed"))).toBe(
+      false,
+    );
+  });
+
+  it("an administration that is no longer synced refuses manual matches", async () => {
+    const item = await addItem({ divisionId: w.divisionId, openMinor: 70 });
+    const t = await tx({ amountMinor: 70 });
+    await db
+      .prepare("UPDATE divisions SET sync_enabled = 0 WHERE id = ?1")
+      .bind(w.divisionId)
+      .run();
+    const r = await send("finance", "POST", "/api/matching/matches", {
+      transactionId: t,
+      ledgerAccountCode: "4500",
+    });
+    expect([r.status, err(r)]).toEqual([422, "division_inactive"]);
+    void item;
+  });
+
+  it("explanations that quote Exact data never carry a full IBAN", async () => {
+    const rel = await addRelation({
+      divisionId: w.divisionId,
+      ibans: [CUSTOMER_IBAN],
+      name: `Acme ${CUSTOMER_IBAN}`,
+    });
+    await addItem({
+      divisionId: w.divisionId,
+      invoiceNumber: "INV-55",
+      openMinor: 555,
+      relationExactId: rel.exactId,
+      relationName: `Acme ${CUSTOMER_IBAN}`,
+    });
+    const t = await tx({ amountMinor: 555, reference: "INV-55", counterpartyIban: CUSTOMER_IBAN });
+    await runMatching(jobContext());
+    const stored = await db
+      .prepare("SELECT explanation_json FROM match_suggestions WHERE bank_transaction_id = ?1")
+      .bind(t)
+      .all<{ explanation_json: string }>();
+    expect(stored.results.length).toBeGreaterThan(0);
+    expect(JSON.stringify(stored.results)).not.toContain(CUSTOMER_IBAN);
+    const d = await get<MatchDetailResponse>("viewer", `/api/matching/transactions/${t}`);
+    expect(JSON.stringify(d.body)).not.toContain(CUSTOMER_IBAN);
+  });
+
+  it("stats count matches that need review", async () => {
+    const item = await addItem({ divisionId: w.divisionId, openMinor: 300 });
+    const t = await tx({ amountMinor: 300 });
+    expect(
+      (
+        await send("finance", "POST", "/api/matching/matches", {
+          transactionId: t,
+          allocations: [{ openItemId: item, allocatedMinor: 300 }],
+        })
+      ).status,
+    ).toBe(201);
+    await db.prepare("UPDATE open_items SET open_minor = 100 WHERE id = ?1").bind(item).run();
+    await runMatching(jobContext());
+    const s = await get<MatchStatsResponse>("viewer", "/api/matching/stats");
+    expect(s.body.matchesNeedingReview).toBe(1);
+    const m = await get<MatchDetailResponse>("viewer", `/api/matching/transactions/${t}`);
+    expect(m.body.match).toMatchObject({ reviewReason: "over_allocated", undoAvailable: true });
   });
 });

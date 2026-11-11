@@ -12,24 +12,25 @@ import { auditStatement, LAST_INSERT_ID } from "../db/audit";
 
 export const MATCH_ENGINE_VERSION = "m7-1";
 
-export type MatchErrCode =
-  | "tx_not_matchable"
-  | "division_mismatch"
-  | "match_not_live"
-  | "item_not_matchable"
-  | "alloc_exceeds_open"
-  | "alloc_exceeds_tx"
-  | "cannot_revive";
-
-const ERR_CODES: readonly MatchErrCode[] = [
+export const ERR_CODES = [
   "tx_not_matchable",
   "division_mismatch",
+  "division_inactive",
+  "bad_match_row",
   "match_not_live",
+  "alloc_on_ledger_match",
   "item_not_matchable",
+  "direction_mismatch",
   "alloc_exceeds_open",
   "alloc_exceeds_tx",
   "cannot_revive",
-];
+  "immutable",
+  "tx_frozen",
+  "status_mismatch",
+  "has_live_matches",
+] as const;
+
+export type MatchErrCode = (typeof ERR_CODES)[number];
 
 /** The code a trigger raised, or the unique-index violation of a second live match; else null. */
 export function matchErrorCode(err: unknown): MatchErrCode | null {
@@ -66,6 +67,8 @@ export interface ApplyMatchInput {
   actor: string;
   allocations: AllocInput[];
   nowIso: string;
+  /** A person confirmed matching to an item of another relation than the IBAN's (audited). */
+  differentRelationConfirmed?: boolean;
 }
 
 export type ApplyResult = { ok: true; matchId: number } | { ok: false; code: MatchErrCode };
@@ -81,6 +84,17 @@ const ACTION: Record<ApplyMatchInput["source"], string> = {
  * stale view is `{ ok: false, code }`; an unexpected database error is thrown.
  */
 export async function applyMatch(db: D1Database, m: ApplyMatchInput): Promise<ApplyResult> {
+  // A match settles invoices (allocations) OR books to a ledger account, never both and never
+  // neither (checkMatchingInvariants). The triggers check every allocation; this checks the shape.
+  if ((m.ledgerAccountCode === null) === (m.allocations.length === 0)) {
+    throw new RangeError("a match needs allocations or a ledger account, not both");
+  }
+  if (m.source === "manual" && m.ledgerAccountCode !== null) {
+    throw new RangeError("a manual match has allocations; a ledger match is source 'ledger'");
+  }
+  if (m.source === "ledger" && m.ledgerAccountCode === null) {
+    throw new RangeError("a ledger match needs a ledger account");
+  }
   const statements: D1PreparedStatement[] = [
     db
       .prepare(
@@ -121,6 +135,7 @@ export async function applyMatch(db: D1Database, m: ApplyMatchInput): Promise<Ap
           remainingAfter: a.remainingAfter,
         })),
         ...(m.note !== null ? { note: m.note } : {}),
+        ...(m.differentRelationConfirmed === true ? { differentRelationConfirmed: true } : {}),
       },
     }),
     ...m.allocations.map((a) =>
@@ -384,4 +399,80 @@ export function suggestionStatements(
       )
       .bind(txId, rows.length > 0 ? "suggested" : "unmatched"),
   ];
+}
+
+export type ReviewReason = "over_allocated" | "item_closed" | "tx_state_conflict" | "tx_changed";
+
+/**
+ * Flags every live, not yet booked match that no longer agrees with the data it was built on
+ * (ADR 0042, "Data that changes after matching"). ONE statement for all divisions. The flag is
+ * sticky: a person undoes the match, and M7c must never book a flagged match. Returns how many
+ * matches were flagged now.
+ *
+ *   tx_state_conflict  Revolut contradicted the line after it was matched (state_conflict).
+ *   tx_changed         the line's amount or currency differ from the match (a database trigger
+ *                      makes this impossible today; checked anyway).
+ *   item_closed        an allocated item is closed or has no open balance any more in Exact
+ *                      (paid or credited elsewhere; the sync wrote it).
+ *   over_allocated     the live allocations of an item now exceed its Exact open balance (Exact's
+ *                      balance fell, for example a part payment booked elsewhere).
+ */
+export async function flagMatchesForReview(db: D1Database, nowIso: string): Promise<number> {
+  const out = await db
+    .prepare(
+      `UPDATE matches SET review_flagged_at = ?1, review_reason = (
+         CASE
+           WHEN EXISTS (SELECT 1 FROM bank_transactions t WHERE t.id = matches.bank_transaction_id
+                          AND t.state_conflict = 1) THEN 'tx_state_conflict'
+           WHEN NOT EXISTS (SELECT 1 FROM bank_transactions t WHERE t.id = matches.bank_transaction_id
+                              AND ABS(t.amount_minor) = matches.amount_minor
+                              AND t.currency = matches.currency) THEN 'tx_changed'
+           WHEN EXISTS (SELECT 1 FROM match_allocations a JOIN open_items oi ON oi.id = a.open_item_id
+                         WHERE a.match_id = matches.id
+                           AND (oi.status <> 'open' OR oi.open_minor = 0)) THEN 'item_closed'
+           WHEN EXISTS (SELECT 1 FROM match_allocations a JOIN open_items oi ON oi.id = a.open_item_id
+                         WHERE a.match_id = matches.id
+                           AND (SELECT SUM(a2.allocated_minor) FROM match_allocations a2
+                                  JOIN matches m2 ON m2.id = a2.match_id
+                                 WHERE a2.open_item_id = a.open_item_id AND m2.undone_at IS NULL)
+                               > ABS(oi.open_minor)) THEN 'over_allocated'
+         END)
+       WHERE undone_at IS NULL AND exact_state = 'not_booked' AND review_reason IS NULL
+         AND (EXISTS (SELECT 1 FROM bank_transactions t WHERE t.id = matches.bank_transaction_id
+                        AND (t.state_conflict = 1 OR ABS(t.amount_minor) <> matches.amount_minor
+                             OR t.currency <> matches.currency))
+              OR EXISTS (SELECT 1 FROM match_allocations a JOIN open_items oi ON oi.id = a.open_item_id
+                          WHERE a.match_id = matches.id
+                            AND (oi.status <> 'open' OR oi.open_minor = 0
+                                 OR (SELECT SUM(a2.allocated_minor) FROM match_allocations a2
+                                       JOIN matches m2 ON m2.id = a2.match_id
+                                      WHERE a2.open_item_id = a.open_item_id AND m2.undone_at IS NULL)
+                                    > ABS(oi.open_minor))))`,
+    )
+    .bind(nowIso)
+    .run();
+  return out.meta.changes ?? 0;
+}
+
+/**
+ * The booking contract for M7c (ADR 0042, "Undo window"): a match moves out of `not_booked` ONLY
+ * through this conditional UPDATE, so Undo (which needs `not_booked`) and booking can never both
+ * win. A match flagged for review is never claimed. True when this caller won the claim.
+ */
+export async function claimMatchForBooking(
+  db: D1Database,
+  matchId: number,
+  nextState: string,
+): Promise<boolean> {
+  if (!/^[a-z_]{1,32}$/.test(nextState) || nextState === "not_booked") {
+    throw new RangeError("bad exact_state");
+  }
+  const out = await db
+    .prepare(
+      `UPDATE matches SET exact_state = ?2
+       WHERE id = ?1 AND undone_at IS NULL AND exact_state = 'not_booked' AND review_reason IS NULL`,
+    )
+    .bind(matchId, nextState)
+    .run();
+  return (out.meta.changes ?? 0) === 1;
 }

@@ -318,7 +318,8 @@ describe("S6: counterparty cache freshness (TTL)", () => {
       counterparty_iban_cached: 0,
     });
     await db
-      .prepare("UPDATE bank_transactions SET match_status = 'matched' WHERE external_id = 't-m'")
+      // 'matched' needs a live match since migration 0022; 'ignored' freezes the same way.
+      .prepare("UPDATE bank_transactions SET match_status = 'ignored' WHERE external_id = 't-m'")
       .run();
     // The counterparty's IBAN changed at Revolut.
     raw.counterparties.set("cp-1", cpRecord("cp-1", [{ id: "x", iban: IBAN_B, currency: "EUR" }]));

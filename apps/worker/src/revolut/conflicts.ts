@@ -81,6 +81,7 @@ export async function clearStateConflict(
   db: D1Database,
   bankTransactionId: number,
   actorEmail: string,
+  note: string | null = null,
 ): Promise<boolean> {
   const out = await db.batch([
     // The audit row first, under the same condition as the change (ADR 0013 pattern).
@@ -92,7 +93,7 @@ export async function clearStateConflict(
         entity: "bank_transaction",
         entityId: bankTransactionId,
         before: { stateConflict: 1 },
-        after: { stateConflict: 0 },
+        after: { stateConflict: 0, ...(note !== null ? { note } : {}) },
       },
       {
         sql: "EXISTS (SELECT 1 FROM bank_transactions WHERE id = ?7 AND state_conflict = 1)",

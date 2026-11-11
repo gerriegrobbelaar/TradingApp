@@ -7,7 +7,9 @@
  *  GET  /api/matching/transactions/:id       any role   one line with every candidate
  *  POST /api/matching/matches                finance, admin   manual match (invoices or ledger)
  *  POST /api/matching/matches/:id/undo       finance, admin   while Exact has not booked it
- *  POST /api/matching/transactions/:id/ignore | unignore | clear-conflict   finance, admin
+ *  POST /api/matching/transactions/:id/ignore | unignore   finance, admin
+ *  POST /api/matching/transactions/:id/clear-conflict      admin, step-up, note required
+ *  POST /api/matching/auto/disable           admin (no step-up: the safe direction, audited)
  *  GET/PUT /api/matching/config              admin (PUT: step-up; switching auto on needs a typed phrase)
  *  GET/PUT /api/matching/account-map         admin (PUT: step-up)
  *  GET/POST/PUT/DELETE /api/matching/patterns[/:id]   admin (writes: step-up)
@@ -19,6 +21,7 @@ import {
   compileSafeRegex,
   likePatterns,
   maskIban,
+  normalizeIban,
   validateMatchConfig,
   type MatchAccountMapDto,
   type MatchAccountMapResponse,
@@ -59,6 +62,7 @@ import { loadMatches, loadSuggestions, safeText, toTxDto, TX_SELECT, type TxSqlR
 import {
   applyMatch,
   ignoreTransaction,
+  matchErrorCode,
   undoMatch,
   unignoreTransaction,
   type MatchErrCode,
@@ -341,8 +345,12 @@ async function statsHandler(ctx: Ctx): Promise<Response> {
     .bind(fiveDaysAgo)
     .first<{ oldest: string | null; over5: number }>();
   const auto = await db
-    .prepare("SELECT COUNT(*) AS n FROM matches WHERE source = 'auto' AND undone_at IS NULL")
-    .first<{ n: number }>();
+    .prepare(
+      `SELECT COALESCE(SUM(CASE WHEN source = 'auto' THEN 1 ELSE 0 END), 0) AS n,
+              COALESCE(SUM(CASE WHEN review_reason IS NOT NULL THEN 1 ELSE 0 END), 0) AS review
+       FROM matches WHERE undone_at IS NULL`,
+    )
+    .first<{ n: number; review: number }>();
   const settings = await loadMatchingSettings(db);
   const { unmappedAccounts } = await loadMappings(db);
   const oldest = open?.oldest ?? null;
@@ -358,6 +366,7 @@ async function statsHandler(ctx: Ctx): Promise<Response> {
       : null,
     unmatchedOverFiveDays: open?.over5 ?? 0,
     liveAutoMatches: auto?.n ?? 0,
+    matchesNeedingReview: auto?.review ?? 0,
     enabled: settings.enabled,
     autoEnabled: settings.autoEnabled,
     unmappedAccounts,
@@ -370,11 +379,19 @@ async function statsHandler(ctx: Ctx): Promise<Response> {
 const ERR_TO_API: Record<MatchErrCode, [string, 409 | 422]> = {
   tx_not_matchable: ["already_matched", 409],
   division_mismatch: ["account_not_mapped", 422],
+  division_inactive: ["division_inactive", 422],
+  bad_match_row: ["bad_request", 422],
   match_not_live: ["already_matched", 409],
+  alloc_on_ledger_match: ["allocations_or_ledger", 422],
   item_not_matchable: ["item_changed", 409],
+  direction_mismatch: ["direction_mismatch", 422],
   alloc_exceeds_open: ["item_changed", 409],
   alloc_exceeds_tx: ["allocation_sum_mismatch", 422],
   cannot_revive: ["already_matched", 409],
+  immutable: ["already_matched", 409],
+  tx_frozen: ["already_matched", 409],
+  status_mismatch: ["already_matched", 409],
+  has_live_matches: ["has_live_matches", 409],
 };
 
 interface ManualTxRow {
@@ -385,13 +402,25 @@ interface ManualTxRow {
   state: string;
   match_status: string;
   state_conflict: number;
+  counterparty_iban: string | null;
   division_id: number | null;
+  division_active: number | null;
 }
 
 async function createMatchHandler(ctx: Ctx): Promise<Response> {
   const db = ctx.env.DB;
   const actor = email(ctx);
-  const b = await readBody(ctx, ["transactionId", "allocations", "ledgerAccountCode", "note"]);
+  const b = await readBody(ctx, [
+    "transactionId",
+    "allocations",
+    "ledgerAccountCode",
+    "note",
+    "confirmDifferentRelation",
+  ]);
+  const confirmOther = b["confirmDifferentRelation"];
+  if (confirmOther !== undefined && typeof confirmOther !== "boolean") {
+    throw new ApiError("bad_confirm");
+  }
   const txId = b["transactionId"];
   if (typeof txId !== "number" || !Number.isSafeInteger(txId) || txId < 1) {
     throw new ApiError("bad_transaction");
@@ -404,7 +433,9 @@ async function createMatchHandler(ctx: Ctx): Promise<Response> {
   const tx = await db
     .prepare(
       `SELECT t.id, t.amount_minor, t.currency, t.is_final, t.state, t.match_status, t.state_conflict,
-              m.division_id
+              t.counterparty_iban, m.division_id,
+              (SELECT 1 FROM divisions d JOIN connections c ON c.id = d.connection_id
+                WHERE d.id = m.division_id AND d.sync_enabled = 1 AND c.status <> 'disabled') AS division_active
        FROM bank_transactions t
        LEFT JOIN bank_account_exact_map m ON m.bank_account_id = t.bank_account_id
        WHERE t.id = ?1`,
@@ -417,11 +448,13 @@ async function createMatchHandler(ctx: Ctx): Promise<Response> {
   if (tx.match_status === "ignored") throw new ApiError("tx_ignored", 409);
   if (tx.state_conflict === 1) throw new ApiError("tx_state_conflict", 409);
   if (tx.division_id === null) throw new ApiError("account_not_mapped", 422);
+  if (tx.division_active !== 1) throw new ApiError("division_inactive", 422);
   const amount = Math.abs(tx.amount_minor);
   if (amount === 0) throw new ApiError("tx_not_matchable", 422);
   const txDirection = tx.amount_minor >= 0 ? "in" : "out";
 
   let ledger: string | null = null;
+  let differentRelation = false;
   const allocations: {
     openItemId: number;
     allocatedMinor: number;
@@ -462,6 +495,8 @@ async function createMatchHandler(ctx: Ctx): Promise<Response> {
       await db
         .prepare(
           `SELECT oi.id, oi.division_id, oi.currency, oi.open_minor, oi.kind, oi.status,
+                  (SELECT r.id FROM relations r WHERE r.division_id = oi.division_id
+                     AND r.exact_id = oi.relation_id) AS rel_id,
                   COALESCE((SELECT SUM(a.allocated_minor) FROM match_allocations a
                               JOIN matches m ON m.id = a.match_id
                              WHERE a.open_item_id = oi.id AND m.undone_at IS NULL), 0) AS allocated
@@ -475,6 +510,7 @@ async function createMatchHandler(ctx: Ctx): Promise<Response> {
           open_minor: number;
           kind: "invoice" | "bill";
           status: string;
+          rel_id: number | null;
           allocated: number;
         }>()
     ).results;
@@ -499,6 +535,31 @@ async function createMatchHandler(ctx: Ctx): Promise<Response> {
       });
     }
     if (sum !== amount) throw new ApiError("allocation_sum_mismatch", 422);
+
+    // The relations the bank line's IBAN belongs to in this administration (active IBANs only). An
+    // item of ANOTHER relation is allowed (a parent company pays for a subsidiary) but must be
+    // confirmed explicitly; an unknown IBAN gives no signal either way.
+    const iban = tx.counterparty_iban === null ? "" : normalizeIban(tx.counterparty_iban);
+    if (iban !== "") {
+      const owners = new Set(
+        (
+          await db
+            .prepare(
+              `SELECT relation_id AS id FROM relation_bank_accounts
+               WHERE division_id = ?1 AND iban = ?2 AND removed_at IS NULL
+               UNION SELECT id FROM relations WHERE division_id = ?1 AND iban = ?2`,
+            )
+            .bind(tx.division_id, iban)
+            .all<{ id: number }>()
+        ).results.map((r) => r.id),
+      );
+      const other =
+        owners.size > 0 && items.some((it) => it.rel_id === null || !owners.has(it.rel_id));
+      if (other) {
+        if (confirmOther !== true) throw new ApiError("different_relation", 409);
+        differentRelation = true;
+      }
+    }
   }
 
   const res = await applyMatch(db, {
@@ -514,6 +575,7 @@ async function createMatchHandler(ctx: Ctx): Promise<Response> {
     actor,
     allocations,
     nowIso: new Date(ctx.nowMs).toISOString(),
+    differentRelationConfirmed: differentRelation,
   });
   if (!res.ok) {
     const [code, status] = ERR_TO_API[res.code];
@@ -595,12 +657,48 @@ async function unignoreHandler(ctx: Ctx): Promise<Response> {
   return txResponse(db, id);
 }
 
+/**
+ * A state conflict means Revolut contradicted a final (possibly matched) line after the fact.
+ * Clearing it re-enables matching of that line, so it is an admin decision with a fresh sign-in and
+ * a written note (audited). A matched line keeps its review flag until the match is undone.
+ */
 async function clearConflictHandler(ctx: Ctx): Promise<Response> {
   const id = idParam(ctx);
+  const b = await readBody(ctx, ["note"]);
+  const note = textField(b["note"], 200, true, "bad_note") as string;
   const db = ctx.env.DB;
   if (!(await loadTx(db, id))) throw new ApiError("not_found", 404);
-  if (!(await clearStateConflict(db, id, email(ctx)))) throw new ApiError("no_conflict", 409);
+  if (!(await clearStateConflict(db, id, email(ctx), note))) throw new ApiError("no_conflict", 409);
   return txResponse(db, id);
+}
+
+/** Switching automatic matching OFF: admin, no step-up and no phrase (the safe direction), audited. */
+async function disableAutoHandler(ctx: Ctx): Promise<Response> {
+  const db = ctx.env.DB;
+  const actor = email(ctx);
+  // No body is needed; anything sent is ignored.
+  const cur = await loadMatchingSettings(db);
+  if (cur.autoEnabled) {
+    const nowIso = new Date(ctx.nowMs).toISOString();
+    await db.batch([
+      db
+        .prepare(
+          `INSERT INTO settings (key, value_json, updated_by, updated_at) VALUES (?1, 'false', ?2, ?3)
+           ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json,
+             updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+        )
+        .bind(SETTING_AUTO, actor, nowIso),
+      auditStatement(db, {
+        actorEmail: actor,
+        action: "matching.auto_changed",
+        entity: "setting",
+        entityId: SETTING_AUTO,
+        before: true,
+        after: false,
+      }),
+    ]);
+  }
+  return json(await configResponse(db));
 }
 
 // ---- config -------------------------------------------------------------------------------------
@@ -779,10 +877,21 @@ async function putMapHandler(ctx: Ctx): Promise<Response> {
       .bind(accountId)
       .first()) !== null;
 
+  // The database refuses a division change or removal under live matches (migration 0022), also
+  // when a match lands between the check above and the write.
+  const guardedBatch = async (stmts: D1PreparedStatement[]): Promise<void> => {
+    try {
+      await db.batch(stmts);
+    } catch (e) {
+      if (matchErrorCode(e) === "has_live_matches") throw new ApiError("has_live_matches", 409);
+      throw e;
+    }
+  };
+
   if (divisionId === null) {
     if (!before) return json(await accountMapResponse(db));
     if (await liveFor()) throw new ApiError("has_live_matches", 409);
-    await db.batch([
+    await guardedBatch([
       auditStatement(db, {
         actorEmail: actor,
         action: "matching.account_map_removed",
@@ -808,7 +917,7 @@ async function putMapHandler(ctx: Ctx): Promise<Response> {
     throw new ApiError("has_live_matches", 409);
   }
   const after = { division_id: divisionId, journal_code: journal, bank_gl_account_code: gl };
-  await db.batch([
+  await guardedBatch([
     auditStatement(db, {
       actorEmail: actor,
       action: before ? "matching.account_map_changed" : "matching.account_map_set",
@@ -1079,9 +1188,10 @@ export function registerMatchingRoutes(router: Router): void {
   router.add(
     "POST",
     "/api/matching/transactions/:id/clear-conflict",
-    FINANCE,
+    ADMIN_STEP_UP,
     safely(clearConflictHandler),
   );
+  router.add("POST", "/api/matching/auto/disable", ADMIN, safely(disableAutoHandler));
   router.add("GET", "/api/matching/config", ADMIN, safely(getConfigHandler));
   router.add("PUT", "/api/matching/config", ADMIN_STEP_UP, safely(putConfigHandler));
   router.add("GET", "/api/matching/account-map", ADMIN, safely(getMapHandler));

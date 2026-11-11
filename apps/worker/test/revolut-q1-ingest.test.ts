@@ -200,9 +200,10 @@ describe("S9: freezing a matched final row", () => {
     expect(await row()).toMatchObject({ state_conflict: 0, amount_minor: -2550 });
   });
 
-  it("match_status 'matched' alone (no matches row) freezes too", async () => {
+  it("match_status 'ignored' (no matches row) freezes too", async () => {
     await ingest(completed({}, { amount: -10 }, 0));
-    await markMatched({ liveMatch: false, status: "matched" });
+    // 'matched' without a live match is impossible since migration 0022 (status trigger).
+    await markMatched({ liveMatch: false, status: "ignored" });
     const r = await ingest(completed({}, { amount: -99 }));
     expect(r.frozenConflicts).toBe(1);
     expect((await row())["amount_minor"]).toBe(-1000);
@@ -222,8 +223,9 @@ describe("S9: freezing a matched final row", () => {
 
   it("a pending row is never frozen (only final rows are booked)", async () => {
     await ingest(completed({ state: "pending" }, { amount: -10 }, 0));
-    // The matching guards (migration 0022) refuse a match on a pending line, so only the status is set.
-    await markMatched({ liveMatch: false, status: "matched" });
+    // The matching guards (migration 0022) refuse a match on a pending line (and 'matched' without a
+    // live match), so only a freezing status is set.
+    await markMatched({ liveMatch: false, status: "ignored" });
     const r = await ingest(completed({ state: "pending" }, { amount: -99 }));
     expect(r.frozenConflicts).toBe(0);
     expect((await row())["amount_minor"]).toBe(-9900);
@@ -280,15 +282,15 @@ describe("S9: freezing a matched final row", () => {
       });
     };
 
-    for (const variant of ["match_status set", "a live matches row only"] as const) {
+    for (const variant of ["match_status set (ignored)", "a live matches row only"] as const) {
       it(`${variant}: the stale write loses and the next pass sees the row frozen`, async () => {
         await ingest(completed({}, { amount: -10 }, 0));
         const r = await upsertTransaction(
           {
             DB: stallingDb(() =>
               markMatched(
-                variant === "match_status set"
-                  ? { liveMatch: false, status: "matched" }
+                variant === "match_status set (ignored)"
+                  ? { liveMatch: false, status: "ignored" }
                   : { liveMatch: true },
               ),
             ),

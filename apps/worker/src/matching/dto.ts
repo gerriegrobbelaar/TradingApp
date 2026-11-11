@@ -193,7 +193,7 @@ export async function loadSuggestions(
       explanation: parseArray(r.explanation_json)
         .filter((c): c is string => typeof c === "string")
         .slice(0, 8)
-        .map((line) => cleanText(line, 240)),
+        .map((line) => cleanText(maskIbans(line), 240)),
       reasonCodes: parseArray(r.reasons_json).flatMap((x) => {
         const c = (x as { c?: unknown }).c;
         return typeof c === "string" ? [cleanText(c, 40)] : [];
@@ -243,11 +243,12 @@ interface MatchSqlRow {
   undone_at: string | null;
   undo_reason: string | null;
   exact_state: string;
+  review_reason: string | null;
 }
 
 export const MATCH_COLUMNS = `m.id, m.bank_transaction_id, m.division_id, m.source, m.status,
   m.ledger_account_code, m.score, m.rule, m.note, m.created_by, m.created_at, m.undone_by,
-  m.undone_at, m.undo_reason, m.exact_state`;
+  m.undone_at, m.undo_reason, m.exact_state, m.review_reason`;
 
 /** Matches by id, with allocations. */
 export async function loadMatches(db: D1Database, ids: number[]): Promise<Map<number, MatchDto>> {
@@ -296,6 +297,7 @@ export async function loadMatches(db: D1Database, ids: number[]): Promise<Map<nu
       undoneAt: r.undone_at,
       undoReason: safeText(r.undo_reason, 200),
       exactState: r.exact_state,
+      reviewReason: r.review_reason,
       undoAvailable: live && r.exact_state === "not_booked",
       allocations: allocs
         .filter((a) => a.match_id === r.id)

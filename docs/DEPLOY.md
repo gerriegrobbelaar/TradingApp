@@ -806,7 +806,8 @@ task). Existing databases get the job when the new release starts (default jobs 
 - **Automatic matching is off.** Turn it on only after reviewing suggestions for a while:
   `PUT /api/matching/config` with `{"autoEnabled":true,"confirm":"ENABLE AUTOMATIC MATCHING"}`
   (admin, sign-in within 15 minutes). An automatic match is only an internal match with an Undo
-  while it is not booked in Exact. Turn it off the same way (`{"autoEnabled":false}`).
+  while it is not booked in Exact. Turn it off with `POST /api/matching/auto/disable` (admin, no
+  fresh sign-in needed) or `{"autoEnabled":false}` on the config route.
 - **Every Revolut account must be mapped to an Exact administration** before anything is matched:
   `PUT /api/matching/account-map` with `{"bankAccountId":..,"divisionId":..,"journalCode":"90",
   "bankGlAccountCode":"1210"}` (admin, step-up). Unmapped accounts are counted in the job result
@@ -815,9 +816,29 @@ task). Existing databases get the job when the new release starts (default jobs 
   fees and similar ledger postings are suggestions only unless `autoLedgerPatterns` is switched on.
 - Emergency stop: `{"enabled":false}` on the same config route, or switch the job off in Settings,
   Schedules. Open matches stay; use `POST /api/matching/matches/<id>/undo` per match.
+- `GET /api/matching/stats` `matchesNeedingReview` > 0 means a match no longer agrees with Exact or
+  Revolut (an invoice paid elsewhere, a state conflict). Such a match is never booked; open the line
+  and undo it. A state conflict is cleared by an admin with a note
+  (`POST /api/matching/transactions/<id>/clear-conflict`, fresh sign-in).
 - Check after the first live run: the `bank.match` run in Settings, Schedules is `ok` with
   `evaluated` > 0; `GET /api/matching/queue` shows candidates with plain-English explanations;
   no response contains a full IBAN.
+- First-live checks of migration 0022 (staging first, then production), because the trigger
+  behaviour is only tested on Miniflare:
+  1. After `wrangler d1 migrations apply <db> --remote`, `SELECT name FROM sqlite_master WHERE
+     type = 'trigger' ORDER BY name` lists nine triggers (`bank_account_map_guard_delete`,
+     `bank_account_map_guard_update`, `bank_transactions_guard_matched`,
+     `bank_transactions_guard_status`, `match_allocations_guard`,
+     `match_allocations_guard_update`, `matches_guard_immutable`, `matches_guard_insert`,
+     `matches_guard_update`). If wrangler split a trigger body, the migration fails; do not hand-edit.
+  2. On staging only: with a test line and an invoice smaller than it, a manual match whose
+     allocation passes the open balance returns 409 `item_changed` and leaves NO `matches` row and
+     no `match.manual` audit row (D1 batch rollback on a trigger abort).
+  3. `PRAGMA foreign_key_check` returns no rows; `SELECT COUNT(*) FROM bank_transactions WHERE
+     match_status = 'matched'` equals the number of live matches.
+  Residual uncertainty: D1 documents batches as transactions, but not trigger `RAISE(ABORT)`
+  explicitly; check 2 is the proof. VIRTUAL generated columns and partial indexes are standard
+  SQLite features that D1 supports.
 
 ### Emergency stop of all jobs
 

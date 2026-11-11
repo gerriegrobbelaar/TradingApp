@@ -194,6 +194,8 @@ describe("schema", () => {
 
   it("allows only one live match per bank line", async () => {
     await seedDomain();
+    // The match guard needs a synced administration (migration 0022).
+    await db.prepare("UPDATE divisions SET sync_enabled = 1 WHERE id = 1").run();
     await db
       .prepare(
         "INSERT INTO bank_account_exact_map (bank_account_id, division_id, journal_code, bank_gl_account_code, created_by, updated_by) VALUES (1, 1, '90', '1210', 'a@b.com', 'a@b.com')",

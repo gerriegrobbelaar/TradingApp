@@ -1,5 +1,7 @@
 import { applyD1Migrations, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { checkMatchingInvariants } from "../src/matching/invariants";
+import { flagMatchesForReview } from "../src/matching/store";
 
 /**
  * Migration 0022 (bank matching data model, ADR 0042) on a populated database: matches and
@@ -87,7 +89,23 @@ describe("migration 0022 on a populated database", () => {
             ].includes(k),
         ),
       );
-    expect(txAfter.map(strip)).toEqual(txBefore);
+    // match_status follows the converted matches: tx 2 lost its (unresolvable) match and goes back
+    // to the review queue; tx 3 has a live match (row 3) and becomes 'matched'. Nothing else moves.
+    const expectedStatus: Record<number, string> = {
+      1: "matched",
+      2: "unmatched",
+      3: "matched",
+      4: "unmatched",
+    };
+    expect(txAfter.map((r) => [r["id"], r["match_status"]])).toEqual(
+      Object.entries(expectedStatus).map(([k, v]) => [Number(k), v]),
+    );
+    const noStatus = (r: Record<string, unknown>): Record<string, unknown> =>
+      Object.fromEntries(Object.entries(r).filter(([k]) => k !== "match_status"));
+    expect(txAfter.map(strip).map(noStatus)).toEqual(txBefore.map(noStatus));
+    // The converted data passes the consistency check once the first run has flagged what changed.
+    await flagMatchesForReview(mdb, "2026-07-04T00:00:00.000Z");
+    expect(await checkMatchingInvariants(mdb)).toEqual([]);
     expect(
       txAfter.every((r) => r["ignored_reason"] === null && r["match_checked_at"] === null),
     ).toBe(true);
@@ -188,6 +206,7 @@ describe("migration 0022 on a populated database", () => {
       )?.n,
     ).toBe(2);
     // New AUTOINCREMENT ids continue after the highest converted id.
+    await mdb.prepare("UPDATE divisions SET sync_enabled = 1 WHERE id = 1").run();
     await mdb
       .prepare(
         "INSERT INTO bank_account_exact_map (bank_account_id, division_id, journal_code, bank_gl_account_code, created_by, updated_by) VALUES (1, 1, '90', '1210', 'a', 'a')",

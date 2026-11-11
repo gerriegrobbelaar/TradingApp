@@ -195,11 +195,12 @@ describe("S6: the counterparty lookup", () => {
     expect(await ibanOf("t1")).toBe(IBAN_A);
   });
 
-  it("a matched row never gets its counterparty IBAN filled in", async () => {
+  it("a decided (ignored) row never gets its counterparty IBAN filled in", async () => {
     raw.rows = [txFor("t1", "cp-1")];
     await sync(); // no record yet: 404, cached as not_found
     await db.prepare("DELETE FROM revolut_counterparties").run();
-    await db.prepare("UPDATE bank_transactions SET match_status = 'matched'").run();
+    // 'matched' needs a live match since migration 0022; 'ignored' freezes the same way.
+    await db.prepare("UPDATE bank_transactions SET match_status = 'ignored'").run();
     raw.counterparties.set("cp-1", cpRecord("cp-1", [{ iban: IBAN_A }]));
     await sync();
     expect(await ibanOf("t1")).toBeNull();

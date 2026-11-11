@@ -300,12 +300,16 @@ describe("callback", () => {
       Response.json({ nokeys: true }),
     ]) {
       const stub = stubWith();
-      const real = globalThis.fetch;
+      // stubWith already spied on fetch; spying again returns the SAME spy, so delegating to
+      // `globalThis.fetch` would call itself (an unhandled stack overflow). Delegate to the stub's
+      // implementation instead.
+      const stubbed = vi.mocked(globalThis.fetch).getMockImplementation();
+      if (!stubbed) throw new Error("fetch is not stubbed");
       vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
         const url =
           typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
         if (url === "https://www.googleapis.com/oauth2/v3/certs") return jwks.clone();
-        return real(input, init);
+        return stubbed(input, init);
       });
       await expectDenied(await doLogin(stub));
     }

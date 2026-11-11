@@ -50,7 +50,8 @@ describe("migration 0015 on a populated database", () => {
         .first(),
     ).toEqual({
       amount_minor: 12345,
-      match_status: "matched",
+      // Migration 0022 puts a 'matched' line without a live match back to 'unmatched' (review queue).
+      match_status: "unmatched",
       fee_minor: null,
       balance_minor: null,
       counterparty_ref: null,

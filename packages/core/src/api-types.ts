@@ -767,6 +767,11 @@ export interface MatchDto {
   undoneAt: string | null;
   undoReason: string | null;
   exactState: string;
+  /**
+   * Set when the data changed after matching (over_allocated, item_closed, tx_state_conflict,
+   * tx_changed): the match is never booked in Exact; a person checks it and undoes it.
+   */
+  reviewReason: string | null;
   /** Live and not booked in Exact yet. */
   undoAvailable: boolean;
   allocations: MatchAllocationDto[];
@@ -811,6 +816,16 @@ export interface MatchCreateRequest {
   allocations?: { openItemId: number; allocatedMinor: number }[];
   ledgerAccountCode?: string;
   note?: string;
+  /**
+   * Required (true) when an item belongs to another relation than the one the line's IBAN belongs
+   * to; otherwise 409 different_relation.
+   */
+  confirmDifferentRelation?: boolean;
+}
+
+/** POST /api/matching/transactions/:id/clear-conflict (admin, step-up). */
+export interface MatchClearConflictRequest {
+  note: string;
 }
 export interface MatchCreateResponse {
   match: MatchDto;
@@ -938,6 +953,8 @@ export interface MatchStatsResponse {
   /** Lines still open for more than 5 days (Phase 8 rule). */
   unmatchedOverFiveDays: number;
   liveAutoMatches: number;
+  /** Live matches flagged because their data changed after matching (see MatchDto.reviewReason). */
+  matchesNeedingReview: number;
   enabled: boolean;
   autoEnabled: boolean;
   /** Active Revolut accounts without an Exact administration mapping. */

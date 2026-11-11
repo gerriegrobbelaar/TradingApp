@@ -21,9 +21,12 @@ import { sha256Hex } from "../auth/crypto";
 import type { HandlerResult, JobContext } from "../jobs/types";
 import { assembleItems, assembleTransactions, loadMappings } from "./assemble";
 import { loadMatchConfig } from "./config";
+import { safeText } from "./dto";
 import {
   applyMatch,
+  flagMatchesForReview,
   MATCH_ENGINE_VERSION,
+  type MatchErrCode,
   suggestionStatements,
   type AllocInput,
   type SuggestionRow,
@@ -69,7 +72,8 @@ export function candidateToRow(
     // the cleaned explanation lines.
     reasonsJson: JSON.stringify(c.reasons.map((r) => ({ c: r.code, w: r.weight }))),
     blockedJson: JSON.stringify(c.blockedReasons),
-    explanationJson: JSON.stringify(explanation),
+    // Explanations name items and relations (Exact data): masked and cleaned before storing.
+    explanationJson: JSON.stringify(explanation.map((l) => safeText(l, 240) ?? "")),
     autoEligible: c.autoEligible,
     groupId: c.groupId ?? null,
   };
@@ -87,6 +91,18 @@ function txSnapshot(tx: MatchTx): string {
   return JSON.stringify(tx, bigintJson);
 }
 
+const CLAIMED = "claimed_by_earlier_transaction";
+
+/** Removes the engine's claim block when none of the candidate's items was really matched. */
+export function dropFalseClaim(c: Candidate, claimedNow: ReadonlySet<number>): void {
+  if (!c.blockedReasons.includes(CLAIMED)) return;
+  const items = c.allocations.map((a) => a.itemId);
+  if (c.itemId !== null) items.push(c.itemId);
+  if (items.some((id) => claimedNow.has(id))) return;
+  c.blockedReasons = c.blockedReasons.filter((b) => b !== CLAIMED);
+  c.autoEligible = c.blockedReasons.length === 0;
+}
+
 export interface RunSummary {
   mapped_accounts: number;
   unmapped_accounts: number;
@@ -96,19 +112,47 @@ export interface RunSummary {
   suggestions_written: number;
   auto_enabled: boolean;
   auto_matched: number;
+  /** Live matches flagged needs-review by this run (item paid elsewhere, conflict, ...). */
+  flagged_for_review: number;
   skipped_by_reason: Record<string, number>;
   capped: boolean;
 }
 
-const SKIP_BY_CODE: Record<string, string> = {
+const SKIP_BY_CODE: Record<MatchErrCode, string> = {
   tx_not_matchable: "lost_race",
   division_mismatch: "division_mismatch",
+  division_inactive: "division_mismatch",
+  bad_match_row: "other",
   match_not_live: "lost_race",
+  alloc_on_ledger_match: "other",
   item_not_matchable: "item_changed",
+  direction_mismatch: "item_changed",
   alloc_exceeds_open: "item_changed",
   alloc_exceeds_tx: "amount_mismatch",
   cannot_revive: "lost_race",
+  immutable: "other",
+  tx_frozen: "lost_race",
+  status_mismatch: "lost_race",
+  has_live_matches: "other",
 };
+
+/**
+ * Worker-side preconditions for an AUTOMATIC match, on top of the engine's decision (defence in
+ * depth, ADR 0042): every input the engine's safety rules depend on must be present. A missing
+ * one leaves the line in review; null means "complete".
+ */
+export function autoInputGap(tx: MatchTx): string | null {
+  if (!tx.isFinal || tx.state !== "completed") return "incomplete_input";
+  if (tx.frozen || tx.stateConflict) return "incomplete_input";
+  if (tx.type === null || tx.type === "") return "incomplete_input";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(tx.bookedAt)) return "incomplete_input";
+  // Without the counterparty account type an own-account transfer (type 'self') could look like a
+  // customer payment. Card payments have no counterparty account.
+  if (tx.type !== "card_payment" && (tx.counterpartyAccountType ?? null) === null) {
+    return "incomplete_input";
+  }
+  return null;
+}
 
 export async function runMatching(ctx: JobContext): Promise<HandlerResult> {
   const db = ctx.env.DB;
@@ -139,6 +183,7 @@ export async function runMatching(ctx: JobContext): Promise<HandlerResult> {
     suggestions_written: 0,
     auto_enabled: settings.autoEnabled,
     auto_matched: 0,
+    flagged_for_review: 0,
     skipped_by_reason: {},
     capped: false,
   };
@@ -203,6 +248,11 @@ export async function runMatching(ctx: JobContext): Promise<HandlerResult> {
             : 1,
       );
 
+    // Items really matched automatically in this run. The engine blocks an item for later lines
+    // as soon as it DECIDES auto for an earlier one; when that match was not made (auto off, a lost
+    // race, incomplete input) the block is not true and is removed from the stored suggestions.
+    const claimedNow = new Set<number>();
+
     for (const { tx, r } of order) {
       if (ctx.signal.aborted || ctx.now() > ctx.deadlineMs) {
         aborted = true;
@@ -212,8 +262,10 @@ export async function runMatching(ctx: JobContext): Promise<HandlerResult> {
       if (r.candidates.length > 0) summary.with_candidates++;
       const currentStatus = status.get(tx.id) ?? "unmatched";
 
-      // Automatic match: opt-in, and only what the engine itself calls automatic.
-      if (settings.autoEnabled && r.decision === "auto" && r.chosen !== null) {
+      // Automatic match: opt-in, and only what the engine itself calls automatic, with complete inputs.
+      const gap = settings.autoEnabled && r.decision === "auto" ? autoInputGap(tx) : null;
+      if (gap !== null) skip(gap);
+      if (settings.autoEnabled && r.decision === "auto" && r.chosen !== null && gap === null) {
         const chosen = r.chosen;
         const allocations: AllocInput[] = [];
         let tooLarge = false;
@@ -246,14 +298,20 @@ export async function runMatching(ctx: JobContext): Promise<HandlerResult> {
             allocations,
             nowIso,
           });
-          if (res.ok) summary.auto_matched++;
-          else skip(SKIP_BY_CODE[res.code] ?? "other");
-          continue;
+          if (res.ok) {
+            for (const a of allocations) claimedNow.add(a.openItemId);
+            summary.auto_matched++;
+            continue;
+          }
+          // Lost a race or the data moved: the line still gets its suggestions below (and is
+          // stamped when capped), so it never blocks the head of the queue run after run.
+          skip(SKIP_BY_CODE[res.code]);
         }
       }
 
       // Suggestions: rewrite only when the inputs changed.
       const rows: SuggestionRow[] = [];
+      for (const c of r.candidates) dropFalseClaim(c, claimedNow);
       r.candidates.forEach((c, i) => {
         const row = candidateToRow(i + 1, c, explainCandidate(c, { tx, items: itemsById }));
         if (row !== null) rows.push(row);
@@ -285,6 +343,9 @@ export async function runMatching(ctx: JobContext): Promise<HandlerResult> {
     if (aborted) break;
   }
   await flush();
+  // Matches whose data changed after matching (Exact closed or reduced an item, Revolut
+  // contradicted a line) are flagged once per run, whatever happened above.
+  summary.flagged_for_review = await flagMatchesForReview(db, new Date(ctx.now()).toISOString());
 
   return {
     status: aborted ? "partial" : "ok",

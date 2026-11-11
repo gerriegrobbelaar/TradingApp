@@ -17,14 +17,28 @@
 --  (d) bank_account_exact_map, ledger_patterns: admin-managed configuration.
 --  (e) Database-level guards (triggers), created AFTER the copy so the migration itself is not
 --      subject to them. They RAISE `match_err:<code>`; the Worker maps the code:
---        matches insert     tx_not_matchable (not final+completed, not unmatched/suggested, amount
---                           or currency differ), division_mismatch (account map)
---        matches update     cannot_revive (an undone match never becomes live again)
---        allocations insert match_not_live, item_not_matchable (closed, zero, other division or
---                           currency), alloc_exceeds_open (live allocations of the item would pass
---                           its open balance), alloc_exceeds_tx (allocations pass the bank amount)
+--        matches insert     tx_not_matchable (not final+completed, state conflict, not
+--                           unmatched/suggested, amount or currency differ), division_mismatch
+--                           (account map), division_inactive (not synced / Exact connection
+--                           disabled), bad_match_row (inserted undone, booked or flagged)
+--        matches update     cannot_revive (an undone match never becomes live again), immutable
+--                           (line, division, source, ledger account, amount, currency)
+--        allocations insert match_not_live, alloc_on_ledger_match, item_not_matchable (closed, zero,
+--                           other division or currency), direction_mismatch (money in pays
+--                           invoices and supplier credit notes, money out bills and customer credit
+--                           notes), alloc_exceeds_open (live allocations of the item would pass its
+--                           open balance), alloc_exceeds_tx (allocations pass the bank amount)
+--        allocations update immutable
+--        bank_transactions  tx_frozen (amount, currency or account of a line with a live match),
+--                           status_mismatch ('matched' if and only if a live match exists)
+--        account map        has_live_matches (division change or removal under live matches)
 --      Together with the partial UNIQUE index (one live match per bank line) two writers racing for
---      the same line or item cannot both win, whatever the application does.
+--      the same line or item cannot both win, whatever the application does. A later migration
+--      that rebuilds bank_transactions, matches, match_allocations or bank_account_exact_map MUST
+--      recreate these triggers.
+--  (f) matches.review_reason: the matching run flags live, unbooked matches whose data changed
+--      after matching (Exact closed or reduced the item, Revolut contradicted the line). The
+--      triggers only guard writes; this is how a change made by the sync AFTER matching surfaces.
 
 -- (a) -------------------------------------------------------------------------------------------
 ALTER TABLE bank_transactions ADD COLUMN ignored_reason TEXT
@@ -95,10 +109,17 @@ CREATE TABLE matches (
   exact_state         TEXT NOT NULL DEFAULT 'not_booked'
                       CHECK (length(exact_state) BETWEEN 1 AND 32 AND exact_state NOT GLOB '*[^a-z_]*'),
   exact_matchset_id   TEXT,
+  -- Set by the matching run when a live, not yet booked match no longer agrees with the data it was
+  -- built on (the item was paid or closed elsewhere, the line got a state conflict). Sticky: a person
+  -- undoes the match (or M7c's booking refuses it). M7c MUST NOT book a match with a review_reason.
+  review_reason       TEXT CHECK (review_reason IS NULL OR review_reason IN
+                        ('over_allocated', 'item_closed', 'tx_state_conflict', 'tx_changed')),
+  review_flagged_at   TEXT,
   status              TEXT GENERATED ALWAYS AS (CASE WHEN undone_at IS NULL THEN 'live' ELSE 'undone' END) VIRTUAL,
   CHECK (source <> 'ledger' OR ledger_account_code IS NOT NULL),
   CHECK (source <> 'manual' OR ledger_account_code IS NULL),
-  CHECK ((undone_at IS NULL) = (undone_by IS NULL))
+  CHECK ((undone_at IS NULL) = (undone_by IS NULL)),
+  CHECK ((review_reason IS NULL) = (review_flagged_at IS NULL))
 );
 
 CREATE TABLE match_allocations (
@@ -141,6 +162,19 @@ INSERT INTO match_allocations (match_id, open_item_id, allocated_minor, currency
   FROM matches_0022_copy c
   WHERE c.open_item_id IS NOT NULL AND c.amount_minor <> 0 AND c.id IN (SELECT id FROM matches);
 
+-- match_status and the matches table agree from the start (the status trigger below keeps it so):
+-- a line that says 'matched' without a live match after the conversion (a dropped or undone row)
+-- goes back to 'unmatched' (the review queue); a line with a live match is 'matched'. The first
+-- matching run flags converted matches whose items no longer agree (review_reason).
+UPDATE bank_transactions SET match_status = 'unmatched'
+WHERE match_status = 'matched'
+  AND NOT EXISTS (SELECT 1 FROM matches m WHERE m.bank_transaction_id = bank_transactions.id
+                    AND m.undone_at IS NULL);
+UPDATE bank_transactions SET match_status = 'matched'
+WHERE match_status <> 'matched'
+  AND EXISTS (SELECT 1 FROM matches m WHERE m.bank_transaction_id = bank_transactions.id
+                AND m.undone_at IS NULL);
+
 CREATE UNIQUE INDEX idx_matches_live_tx ON matches (bank_transaction_id) WHERE undone_at IS NULL;
 CREATE INDEX idx_matches_tx ON matches (bank_transaction_id);
 CREATE INDEX idx_matches_source ON matches (source, created_at DESC, id DESC);
@@ -179,37 +213,69 @@ DROP TABLE matches_0022_copy;
 DROP TABLE match_suggestions_0022_copy;
 
 -- (e) -------------------------------------------------------------------------------------------
+-- Every guard is a BEFORE trigger that RAISEs ABORT: the statement fails and D1 rolls back the whole
+-- db.batch it is part of (D1 batches are one transaction). The Worker maps `match_err:<code>`.
+
 CREATE TRIGGER matches_guard_insert BEFORE INSERT ON matches
 BEGIN
   SELECT RAISE(ABORT, 'match_err:tx_not_matchable')
   WHERE NOT EXISTS (
     SELECT 1 FROM bank_transactions t
     WHERE t.id = NEW.bank_transaction_id AND t.match_status IN ('unmatched', 'suggested')
-      AND t.is_final = 1 AND t.state = 'completed'
+      AND t.is_final = 1 AND t.state = 'completed' AND t.state_conflict = 0
       AND ABS(t.amount_minor) = NEW.amount_minor AND t.currency = NEW.currency);
   SELECT RAISE(ABORT, 'match_err:division_mismatch')
   WHERE NOT EXISTS (
     SELECT 1 FROM bank_transactions t
       JOIN bank_account_exact_map m ON m.bank_account_id = t.bank_account_id
     WHERE t.id = NEW.bank_transaction_id AND m.division_id = NEW.division_id);
+  -- The administration must still be synced and its Exact connection not disabled: its open items
+  -- would otherwise be stale.
+  SELECT RAISE(ABORT, 'match_err:division_inactive')
+  WHERE NOT EXISTS (
+    SELECT 1 FROM divisions d JOIN connections c ON c.id = d.connection_id
+    WHERE d.id = NEW.division_id AND d.sync_enabled = 1 AND c.status <> 'disabled');
+  SELECT RAISE(ABORT, 'match_err:bad_match_row')
+  WHERE NEW.undone_at IS NOT NULL OR NEW.exact_state <> 'not_booked' OR NEW.review_reason IS NOT NULL;
 END;
 
+-- An undone match never becomes live again (a new match is a new row).
 CREATE TRIGGER matches_guard_update BEFORE UPDATE OF undone_at ON matches
-WHEN OLD.undone_at IS NOT NULL AND NEW.undone_at IS NULL
+WHEN OLD.undone_at IS NOT NULL AND (NEW.undone_at IS NULL OR NEW.undone_at <> OLD.undone_at)
 BEGIN
   SELECT RAISE(ABORT, 'match_err:cannot_revive');
+END;
+
+-- What a match is about never changes after insert (undo, exact_state, review flags may).
+CREATE TRIGGER matches_guard_immutable BEFORE UPDATE OF bank_transaction_id, division_id, source,
+  ledger_account_code, amount_minor, currency ON matches
+WHEN NEW.bank_transaction_id IS NOT OLD.bank_transaction_id OR NEW.division_id IS NOT OLD.division_id
+  OR NEW.source IS NOT OLD.source OR NEW.ledger_account_code IS NOT OLD.ledger_account_code
+  OR NEW.amount_minor IS NOT OLD.amount_minor OR NEW.currency IS NOT OLD.currency
+BEGIN
+  SELECT RAISE(ABORT, 'match_err:immutable');
 END;
 
 CREATE TRIGGER match_allocations_guard BEFORE INSERT ON match_allocations
 BEGIN
   SELECT RAISE(ABORT, 'match_err:match_not_live')
   WHERE NOT EXISTS (SELECT 1 FROM matches m WHERE m.id = NEW.match_id AND m.undone_at IS NULL);
+  -- A ledger match books to a ledger account; it has no invoice allocations.
+  SELECT RAISE(ABORT, 'match_err:alloc_on_ledger_match')
+  WHERE EXISTS (SELECT 1 FROM matches m WHERE m.id = NEW.match_id AND m.ledger_account_code IS NOT NULL);
   SELECT RAISE(ABORT, 'match_err:item_not_matchable')
   WHERE NOT EXISTS (
     SELECT 1 FROM open_items oi JOIN matches m ON m.id = NEW.match_id
     WHERE oi.id = NEW.open_item_id AND oi.status = 'open' AND oi.open_minor <> 0
       AND oi.division_id = m.division_id AND oi.currency = NEW.currency
       AND oi.currency = m.currency);
+  -- Money in settles an invoice or a supplier credit note; money out a bill or a customer credit
+  -- note: (kind = invoice) = (open_minor > 0) is "settled by money in".
+  SELECT RAISE(ABORT, 'match_err:direction_mismatch')
+  WHERE NOT EXISTS (
+    SELECT 1 FROM open_items oi, matches m JOIN bank_transactions t ON t.id = m.bank_transaction_id
+    WHERE oi.id = NEW.open_item_id AND m.id = NEW.match_id
+      AND ((oi.kind = 'invoice') = (oi.open_minor > 0)) = (t.amount_minor > 0));
   SELECT RAISE(ABORT, 'match_err:alloc_exceeds_open')
   WHERE (SELECT COALESCE(SUM(a.allocated_minor), 0) FROM match_allocations a
            JOIN matches m ON m.id = a.match_id
@@ -219,4 +285,48 @@ BEGIN
   WHERE (SELECT COALESCE(SUM(a.allocated_minor), 0) FROM match_allocations a
           WHERE a.match_id = NEW.match_id) + NEW.allocated_minor
         > (SELECT m.amount_minor FROM matches m WHERE m.id = NEW.match_id);
+END;
+
+-- Allocations are never edited: Undo marks the whole match undone, a new match is a new row.
+CREATE TRIGGER match_allocations_guard_update BEFORE UPDATE ON match_allocations
+BEGIN
+  SELECT RAISE(ABORT, 'match_err:immutable');
+END;
+
+-- The money fields of a line with a live match never change (the Revolut ingest keeps them and only
+-- flags state_conflict, ADR 0034); this is the database backstop for any other writer.
+CREATE TRIGGER bank_transactions_guard_matched BEFORE UPDATE OF amount_minor, currency, bank_account_id
+  ON bank_transactions
+WHEN (NEW.amount_minor IS NOT OLD.amount_minor OR NEW.currency IS NOT OLD.currency
+      OR NEW.bank_account_id IS NOT OLD.bank_account_id)
+  AND EXISTS (SELECT 1 FROM matches m WHERE m.bank_transaction_id = OLD.id AND m.undone_at IS NULL)
+BEGIN
+  SELECT RAISE(ABORT, 'match_err:tx_frozen');
+END;
+
+-- match_status and the matches table agree: a line with a live match stays 'matched'; nothing else
+-- may claim 'matched' without a live match (applyMatch inserts the match first, undo ends it first).
+CREATE TRIGGER bank_transactions_guard_status BEFORE UPDATE OF match_status ON bank_transactions
+WHEN NEW.match_status IS NOT OLD.match_status
+  AND ((NEW.match_status = 'matched') <> EXISTS (SELECT 1 FROM matches m
+         WHERE m.bank_transaction_id = OLD.id AND m.undone_at IS NULL))
+BEGIN
+  SELECT RAISE(ABORT, 'match_err:status_mismatch');
+END;
+
+-- The administration of a bank account cannot move (or be removed) under live matches.
+CREATE TRIGGER bank_account_map_guard_update BEFORE UPDATE OF division_id, bank_account_id
+  ON bank_account_exact_map
+WHEN (NEW.division_id IS NOT OLD.division_id OR NEW.bank_account_id IS NOT OLD.bank_account_id)
+  AND EXISTS (SELECT 1 FROM matches m JOIN bank_transactions t ON t.id = m.bank_transaction_id
+              WHERE t.bank_account_id = OLD.bank_account_id AND m.undone_at IS NULL)
+BEGIN
+  SELECT RAISE(ABORT, 'match_err:has_live_matches');
+END;
+
+CREATE TRIGGER bank_account_map_guard_delete BEFORE DELETE ON bank_account_exact_map
+WHEN EXISTS (SELECT 1 FROM matches m JOIN bank_transactions t ON t.id = m.bank_transaction_id
+             WHERE t.bank_account_id = OLD.bank_account_id AND m.undone_at IS NULL)
+BEGIN
+  SELECT RAISE(ABORT, 'match_err:has_live_matches');
 END;
