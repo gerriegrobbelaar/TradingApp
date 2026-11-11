@@ -12,10 +12,12 @@ import {
 import { useSignedIn } from "../auth";
 import { PageHeader } from "../components/PageHeader";
 import { Connections } from "./Connections";
-import { FxRates } from "./FxRates";
-import { MatchingSettings } from "./MatchingSettings";
+import { Lazy, lazyNamed } from "../components/Lazy";
 import { Schedules } from "./Schedules";
 import { Users } from "./Users";
+
+const FxRates = lazyNamed(() => import("./FxRates"), "FxRates");
+const MatchingSettings = lazyNamed(() => import("./MatchingSettings"), "MatchingSettings");
 
 type Tab = "appearance" | "users" | "connections" | "schedules" | "fx" | "matching";
 
@@ -89,8 +91,16 @@ export function Settings() {
       {current === "users" && <Users />}
       {current === "connections" && <Connections />}
       {current === "schedules" && <Schedules />}
-      {current === "fx" && <FxRates />}
-      {current === "matching" && <MatchingSettings />}
+      {current === "fx" && (
+        <Lazy>
+          <FxRates />
+        </Lazy>
+      )}
+      {current === "matching" && (
+        <Lazy>
+          <MatchingSettings />
+        </Lazy>
+      )}
     </>
   );
 }

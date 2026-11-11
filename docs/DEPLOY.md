@@ -609,8 +609,8 @@ sync panel on the test division.
     1. **Prepare.** A test division with a test bank journal, a test debtor with one open invoice
        of EUR 0.01 or more, and a test creditor with one open bill. In Settings, Matching map the
        Revolut account (journal, bank GL account) AND the debtor and creditor control accounts
-       (`receivableGlAccountCode`, `payableGlAccountCode` via `PUT /api/matching/account-map`
-       until the screen has fields for them). Decide `creates_bank_entries` on the Revolut
+       (`receivableGlAccountCode`, `payableGlAccountCode`, and the optional opening balance of an
+       empty journal) in Settings, Matching, Account map (or `PUT /api/matching/account-map`). Decide `creates_bank_entries` on the Revolut
        connection (does Revolut's own Exact integration import the lines?).
     2. **Check the assumptions by hand** (Exact UI and `curl` against the API), recording each
        answer in ADR 0040 / 0044:
@@ -635,8 +635,15 @@ sync panel on the test division.
     3. **Verify.** In the Booking card (Settings): "Verify" with a note that lists the checks of
        step 2 that passed (the dialog asks for the phrase
        `I VERIFIED THE EXACT WRITE PATH ON A TEST DIVISION`; the note is stored with your email,
-       the time and the protocol version). Verifying always leaves booking off.
-    4. **Enable.** "Enable" (fresh sign-in, phrase `ENABLE EXACT BOOKING`). `GET
+       the time and the protocol version). The dialog has one tick box per check (probe returns
+       zero for a random reference; bank entry sign; match signs and control account; balance
+       chain; match read-back; lost-answer drill; Preview booking matches the manual payload) and
+       stays disabled until all are ticked. Use **Preview booking** (admin, fresh sign-in; nothing is
+       sent to Exact) to compare the bodies and hashes with what you posted by hand.
+       Verifying always leaves booking off.
+    4. **Enable.** "Enable" (fresh sign-in, phrase `ENABLE EXACT BOOKING`). Tick ONLY the test
+       administration and keep "Matches booked per run" at 1; the dialog shows that only matches
+       made after the shown time are booked and how many existing matches stay behind. `GET
        /api/booking/settings` must show no blockers.
     5. **One booking.** Create one real test match in the app (a test bank line against the test
        invoice), wait out the 10-minute undo window, and press **Run now** on

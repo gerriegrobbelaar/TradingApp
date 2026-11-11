@@ -18,15 +18,19 @@ import { PLACEHOLDERS, RENAMED_PATHS } from "./routes";
 import { ToastProvider, useToast } from "./toasts";
 import { ComingSoon, NotFound } from "./pages/Placeholder";
 import { Approvals } from "./pages/Approvals";
-import { CreditorsAgeing, ReceivablesAgeing } from "./pages/AgeingReport";
-import { Bank } from "./pages/Bank";
-import { BalanceSheet } from "./pages/BalanceSheet";
+import { Lazy, lazyNamed } from "./components/Lazy";
 import { Invoices } from "./pages/Invoices";
 import { Overview } from "./pages/Overview";
 import { Payables } from "./pages/Payables";
-import { ProfitLoss } from "./pages/ProfitLoss";
-import { Settings } from "./pages/Settings";
 import { Checking, SessionError, SignedOut } from "./pages/SignedOut";
+
+// Heavy screens load when first opened (Phase 7 review N9).
+const Bank = lazyNamed(() => import("./pages/Bank"), "Bank");
+const BalanceSheet = lazyNamed(() => import("./pages/BalanceSheet"), "BalanceSheet");
+const ProfitLoss = lazyNamed(() => import("./pages/ProfitLoss"), "ProfitLoss");
+const CreditorsAgeing = lazyNamed(() => import("./pages/AgeingReport"), "CreditorsAgeing");
+const ReceivablesAgeing = lazyNamed(() => import("./pages/AgeingReport"), "ReceivablesAgeing");
+const Settings = lazyNamed(() => import("./pages/Settings"), "Settings");
 
 /** Sends an old address to its new one, keeping the query (year, period, search). */
 function Renamed({ to }: { to: string }) {
@@ -94,30 +98,32 @@ function SignedInShell() {
           <TopNav />
           <main ref={mainRef} id="main" tabIndex={-1} className="main">
             <PageErrorBoundary path={pathname}>
-              <Routes>
-                <Route path="/" element={<Navigate to="/overview" replace />} />
-                <Route path="/overview" element={<Overview />} />
-                <Route path="/invoices" element={<Invoices />} />
-                <Route path="/purchases/payables" element={<Payables />} />
-                <Route path="/purchases/approvals" element={<Approvals />} />
-                <Route path="/treasury/bank" element={<Bank />} />
-                <Route path="/reporting/balance-sheet" element={<BalanceSheet />} />
-                <Route path="/reporting/profit-loss" element={<ProfitLoss />} />
-                <Route path="/reporting/creditors-ageing" element={<CreditorsAgeing />} />
-                <Route path="/reporting/receivables-ageing" element={<ReceivablesAgeing />} />
-                {RENAMED_PATHS.map((r) => (
-                  <Route key={r.from} path={r.from} element={<Renamed to={r.to} />} />
-                ))}
-                {PLACEHOLDERS.map((p) => (
-                  <Route
-                    key={p.to}
-                    path={p.to}
-                    element={<ComingSoon path={p.to} title={p.label} />}
-                  />
-                ))}
-                <Route path="/settings/:tab?" element={<Settings />} />
-                <Route path="*" element={<NotFound />} />
-              </Routes>
+              <Lazy>
+                <Routes>
+                  <Route path="/" element={<Navigate to="/overview" replace />} />
+                  <Route path="/overview" element={<Overview />} />
+                  <Route path="/invoices" element={<Invoices />} />
+                  <Route path="/purchases/payables" element={<Payables />} />
+                  <Route path="/purchases/approvals" element={<Approvals />} />
+                  <Route path="/treasury/bank" element={<Bank />} />
+                  <Route path="/reporting/balance-sheet" element={<BalanceSheet />} />
+                  <Route path="/reporting/profit-loss" element={<ProfitLoss />} />
+                  <Route path="/reporting/creditors-ageing" element={<CreditorsAgeing />} />
+                  <Route path="/reporting/receivables-ageing" element={<ReceivablesAgeing />} />
+                  {RENAMED_PATHS.map((r) => (
+                    <Route key={r.from} path={r.from} element={<Renamed to={r.to} />} />
+                  ))}
+                  {PLACEHOLDERS.map((p) => (
+                    <Route
+                      key={p.to}
+                      path={p.to}
+                      element={<ComingSoon path={p.to} title={p.label} />}
+                    />
+                  ))}
+                  <Route path="/settings/:tab?" element={<Settings />} />
+                  <Route path="*" element={<NotFound />} />
+                </Routes>
+              </Lazy>
             </PageErrorBoundary>
           </main>
           <Footer email={auth.me.email} />

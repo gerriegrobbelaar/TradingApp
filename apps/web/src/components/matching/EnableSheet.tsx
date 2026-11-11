@@ -119,7 +119,7 @@ export function EnableSheet({
             <select
               className="input"
               value={perRun}
-              onChange={(e) => setPerRun(Number(e.target.value))}
+              onChange={(e) => setPerRun(sizes.find((n) => String(n) === e.target.value) ?? 1)}
             >
               {sizes.map((n) => (
                 <option key={n} value={n}>
