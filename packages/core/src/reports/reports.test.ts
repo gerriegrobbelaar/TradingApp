@@ -41,7 +41,7 @@ const acc = (
 /** A small chart, hand-built. */
 const BANK = acc(1, "1100", "Bank", { type: 12, balanceSide: "D" });
 const DEBTORS = acc(2, "1300", "Receivables", { type: 20, balanceSide: "D" });
-const CREDITORS = acc(3, "1600", "Creditors", { type: 21, balanceSide: "C" });
+const CREDITORS = acc(3, "1600", "Creditors", { type: 22, balanceSide: "C" });
 const CAPITAL = acc(4, "0500", "Share capital", {
   type: 40,
   typeDescription: "Equity",
@@ -436,13 +436,12 @@ describe("account classification", () => {
   it("maps by Exact type code, then by description, then gives up", () => {
     const c = classifyBalanceSheetAccount;
     expect(c({ type: 12, typeDescription: null, balanceSide: "D" })).toBe("assets");
-    expect(c({ type: 21, typeDescription: null, balanceSide: "C" })).toBe("liabilities");
+    expect(c({ type: 22, typeDescription: null, balanceSide: "C" })).toBe("liabilities");
+    expect(c({ type: 22, typeDescription: null, balanceSide: null })).toBe("liabilities");
     expect(c({ type: 99, typeDescription: "Equity", balanceSide: "C" })).toBe("equity");
-    expect(c({ type: null, typeDescription: "Eigen vermogen", balanceSide: null })).toBe("equity");
+    expect(c({ type: null, typeDescription: "Eigen vermogen", balanceSide: "C" })).toBe("equity");
     expect(c({ type: null, typeDescription: "Crediteuren", balanceSide: "C" })).toBe("liabilities");
-    expect(c({ type: null, typeDescription: "VAT payable", balanceSide: null })).toBe(
-      "liabilities",
-    );
+    expect(c({ type: null, typeDescription: "VAT payable", balanceSide: "C" })).toBe("liabilities");
     expect(c({ type: null, typeDescription: "Debiteuren", balanceSide: "D" })).toBe("assets");
     expect(c({ type: null, typeDescription: "Something else", balanceSide: "D" })).toBe(
       "unclassified",
@@ -450,10 +449,33 @@ describe("account classification", () => {
     expect(c({ type: null, typeDescription: null, balanceSide: null })).toBe("unclassified");
   });
 
+  it("fails safe: unknown codes and unconfirmed keywords never land in a section", () => {
+    const c = classifyBalanceSheetAccount;
+    // 21 is ambiguous in our recollections (payable or customer prepayment): not mapped
+    expect(c({ type: 21, typeDescription: null, balanceSide: "C" })).toBe("unclassified");
+    expect(c({ type: 21, typeDescription: null, balanceSide: "D" })).toBe("unclassified");
+    // an unknown code with no description, whatever the side
+    for (const side of ["D", "C", null] as const) {
+      expect(c({ type: 77, typeDescription: null, balanceSide: side })).toBe("unclassified");
+    }
+    // a keyword without a side to confirm it
+    expect(c({ type: 77, typeDescription: "Bank", balanceSide: null })).toBe("unclassified");
+    expect(c({ type: null, typeDescription: "Eigen vermogen", balanceSide: null })).toBe(
+      "unclassified",
+    );
+    expect(c({ type: null, typeDescription: "VAT payable", balanceSide: null })).toBe(
+      "unclassified",
+    );
+    // a keyword with the wrong side ("VAT receivable" on the debit side is not a liability)
+    expect(c({ type: null, typeDescription: "VAT receivable", balanceSide: "D" })).toBe(
+      "unclassified",
+    );
+  });
+
   it("does not trust a guess that contradicts the account's side", () => {
     const c = classifyBalanceSheetAccount;
     expect(c({ type: 12, typeDescription: null, balanceSide: "C" })).toBe("unclassified");
-    expect(c({ type: 21, typeDescription: null, balanceSide: "D" })).toBe("unclassified");
+    expect(c({ type: 22, typeDescription: null, balanceSide: "D" })).toBe("unclassified");
     expect(c({ type: null, typeDescription: "Equity", balanceSide: "D" })).toBe("unclassified");
   });
 
@@ -549,15 +571,15 @@ describe("properties over random ledgers", () => {
         }));
       const pl = buildProfitAndLoss(accounts, balances, budgets, { year: 2026, periodTo: period });
       const lineSum = (
-        pick2: (l: { actual: number; budget: number | null; lastYear: number }) => number,
+        pick2: (l: { actual: number; budget: number | null; lastYear: number | null }) => number,
       ) => sumMinor(PROFIT_LOSS_SECTIONS.flatMap((s) => pl.sections[s].lines.map(pick2)));
       expect(lineSum((l) => l.actual)).toBe(pl.result.actual);
       expect(lineSum((l) => l.budget ?? 0)).toBe(pl.result.budget);
-      expect(lineSum((l) => l.lastYear)).toBe(pl.result.lastYear);
+      expect(lineSum((l) => l.lastYear ?? 0)).toBe(pl.result.lastYear);
       for (const s of PROFIT_LOSS_SECTIONS) {
         const t = pl.sections[s].total;
         expect(t.vsBudget.minor).toBe(t.actual - (t.budget ?? 0));
-        expect(t.vsLastYear.minor).toBe(t.actual - t.lastYear);
+        expect(t.vsLastYear.minor).toBe(t.actual - (t.lastYear ?? 0));
       }
       // Result = revenue + costs + unclassified.
       expect(pl.result.actual).toBe(

@@ -345,7 +345,11 @@ export const REPORTING_BALANCE_FIELDS = [
   "AmountCredit",
   "BalanceType",
   "Status",
-  "CostcenterCode",
+  // Review K2: our recollection of ReportingBalance spells these CostCenterCode / CostUnitCode
+  // (capital C), unlike Budgets (Costcenter / Costunit). Unverified either way; a 400 on the
+  // balances read on the first live run means one of them is wrong (ADR 0024).
+  "CostCenterCode",
+  "CostUnitCode",
 ] as const;
 export const BUDGET_FIELDS = [
   "GLAccount",
@@ -355,6 +359,7 @@ export const BUDGET_FIELDS = [
   "AmountDC",
   "BudgetScenario",
   "Costcenter",
+  "Costunit",
 ] as const;
 export const SYNC_ACCOUNT_FIELDS = [...ACCOUNT_FIELDS, "Timestamp"] as const;
 
@@ -828,7 +833,8 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
   function mapReportingBalance(r: Row): ReportingBalanceRow {
     const { year, period } = reqYearPeriod(r);
     const status = trimField(r, "Status");
-    const cc = trimField(r, "CostcenterCode");
+    const cc = trimField(r, "CostCenterCode");
+    const cu = trimField(r, "CostUnitCode");
     return {
       glAccountId: reqGuid(r, "GLAccount"),
       glAccountCode: trimField(r, "GLAccountCode"),
@@ -838,7 +844,10 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
       debit: optionalMoney(r, "AmountDebit", divisionCurrency),
       credit: optionalMoney(r, "AmountCredit", divisionCurrency),
       balanceType: balanceTypeOf(r),
-      dimension: status === null && cc === null ? "" : `${status ?? ""}|${cc ?? ""}`,
+      dimension:
+        status === null && cc === null && cu === null
+          ? ""
+          : `${status ?? ""}|${cc ?? ""}${cu === null ? "" : `|${cu}`}`,
     };
   }
 
@@ -851,7 +860,10 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
       reportingPeriod: period,
       amount: moneyField(r, "AmountDC", divisionCurrency),
       scenario: guidOrNull(r, "BudgetScenario") ?? "",
-      dimension: trimField(r, "Costcenter") ?? "",
+      dimension: ((cc, cu) => (cu === null ? (cc ?? "") : `${cc ?? ""}|${cu}`))(
+        trimField(r, "Costcenter"),
+        trimField(r, "Costunit"),
+      ),
     };
   }
 

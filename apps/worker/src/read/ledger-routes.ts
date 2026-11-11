@@ -12,7 +12,12 @@
  * through their division (an account id of a division the user cannot read is a 404), responses are
  * `no-store`. Amounts are integer minor units in the DIVISION currency. A division whose ledger was
  * never synced answers 200 with `status: "not_synced"` and no report, so a screen can show an empty
- * state. Freshness is reported per ledger entity; budgets are optional (`budgetsAvailable`).
+ * state; a year that was read completely but holds no rows at all (a new year before Exact has
+ * figures for it, a new administration) answers `status: "no_data"`, also without a report, so an
+ * empty sheet is never presented as a real one. Freshness is reported per ledger entity (the
+ * balances of the current year are read nightly, other years at most weekly, budgets weekly) and
+ * for the compare year; budgets are optional (`budgetsAvailable`). `splitKeys` counts figures that
+ * Exact split over a field we do not read (they may be low, ADR 0024).
  */
 import {
   buildBalanceSheet,
@@ -32,6 +37,7 @@ import {
   type LedgerFreshness,
   type LedgerFreshnessEntry,
   type LedgerPeriodRow,
+  type LedgerReportStatus,
   type BalanceSheetResponse,
   type ProfitLossResponse,
 } from "@camelthorn/core";
@@ -49,6 +55,8 @@ import {
 
 /** Budgets are read weekly, so they are stale only after a week and a day. */
 export const BUDGETS_STALE_AFTER_HOURS = 8 * 24;
+/** The previous year's balances are read at most weekly too (ADR 0024): same rule. */
+export const OTHER_YEAR_STALE_AFTER_HOURS = BUDGETS_STALE_AFTER_HOURS;
 /** The most chart rows one answer holds (a chart has a few hundred). */
 export const MAX_ACCOUNT_ROWS = 5000;
 /** Reporting periods the API accepts (12 months and the extra closing periods). */
@@ -84,6 +92,13 @@ const defaultPeriod = (year: number, nowMs: number): number => {
 
 // ---- state and freshness --------------------------------------------------------------------
 
+interface YearInfo {
+  completedAt: string | null;
+  splitKeys: number;
+  /** Any stored balance row for the year. */
+  hasRows: boolean;
+}
+
 interface LedgerState {
   freshness: LedgerFreshness;
   budgetsAvailable: boolean;
@@ -91,6 +106,10 @@ interface LedgerState {
   balanceYears: Set<number>;
   budgetYears: Set<number>;
   accountsSynced: boolean;
+  /** The requested year and the compare year (when asked for). */
+  balances: Map<number, YearInfo>;
+  budgetSplitKeys: number;
+  currentYear: number;
 }
 
 function entry(at: string | null, staleAfterHours: number, nowMs: number): LedgerFreshnessEntry {
@@ -102,21 +121,31 @@ function entry(at: string | null, staleAfterHours: number, nowMs: number): Ledge
   };
 }
 
+/** Balances of the current year are read nightly; any other year at most weekly. */
+const balancesStaleAfter = (year: number, currentYear: number): number =>
+  year === currentYear ? STALE_AFTER_HOURS : OTHER_YEAR_STALE_AFTER_HOURS;
+
 async function ledgerState(
   db: D1Database,
   divisionId: number,
   year: number,
   nowMs: number,
+  compareYear: number | null = null,
 ): Promise<LedgerState> {
-  const [years, sync] = await db.batch<{
+  const currentYear = nowParts(nowMs).year;
+  const asked = compareYear === null ? [year] : [year, compareYear];
+  const [years, sync, present] = await db.batch<{
     entity: string;
     year: number;
     completed_at: string;
+    split_keys: number;
     unavailable_until: string | null;
     last_completed_at: string | null;
   }>([
     db
-      .prepare("SELECT entity, year, completed_at FROM gl_sync_years WHERE division_id = ?1")
+      .prepare(
+        "SELECT entity, year, completed_at, split_keys FROM gl_sync_years WHERE division_id = ?1",
+      )
       .bind(divisionId),
     db
       .prepare(
@@ -124,24 +153,73 @@ async function ledgerState(
          WHERE division_id = ?1 AND entity IN ('gl_accounts', 'gl_budgets')`,
       )
       .bind(divisionId),
+    // one indexed probe per asked year (idx_gl_balances_year)
+    db
+      .prepare(
+        `SELECT y.value AS year FROM json_each(?2) y
+         WHERE EXISTS (SELECT 1 FROM gl_balances b WHERE b.division_id = ?1 AND b.year = y.value)`,
+      )
+      .bind(divisionId, JSON.stringify(asked)),
   ]);
   const yearRows = years?.results ?? [];
   const stateRows = sync?.results ?? [];
-  const at = (entity: LedgerEntity): string | null =>
-    yearRows.find((r) => r.entity === entity && r.year === year)?.completed_at ?? null;
+  const withRows = new Set((present?.results ?? []).map((r) => Number(r.year)));
+  const row = (entity: LedgerEntity, y: number) =>
+    yearRows.find((r) => r.entity === entity && r.year === y);
   const accounts = stateRows.find((r) => r.entity === "gl_accounts")?.last_completed_at ?? null;
   const until = stateRows.find((r) => r.entity === "gl_budgets")?.unavailable_until ?? null;
+  const balances = new Map<number, YearInfo>(
+    asked.map((y) => [
+      y,
+      {
+        completedAt: row("gl_balances", y)?.completed_at ?? null,
+        splitKeys: row("gl_balances", y)?.split_keys ?? 0,
+        hasRows: withRows.has(y),
+      },
+    ]),
+  );
   return {
     freshness: {
       gl_accounts: entry(accounts, STALE_AFTER_HOURS, nowMs),
-      gl_balances: entry(at("gl_balances"), STALE_AFTER_HOURS, nowMs),
-      gl_budgets: entry(at("gl_budgets"), BUDGETS_STALE_AFTER_HOURS, nowMs),
+      gl_balances: entry(
+        row("gl_balances", year)?.completed_at ?? null,
+        balancesStaleAfter(year, currentYear),
+        nowMs,
+      ),
+      gl_budgets: entry(
+        row("gl_budgets", year)?.completed_at ?? null,
+        BUDGETS_STALE_AFTER_HOURS,
+        nowMs,
+      ),
     },
     budgetsAvailable: until === null || !(Date.parse(until) > nowMs),
     balanceYears: new Set(yearRows.filter((r) => r.entity === "gl_balances").map((r) => r.year)),
     budgetYears: new Set(yearRows.filter((r) => r.entity === "gl_budgets").map((r) => r.year)),
     accountsSynced: accounts !== null,
+    balances,
+    budgetSplitKeys: row("gl_budgets", year)?.split_keys ?? 0,
+    currentYear,
   };
+}
+
+/** Freshness of the compare year's balances, or null when there is no comparison. */
+function compareFreshness(
+  state: LedgerState,
+  compareYear: number | null,
+  nowMs: number,
+): LedgerFreshnessEntry | null {
+  if (compareYear === null) return null;
+  return entry(
+    state.balances.get(compareYear)?.completedAt ?? null,
+    balancesStaleAfter(compareYear, state.currentYear),
+    nowMs,
+  );
+}
+
+/** Report status of the requested year: never read, read but empty, or ok. */
+function yearStatus(state: LedgerState, year: number): LedgerReportStatus {
+  if (!state.balanceYears.has(year)) return "not_synced";
+  return state.balances.get(year)?.hasRows === true ? "ok" : "no_data";
 }
 
 // ---- stored rows ----------------------------------------------------------------------------
@@ -231,20 +309,24 @@ async function balanceSheetHandler(ctx: Ctx): Promise<Response> {
   if (wantYear === year) throw new BadRequest("bad_compare_year");
 
   const db = ctx.env.DB;
-  const state = await ledgerState(db, division.id, year, ctx.nowMs);
-  const synced = state.balanceYears.has(year);
+  const state = await ledgerState(db, division.id, year, ctx.nowMs, wantYear);
+  const status = yearStatus(state, year);
   const compareSynced = wantYear !== null && state.balanceYears.has(wantYear);
   const base = {
     division: ref,
     year,
     period,
     freshness: state.freshness,
+    compareFreshness: compareFreshness(state, compareSynced ? wantYear : null, ctx.nowMs),
     budgetsAvailable: state.budgetsAvailable,
+    splitKeys:
+      (state.balances.get(year)?.splitKeys ?? 0) +
+      (compareSynced && wantYear !== null ? (state.balances.get(wantYear)?.splitKeys ?? 0) : 0),
   };
-  if (!synced) {
+  if (status !== "ok") {
     const body: BalanceSheetResponse = {
       ...base,
-      status: "not_synced",
+      status,
       compareYear: null,
       compareMissing: wantYear !== null,
       report: null,
@@ -308,20 +390,28 @@ async function profitLossHandler(ctx: Ctx): Promise<Response> {
   const compareYear = year - 1;
 
   const db = ctx.env.DB;
-  const state = await ledgerState(db, division.id, year, ctx.nowMs);
+  const state = await ledgerState(db, division.id, year, ctx.nowMs, compareYear);
+  const status = yearStatus(state, year);
+  const compareSynced = state.balanceYears.has(compareYear);
+  const useBudgets = state.budgetsAvailable && state.budgetYears.has(year);
   const base = {
     division: ref,
     year,
     periodTo,
     compareYear,
     freshness: state.freshness,
+    compareFreshness: compareFreshness(state, compareSynced ? compareYear : null, ctx.nowMs),
     budgetsAvailable: state.budgetsAvailable,
+    splitKeys:
+      (state.balances.get(year)?.splitKeys ?? 0) +
+      (compareSynced ? (state.balances.get(compareYear)?.splitKeys ?? 0) : 0) +
+      (useBudgets ? state.budgetSplitKeys : 0),
   };
-  if (!state.balanceYears.has(year)) {
+  if (status !== "ok") {
     const body: ProfitLossResponse = {
       ...base,
-      status: "not_synced",
-      compareMissing: true,
+      status,
+      compareMissing: !compareSynced,
       report: null,
       budgetScenario: null,
       budgetScenarios: [],
@@ -329,7 +419,6 @@ async function profitLossHandler(ctx: Ctx): Promise<Response> {
     return json(body);
   }
 
-  const useBudgets = state.budgetsAvailable && state.budgetYears.has(year);
   const [accounts, balances, scenarios] = await db.batch<AccountSql | BalanceSql | { s: string }>([
     db.prepare(ACCOUNT_SQL).bind(division.id),
     db
@@ -343,7 +432,7 @@ async function profitLossHandler(ctx: Ctx): Promise<Response> {
          GROUP BY b.gl_account_exact_id, b.year, b.period`,
       )
       // a year that was never read completely may hold partial rows: not shown
-      .bind(division.id, year, state.balanceYears.has(compareYear) ? compareYear : -1, periodTo),
+      .bind(division.id, year, compareSynced ? compareYear : -1, periodTo),
     db
       .prepare(
         "SELECT DISTINCT scenario AS s FROM gl_budgets WHERE division_id = ?1 AND year = ?2 ORDER BY scenario",
@@ -354,7 +443,11 @@ async function profitLossHandler(ctx: Ctx): Promise<Response> {
   if (wanted !== null && useBudgets && !scenarioList.includes(wanted)) {
     throw new BadRequest("unknown_scenario");
   }
-  const scenario = !useBudgets ? null : (wanted ?? scenarioList[0] ?? "");
+  // Budgets read completely but none for the year: no budget column (null figures), not zeros.
+  const scenario =
+    !useBudgets || (wanted === null && scenarioList.length === 0)
+      ? null
+      : (wanted ?? scenarioList[0] ?? null);
   let budgets: LedgerBudget[] | null = null;
   if (useBudgets && scenario !== null) {
     const rows = (
@@ -379,12 +472,13 @@ async function profitLossHandler(ctx: Ctx): Promise<Response> {
     ((accounts?.results ?? []) as AccountSql[]).map(toLedgerAccount),
     ((balances?.results ?? []) as BalanceSql[]).map(toBalance),
     budgets,
-    { year, periodTo, compareYear },
+    // a compare year never read completely gives null last-year figures, not zeros
+    { year, periodTo, compareYear: compareSynced ? compareYear : null },
   );
   const body: ProfitLossResponse = {
     ...base,
     status: "ok",
-    compareMissing: !state.balanceYears.has(compareYear),
+    compareMissing: !compareSynced,
     report,
     budgetScenario: scenario,
     budgetScenarios: scenarioList,
@@ -400,14 +494,16 @@ async function accountsHandler(ctx: Ctx): Promise<Response> {
   const state = await ledgerState(db, division.id, nowParts(ctx.nowMs).year, ctx.nowMs);
   const rows = (
     await db
-      .prepare(`${ACCOUNT_SQL} ORDER BY code IS NULL, code, name, id LIMIT ${MAX_ACCOUNT_ROWS}`)
+      .prepare(`${ACCOUNT_SQL} ORDER BY code IS NULL, code, name, id LIMIT ${MAX_ACCOUNT_ROWS + 1}`)
       .bind(division.id)
       .all<AccountSql>()
   ).results;
-  const accounts = rows.map(accountRow);
+  const truncated = rows.length > MAX_ACCOUNT_ROWS;
+  const accounts = rows.slice(0, MAX_ACCOUNT_ROWS).map(accountRow);
   const body: LedgerAccountsResponse = {
     division: toRef(division),
     status: state.accountsSynced ? "ok" : "not_synced",
+    truncated,
     accounts,
     unclassifiedCount: accounts.filter((a) => a.section === "unclassified").length,
     freshness: state.freshness,

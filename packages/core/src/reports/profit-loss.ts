@@ -42,8 +42,11 @@ export interface ProfitLossOptions {
   year: number;
   /** Last period of the year to date (1..). */
   periodTo: number;
-  /** Year for the last-year column; default year - 1. */
-  compareYear?: number;
+  /**
+   * Year for the last-year column; default year - 1. `null` = that year is not available (never
+   * synced): every last-year figure is then null, not 0, exactly like missing budgets.
+   */
+  compareYear?: number | null;
   semantics?: BalanceSemantics;
 }
 
@@ -57,7 +60,8 @@ export interface Variance {
 export interface ProfitLossFigures {
   actual: number;
   budget: number | null;
-  lastYear: number;
+  /** Null when the compare year is not available. */
+  lastYear: number | null;
   vsBudget: Variance;
   vsLastYear: Variance;
 }
@@ -73,7 +77,8 @@ export interface ProfitLossSectionResult {
 export interface ProfitLoss {
   year: number;
   periodTo: number;
-  compareYear: number;
+  /** Null when the last-year column is not available. */
+  compareYear: number | null;
   budgetsIncluded: boolean;
   sections: Record<ProfitLossSection, ProfitLossSectionResult>;
   /** Revenue + costs + unclassified (a profit is positive). */
@@ -93,9 +98,9 @@ interface Acc {
 }
 const zero = (): Acc => ({ actual: 0n, budget: 0n, lastYear: 0n });
 
-function figures(a: Acc, withBudget: boolean): ProfitLossFigures {
+function figures(a: Acc, withBudget: boolean, withLastYear: boolean): ProfitLossFigures {
   const actual = toSafe(a.actual);
-  const lastYear = toSafe(a.lastYear);
+  const lastYear = withLastYear ? toSafe(a.lastYear) : null;
   const budget = withBudget ? toSafe(a.budget) : null;
   return {
     actual,
@@ -108,10 +113,13 @@ function figures(a: Acc, withBudget: boolean): ProfitLossFigures {
             minor: toSafe(a.actual - a.budget),
             bps: varianceBps(toSafe(a.actual - a.budget), budget),
           },
-    vsLastYear: {
-      minor: toSafe(a.actual - a.lastYear),
-      bps: varianceBps(toSafe(a.actual - a.lastYear), lastYear),
-    },
+    vsLastYear:
+      lastYear === null
+        ? { minor: null, bps: null }
+        : {
+            minor: toSafe(a.actual - a.lastYear),
+            bps: varianceBps(toSafe(a.actual - a.lastYear), lastYear),
+          },
   };
 }
 
@@ -122,12 +130,24 @@ export function buildProfitAndLoss(
   opts: ProfitLossOptions,
 ): ProfitLoss {
   const semantics = opts.semantics ?? LEDGER_BALANCE_SEMANTICS;
-  const compareYear = opts.compareYear ?? opts.year - 1;
+  const compareYear = opts.compareYear === undefined ? opts.year - 1 : opts.compareYear;
+  const withLastYear = compareYear !== null;
   const range = { from: 1, to: opts.periodTo };
-  const resolved = resolveAccounts(accounts, [...balances, ...(budgets ?? [])]);
+  // Budgets exist for profit and loss accounts only, so a budget row is evidence of 'W' for an
+  // account the chart does not know (balance rows, listed first, still win).
+  const resolved = resolveAccounts(accounts, [
+    ...balances,
+    ...(budgets ?? []).map((b) => ({
+      glAccountExactId: b.glAccountExactId,
+      balanceType: "W" as const,
+    })),
+  ]);
 
   const actual = signedByAccount(balances, opts.year, range, semantics);
-  const last = signedByAccount(balances, compareYear, range, semantics);
+  const last =
+    compareYear === null
+      ? new Map<string, bigint>()
+      : signedByAccount(balances, compareYear, range, semantics);
   // Budgets are per-period amounts whatever the ledger semantics: always added up.
   const budget = signedByAccount(
     (budgets ?? []).map((b) => ({ ...b, balanceType: null })),
@@ -166,7 +186,7 @@ export function buildProfitAndLoss(
       accountId: a.accountId,
       code: a.code,
       name: a.name,
-      ...figures(acc, withBudget),
+      ...figures(acc, withBudget, withLastYear),
     });
   }
   const sections = {} as Record<ProfitLossSection, ProfitLossSectionResult>;
@@ -175,7 +195,7 @@ export function buildProfitAndLoss(
     sections[s] = {
       section: s,
       lines: lines[s].sort(compareRefs),
-      total: figures(totals[s], withBudget),
+      total: figures(totals[s], withBudget, withLastYear),
     };
     grand.actual += totals[s].actual;
     grand.budget += totals[s].budget;
@@ -187,6 +207,6 @@ export function buildProfitAndLoss(
     compareYear,
     budgetsIncluded: withBudget,
     sections,
-    result: figures(grand, withBudget),
+    result: figures(grand, withBudget, withLastYear),
   };
 }

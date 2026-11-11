@@ -276,6 +276,8 @@ interface StateRow {
   retry_count: number;
   retry_day: string | null;
   unavailable_until: string | null;
+  pass_seq: number | null;
+  pass_started_at: string | null;
 }
 
 type Failure = {
@@ -681,7 +683,8 @@ export async function syncDivision(
       .prepare(
         `SELECT entity, cursor, mode, last_status, last_error, last_started_at, last_completed_at,
                 rows_seen, cycle_seq, cycle_started_at, pass_cycle, pass_token, pass_rows,
-                pass_total, done_cycle, retry_count, retry_day, unavailable_until
+                pass_total, done_cycle, retry_count, retry_day, unavailable_until, pass_seq,
+                pass_started_at
          FROM sync_state WHERE division_id = ?1`,
       )
       .bind(division.id)

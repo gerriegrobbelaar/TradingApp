@@ -14,6 +14,11 @@
  * hidden or "fixed": a non-zero value means missing data (an opening balance, a period not yet
  * synced, a wrong semantics assumption) and the UI must show it.
  *
+ * Opening balances: the check line does NOT catch opening balances that are missing altogether (the
+ * movements of the year still net to zero, so the sheet "balances" while showing only this year's
+ * movements). `hasOpeningBalances` therefore says per column whether ANY period 0 row exists for
+ * that year; a screen must warn when it is false for a year whose predecessor had balances.
+ *
  * Comparison: with `compareYear` set, the second column is that year at its YEAR END (all periods,
  * including the extra closing periods) when `compareToYearEnd` is true, else at the same period.
  * Each year's own profit and loss accounts make that column's result line, so both columns balance
@@ -71,6 +76,8 @@ export interface BalanceSheet {
   liabilitiesAndEquity: Pair;
   /** Assets - (liabilities + equity + result) + unclassified. 0 for a complete ledger. */
   difference: Pair;
+  /** Whether any opening (period 0) row exists for the year / the compare year (null: none). */
+  hasOpeningBalances: { current: boolean; compare: boolean | null };
 }
 
 export const BALANCE_SHEET_SECTIONS: readonly BalanceSheetSection[] = [
@@ -156,6 +163,7 @@ export function buildBalanceSheet(
     });
   }
 
+  const opening = (y: number): boolean => balances.some((b) => b.year === y && b.period === 0);
   const pair = (c: bigint, k: bigint): Pair => ({
     current: toSafe(c),
     compare: cmp === null ? null : toSafe(k),
@@ -184,5 +192,9 @@ export function buildBalanceSheet(
       totals.assets.cur - leCur + totals.unclassified.cur,
       totals.assets.cmp - leCmp + totals.unclassified.cmp,
     ),
+    hasOpeningBalances: {
+      current: opening(opts.year),
+      compare: compareYear === null ? null : opening(compareYear),
+    },
   };
 }

@@ -241,7 +241,11 @@ export interface OverviewResponse {
 export type LedgerEntity = "gl_accounts" | "gl_balances" | "gl_budgets";
 
 export interface LedgerFreshnessEntry {
-  /** Last COMPLETE read, or null when never. Balances and budgets: of the requested year. */
+  /**
+   * Last COMPLETE read, or null when never. Balances and budgets: of the requested year. Balances
+   * of the current year go stale after 36 hours; other years and budgets, read at most weekly,
+   * after 8 days.
+   */
   lastCompletedAt: string | null;
   /** True when never read, or older than staleAfterHours. */
   stale: boolean;
@@ -251,11 +255,12 @@ export interface LedgerFreshnessEntry {
 export type LedgerFreshness = Record<LedgerEntity, LedgerFreshnessEntry>;
 
 /**
- * `not_synced`: the balances of the requested year were never read from Exact. The answer is still
- * 200, with `report: null`, so a screen can show an empty state ("Sync from Exact first") instead
- * of an error.
+ * `not_synced`: the balances of the requested year were never read from Exact. `no_data`: they
+ * were read completely but Exact holds no figures for that year (a new year before its opening
+ * balances exist, a new administration). Either way the answer is still 200, with `report: null`,
+ * so a screen can show an empty state instead of an error or an empty sheet presented as real.
  */
-export type LedgerReportStatus = "ok" | "not_synced";
+export type LedgerReportStatus = "ok" | "not_synced" | "no_data";
 
 export interface BalanceSheetResponse {
   division: DivisionRef;
@@ -269,7 +274,14 @@ export interface BalanceSheetResponse {
   compareMissing: boolean;
   report: BalanceSheet | null;
   freshness: LedgerFreshness;
+  /** Freshness of the compare year's balances (read at most weekly), null without one. */
+  compareFreshness: LedgerFreshnessEntry | null;
   budgetsAvailable: boolean;
+  /**
+   * Figures in the data used that Exact split over a field we do not read (the same key twice in
+   * one read, ADR 0024): they may be too low. 0 normally; a screen warns otherwise.
+   */
+  splitKeys: number;
 }
 
 export interface ProfitLossResponse {
@@ -279,7 +291,7 @@ export interface ProfitLossResponse {
   periodTo: number;
   /** The year of the last-year column. */
   compareYear: number;
-  /** True when that year was never synced: its figures are then 0 only because nothing is held. */
+  /** True when that year was never synced: the last-year figures are then null. */
   compareMissing: boolean;
   report: ProfitLoss | null;
   /** The budget scenario used (its GUID, "" for none), or null without budgets. */
@@ -287,8 +299,12 @@ export interface ProfitLossResponse {
   /** Every scenario that has budget rows for the year. */
   budgetScenarios: string[];
   freshness: LedgerFreshness;
+  /** Freshness of the compare year's balances (read at most weekly), null when never read. */
+  compareFreshness: LedgerFreshnessEntry | null;
   /** False while Exact refuses the budget resource (not licensed); budget figures are then null. */
   budgetsAvailable: boolean;
+  /** As on the balance sheet, including the budgets used. */
+  splitKeys: number;
 }
 
 export type LedgerStatement = "balance_sheet" | "profit_loss";
@@ -314,6 +330,8 @@ export interface LedgerAccountRow {
 export interface LedgerAccountsResponse {
   division: DivisionRef;
   status: LedgerReportStatus;
+  /** True when the chart has more than the 5,000 accounts one answer holds. */
+  truncated: boolean;
   accounts: LedgerAccountRow[];
   unclassifiedCount: number;
   freshness: LedgerFreshness;

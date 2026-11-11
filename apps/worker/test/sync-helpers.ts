@@ -58,6 +58,7 @@ export interface FakeBalance {
   bt?: "B" | "W";
   status?: string | null;
   costcenter?: string | null;
+  costunit?: string | null;
 }
 export interface FakeBudget {
   account: number;
@@ -214,7 +215,8 @@ export class FakeExact {
             AmountCredit: b.amount < 0 ? -b.amount : 0,
             BalanceType: b.bt ?? "B",
             Status: b.status ?? null,
-            CostcenterCode: b.costcenter ?? null,
+            CostCenterCode: b.costcenter ?? null,
+            CostUnitCode: b.costunit ?? null,
           }));
       }
       case "/budget/Budgets": {
@@ -229,6 +231,7 @@ export class FakeExact {
             AmountDC: b.amount,
             BudgetScenario: b.scenario ?? null,
             Costcenter: null,
+            Costunit: null,
           }));
       }
       default:

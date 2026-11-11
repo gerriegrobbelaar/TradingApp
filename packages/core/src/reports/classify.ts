@@ -7,10 +7,13 @@
  * line of its own, so totals still reconcile and a wrong guess is visible rather than hidden.
  *
  * Balance sheet (BalanceType 'B'), in this order:
- *  1. The numeric Type code, from BS_TYPE_SECTIONS.
+ *  1. The numeric Type code, from BS_TYPE_SECTIONS (only the codes we are fairly sure of).
  *  2. Else keywords in TypeDescription (English and Dutch), equity before liabilities before
- *     assets so a word such as "reserve" is not read as an asset.
- *  3. Else unclassified.
+ *     assets so a word such as "reserve" is not read as an asset. A keyword is a weaker signal than
+ *     a code, so it only counts when the account ALSO has a BalanceSide that agrees (below); with
+ *     no side it stays unclassified.
+ *  3. Else unclassified: an unknown Type code without a confirmed keyword never lands in a
+ *     section (review K2: fail safe, a wrong guess must be visible, not moved between sections).
  *  Then a side check: assets are expected on the debit side, liabilities and equity on the credit
  *  side. If Exact says the account's BalanceSide is the other one, the guess is not trusted and the
  *  account is unclassified.
@@ -23,13 +26,16 @@ import type { ResolvedAccount } from "./ledger";
 export type BalanceSheetSection = "assets" | "liabilities" | "equity" | "unclassified";
 export type ProfitLossSection = "revenue" | "costs" | "unclassified";
 
-/** Exact GLAccount.Type codes (recollection, verify with credentials). */
+/**
+ * Exact GLAccount.Type codes (recollection, verify with credentials). 21 is deliberately NOT here:
+ * one recollection has it as "accounts payable", another as "prepayment accounts receivable"
+ * (review K2), so it is left to the keyword and side rules.
+ */
 export const BS_TYPE_SECTIONS: Readonly<Record<number, "assets" | "liabilities">> = {
   10: "assets", // cash
   12: "assets", // bank
   20: "assets", // accounts receivable
-  21: "liabilities", // accounts payable
-  22: "liabilities", // accounts payable (alternative code)
+  22: "liabilities", // accounts payable
 };
 
 const EQUITY_WORDS =
@@ -47,6 +53,8 @@ export function classifyBalanceSheetAccount(
   if (byCode !== undefined) {
     section = byCode;
   } else if (a.typeDescription !== null) {
+    // A keyword alone is not enough: without a side to confirm it the account stays unclassified.
+    if (a.balanceSide === null) return "unclassified";
     const d = a.typeDescription;
     if (EQUITY_WORDS.test(d)) section = "equity";
     else if (LIABILITY_WORDS.test(d)) section = "liabilities";

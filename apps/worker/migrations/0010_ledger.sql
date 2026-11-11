@@ -15,6 +15,10 @@
 -- returns keeps its history.
 -- Every table carries the sync bookkeeping of open_items (last_seen_sync_id = run_seq of the run
 -- that last saw the row, missed_cycles and strike_cycle for the two-strike rule, ADR 0017).
+-- Balances and budgets also carry the pass that last wrote them (pass_seq = run_seq of the run
+-- that STARTED the pass, pass_chunk = rows read in that pass before the chunk) and split_key = 1
+-- when the same key came twice in one pass: then Exact splits the figure over a field we do not
+-- read and the stored amount may be low (review K2, ADR 0024). The report shows the count.
 -- All money is integer minor units at the scale of `currency` (currencyScale), never a float.
 --
 -- Additive only: nothing existing is rebuilt, so the migration is safe on a populated database
@@ -55,6 +59,9 @@ CREATE TABLE gl_balances (
   last_seen_sync_id  INTEGER,
   missed_cycles      INTEGER NOT NULL DEFAULT 0,
   strike_cycle       INTEGER,
+  pass_seq           INTEGER,
+  pass_chunk         INTEGER,
+  split_key          INTEGER NOT NULL DEFAULT 0 CHECK (split_key IN (0, 1)),
   updated_at         TEXT NOT NULL,
   UNIQUE (division_id, gl_account_exact_id, year, period, dimension)
 );
@@ -74,6 +81,9 @@ CREATE TABLE gl_budgets (
   last_seen_sync_id  INTEGER,
   missed_cycles      INTEGER NOT NULL DEFAULT 0,
   strike_cycle       INTEGER,
+  pass_seq           INTEGER,
+  pass_chunk         INTEGER,
+  split_key          INTEGER NOT NULL DEFAULT 0 CHECK (split_key IN (0, 1)),
   updated_at         TEXT NOT NULL,
   UNIQUE (division_id, gl_account_exact_id, year, period, scenario, dimension)
 );
@@ -89,6 +99,8 @@ CREATE TABLE gl_sync_years (
   completed_at TEXT NOT NULL,
   cycle        INTEGER,
   rows_read    INTEGER NOT NULL DEFAULT 0,
+  -- keys that came twice in that read (see split_key above); 0 when the key is complete
+  split_keys   INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (division_id, entity, year)
 );
 
@@ -96,3 +108,10 @@ CREATE TABLE gl_sync_years (
 -- read answers 400/403/404 the entity is not tried again until this moment (one week later).
 -- sync_state.last_error then holds budgets_unavailable_<http status>.
 ALTER TABLE sync_state ADD COLUMN unavailable_until TEXT;
+
+-- The ledger passes may outlive a 36-hour full cycle (a large ledger needs more than two nights,
+-- review K2): pass_seq is the run_seq of the run that started the saved pass (rows it has not seen
+-- are those last seen before it) and pass_started_at its start, so a pass is resumed for at most
+-- LEDGER_PASS_MAX_AGE_MS (ledger-sync.ts) whatever cycle it is in. Unused by the other entities.
+ALTER TABLE sync_state ADD COLUMN pass_seq INTEGER;
+ALTER TABLE sync_state ADD COLUMN pass_started_at TEXT;

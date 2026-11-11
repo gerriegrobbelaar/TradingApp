@@ -2,6 +2,18 @@ import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   amsterdamParts,
+  type BalanceSheet,
+  type BalanceSheetLine,
+  type BalanceSheetSectionResult,
+  type LedgerFreshnessEntry,
+  type LedgerPeriodRow,
+  type LedgerAccountRow,
+  type Pair,
+  type ProfitLoss,
+  type ProfitLossFigures,
+  type ProfitLossLine,
+  type ProfitLossSectionResult,
+  type Variance,
   type BalanceSheetResponse,
   type LedgerAccountBalancesResponse,
   type LedgerAccountsResponse,
@@ -47,7 +59,7 @@ interface Acc {
 const CHART: Acc[] = [
   { n: 1, code: "1100", name: "Bank", type: 12, side: "D", bt: "B" },
   { n: 2, code: "1300", name: "Receivables", type: 20, side: "D", bt: "B" },
-  { n: 3, code: "1600", name: "Creditors", type: 21, side: "C", bt: "B" },
+  { n: 3, code: "1600", name: "Creditors", type: 22, side: "C", bt: "B" },
   { n: 4, code: "0500", name: "Share capital", type: 40, desc: "Equity", side: "C", bt: "B" },
   { n: 5, code: "4000", name: "Consulting revenue", side: "C", bt: "W" },
   { n: 6, code: "6000", name: "Salaries", side: "D", bt: "W" },
@@ -555,7 +567,11 @@ describe("profit and loss", () => {
     await db.prepare("DELETE FROM gl_sync_years WHERE year = 2025").run();
     const r = await get<ProfitLossResponse>(url());
     expect(r.body.compareMissing).toBe(true);
-    expect(r.body.report?.result.lastYear).toBe(0);
+    // null, not 0: an unread year is not a year with no figures (review K2)
+    expect(r.body.report?.result.lastYear).toBeNull();
+    expect(r.body.report?.result.vsLastYear).toEqual({ minor: null, bps: null });
+    expect(r.body.report?.compareYear).toBeNull();
+    expect(r.body.compareFreshness).toBeNull();
   });
 
   it("splits revenue and costs by the side of the account, and keeps the rest", async () => {
@@ -755,5 +771,335 @@ describe("amounts are integers in the division currency", () => {
     expect(k.body.division.currency).toBe("KWD");
     expect(k.body.report?.sections.assets.total.current).toBe(1_234_567);
     expect(k.body.report?.difference.current).toBe(1_234_567);
+  });
+});
+
+describe("review K2", () => {
+  const bsUrl = (q: string) => `/api/reports/balance-sheet?division=${divA}&${q}`;
+  const plUrl = (q: string) => `/api/reports/profit-loss?division=${divA}&${q}`;
+
+  it("answers no_data, without a report, for a year read completely that holds no rows", async () => {
+    // 1 January: the new year was read, Exact has no figures for it yet; last year is still there
+    await addAccounts(divA);
+    await addBalances(
+      divA,
+      LEDGER.filter((r) => r[1] === 2025),
+    );
+    await markSynced(divA, { years: [2025, 2026] });
+    const bs = await get<BalanceSheetResponse>(bsUrl("year=2026&period=1"));
+    expect(bs.status).toBe(200);
+    expect(bs.body).toMatchObject({ status: "no_data", report: null });
+    const pl = await get<ProfitLossResponse>(plUrl("year=2026&periodTo=1"));
+    expect(pl.body).toMatchObject({ status: "no_data", report: null, budgetScenario: null });
+    const old = await get<BalanceSheetResponse>(bsUrl("year=2025&period=12&compare=none"));
+    expect(old.body.status).toBe("ok");
+    expect(old.body.report?.difference.current).toBe(0);
+  });
+
+  it("uses the weekly rule for another year's balances and reports the compare year's freshness", async () => {
+    await addAccounts(divA);
+    await addBalances(divA);
+    const current = now().year;
+    const other = current - 1;
+    await db.batch([
+      db
+        .prepare(
+          `INSERT INTO gl_sync_years (division_id, entity, year, completed_at, cycle)
+           VALUES (?1, 'gl_balances', ?2, ?3, 1), (?1, 'gl_balances', ?4, ?5, 1)`,
+        )
+        .bind(divA, current, hoursAgo(2), other, hoursAgo(5 * 24)),
+    ]);
+    const r = await get<BalanceSheetResponse>(bsUrl(`year=${other}&period=12&compare=none`));
+    // read five days ago, weekly cadence: not stale (a literal 36 hours would always flag it)
+    expect(r.body.freshness.gl_balances).toMatchObject({ stale: false, staleAfterHours: 192 });
+    const c = await get<BalanceSheetResponse>(bsUrl(`year=${current}&period=1`));
+    expect(c.body.freshness.gl_balances).toMatchObject({ stale: false, staleAfterHours: 36 });
+    expect(c.body.compareFreshness).toMatchObject({ stale: false, staleAfterHours: 192 });
+    await db
+      .prepare("UPDATE gl_sync_years SET completed_at = ?2 WHERE division_id = ?1 AND year = ?3")
+      .bind(divA, hoursAgo(9 * 24), other)
+      .run();
+    const late = await get<BalanceSheetResponse>(bsUrl(`year=${current}&period=1`));
+    expect(late.body.compareFreshness?.stale).toBe(true);
+    const none = await get<BalanceSheetResponse>(bsUrl(`year=${current}&period=1&compare=none`));
+    expect(none.body.compareFreshness).toBeNull();
+  });
+
+  it("shows no budget column when budgets were read but none exist for the year", async () => {
+    await addAccounts(divA);
+    await addBalances(divA);
+    await markSynced(divA, { budgetYears: [2026] });
+    const r = await get<ProfitLossResponse>(plUrl("year=2026&periodTo=2"));
+    expect(r.body).toMatchObject({ status: "ok", budgetScenario: null, budgetScenarios: [] });
+    expect(r.body.report?.budgetsIncluded).toBe(false);
+    expect(r.body.report?.result.budget).toBeNull();
+  });
+
+  it("reports split keys of the data used", async () => {
+    await addAccounts(divA);
+    await addBalances(divA);
+    await markSynced(divA, { budgetYears: [2026] });
+    await db
+      .prepare(
+        "UPDATE gl_sync_years SET split_keys = CASE year WHEN 2026 THEN 2 ELSE 1 END WHERE division_id = ?1",
+      )
+      .bind(divA)
+      .run();
+    // balances 2026 (2) + 2025 (1); budgets of 2026 (2) are used only when there are rows
+    expect((await get<BalanceSheetResponse>(bsUrl("year=2026&period=2"))).body.splitKeys).toBe(3);
+    expect(
+      (await get<BalanceSheetResponse>(bsUrl("year=2026&period=2&compare=none"))).body.splitKeys,
+    ).toBe(2);
+    expect((await get<ProfitLossResponse>(plUrl("year=2026&periodTo=2"))).body.splitKeys).toBe(5);
+  });
+
+  it("reads the report rows through the indexes", async () => {
+    const plan = async (sql: string, ...binds: unknown[]): Promise<string> =>
+      (
+        await db
+          .prepare(`EXPLAIN QUERY PLAN ${sql}`)
+          .bind(...binds)
+          .all<{ detail: string }>()
+      ).results
+        .map((r) => r.detail)
+        .join(" | ");
+    const bs = await plan(
+      `SELECT gl_account_exact_id, year, period, SUM(amount_minor) FROM gl_balances
+       WHERE division_id = ?1 AND ((year = ?2 AND period <= ?3) OR (year = ?4 AND period <= ?5))
+       GROUP BY gl_account_exact_id, year, period`,
+      1,
+      2026,
+      2,
+      2025,
+      99,
+    );
+    expect(bs).toMatch(/idx_gl_balances_year|sqlite_autoindex_gl_balances/);
+    expect(bs).not.toMatch(/SCAN gl_balances(?! USING)/);
+    const drill = await plan(
+      "SELECT period, SUM(amount_minor) FROM gl_balances WHERE division_id = ?1 AND gl_account_exact_id = ?2 AND year = ?3 GROUP BY period",
+      1,
+      "x",
+      2026,
+    );
+    expect(drill).not.toMatch(/SCAN gl_balances(?! USING)/);
+    const budgets = await plan(
+      "SELECT gl_account_exact_id, SUM(amount_minor) FROM gl_budgets WHERE division_id = ?1 AND year = ?2 AND scenario = ?3 AND period BETWEEN 1 AND ?4 GROUP BY gl_account_exact_id, year, period",
+      1,
+      2026,
+      "",
+      12,
+    );
+    expect(budgets).not.toMatch(/SCAN gl_budgets(?! USING)/);
+  });
+});
+
+/**
+ * The ledger responses have EXACTLY the keys of their types in packages/core (as the K1 shape
+ * tests do for the open-item reads): `keysOf<T>()` fails to compile when a key of T is missing from
+ * the list, the runtime check when a response has a key the type does not, or lacks one.
+ */
+const keysOf =
+  <T>() =>
+  <const K extends readonly (keyof T)[]>(
+    k: K & ([keyof T] extends [K[number]] ? unknown : "missing keys"),
+  ): string[] =>
+    [...k].map(String).sort();
+const shape = (v: unknown): string[] => Object.keys(v as object).sort();
+
+const FRESH = keysOf<LedgerFreshnessEntry>()(["lastCompletedAt", "stale", "staleAfterHours"]);
+const PAIR = keysOf<Pair>()(["current", "compare"]);
+const BS_LINE = keysOf<BalanceSheetLine>()(["accountId", "code", "name", "current", "compare"]);
+const BS_SECTION = keysOf<BalanceSheetSectionResult>()(["section", "lines", "total"]);
+const BS = keysOf<BalanceSheet>()([
+  "year",
+  "period",
+  "compareYear",
+  "compareBasis",
+  "sections",
+  "result",
+  "liabilitiesAndEquity",
+  "difference",
+  "hasOpeningBalances",
+]);
+const BS_RESPONSE = keysOf<BalanceSheetResponse>()([
+  "division",
+  "status",
+  "year",
+  "period",
+  "compareYear",
+  "compareMissing",
+  "report",
+  "freshness",
+  "compareFreshness",
+  "budgetsAvailable",
+  "splitKeys",
+]);
+const VARIANCE = keysOf<Variance>()(["minor", "bps"]);
+const FIGURES = keysOf<ProfitLossFigures>()([
+  "actual",
+  "budget",
+  "lastYear",
+  "vsBudget",
+  "vsLastYear",
+]);
+const PL_LINE = keysOf<ProfitLossLine>()([
+  "accountId",
+  "code",
+  "name",
+  "actual",
+  "budget",
+  "lastYear",
+  "vsBudget",
+  "vsLastYear",
+]);
+const PL_SECTION = keysOf<ProfitLossSectionResult>()(["section", "lines", "total"]);
+const PL = keysOf<ProfitLoss>()([
+  "year",
+  "periodTo",
+  "compareYear",
+  "budgetsIncluded",
+  "sections",
+  "result",
+]);
+const PL_RESPONSE = keysOf<ProfitLossResponse>()([
+  "division",
+  "status",
+  "year",
+  "periodTo",
+  "compareYear",
+  "compareMissing",
+  "report",
+  "budgetScenario",
+  "budgetScenarios",
+  "freshness",
+  "compareFreshness",
+  "budgetsAvailable",
+  "splitKeys",
+]);
+const ACCOUNT_ROW = keysOf<LedgerAccountRow>()([
+  "id",
+  "exactId",
+  "code",
+  "name",
+  "type",
+  "typeDescription",
+  "balanceSide",
+  "balanceType",
+  "isBlocked",
+  "isActive",
+  "statement",
+  "section",
+]);
+const ACCOUNTS = keysOf<LedgerAccountsResponse>()([
+  "division",
+  "status",
+  "truncated",
+  "accounts",
+  "unclassifiedCount",
+  "freshness",
+]);
+const PERIOD_ROW = keysOf<LedgerPeriodRow>()([
+  "period",
+  "amountMinor",
+  "debitMinor",
+  "creditMinor",
+  "rows",
+]);
+const BALANCES = keysOf<LedgerAccountBalancesResponse>()([
+  "division",
+  "status",
+  "year",
+  "account",
+  "periods",
+  "totalMinor",
+  "freshness",
+]);
+
+describe("ledger response shapes match api-types.ts exactly", () => {
+  beforeEach(async () => {
+    await addAccounts(divA);
+    await addBalances(divA);
+    await addBudgets(divA, [[5, 2026, 1, -6000]]);
+    await markSynced(divA, { budgetYears: [2026] });
+  });
+
+  const freshness = (f: unknown): void => {
+    expect(shape(f)).toEqual(["gl_accounts", "gl_balances", "gl_budgets"]);
+    for (const e of Object.values(f as object)) expect(shape(e)).toEqual(FRESH);
+  };
+
+  it("balance sheet", async () => {
+    const r = (
+      await get<BalanceSheetResponse>(
+        `/api/reports/balance-sheet?division=${divA}&year=2026&period=2`,
+      )
+    ).body;
+    expect(shape(r)).toEqual(BS_RESPONSE);
+    freshness(r.freshness);
+    expect(shape(r.compareFreshness)).toEqual(FRESH);
+    const bs = r.report as BalanceSheet;
+    expect(shape(bs)).toEqual(BS);
+    expect(shape(bs.sections)).toEqual(["assets", "equity", "liabilities", "unclassified"]);
+    for (const sec of Object.values(bs.sections)) {
+      expect(shape(sec)).toEqual(BS_SECTION);
+      expect(shape(sec.total)).toEqual(PAIR);
+      for (const l of sec.lines) expect(shape(l)).toEqual(BS_LINE);
+    }
+    expect(bs.sections.assets.lines.length).toBeGreaterThan(0);
+    for (const k of ["result", "liabilitiesAndEquity", "difference", "hasOpeningBalances"] as const)
+      expect(shape(bs[k])).toEqual(PAIR);
+    const empty = (
+      await get<BalanceSheetResponse>(
+        `/api/reports/balance-sheet?division=${divB}&year=2026&period=2`,
+      )
+    ).body;
+    expect(shape(empty)).toEqual(BS_RESPONSE);
+  });
+
+  it("profit and loss", async () => {
+    const r = (
+      await get<ProfitLossResponse>(
+        `/api/reports/profit-loss?division=${divA}&year=2026&periodTo=2`,
+      )
+    ).body;
+    expect(shape(r)).toEqual(PL_RESPONSE);
+    freshness(r.freshness);
+    const pl = r.report as ProfitLoss;
+    expect(shape(pl)).toEqual(PL);
+    expect(shape(pl.sections)).toEqual(["costs", "revenue", "unclassified"]);
+    for (const sec of Object.values(pl.sections)) {
+      expect(shape(sec)).toEqual(PL_SECTION);
+      expect(shape(sec.total)).toEqual(FIGURES);
+      for (const l of sec.lines) {
+        expect(shape(l)).toEqual(PL_LINE);
+        expect(shape(l.vsBudget)).toEqual(VARIANCE);
+        expect(shape(l.vsLastYear)).toEqual(VARIANCE);
+      }
+    }
+    expect(shape(pl.result)).toEqual(FIGURES);
+    const empty = (
+      await get<ProfitLossResponse>(
+        `/api/reports/profit-loss?division=${divB}&year=2026&periodTo=2`,
+      )
+    ).body;
+    expect(shape(empty)).toEqual(PL_RESPONSE);
+  });
+
+  it("chart and account drill-down", async () => {
+    const list = (await get<LedgerAccountsResponse>(`/api/ledger/accounts?division=${divA}`)).body;
+    expect(shape(list)).toEqual(ACCOUNTS);
+    expect(list.truncated).toBe(false);
+    freshness(list.freshness);
+    for (const a of list.accounts) expect(shape(a)).toEqual(ACCOUNT_ROW);
+    const bank = list.accounts.find((a) => a.code === "1100");
+    const d = (
+      await get<LedgerAccountBalancesResponse>(
+        `/api/ledger/accounts/${bank?.id}/balances?year=2026`,
+      )
+    ).body;
+    expect(shape(d)).toEqual(BALANCES);
+    expect(shape(d.account)).toEqual(ACCOUNT_ROW);
+    expect(d.periods.length).toBeGreaterThan(0);
+    for (const p of d.periods) expect(shape(p)).toEqual(PERIOD_ROW);
   });
 });

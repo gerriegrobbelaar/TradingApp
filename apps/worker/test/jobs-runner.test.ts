@@ -864,6 +864,10 @@ describe("queue consumer (fake batch)", () => {
 
 describe("heartbeat and entry points", () => {
   it("a long job renews its lease and heartbeat; a lost lease aborts the handler", async () => {
+    // Deterministic (review K2): the lease is long (60 s), so it never runs out by itself while the
+    // test waits, whatever the machine's speed; the test only waits for observable state (a beat
+    // has extended the lease and written the heartbeat), and the lease is taken away explicitly
+    // instead of racing an expiry against the beat interval.
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     const e = envWith(new FakeQueue());
     const id = await addJob({ name: "hb", handler: "h" });
@@ -873,48 +877,60 @@ describe("heartbeat and entry points", () => {
       h: def(async () => {
         const first = (await runById(run)).id;
         const initial = (await lockOf("hb").peek())?.until ?? 0;
-        // Wait until a beat has extended the lease and written the heartbeat (not a fixed time).
-        await vi.waitFor(async () => {
-          expect((await lockOf("hb").peek())?.until ?? 0).toBeGreaterThan(initial);
-          const row = await db
-            .prepare("SELECT heartbeat_at, started_at FROM job_runs WHERE id = ?1")
-            .bind(first)
-            .first<{ heartbeat_at: string; started_at: string }>();
-          beats = Date.parse(row?.heartbeat_at ?? "") > Date.parse(row?.started_at ?? "") ? 1 : 0;
-          expect(beats).toBe(1);
-        });
+        expect(initial).toBeGreaterThan(0);
+        await vi.waitFor(
+          async () => {
+            expect((await lockOf("hb").peek())?.until ?? 0).toBeGreaterThan(initial);
+            const row = await db
+              .prepare("SELECT heartbeat_at, started_at FROM job_runs WHERE id = ?1")
+              .bind(first)
+              .first<{ heartbeat_at: string; started_at: string }>();
+            beats = Date.parse(row?.heartbeat_at ?? "") > Date.parse(row?.started_at ?? "") ? 1 : 0;
+            expect(beats).toBe(1);
+          },
+          { timeout: 10_000, interval: 10 },
+        );
+        // The lease is held (60 s) and renewed: nobody else can take it.
         const stolen = await lockOf("hb").acquire("intruder", 1000);
         return ok({ stolen: stolen.ok });
       }),
     };
-    await executeRun(e, run, { handlers, lockTtlMs: 60, heartbeatMs: 20 });
+    await executeRun(e, run, { handlers, lockTtlMs: 60_000, heartbeatMs: 20 });
     expect(beats).toBe(1);
     const r = await runById(run);
     expect(JSON.parse(r.result_json ?? "{}").summary).toEqual({ stolen: false });
-    await lockOf("hb").release("intruder");
+    // released at the end of the run
+    expect(await lockOf("hb").peek()).toBeNull();
 
-    // Lease lost: the signal aborts, the handler winds down.
+    // Lease lost: another holder takes the lock; the next beat sees it and aborts the handler.
     const run2 = await addRun(id, { scheduledFor: "2026-03-10T12:00:00.000Z" });
     let sawAbort = false;
     const handlers2 = {
-      h: def(
-        (ctx) =>
-          new Promise<HandlerResult>((resolve) => {
-            ctx.signal.addEventListener("abort", () => {
-              sawAbort = true;
-              resolve({ status: "partial", summary: {}, code: "aborted" });
-            });
-            // The lease expires (60 ms TTL, first beat at 150 ms) and another run takes the lock.
-            void vi.waitFor(async () => {
-              const got = await lockOf("hb").acquire("thief", 5000);
-              if (!got.ok) throw new Error("still held");
-            });
-          }),
-      ),
+      h: def(async (ctx) => {
+        const aborted = new Promise<void>((resolve) => {
+          ctx.signal.addEventListener("abort", () => {
+            sawAbort = true;
+            resolve();
+          });
+        });
+        const lease = await lockOf("hb").peek();
+        expect(lease).not.toBeNull();
+        expect(await lockOf("hb").release(lease?.holder ?? "")).toBe(true);
+        expect((await lockOf("hb").acquire("thief", 60_000)).ok).toBe(true);
+        await aborted;
+        return { status: "partial", summary: {}, code: "aborted" } satisfies HandlerResult;
+      }),
     };
-    await executeRun(e, run2, { handlers: handlers2, lockTtlMs: 60, heartbeatMs: 150 });
+    await executeRun(e, run2, {
+      handlers: handlers2,
+      lockTtlMs: 60_000,
+      heartbeatMs: 20,
+      graceMs: 60_000,
+    });
     expect(sawAbort).toBe(true);
     expect((await runById(run2)).status).toBe("partial");
+    // the thief's lease is untouched by the aborted run's release
+    expect((await lockOf("hb").peek())?.holder).toBe("thief");
     await lockOf("hb").release("thief");
   });
 

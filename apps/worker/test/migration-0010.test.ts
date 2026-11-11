@@ -59,10 +59,17 @@ describe("migration 0010 on a populated database", () => {
     expect(await snapshot()).toEqual(before);
     const st = await mdb
       .prepare(
-        "SELECT pass_token, done_cycle, unavailable_until FROM sync_state WHERE entity = 'receivables'",
+        `SELECT pass_token, done_cycle, unavailable_until, pass_seq, pass_started_at
+         FROM sync_state WHERE entity = 'receivables'`,
       )
       .first();
-    expect(st).toEqual({ pass_token: "tok", done_cycle: 7, unavailable_until: null });
+    expect(st).toEqual({
+      pass_token: "tok",
+      done_cycle: 7,
+      unavailable_until: null,
+      pass_seq: null,
+      pass_started_at: null,
+    });
     const tables = (
       await mdb
         .prepare(
@@ -101,9 +108,23 @@ describe("migration 0010 on a populated database", () => {
     await expect(mdb.prepare(bal(100)).run()).rejects.toThrow(); // period 0..99
     await expect(mdb.prepare(bal(2).replace("'EUR'", "'eur'")).run()).rejects.toThrow(); // upper-case ISO code
     const saved = await mdb
-      .prepare("SELECT amount_minor FROM gl_balances WHERE period = 1 AND dimension = ''")
+      .prepare(
+        "SELECT amount_minor, split_key, pass_seq FROM gl_balances WHERE period = 1 AND dimension = ''",
+      )
       .first();
-    expect(saved).toEqual({ amount_minor: -150 });
+    expect(saved).toEqual({ amount_minor: -150, split_key: 0, pass_seq: null });
+    await expect(
+      mdb.prepare("UPDATE gl_balances SET split_key = 2 WHERE period = 1").run(),
+    ).rejects.toThrow(); // 0 or 1
+    await mdb
+      .prepare(
+        "INSERT INTO gl_sync_years (division_id, entity, year, completed_at) VALUES (9, 'gl_balances', 2026, '2026-01-01T00:00:00Z')",
+      )
+      .run();
+    expect(await mdb.prepare("SELECT rows_read, split_keys FROM gl_sync_years").first()).toEqual({
+      rows_read: 0,
+      split_keys: 0,
+    });
     await mdb
       .prepare(
         `INSERT INTO gl_budgets (division_id, gl_account_exact_id, year, period, scenario, amount_minor,

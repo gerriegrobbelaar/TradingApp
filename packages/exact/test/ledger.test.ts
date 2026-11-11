@@ -20,7 +20,7 @@ const envelope = (rows: string[], next?: string): string =>
 const account = (n: number, over = ""): string =>
   `{"ID":"${G(n)}","Code":"  ${1000 + n}","Description":" Account ${n} ","Type":12,"TypeDescription":"Bank","BalanceSide":"D","BalanceType":"B","Blocked":false${over}}`;
 const balance = (n: number, year: number, period: number, amount: string, over = ""): string =>
-  `{"GLAccount":"${G(n)}","GLAccountCode":"${1000 + n}","ReportingYear":${year},"ReportingPeriod":${period},"Amount":${amount},"AmountDebit":${amount.startsWith("-") ? "0" : amount},"AmountCredit":${amount.startsWith("-") ? amount.slice(1) : "0"},"BalanceType":"B","Status":null,"CostcenterCode":null${over}}`;
+  `{"GLAccount":"${G(n)}","GLAccountCode":"${1000 + n}","ReportingYear":${year},"ReportingPeriod":${period},"Amount":${amount},"AmountDebit":${amount.startsWith("-") ? "0" : amount},"AmountCredit":${amount.startsWith("-") ? amount.slice(1) : "0"},"BalanceType":"B","Status":null,"CostCenterCode":null${over}}`;
 
 describe("chart of accounts", () => {
   it("maps accounts, trims, and sends a $select of the documented fields", async () => {
@@ -170,14 +170,27 @@ describe("reporting balances", () => {
 
   it("splits periods over status and cost centre in the dimension", async () => {
     const row = balance(1, 2026, 3, "5", "").replace(
-      `"Status":null,"CostcenterCode":null`,
-      `"Status":"20","CostcenterCode":" CC1 "`,
+      `"Status":null,"CostCenterCode":null`,
+      `"Status":"20","CostCenterCode":" CC1 "`,
     );
     const { transport } = scripted([ok(envelope([row]))]);
     const r = await createExactClient(transport, base).listReportingBalancesChunk(null, {
       year: 2026,
     });
     expect(r.items[0]?.dimension).toBe("20|CC1");
+  });
+
+  it("adds the cost unit to the dimension and reads a numeric status (review K2)", async () => {
+    const row = balance(1, 2026, 3, "5", "").replace(
+      `"Status":null,"CostCenterCode":null`,
+      `"Status":50,"CostCenterCode":null,"CostUnitCode":"U7"`,
+    );
+    const { transport, calls } = scripted([ok(envelope([row]))]);
+    const r = await createExactClient(transport, base).listReportingBalancesChunk(null, {
+      year: 2026,
+    });
+    expect(r.items[0]?.dimension).toBe("50||U7");
+    expect(calls[0]?.query?.["$select"]).toContain("CostUnitCode");
   });
 
   it("validates the year and rows", async () => {

@@ -320,27 +320,44 @@ sync panel on the test division.
     until the cycle completes, then check, in this order:
     - `financial/GLAccounts`, `financial/ReportingBalance` and `budget/Budgets` answer to the
       `$select` lists in `packages/exact/src/client.ts` (`GL_ACCOUNT_FIELDS`,
-      `REPORTING_BALANCE_FIELDS`, `BUDGET_FIELDS`). A 400 names a wrong field; for budgets it shows
-      as `gl_budgets` with `last_error = budgets_unavailable_400` (budgets are optional and tried
-      again after a week, or at once with a full sync that restarts). Also: page size (60?),
-      `$skiptoken` paging, `Blocked` as the blocked flag, `Type` numeric, `BalanceSide` D/C,
-      `BalanceType` B/W.
-    - **Sign and meaning of `Amount`.** Open Reporting, Balance sheet for the last closed month and
-      compare with Exact's own trial balance: if every figure has the wrong sign or the totals are
-      off, adjust the debit - credit assumption; if balance sheet figures look like movements, or
-      a double-counted year, set `LEDGER_BALANCE_SEMANTICS` (`packages/core/src/reports/ledger.ts`)
-      to `"cumulative"`. The **check line** (`difference`) must be 0; a non-zero value usually means
-      period 0 (brought-forward balances) is missing or the semantics are wrong.
+      `REPORTING_BALANCE_FIELDS`, `BUDGET_FIELDS`). A 400 names a wrong field. For balances it
+      shows as `gl_balances` with `last_error = http_400` and no report; the cost centre / cost
+      unit fields are the likeliest culprits (`CostCenterCode` / `CostUnitCode` on ReportingBalance
+      against `Costcenter` / `Costunit` on Budgets: try the other spelling). **For budgets a 400 is
+      read as "not licensed"**: `gl_budgets` then has `last_error = budgets_unavailable_400` and
+      the reports silently have no budget column for a week. So check `sync_state.last_error` of
+      `gl_budgets` on the first live run even when budgets are expected to be unavailable, and
+      fix a wrong field before accepting "unavailable"; a full sync with "restart" tries again at
+      once. Also: page size (60?), `$skiptoken` paging (an ID keyset or an offset?), `Blocked` as
+      the blocked flag, `Type` numeric, `BalanceSide` D/C, `BalanceType` B/W, `Status` 20/50.
+    - **Sign and meaning of `Amount`.** Open the balance sheet for the last closed month and
+      compare it with Exact's own balance sheet / trial balance, line by line: if every figure has
+      the wrong sign, adjust the debit - credit assumption; if balance sheet figures look like
+      movements, or a double-counted year, set `LEDGER_BALANCE_SEMANTICS`
+      (`packages/core/src/reports/ledger.ts`) to `"cumulative"`. The **check line**
+      (`difference`) must be 0, **but 0 alone does not prove the opening balances are there**:
+      when period 0 is missing altogether the movements still balance. `hasOpeningBalances` must
+      be `true` for every year after the first, and the bank line must equal the bank balance in
+      Exact. A non-zero difference usually means the opening of the year does not include last
+      year's result (year not closed in Exact) or the semantics are wrong.
     - **Unclassified accounts.** `GET /api/ledger/accounts` lists `section: "unclassified"` and
       `unclassifiedCount`. Fill the real `GLAccount.Type` codes into `BS_TYPE_SECTIONS`
-      (`reports/classify.ts`) and list the type descriptions seen.
-    - Whether ReportingBalance includes draft entries, whether rows are split over more than
-      status and cost centre (compare `gl_balances` row counts per account and period with the
-      distinct keys in Exact), the budget sign and scenarios, and the reporting year when the
+      (`reports/classify.ts`; only 10, 12, 20 and 22 are mapped now, 21 is deliberately not) and
+      list the type descriptions seen. An account whose `BalanceSide` is empty is never placed by
+      a keyword alone.
+    - **Split keys.** `splitKeys` in the report responses (and `gl_sync_years.split_keys`) must be
+      0. A non-zero value means Exact returned the same account, period, status, cost centre and
+      cost unit twice in one read: another field splits the figure (item, project, ...), the
+      stored amount is the last part only and is too low. Add that field to
+      `REPORTING_BALANCE_FIELDS` / `BUDGET_FIELDS` and to the dimension.
+    - Whether ReportingBalance includes draft entries (status 20) and whether the reports should
+      (ADR 0024 open question 3), the budget sign and scenarios, and the reporting year when the
       financial year is not the calendar year.
-    - Call arithmetic: a normal night adds about 65 calls for 300 accounts, the
-      weekly night about 155; read `exact_usage` after the first full cycle.
-
+    - Call arithmetic: a normal night adds about 65 calls for 300 accounts (70 with an opening
+      row for every account), the weekly night about 155; read `exact_usage` after the first full
+      cycle. A ledger that needs more than one night continues for up to 5 days
+      (`LEDGER_PASS_MAX_AGE_MS`); if `gl_balances` is still `partial` after that, raise the
+      job's `exact_budget` or the page size question first.
 ---
 
 ## Operations
