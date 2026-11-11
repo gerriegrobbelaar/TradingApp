@@ -1470,11 +1470,14 @@ describe("response shapes", () => {
       "exactState",
       "reviewReason",
       "undoAvailable",
+      "bookingDeferredCode",
+      "bookedManually",
       "allocations",
     ];
     expect(keys(created.match)).toEqual([...matchKeys].sort());
     expect(keys((await get<MatchStatsResponse>("admin", "/api/matching/stats")).body)).toEqual([
       "autoEnabled",
+      "booking",
       "enabled",
       "ignored",
       "liveAutoMatches",

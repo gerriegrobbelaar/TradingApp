@@ -499,7 +499,8 @@ export function claimStatement(
   }
   return db
     .prepare(
-      `UPDATE matches SET exact_state = ?2, exact_note = ?3
+      `UPDATE matches SET exact_state = ?2, exact_note = ?3, booking_deferred_code = NULL,
+         booking_deferred_at = NULL
        WHERE id = ?1 AND undone_at IS NULL AND exact_state = 'not_booked' AND review_reason IS NULL`,
     )
     .bind(matchId, nextState, note);

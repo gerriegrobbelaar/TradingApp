@@ -49,8 +49,12 @@ const cand = (over: Partial<Candidate> = {}, items: CandidateItem[] = [item()]):
     counterpartyName: "Acme B.V.",
     reference: "INV 2026001",
     description: null,
+    feeMinor: null,
   },
-  map: { journalCode: "90", receivableGl: "1300", payableGl: "1600" },
+  map: { journalCode: "90", receivableGl: "1300", payableGl: "1600", openingBalanceMinor: null },
+  txConnectionCreatesBankEntries: true,
+  deferredCode: null,
+  deferredAt: null,
   items,
   ...over,
 });
@@ -146,7 +150,14 @@ describe("planMatch", () => {
     ["no relation code", cand({}, [item({ relationCode: null })]), "relation_code_unknown"],
     [
       "no control account",
-      cand({ map: { journalCode: "90", receivableGl: null, payableGl: "1600" } }),
+      cand({
+        map: {
+          journalCode: "90",
+          receivableGl: null,
+          payableGl: "1600",
+          openingBalanceMinor: null,
+        },
+      }),
       "control_account_unknown",
     ],
     [

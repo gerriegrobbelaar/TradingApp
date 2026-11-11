@@ -9,6 +9,7 @@
  *                                                      on a TEST division (stores the protocol version).
  *                                                      Also switches booking OFF: enabling is always explicit.
  *  GET  /api/booking/outbox                 any role   ?status=&limit=&cursor=
+ *  POST /api/booking/preview                admin, step-up   {matchIds: 1..3}: a dry run, reads only
  *  POST /api/booking/outbox/:id/resolve     admin, step-up   {resolution, note}
  *
  * Every write is audited in the same batch (ADR 0013). Nothing here calls Exact.
@@ -16,11 +17,12 @@
 import {
   type BookingOutboxItemDto,
   type BookingOutboxResponse,
+  type BookingPreviewResponse,
   type BookingResolveResponse,
   type BookingSettingsResponse,
   type BookingStatus,
 } from "@camelthorn/core";
-import { maskIbans, phraseMatches } from "@camelthorn/core";
+import { BOOKING_VERIFY_CHECKS, maskIbans, phraseMatches } from "@camelthorn/core";
 import { BOOKING_PROTOCOL_VERSION } from "./protocol";
 import { isStepUpFresh } from "../auth/session";
 import { auditStatement } from "../db/audit";
@@ -37,11 +39,19 @@ import {
   type OutboxStatus,
 } from "./outbox";
 import { parseDoc } from "./plan";
+import { PREVIEW_MAX_MATCHES, runPreview } from "./preview";
+import { retryUnsentClaim } from "./unsent";
 import {
   blockersOf,
+  BOOKING_FROM_MAX_FUTURE_MS,
   ENABLE_PHRASE,
   loadBookingState,
+  MAX_MAX_PER_RUN,
+  sameChecks,
+  SETTING_DIVISIONS,
   SETTING_ENABLED,
+  SETTING_FROM,
+  SETTING_MAX_PER_RUN,
   SETTING_VERIFIED,
   VERIFY_PHRASE,
 } from "./settings";
@@ -54,7 +64,7 @@ const MAX_LIMIT = 100;
 class ApiError extends Error {
   constructor(
     readonly code: string,
-    readonly status: 400 | 401 | 404 | 409 = 400,
+    readonly status: 400 | 401 | 404 | 409 | 422 = 400,
     readonly extra: Record<string, unknown> = {},
   ) {
     super(code);
@@ -110,6 +120,18 @@ function note(v: unknown, min: number, max: number, code: string): string {
 
 // ---- settings -------------------------------------------------------------------------------------
 
+/** Live, not-booked matches older than the watermark (all of them while booking was never enabled). */
+async function backlogCountOf(db: D1Database, bookingFrom: string | null): Promise<number> {
+  const r = await db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM matches
+       WHERE undone_at IS NULL AND exact_state = 'not_booked' AND (?1 IS NULL OR created_at < ?1)`,
+    )
+    .bind(bookingFrom)
+    .first<{ n: number }>();
+  return r?.n ?? 0;
+}
+
 async function settingsResponse(db: D1Database): Promise<BookingSettingsResponse> {
   const s = await loadBookingState(db);
   return {
@@ -119,6 +141,10 @@ async function settingsResponse(db: D1Database): Promise<BookingSettingsResponse
     protocolChanged: s.protocolChanged,
     createsBankEntries: s.createsBankEntries,
     blockers: blockersOf(s),
+    bookingFrom: s.bookingFrom,
+    backlogCount: await backlogCountOf(db, s.bookingFrom),
+    divisions: s.divisions,
+    maxPerRun: s.maxPerRun,
   };
 }
 
@@ -130,12 +156,114 @@ const UPSERT_SETTING = `INSERT INTO settings (key, value_json, updated_by) VALUE
   ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, updated_by = excluded.updated_by,
     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`;
 
+const MAX_DIVISIONS = 20;
+
+/** The limits of booking (U1, review B2b/c): the watermark, the allow-list and the per-run cap. */
+async function putLimits(
+  ctx: Ctx,
+  b: Record<string, unknown>,
+  who: string,
+  why: string | null,
+): Promise<Response> {
+  const db = ctx.env.DB;
+  const before = await loadBookingState(db);
+  const stmts: D1PreparedStatement[] = [];
+  const beforeJson: Record<string, unknown> = {};
+  const afterJson: Record<string, unknown> = {};
+  let widening = false;
+
+  if (b["bookingFrom"] !== undefined) {
+    const raw = b["bookingFrom"];
+    if (typeof raw !== "string" || raw.length > 40) throw new ApiError("bad_booking_from");
+    const ms = Date.parse(raw);
+    if (!Number.isFinite(ms) || ms < Date.parse("2000-01-01T00:00:00Z")) {
+      throw new ApiError("bad_booking_from");
+    }
+    if (ms > ctx.nowMs + BOOKING_FROM_MAX_FUTURE_MS) throw new ApiError("booking_from_in_future");
+    const next = new Date(ms).toISOString();
+    // Moving the watermark LATER only narrows what is booked; anything else widens it.
+    if (before.bookingFrom === null || next < before.bookingFrom) widening = true;
+    beforeJson["bookingFrom"] = before.bookingFrom;
+    afterJson["bookingFrom"] = next;
+    stmts.push(db.prepare(UPSERT_SETTING).bind(SETTING_FROM, JSON.stringify(next), who));
+  }
+  if (b["divisions"] !== undefined) {
+    const raw = b["divisions"];
+    if (
+      !Array.isArray(raw) ||
+      raw.length > MAX_DIVISIONS ||
+      !raw.every((x) => typeof x === "number" && Number.isSafeInteger(x) && x >= 1)
+    ) {
+      throw new ApiError("bad_divisions");
+    }
+    const ids = [...new Set(raw as number[])].sort((a, c) => a - c);
+    if (ids.length > 0) {
+      const marks = ids.map((_, i) => `?${i + 1}`).join(", ");
+      const known = (
+        await db
+          .prepare(
+            `SELECT d.id FROM divisions d JOIN connections c ON c.id = d.connection_id
+             WHERE c.kind = 'exact' AND d.id IN (${marks})`,
+          )
+          .bind(...ids)
+          .all<{ id: number }>()
+      ).results;
+      if (known.length !== ids.length) throw new ApiError("unknown_division", 422);
+    }
+    if (ids.some((id) => !before.divisions.includes(id))) widening = true;
+    beforeJson["divisions"] = before.divisions;
+    afterJson["divisions"] = ids;
+    stmts.push(db.prepare(UPSERT_SETTING).bind(SETTING_DIVISIONS, JSON.stringify(ids), who));
+  }
+  if (b["maxPerRun"] !== undefined) {
+    const raw = b["maxPerRun"];
+    if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1 || raw > MAX_MAX_PER_RUN) {
+      throw new ApiError("bad_max_per_run");
+    }
+    if (raw > before.maxPerRun) widening = true;
+    beforeJson["maxPerRun"] = before.maxPerRun;
+    afterJson["maxPerRun"] = raw;
+    stmts.push(db.prepare(UPSERT_SETTING).bind(SETTING_MAX_PER_RUN, JSON.stringify(raw), who));
+  }
+  if (stmts.length === 0) throw new ApiError("bad_request");
+  // Widening what may be written to Exact needs a fresh sign-in; narrowing is the safe direction.
+  if (widening && (!ctx.session || !isStepUpFresh(ctx.session, ctx.nowMs))) {
+    return json({ error: "step_up_required" }, 401);
+  }
+  await db.batch([
+    ...stmts,
+    auditStatement(db, {
+      actorEmail: who,
+      action: "booking.limits_changed",
+      entity: "settings",
+      entityId: "exact.booking_limits",
+      before: beforeJson,
+      after: { ...afterJson, ...(why !== null ? { note: why } : {}) },
+    }),
+  ]);
+  return json(await settingsResponse(db));
+}
+
 async function putSettingsHandler(ctx: Ctx): Promise<Response> {
   const db = ctx.env.DB;
   const who = actor(ctx);
-  const b = await readBody(ctx, ["enabled", "confirm", "note"]);
-  if (typeof b["enabled"] !== "boolean") throw new ApiError("bad_request");
+  const b = await readBody(ctx, [
+    "enabled",
+    "confirm",
+    "note",
+    "bookingFrom",
+    "divisions",
+    "maxPerRun",
+  ]);
   const why = b["note"] === undefined ? null : note(b["note"], 1, 200, "bad_note");
+  const hasLimits =
+    b["bookingFrom"] !== undefined || b["divisions"] !== undefined || b["maxPerRun"] !== undefined;
+  if (b["enabled"] === undefined) {
+    // Limits only. A phrase here would mean the caller expects a switch: refuse the mixed shape.
+    if (!hasLimits || b["confirm"] !== undefined) throw new ApiError("bad_request");
+    return putLimits(ctx, b, who, why);
+  }
+  if (typeof b["enabled"] !== "boolean" || hasLimits) throw new ApiError("bad_request");
 
   if (b["enabled"] === false) {
     // The safe direction: admin only (route), no step-up, no phrase. Audited when it changes.
@@ -163,20 +291,28 @@ async function putSettingsHandler(ctx: Ctx): Promise<Response> {
   const before = await loadBookingState(db);
   const blockers = blockersOf(before).filter((x) => x !== "writes_disabled");
   if (blockers.length > 0) throw new ApiError("blocked", 409, { blockers });
+  // The watermark is NOW on every enable: only matches made from here on are booked (review B2b).
+  const from = new Date(ctx.nowMs).toISOString();
+  const backlog = await backlogCountOf(db, from);
   // The conditions are repeated in the write itself, so a change between the read and the write
-  // (a connection disabled, a verification replaced) cannot slip through.
+  // (a connection disabled, a verification replaced, a mode flipped, the allow-list emptied) cannot
+  // slip through.
   const out = await db.batch([
     db
       .prepare(
         `INSERT INTO settings (key, value_json, updated_by)
          SELECT ?1, 'true', ?2
-         WHERE EXISTS (SELECT 1 FROM settings WHERE key = ?3 AND json_extract(value_json, '$.protocolVersion') = ?4)
+         WHERE EXISTS (SELECT 1 FROM settings WHERE key = ?3 AND json_extract(value_json, '$.protocolVersion') = ?4
+                         AND json_extract(value_json, '$.createsBankEntries') =
+                             (SELECT creates_bank_entries FROM connections WHERE kind = 'revolut' ORDER BY id LIMIT 1))
+           AND EXISTS (SELECT 1 FROM settings WHERE key = ?5 AND json_valid(value_json)
+                         AND json_array_length(value_json) > 0)
            AND EXISTS (SELECT 1 FROM connections WHERE kind = 'exact' AND status = 'active')
            AND EXISTS (SELECT 1 FROM connections WHERE kind = 'revolut' AND bank_entries_decided_at IS NOT NULL)
          ON CONFLICT (key) DO UPDATE SET value_json = 'true', updated_by = excluded.updated_by,
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
       )
-      .bind(SETTING_ENABLED, who, SETTING_VERIFIED, BOOKING_PROTOCOL_VERSION),
+      .bind(SETTING_ENABLED, who, SETTING_VERIFIED, BOOKING_PROTOCOL_VERSION, SETTING_DIVISIONS),
     auditStatement(
       db,
       {
@@ -184,16 +320,28 @@ async function putSettingsHandler(ctx: Ctx): Promise<Response> {
         action: "booking.enabled",
         entity: "settings",
         entityId: SETTING_ENABLED,
-        before: { enabled: before.enabled },
+        before: { enabled: before.enabled, bookingFrom: before.bookingFrom },
         after: {
           enabled: true,
           protocolVersion: BOOKING_PROTOCOL_VERSION,
           createsBankEntries: before.createsBankEntries,
+          bookingFrom: from,
+          divisions: before.divisions,
+          maxPerRun: before.maxPerRun,
+          backlogCount: backlog,
           ...(why !== null ? { note: why } : {}),
         },
       },
       { sql: GUARD, binds: [] },
     ),
+    // Only when the switch really went on: the watermark moves to now.
+    db
+      .prepare(
+        `INSERT INTO settings (key, value_json, updated_by) SELECT ?1, ?2, ?3 WHERE ${GUARD}
+         ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, updated_by = excluded.updated_by,
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+      )
+      .bind(SETTING_FROM, JSON.stringify(from), who),
   ]);
   if ((out[0]?.meta.changes ?? 0) !== 1) {
     const now = await loadBookingState(db);
@@ -207,16 +355,24 @@ async function putSettingsHandler(ctx: Ctx): Promise<Response> {
 async function verifyHandler(ctx: Ctx): Promise<Response> {
   const db = ctx.env.DB;
   const who = actor(ctx);
-  const b = await readBody(ctx, ["note", "confirm"]);
+  const b = await readBody(ctx, ["note", "confirm", "checks"]);
   if (typeof b["confirm"] !== "string" || !phraseMatches(b["confirm"], VERIFY_PHRASE))
     throw new ApiError("confirmation_required");
+  // Every check ticked: exactly the list of core, nothing missing, nothing extra, no duplicates (S7).
+  if (!Array.isArray(b["checks"]) || !sameChecks(b["checks"])) {
+    throw new ApiError("checks_incomplete");
+  }
   const text = note(b["note"], 10, 500, "bad_note");
   const before = await loadBookingState(db);
+  // A verification belongs to one booking mode: without a decision there is nothing to verify.
+  if (before.createsBankEntries === null) throw new ApiError("bank_entries_undecided", 409);
   const mark = {
     at: new Date(ctx.nowMs).toISOString(),
     by: who,
     note: text,
     protocolVersion: BOOKING_PROTOCOL_VERSION,
+    checks: [...BOOKING_VERIFY_CHECKS],
+    createsBankEntries: before.createsBankEntries,
   };
   await db.batch([
     db.prepare(UPSERT_SETTING).bind(SETTING_VERIFIED, JSON.stringify(mark), who),
@@ -232,7 +388,13 @@ async function verifyHandler(ctx: Ctx): Promise<Response> {
         protocolVersion: before.verified?.protocolVersion ?? null,
         enabled: before.enabled,
       },
-      after: { protocolVersion: BOOKING_PROTOCOL_VERSION, note: text, enabled: false },
+      after: {
+        protocolVersion: BOOKING_PROTOCOL_VERSION,
+        note: text,
+        enabled: false,
+        checks: mark.checks,
+        createsBankEntries: mark.createsBankEntries,
+      },
     }),
   ]);
   return json(await settingsResponse(db));
@@ -255,11 +417,12 @@ interface ListRow {
   currency: string;
   counterparty_name: string | null;
   ledger_account_code: string | null;
+  manually_booked: number;
 }
 
 const LIST_SELECT = `SELECT o.id, o.match_id, o.kind, o.status, o.attempts, o.last_error_code, o.exact_ref,
     o.created_at, o.updated_at, t.id AS tx_id, m.amount_minor, m.currency, t.counterparty_name,
-    m.ledger_account_code
+    m.ledger_account_code, m.manually_booked
   FROM exact_write_outbox o
     JOIN matches m ON m.id = o.match_id
     JOIN bank_transactions t ON t.id = m.bank_transaction_id`;
@@ -286,6 +449,7 @@ async function toDtos(db: D1Database, rows: ListRow[]): Promise<BookingOutboxIte
     }
   }
   return rows.map((r) => ({
+    bookedManually: r.manually_booked === 1,
     id: r.id,
     matchId: r.match_id,
     kind: r.kind,
@@ -397,6 +561,17 @@ async function resolveHandler(ctx: Ctx): Promise<Response> {
   if (sibling !== null) throw new ApiError("in_flight", 409);
 
   let applied: boolean;
+  if (resolution === "retry" && row.status === "manual_required") {
+    // A claimed match that never reached Exact (stage 'none', nothing sent): back to the review
+    // queue, the next run plans it again (or defers it with a code). Anything else is not retryable.
+    const none = parseDoc(row.payload_json, row.payload_hash)?.stage === "none";
+    if (!none) throw new ApiError("not_retryable", 409);
+    const snapshot = await rowDto(db, row);
+    const r = await retryUnsentClaim(db, row.match_id, who, text);
+    if (r.kind !== "done") throw new ApiError("not_retryable", 409);
+    const out: BookingResolveResponse = { item: snapshot, released: true };
+    return json(out);
+  }
   if (resolution === "retry") {
     if (!RETRYABLE.includes(row.status)) throw new ApiError("not_retryable", 409);
     const doc = parseDoc(row.payload_json, row.payload_hash);
@@ -411,9 +586,10 @@ async function resolveHandler(ctx: Ctx): Promise<Response> {
       to: "pending",
       token: null,
       nowIso,
-      errorCode: null,
+      // The last error code stays: the executor needs it to judge a later read-back (B2a).
       needsProbe: true,
       nextAttemptAt: null,
+      adminResolved: { by: who, at: nowIso },
       ...(resetsMatch ? { match: { from: match.exact_state, to: "booking", note: null } } : {}),
       actor: who,
       action: "booking.retry",
@@ -438,8 +614,8 @@ async function resolveHandler(ctx: Ctx): Promise<Response> {
             match: {
               from: match.exact_state,
               to: toMatch,
-              note: done ? null : "given_up",
-              ...(done ? { bookedAt: nowIso } : {}),
+              note: done ? "booked_manually" : "given_up",
+              ...(done ? { bookedAt: nowIso, manuallyBooked: true } : {}),
             },
           }
         : {}),
@@ -467,13 +643,40 @@ async function resolveHandler(ctx: Ctx): Promise<Response> {
   return json(out);
 }
 
+/** The DTO of a row as it was before it was removed (the response of a released claim). */
+async function rowDto(db: D1Database, row: OutboxRow): Promise<BookingOutboxItemDto> {
+  const fresh = await db.prepare(`${LIST_SELECT} WHERE o.id = ?1`).bind(row.id).first<ListRow>();
+  const [item] = fresh === null ? [] : await toDtos(db, [fresh]);
+  if (item === undefined) throw new ApiError("not_found", 404);
+  return item;
+}
+
 // ---- registration ---------------------------------------------------------------------------------
+
+async function previewHandler(ctx: Ctx): Promise<Response> {
+  const who = actor(ctx);
+  const b = await readBody(ctx, ["matchIds"]);
+  const raw = b["matchIds"];
+  if (
+    !Array.isArray(raw) ||
+    raw.length < 1 ||
+    raw.length > PREVIEW_MAX_MATCHES ||
+    !raw.every((x) => typeof x === "number" && Number.isSafeInteger(x) && x >= 1)
+  ) {
+    throw new ApiError("bad_match_ids");
+  }
+  const ids = [...new Set(raw as number[])];
+  const out: BookingPreviewResponse = await runPreview(ctx.env, ctx.env.DB, ids, who, ctx.nowMs);
+  return json(out);
+}
 
 export function registerBookingRoutes(router: Router): void {
   router.add("GET", "/api/booking/settings", ANY_ROLE, safely(getSettingsHandler));
   // Disabling needs only an admin; enabling checks the fresh sign-in itself (same answer as the router).
   router.add("PUT", "/api/booking/settings", ADMIN, safely(putSettingsHandler));
   router.add("POST", "/api/booking/verify", ADMIN_STEP_UP, safely(verifyHandler));
+  // A dry run: reads only (job id exact-booking-preview), never needs the switch, writes one audit row.
+  router.add("POST", "/api/booking/preview", ADMIN_STEP_UP, safely(previewHandler));
   router.add("GET", "/api/booking/outbox", ANY_ROLE, safely(listHandler));
   router.add("POST", "/api/booking/outbox/:id/resolve", ADMIN_STEP_UP, safely(resolveHandler));
 }

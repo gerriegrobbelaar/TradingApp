@@ -200,6 +200,7 @@ export const ERROR_TEXT: Record<string, string> = {
   bad_division: "That administration is not valid.",
   bad_journal_code: "That journal code is not valid.",
   bad_gl_account: "That bank ledger account code is not valid.",
+  bad_opening_balance: "The opening balance must be a whole number of cents.",
   bad_ids: "The invoices could not be checked. Remove one and try again.",
   bad_status: "That filter is not valid.",
   bad_q: "That search is too long or not valid.",

@@ -19,7 +19,16 @@ import {
 } from "@camelthorn/exact";
 import { classifyWriteError, RunStop } from "./classify";
 import * as K from "./constants";
-import { bankLineText, buildMatchsetFromPlan, planMatch, type Candidate } from "./plan";
+import {
+  bankLineText,
+  buildMatchsetFromPlan,
+  DEFER_PLAN_CODES,
+  modeDeferral,
+  planMatch,
+  READ_DEFERRAL_CODES,
+  type Candidate,
+} from "./plan";
+import { ourPostMayHaveLanded, PREFLIGHT_CODE, preflightFromVerdict } from "./preflight";
 
 const G = (n: number): string => `0000000${n}-1111-4222-8333-444444444444`.slice(-36);
 
@@ -30,6 +39,8 @@ function candidate(o: {
   currency?: string;
   base?: string;
   text?: [string | null, string | null, string | null];
+  fee?: number | null;
+  connMode?: boolean | null;
 }): Candidate {
   return {
     matchId: 1,
@@ -50,8 +61,12 @@ function candidate(o: {
       counterpartyName: o.text?.[0] ?? "Acme B.V.",
       reference: o.text?.[1] ?? "Invoice 2026001",
       description: o.text?.[2] ?? null,
+      feeMinor: o.fee ?? null,
     },
-    map: { journalCode: "90", receivableGl: "1300", payableGl: "1600" },
+    map: { journalCode: "90", receivableGl: "1300", payableGl: "1600", openingBalanceMinor: null },
+    txConnectionCreatesBankEntries: o.connMode === undefined ? true : o.connMode,
+    deferredCode: null,
+    deferredAt: null,
     items: (o.items ?? []).map((i, n) => ({
       id: n + 1,
       exactId: G(n + 1),
@@ -172,6 +187,40 @@ const ERROR_SAMPLES: readonly unknown[] = [
   new Error("boom"),
 ];
 
+const VERDICT_SAMPLES: readonly Parameters<typeof preflightFromVerdict>[0][] = [
+  { outcome: "verified" },
+  { outcome: "not_applied" },
+  { outcome: "inconclusive", problems: [{ index: -1, reason: "partially_applied" }] },
+  { outcome: "inconclusive", problems: [{ index: 0, reason: "unexpected_open_amount" }] },
+  { outcome: "inconclusive", problems: [{ index: 0, reason: "missing" }] },
+  { outcome: "inconclusive", problems: [{ index: 0, reason: "ambiguous" }] },
+];
+
+/** What decides whether a match is deferred, refused or sent (U1): the rules, on samples. */
+function guardSamples(): unknown {
+  return [
+    DEFER_PLAN_CODES,
+    READ_DEFERRAL_CODES,
+    PREFLIGHT_CODE,
+    VERDICT_SAMPLES.map((v) => preflightFromVerdict(v)),
+    [
+      candidate({ tx: 100, items: [{ kind: "invoice", open: 100, alloc: 100 }], fee: 5 }),
+      candidate({ tx: 100, items: [{ kind: "invoice", open: 100, alloc: 100 }], fee: 0 }),
+      candidate({ tx: 100, items: [{ kind: "invoice", open: 100, alloc: 100 }], connMode: false }),
+      candidate({ tx: 100, items: [{ kind: "invoice", open: 100, alloc: 100 }], connMode: null }),
+    ].flatMap((c) => [modeDeferral(c, true), modeDeferral(c, false)]),
+    [
+      [0, null],
+      [1, null],
+      [1, "network"],
+      [1, "matchset_refused"],
+      [1, "matchset_not_applied"],
+      [2, "exact_http_502"],
+      [1, "exact_rejected_400"],
+    ].map(([n, c]) => ourPostMayHaveLanded(n as number, c as string | null)),
+  ];
+}
+
 /** The canonical text hashed into the version (exported for tests). */
 export function workerProtocolCanonical(): string {
   return JSON.stringify([
@@ -179,6 +228,7 @@ export function workerProtocolCanonical(): string {
     planSamples(),
     TEXT_SAMPLES.map((t) => bankLineText(candidate({ tx: 1, text: t }))),
     ERROR_SAMPLES.map((e) => classifyWriteError(e)),
+    guardSamples(),
     K,
   ]);
 }

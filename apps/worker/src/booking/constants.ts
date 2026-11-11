@@ -2,7 +2,12 @@
  * The booking executor's limits and timings (task M7c, ADR 0044). Kept apart from the executor so
  * they can be part of BOOKING_PROTOCOL_VERSION (booking/protocol.ts) without an import cycle.
  */
+/** Upper bound of matches a run may START (the admin's `exact.booking_max_per_run` is 1 to this). */
 export const MAX_MATCHES_PER_RUN = 10;
+/** Candidates a run looks at (deferred ones included), so a deferred match cannot starve the rest. */
+export const MAX_CANDIDATES_SCANNED = 25;
+/** A match deferred for a reason read from Exact is looked at again after this long, not every run. */
+export const DEFER_RECHECK_MS = 30 * 60_000;
 export const MAX_CALLS_PER_RUN = 30;
 /**
  * Calls this job may spend in any rolling 25 hours (all administrations together). 25, not 24: the

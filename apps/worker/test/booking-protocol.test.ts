@@ -41,9 +41,29 @@ describe("worker BOOKING_PROTOCOL_VERSION", () => {
     expect(c).not.toMatch(/NL91ABNA0417164300/);
   });
 
+  it("covers what decides whether something is sent at all (U1): deferrals, preflight, fees, mode, canary", () => {
+    const c = workerProtocolCanonical();
+    for (const part of [
+      "control_account_unknown", // deferral codes
+      "bank_balance_unknown",
+      "already_settled_in_exact", // preflight codes
+      "items_changed",
+      "preflight_inconclusive",
+      "fee_not_supported_v1", // the fee rule
+      "mode_mismatch", // the mode rule
+      '"open_as_expected"', // the verdicts on samples
+      '"already_settled"',
+      '"changed"',
+      '"MAX_CANDIDATES_SCANNED":25', // the new limits
+      '"DEFER_RECHECK_MS":1800000',
+    ]) {
+      expect(c, part).toContain(part);
+    }
+  });
+
   it("is pinned: a deliberate change must update this value AND re-verify on a test division", () => {
     expect(BOOKING_PROTOCOL_VERSION).toBe(PINNED);
   });
 });
 
-const PINNED = "19fac016d84e4df990f8bd67d603bbc28fac3576074bc02e20213295be165750";
+const PINNED = "924f9b963ea6162749dec23887cc55efb20c6b245ca94a3b3ddde99572ac9997";

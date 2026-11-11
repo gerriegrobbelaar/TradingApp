@@ -56,7 +56,7 @@ describe("migration 0023 on a populated database", () => {
       await mdb.prepare("SELECT * FROM matches ORDER BY id").all<Record<string, unknown>>()
     ).results;
 
-    await applyD1Migrations(mdb, all);
+    await applyD1Migrations(mdb, all.slice(idx, idx + 1)); // this migration only (later ones have their own test)
 
     expect((await mdb.prepare("PRAGMA foreign_key_check").all()).results).toEqual([]);
     const after = (

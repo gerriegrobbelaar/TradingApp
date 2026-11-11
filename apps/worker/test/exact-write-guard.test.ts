@@ -27,13 +27,18 @@ const files = (
 const BOOKER = "../src/booking/executor.ts";
 const BOOKER_WHY =
   "the booking executor: the one caller of the writer, behind the fail-closed switch, the verification mark, the gate policy and the outbox";
+const PREVIEW = "../src/booking/preview.ts";
+const PREVIEW_WHY =
+  "the booking preview (dry run): its writer is created with writeEnabled: false and a job id the gate accepts for GET only; it holds no write method";
+const READBACK = "../src/booking/readback.ts";
+const READBACK_WHY = "the item read-back (GET only): takes the writer's read method, never a write";
 const POLICY = "../src/exact/write-policy.ts";
 const POLICY_WHY =
   "the gate policy: it names the two allowed write endpoints to REFUSE everything else (it never builds a request)";
 
 const WRITE_NAMES: Record<string, Record<string, string>> = {
-  createExactWriter: { [BOOKER]: BOOKER_WHY },
-  ExactWriter: { [BOOKER]: BOOKER_WHY },
+  createExactWriter: { [BOOKER]: BOOKER_WHY, [PREVIEW]: PREVIEW_WHY },
+  ExactWriter: { [BOOKER]: BOOKER_WHY, [PREVIEW]: PREVIEW_WHY, [READBACK]: READBACK_WHY },
   createBankEntry: { [BOOKER]: BOOKER_WHY },
   submitMatchSet: { [BOOKER]: BOOKER_WHY },
   xmlUpload: {},
@@ -87,6 +92,15 @@ describe("Exact write guard (source scan)", () => {
       if (inArea && NON_GET.test(src) && !(file in NON_GET_ALLOWED)) offenders.push(file);
     }
     expect(offenders).toEqual([]);
+  });
+
+  it("the preview never enables writes and only knows its own job id (U1, S8)", () => {
+    const preview = stripComments(files["../src/booking/preview.ts"] ?? "");
+    expect(preview).toContain("writeEnabled: false");
+    expect(preview).not.toMatch(/writeEnabled:(?!\s*false\b)/);
+    expect(preview).toContain("BOOKING_PREVIEW_JOB_ID");
+    expect(preview).not.toContain("BOOKING_JOB_ID");
+    expect(preview).toContain('priority: "user"');
   });
 
   it("the gate checks writes at the door and again right before the network call (M7c)", () => {

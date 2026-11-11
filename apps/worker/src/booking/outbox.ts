@@ -50,11 +50,13 @@ export interface OutboxRow {
   lease_expires_at: string | null;
   created_at: string;
   updated_at: string;
+  /** The booking mode when the row was claimed (1 = this app creates the bank entries); null = legacy. */
+  creates_bank_entries: number | null;
 }
 
 export const OUTBOX_COLUMNS = `id, match_id, division_id, journal_code, kind, idempotency_key, payload_json,
   payload_hash, status, attempts, last_error_code, exact_ref, needs_probe, next_attempt_at, claimed_at,
-  lease_expires_at, created_at, updated_at`;
+  lease_expires_at, created_at, updated_at, creates_bank_entries`;
 
 /** Lease of a row while an executor works on it. A POST in flight longer than this is "unknown". */
 export const LEASE_MS = 10 * 60_000;
@@ -77,6 +79,8 @@ export interface NewOutboxRow {
   status: "pending" | "manual_required" | "waiting_for_bank_line";
   errorCode: string | null;
   nowIso: string;
+  /** The booking mode in force at the claim (stored on the row; re-checked before every POST). */
+  createsBankEntries: boolean;
 }
 
 /** The previous statement of the batch changed exactly one row. */
@@ -96,8 +100,9 @@ export async function claimAndEnqueue(db: D1Database, r: NewOutboxRow): Promise<
     db
       .prepare(
         `INSERT INTO exact_write_outbox (match_id, division_id, journal_code, kind, idempotency_key,
-           payload_json, payload_hash, status, last_error_code, needs_probe, created_at, updated_at)
-         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?10 WHERE ${GUARD}`,
+           payload_json, payload_hash, status, last_error_code, needs_probe, created_at, updated_at,
+           creates_bank_entries)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?10, ?11 WHERE ${GUARD}`,
       )
       .bind(
         r.matchId,
@@ -110,6 +115,7 @@ export async function claimAndEnqueue(db: D1Database, r: NewOutboxRow): Promise<
         r.status,
         code,
         r.nowIso,
+        r.createsBankEntries ? 1 : 0,
       ),
     auditStatement(
       db,
@@ -123,6 +129,7 @@ export async function claimAndEnqueue(db: D1Database, r: NewOutboxRow): Promise<
           exactState: initial,
           kind: r.kind,
           outboxStatus: r.status,
+          createsBankEntries: r.createsBankEntries,
           ...(code !== null ? { code } : {}),
         },
       },
@@ -168,6 +175,8 @@ export interface MatchMove {
   note: string | null;
   /** Set together with 'matched_in_exact'. */
   bookedAt?: string;
+  /** Set together with 'matched_in_exact' by an admin's `booked_manually` (N7). */
+  manuallyBooked?: boolean;
 }
 
 export interface Transition {
@@ -188,6 +197,8 @@ export interface Transition {
   payload?: { json: string; hash: string; journalCode: string | null };
   /** Keep the lease (the executor continues with the row) instead of releasing it. */
   keepLease?: boolean;
+  /** An admin's decision (retry): recorded on the row; the database refuses a retry without it. */
+  adminResolved?: { by: string; at: string };
   match?: MatchMove;
   actor: string;
   action: string;
@@ -230,6 +241,10 @@ export async function transition(db: D1Database, t: Transition): Promise<boolean
     add("payload_hash", t.payload.hash);
     add("journal_code", t.payload.journalCode);
   }
+  if (t.adminResolved !== undefined) {
+    add("admin_resolved_by", t.adminResolved.by);
+    add("admin_resolved_at", t.adminResolved.at);
+  }
   if (t.keepLease !== true) set.push("claimed_at = NULL", "lease_expires_at = NULL");
   const nonce = crypto.randomUUID();
   add("op_nonce", nonce);
@@ -257,7 +272,8 @@ export async function transition(db: D1Database, t: Transition): Promise<boolean
     stmts.push(
       db
         .prepare(
-          `UPDATE matches SET exact_state = ?2, exact_note = ?3, booked_at = COALESCE(?4, booked_at)
+          `UPDATE matches SET exact_state = ?2, exact_note = ?3, booked_at = COALESCE(?4, booked_at),
+             manually_booked = CASE WHEN ?6 = 1 THEN 1 ELSE manually_booked END, op_nonce = ?7
            WHERE id = ?1 AND exact_state = ?5 AND undone_at IS NULL AND ${GUARD}`,
         )
         .bind(
@@ -266,24 +282,35 @@ export async function transition(db: D1Database, t: Transition): Promise<boolean
           t.match.note === null ? null : safeCode(t.match.note),
           t.match.bookedAt ?? null,
           t.match.from,
+          t.match.manuallyBooked === true ? 1 : 0,
+          nonce,
         ),
-      // The row moved (its nonce is ours) but the match did not: abort the WHOLE batch (json()
-      // of invalid text raises), so a row can never change state without its match.
-      db
-        .prepare(
-          `SELECT CASE WHEN changes() = 0 AND EXISTS (SELECT 1 FROM exact_write_outbox
-                    WHERE id = ?1 AND op_nonce = ?2) THEN json('booking_err:match_out_of_step') END`,
-        )
-        .bind(t.rowId, nonce),
     );
   }
   if (t.after !== undefined) stmts.push(...t.after(db));
+  if (t.match !== undefined) {
+    // LAST statement (an INSERT that adds nothing would reset changes() for the statements after
+    // it): the row moved (its nonce is ours) but the match did not take our nonce, so it was not
+    // where the transition expected it. The insert fires the trigger of migration 0024, which
+    // raises `batch_guard:match_out_of_step` and aborts the WHOLE batch: a row can never change
+    // state without its match, and the error is a code, not text matching on SQLite internals.
+    stmts.push(
+      db
+        .prepare(
+          `INSERT INTO batch_guard (code)
+           SELECT 'match_out_of_step'
+           WHERE EXISTS (SELECT 1 FROM exact_write_outbox WHERE id = ?1 AND op_nonce = ?2)
+             AND NOT EXISTS (SELECT 1 FROM matches WHERE id = ?3 AND op_nonce = ?2)`,
+        )
+        .bind(t.rowId, nonce, t.matchId),
+    );
+  }
   let out: D1Result[];
   try {
     out = await db.batch(stmts);
   } catch (e) {
     // The out-of-step guard rolled the batch back: nothing changed, the caller lost a race.
-    if (e instanceof Error && /malformed JSON/i.test(e.message)) {
+    if (isOutOfStep(e)) {
       console.error("booking: match state out of step", t.matchId);
       return false;
     }
@@ -296,6 +323,12 @@ export async function transition(db: D1Database, t: Transition): Promise<boolean
     return false;
   }
   return true;
+}
+
+/** True for the error the batch guard raises (migration 0024): the message or its cause carries the code. */
+export function isOutOfStep(err: unknown): boolean {
+  const msg = err instanceof Error ? `${err.message} ${String(err.cause ?? "")}` : String(err);
+  return /batch_guard:match_out_of_step/.test(msg);
 }
 
 /** Marks the idempotency key of a finished write completed (codes only in the stored result). */

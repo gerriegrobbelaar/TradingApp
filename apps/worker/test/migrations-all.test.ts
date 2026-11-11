@@ -129,8 +129,37 @@ describe("all migrations on a database populated at the first schema", () => {
         "matches_guard_undo_claimed",
         "outbox_guard_insert",
         "outbox_guard_update",
+        // 0024 (booking guards, U1)
+        "outbox_guard_status",
+        "matches_guard_manually_booked",
+        "batch_guard_match_out_of_step",
+        "batch_guard_other",
       ]),
     );
+    // 0024: the new columns exist and start empty on migrated data.
+    const cols = async (table: string): Promise<string[]> =>
+      (await mdb.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>()).results.map(
+        (c) => c.name,
+      );
+    expect(await cols("matches")).toEqual(
+      expect.arrayContaining([
+        "booking_deferred_code",
+        "booking_deferred_at",
+        "manually_booked",
+        "op_nonce",
+      ]),
+    );
+    expect(await cols("exact_write_outbox")).toEqual(
+      expect.arrayContaining(["creates_bank_entries", "admin_resolved_by", "admin_resolved_at"]),
+    );
+    expect(await cols("bank_account_exact_map")).toContain("opening_balance_minor");
+    expect(
+      await mdb
+        .prepare(
+          "SELECT 1 FROM matches WHERE booking_deferred_code IS NOT NULL OR manually_booked <> 0",
+        )
+        .first(),
+    ).toBeNull();
 
     // 0023 on migrated data: the old matches are not booked, nothing is in the outbox, booking is
     // off (no settings row), and the new columns and the call ledger exist.
