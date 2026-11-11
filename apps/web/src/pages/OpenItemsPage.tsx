@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import type { Freshness, OpenItemListResponse, OpenItemRow } from "@camelthorn/core";
 import { Card, Chip } from "@camelthorn/ui";
-import { ApiError, listOpenItems } from "../api";
+import { ApiError, getRelation, listOpenItems } from "../api";
 import { useDivision } from "../division";
 import { DataTable, KeyboardHint, LoadMore, type Column } from "../components/DataTable";
 import { EmptyState } from "../components/EmptyState";
@@ -16,6 +16,7 @@ import { BUCKET_LABEL, BUCKET_TONE } from "../lib/ageing";
 import { describeLoadError } from "../lib/errors";
 import { describeDue, formatCount, formatDate } from "../lib/format";
 import { useCursorList } from "../lib/useCursorList";
+import { useSearchText } from "../lib/useSearchText";
 
 export type OpenItemsView = "open" | "overdue" | "closed" | "all";
 const VIEWS: readonly OpenItemsView[] = ["open", "overdue", "closed", "all"];
@@ -85,8 +86,11 @@ function useKnownCurrencies(divisionId: number | null, seen: string[]): string[]
 
 const CURRENCY = /^[A-Za-z]{3}$/;
 const POSITIVE_ID = /^[1-9][0-9]{0,15}$/;
-/** Address parameters this page owns; anything invalid is dropped from the address. */
-const OWN = ["view", "q", "currency", "relationId", "relationName", "sort"] as const;
+/**
+ * Address parameters this page owns; anything invalid is dropped from the address. Names are never
+ * kept there (review S7): `relationName` of older links is removed, the search text lives in state.
+ */
+const OWN = ["view", "currency", "relationId", "relationName", "sort"] as const;
 
 export function OpenItemsPage({ copy }: { copy: Copy }) {
   const { selected, status: divStatus } = useDivision();
@@ -96,17 +100,16 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
   const rawRelation = params.get("relationId");
   const rawSort = params.get("sort");
   const view: OpenItemsView = isView(rawView) ? rawView : "open";
-  const q = params.get("q") ?? "";
+  const [q, setQ] = useSearchText(params, setParams);
   const currency =
     rawCurrency !== null && CURRENCY.test(rawCurrency) ? rawCurrency.toUpperCase() : "";
   const relationId = rawRelation !== null && POSITIVE_ID.test(rawRelation) ? rawRelation : "";
-  const relationName = relationId ? (params.get("relationName") ?? "") : "";
   const sortDir = rawSort === "-due" ? "desc" : "asc";
 
   /**
    * Filters live in the address so a view can be shared and Back works: a discrete change
-   * (status, currency, relation, sort) is a new history entry, typing in the search box
-   * replaces the current one.
+   * (status, currency, relation id, sort) is a new history entry. The search text is not in the
+   * address (it can be a customer name, review S7).
    */
   const setParam = useCallback(
     (patch: Record<string, string | null>, how: "push" | "replace" = "push") => {
@@ -130,7 +133,7 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
     (rawView !== null && !isView(rawView)) ||
     (rawCurrency !== null && currency === "") ||
     (rawRelation !== null && relationId === "") ||
-    (params.has("relationName") && relationId === "") ||
+    params.has("relationName") ||
     (rawSort !== null && rawSort !== "-due");
   useEffect(() => {
     if (!invalid) return;
@@ -139,10 +142,9 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
     if (rawView !== null && !isView(rawView)) patch["view"] = null;
     if (currency === "") patch["currency"] = null;
     else patch["currency"] = currency;
-    if (relationId === "") {
-      patch["relationId"] = null;
-      patch["relationName"] = null;
-    }
+    patch["relationName"] = null;
+    patch["q"] = null; // moved to state by useSearchText
+    if (relationId === "") patch["relationId"] = null;
     if (rawSort !== "-due") patch["sort"] = null;
     setParam(patch, "replace");
   }, [invalid, params, rawView, currency, relationId, rawSort, setParam]);
@@ -164,7 +166,7 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
     const prev = prevDivision.current;
     prevDivision.current = divisionId;
     if (prev !== null && divisionId !== null && prev !== divisionId && relationId) {
-      setParam({ relationId: null, relationName: null }, "replace");
+      setParam({ relationId: null }, "replace");
     }
   }, [divisionId, relationId, setParam]);
   const crossRelation = prevDivision.current !== null && prevDivision.current !== divisionId;
@@ -266,11 +268,33 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
     list.error instanceof ApiError &&
     list.error.code === "unknown_relation";
   const neverSynced = list.first !== null && list.first.freshness.lastCompletedAt === null;
-  // The chip shows the name the rows carry; the address name is only a fallback (it is text from
-  // a link and could say anything).
+  // The chip shows the name the rows carry. Without such a row (an empty result, a link) the name
+  // is looked up by id: it is never taken from the address (review S7).
+  const fromRows = list.items.find((r) => String(r.relation.id) === relationId)?.relation.name;
+  const [looked, setLooked] = useState<{ division: number; id: string; name: string } | null>(null);
+  const needLookup =
+    relationId !== "" &&
+    divisionId !== null &&
+    list.status === "ready" &&
+    fromRows === undefined &&
+    !(looked && looked.id === relationId && looked.division === divisionId);
+  useEffect(() => {
+    if (!needLookup || divisionId === null) return;
+    const ctl = new AbortController();
+    getRelation(Number(relationId), ctl.signal).then(
+      (rel) => {
+        if (rel.divisionId === divisionId) {
+          setLooked({ division: divisionId, id: relationId, name: rel.name });
+        }
+      },
+      () => undefined,
+    );
+    return () => ctl.abort();
+  }, [needLookup, relationId, divisionId]);
   const shownRelationName =
-    list.items.find((r) => String(r.relation.id) === relationId)?.relation.name ?? relationName;
-  const clearRelation = () => setParam({ relationId: null, relationName: null });
+    fromRows ??
+    (looked && looked.id === relationId && looked.division === divisionId ? looked.name : "");
+  const clearRelation = () => setParam({ relationId: null });
 
   return (
     <>
@@ -291,7 +315,7 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
         <FilterBar
           search={{
             value: q,
-            onChange: (v) => setParam({ q: v }, "replace"),
+            onChange: setQ,
             label: `Search ${copy.title.toLowerCase()}`,
             placeholder: "Number, name or reference",
           }}
@@ -418,7 +442,8 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
         onShowRelation={(id, name) => {
           setSheet(null);
           focusClear.current = true;
-          setParam({ relationId: String(id), relationName: name });
+          if (divisionId !== null) setLooked({ division: divisionId, id: String(id), name });
+          setParam({ relationId: String(id) });
         }}
       />
     </>

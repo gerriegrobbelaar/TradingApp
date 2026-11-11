@@ -12,6 +12,7 @@ import {
   type OpenItemListResponse,
   type OverviewResponse,
   type ProfitLossResponse,
+  type RelationSummary,
   type Role,
   type Schedule,
 } from "@camelthorn/core";
@@ -263,9 +264,11 @@ export const setDivisionSync = (divisionId: number, enabled: boolean) =>
 export interface SyncSettings {
   /** Hourly syncs also read open receivables and payables (off until verified, ADR 0017). */
   incrementalOpenItems: boolean;
+  /** While the Amsterdam month is at most this, last year's balances are read nightly. */
+  priorYearNightlyUntilMonth: number;
 }
 export const getSyncSettings = () => request<SyncSettings>("/api/sync/settings");
-export const putSyncSettings = (s: SyncSettings) =>
+export const putSyncSettings = (s: Partial<SyncSettings>) =>
   request<SyncSettings>("/api/sync/settings", { method: "PUT", body: s });
 
 export type SyncStatus = "running" | "ok" | "partial" | "error" | "needs_reauth";
@@ -439,6 +442,9 @@ export const listOpenItems = (
   request<OpenItemListResponse>(`${path}${queryString(params)}`, {
     ...(signal ? { signal } : {}),
   });
+
+export const getRelation = (id: number, signal?: AbortSignal) =>
+  request<RelationSummary>(`/api/relations/${id}`, { ...(signal ? { signal } : {}) });
 
 export const getOpenItem = (id: number, signal?: AbortSignal) =>
   request<OpenItemDetail>(`/api/open-items/${id}`, { ...(signal ? { signal } : {}) });

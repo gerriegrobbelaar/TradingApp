@@ -94,6 +94,28 @@ describe("ledger call arithmetic", () => {
     expect(LEDGER_PASS_MAX_AGE_MS).toBeLessThan(LEDGER_REFRESH_MS);
   });
 
+  it("January to April the previous year is read nightly: about +60 calls, a two-attempt night (review S4)", () => {
+    const other = 153; // open items, IBANs, divisions, relations
+    const purchases = Math.ceil(640 / 60); // 11, reference window (purchase-budget.test.ts)
+    const normal = other + purchases + estimateLedgerCalls({ accounts: 300, balanceYears: 1 });
+    const nightly = other + purchases + estimateLedgerCalls({ accounts: 300, balanceYears: 2 });
+    expect(normal).toBe(229);
+    expect(nightly).toBe(289);
+    expect(nightly - normal).toBe(60);
+    // Does NOT fit one attempt of 240: the first attempt ends partway through last year's balances
+    // and the scheduler's retry five minutes later resumes it from the saved token.
+    expect(nightly).toBeGreaterThan(FULL_SYNC_BUDGET);
+    expect(nightly).toBeLessThanOrEqual(2 * FULL_SYNC_BUDGET);
+    // Still inside the unchanged daily worst case: the cap per attempt does not move.
+    expect(FULL_SYNC_MAX_ATTEMPTS * FULL_SYNC_BUDGET + MAX_INCREMENTAL_RUNS_PER_DAY * INCREMENTAL_SYNC_BUDGET).toBe(
+      SCHEDULED_WORST_CASE_CALLS_PER_DAY,
+    );
+    // The nightly read replaces the weekly one in those months, it does not add to it.
+    const weekly = other + purchases + estimateLedgerCalls({ accounts: 300, balanceYears: 2, budgetAccounts: 150 });
+    expect(weekly).toBe(319);
+    expect(weekly).toBeLessThanOrEqual(2 * FULL_SYNC_BUDGET);
+  });
+
   it("the hourly run does not grow: it never reads ledger data (tested in ledger-sync.test.ts)", () => {
     expect(INCREMENTAL_SYNC_BUDGET).toBe(40);
   });

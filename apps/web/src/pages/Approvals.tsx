@@ -16,6 +16,7 @@ import { PageHeader } from "../components/PageHeader";
 import { describeLoadError } from "../lib/errors";
 import { NO_VALUE, formatDate, formatDays } from "../lib/format";
 import { useCursorList } from "../lib/useCursorList";
+import { useSearchText } from "../lib/useSearchText";
 
 type View = "pending_approval" | "approved" | "rejected" | "all";
 const VIEWS: readonly View[] = ["pending_approval", "approved", "rejected", "all"];
@@ -74,7 +75,7 @@ export function Approvals() {
   const admin = auth.status === "ready" && auth.me.roles.includes("admin");
   const [params, setParams] = useSearchParams();
   const view = isView(params.get("view")) ? (params.get("view") as View) : "pending_approval";
-  const q = params.get("q") ?? "";
+  const [q, setQ] = useSearchText(params, setParams);
   const divisionId = selected?.id ?? null;
   // The open row belongs to one administration: after a switch it is not shown, not even for
   // one render (tagged state instead of a reset effect).
@@ -197,7 +198,7 @@ export function Approvals() {
         <FilterBar
           search={{
             value: q,
-            onChange: (v) => setParam({ q: v }, "replace"),
+            onChange: setQ,
             label: "Search approvals",
             placeholder: "Entry, supplier or reference",
           }}

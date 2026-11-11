@@ -40,6 +40,7 @@ const PRE = 6;
 
 beforeEach(async () => {
   await resetSync();
+  await db.prepare("DELETE FROM settings WHERE key = 'exact.prior_year_nightly_until_month'").run();
   div = await addDivision();
   fx = new FakeExact(div.exactDivision);
   fx.divisions = [{ code: div.exactDivision, description: "BV" }];
@@ -326,7 +327,12 @@ describe("the Amsterdam year boundary", () => {
     expect(reportingYear(Date.parse("2026-12-31T23:00:00Z"))).toBe(2027);
   });
 
-  it("on 1 January reads the new year and the old one once more, then the old one weekly", async () => {
+  it("on 1 January reads the new year and the old one once more, then the old one weekly (nightly limit off)", async () => {
+    await db
+      .prepare(
+        "INSERT OR REPLACE INTO settings (key, value_json, updated_by) VALUES ('exact.prior_year_nightly_until_month', '0', 't')",
+      )
+      .run();
     clock = Date.parse("2026-12-31T01:00:00Z"); // 31 Dec 02:00 Amsterdam
     unlimited();
     await run();
@@ -349,6 +355,61 @@ describe("the Amsterdam year boundary", () => {
     await run();
     expect(balanceCalls(2026)).toHaveLength(0);
     expect(balanceCalls(2027)).toHaveLength(1);
+  });
+
+  it("with the default limit (4 = April) the old year is read every night until the end of April, then weekly (review S4)", async () => {
+    clock = Date.parse("2026-12-31T01:00:00Z");
+    unlimited();
+    await run();
+    clock = Date.parse("2027-01-01T01:00:00Z");
+    unlimited();
+    await run();
+    for (const day of ["2027-01-02", "2027-02-15", "2027-04-30"]) {
+      clock = Date.parse(`${day}T01:00:00Z`);
+      unlimited();
+      await run();
+      expect(balanceCalls(2026), day).toHaveLength(1);
+    }
+    // 1 May: past the limit; the last nightly read was yesterday, so it waits for the week
+    clock = Date.parse("2027-05-01T01:00:00Z");
+    unlimited();
+    await run();
+    expect(balanceCalls(2026)).toHaveLength(0);
+    clock = Date.parse("2027-05-06T01:00:00Z");
+    unlimited();
+    await run();
+    expect(balanceCalls(2026)).toHaveLength(0);
+    clock = Date.parse("2027-05-08T01:00:00Z"); // 7 days after the last complete read
+    unlimited();
+    await run();
+    expect(balanceCalls(2026)).toHaveLength(1);
+  });
+
+  it("an admin can move the limit: month 6 keeps the nightly read in June, month 0 never reads nightly", async () => {
+    await db
+      .prepare(
+        "INSERT OR REPLACE INTO settings (key, value_json, updated_by) VALUES ('exact.prior_year_nightly_until_month', '6', 't')",
+      )
+      .run();
+    clock = Date.parse("2027-05-31T01:00:00Z");
+    unlimited();
+    await run();
+    clock = Date.parse("2027-06-02T01:00:00Z");
+    unlimited();
+    await run();
+    expect(balanceCalls(2026)).toHaveLength(1);
+    clock = Date.parse("2027-06-03T01:00:00Z");
+    unlimited();
+    await run();
+    expect(balanceCalls(2026)).toHaveLength(1);
+    // a malformed value falls back to the default (4): June is then weekly
+    await db
+      .prepare("UPDATE settings SET value_json = '\"x\"' WHERE key = 'exact.prior_year_nightly_until_month'")
+      .run();
+    clock = Date.parse("2027-06-04T01:00:00Z");
+    unlimited();
+    await run();
+    expect(balanceCalls(2026)).toHaveLength(0);
   });
 
   it("a run at 00:30 Amsterdam on 1 January (still 31 December in UTC) is in the new year", async () => {

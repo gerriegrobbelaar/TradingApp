@@ -18,10 +18,15 @@
  *                                 division on or off (audited). Only the division /current/Me
  *                                 returned is enabled by default; the others are listed but off.
  *                                 Sync (manual and scheduled) only handles enabled divisions.
- *  GET  /api/sync/settings        any signed-in role: `{ incrementalOpenItems }`
- *  PUT  /api/sync/settings        admin (no step-up): `{ incrementalOpenItems: boolean }`, the
- *                                 `exact.incremental_open_items` setting (default OFF until the
- *                                 same-ID assumption of ADR 0017 is verified), audited.
+ *  GET  /api/sync/settings        any signed-in role: `{ incrementalOpenItems,
+ *                                 priorYearNightlyUntilMonth }`
+ *  PUT  /api/sync/settings        admin (no step-up): `{ incrementalOpenItems?: boolean,
+ *                                 priorYearNightlyUntilMonth?: integer 0..12 }` (at least one
+ *                                 key; unknown keys are refused). `exact.incremental_open_items`
+ *                                 is OFF until the same-ID assumption of ADR 0017 is verified.
+ *                                 `exact.prior_year_nightly_until_month` (default 4): while the
+ *                                 Amsterdam month is at most this, last year's balances are read
+ *                                 nightly (review S4, ADR 0024). Each is audited when it changes.
  *  GET  /api/sync/status          any signed-in role: per-division, per-entity sync state
  *
  * `:id` and `divisionId` are our divisions.id, never the raw Exact division number. A division
@@ -29,6 +34,10 @@
  */
 import { auditStatement } from "../db/audit";
 import { json, type Ctx, type Router } from "../router";
+import {
+  PRIOR_YEAR_NIGHTLY_UNTIL_MONTH_KEY,
+  readPriorYearNightlyUntilMonth,
+} from "./ledger-sync";
 import {
   INCREMENTAL_OPEN_ITEMS_KEY,
   readBoolSetting,
@@ -223,37 +232,35 @@ export function registerSyncRoutes(router: Router): void {
     return json({ selectedId: id });
   });
 
+  const readSettings = async (db: D1Database) => ({
+    incrementalOpenItems: await readBoolSetting(db, INCREMENTAL_OPEN_ITEMS_KEY, false),
+    priorYearNightlyUntilMonth: await readPriorYearNightlyUntilMonth(db),
+  });
+
   router.add("GET", "/api/sync/settings", ANY_ROLE, async (ctx) => {
-    return json({
-      incrementalOpenItems: await readBoolSetting(ctx.env.DB, INCREMENTAL_OPEN_ITEMS_KEY, false),
-    });
+    return json(await readSettings(ctx.env.DB));
   });
 
   router.add("PUT", "/api/sync/settings", ADMIN, async (ctx: Ctx) => {
     const session = ctx.session;
     if (!session) return json({ error: "unauthenticated" }, 401);
     const body = await readJson(ctx.request);
-    const value = body?.["incrementalOpenItems"];
-    if (typeof value !== "boolean") return json({ error: "bad_request" }, 400);
+    if (body === null) return json({ error: "bad_request" }, 400);
+    const keys = Object.keys(body);
+    const incremental = body["incrementalOpenItems"];
+    const month = body["priorYearNightlyUntilMonth"];
+    if (
+      keys.length === 0 ||
+      keys.some((k) => k !== "incrementalOpenItems" && k !== "priorYearNightlyUntilMonth") ||
+      (incremental !== undefined && typeof incremental !== "boolean") ||
+      (month !== undefined &&
+        (typeof month !== "number" || !Number.isInteger(month) || month < 0 || month > 12))
+    ) {
+      return json({ error: "bad_request" }, 400);
+    }
     const db = ctx.env.DB;
-    const before = await readBoolSetting(db, INCREMENTAL_OPEN_ITEMS_KEY, false);
-    // The audit row only exists when the stored value really changes.
-    await db.batch([
-      auditStatement(
-        db,
-        {
-          actorEmail: session.email,
-          action: "settings.exact_incremental_open_items",
-          entity: "settings",
-          entityId: INCREMENTAL_OPEN_ITEMS_KEY,
-          before: { value: before },
-          after: { value },
-        },
-        {
-          sql: `COALESCE((SELECT value_json FROM settings WHERE key = ?7), 'false') <> ?8`,
-          binds: [INCREMENTAL_OPEN_ITEMS_KEY, JSON.stringify(value)],
-        },
-      ),
+    const before = await readSettings(db);
+    const upsert = (key: string, value: unknown) =>
       db
         .prepare(
           `INSERT INTO settings (key, value_json, updated_by, updated_at)
@@ -261,9 +268,51 @@ export function registerSyncRoutes(router: Router): void {
            ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json,
              updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
         )
-        .bind(INCREMENTAL_OPEN_ITEMS_KEY, JSON.stringify(value), session.email),
-    ]);
-    return json({ incrementalOpenItems: value });
+        .bind(key, JSON.stringify(value), session.email);
+    // The audit row only exists when the stored value really changes (guard on the same SQL).
+    const statements: D1PreparedStatement[] = [];
+    if (typeof incremental === "boolean") {
+      statements.push(
+        auditStatement(
+          db,
+          {
+            actorEmail: session.email,
+            action: "settings.exact_incremental_open_items",
+            entity: "settings",
+            entityId: INCREMENTAL_OPEN_ITEMS_KEY,
+            before: { value: before.incrementalOpenItems },
+            after: { value: incremental },
+          },
+          {
+            sql: `COALESCE((SELECT value_json FROM settings WHERE key = ?7), 'false') <> ?8`,
+            binds: [INCREMENTAL_OPEN_ITEMS_KEY, JSON.stringify(incremental)],
+          },
+        ),
+        upsert(INCREMENTAL_OPEN_ITEMS_KEY, incremental),
+      );
+    }
+    if (typeof month === "number") {
+      statements.push(
+        auditStatement(
+          db,
+          {
+            actorEmail: session.email,
+            action: "settings.exact_prior_year_nightly_until_month",
+            entity: "settings",
+            entityId: PRIOR_YEAR_NIGHTLY_UNTIL_MONTH_KEY,
+            before: { value: before.priorYearNightlyUntilMonth },
+            after: { value: month },
+          },
+          {
+            sql: `COALESCE((SELECT value_json FROM settings WHERE key = ?7), 'x') <> ?8`,
+            binds: [PRIOR_YEAR_NIGHTLY_UNTIL_MONTH_KEY, JSON.stringify(month)],
+          },
+        ),
+        upsert(PRIOR_YEAR_NIGHTLY_UNTIL_MONTH_KEY, month),
+      );
+    }
+    await db.batch(statements);
+    return json(await readSettings(db));
   });
 
   router.add("PUT", "/api/divisions/:id/sync-enabled", ADMIN, async (ctx: Ctx) => {

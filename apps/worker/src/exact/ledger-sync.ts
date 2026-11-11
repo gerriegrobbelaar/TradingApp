@@ -5,10 +5,13 @@
  *
  *   gl_accounts  financial/GLAccounts, read completely every cycle.
  *   gl_balances  financial/ReportingBalance of the CURRENT reporting year every cycle, and of the
- *                PREVIOUS year only when it was never read completely or the last complete read is
+ *                PREVIOUS year only when it was never read completely, the last complete read is
  *                a week old (the year-end figures only move through late adjustments; we cannot
  *                cheaply see whether the year-end period changed, so "at most weekly" is the
- *                rule). The reporting year is the Amsterdam calendar year (assumption).
+ *                rule), or, while the old year is still being booked, EVERY night: when the
+ *                current Amsterdam month is at most `exact.prior_year_nightly_until_month`
+ *                (default 4 = April, review S4). The reporting year is the Amsterdam calendar
+ *                year (assumption).
  *   gl_budgets   budget/Budgets of the current year, at most weekly. OPTIONAL: the module may not
  *                be licensed. When the very first page of a pass answers 400, 403 or 404 the
  *                entity is marked unavailable for a week (sync_state.unavailable_until) and the
@@ -91,6 +94,35 @@ export const GATE_REJECT_CODES: ReadonlySet<string> = new Set([
  */
 export const LEDGER_PASS_MAX_AGE_MS = 5 * 24 * 60 * 60 * 1000;
 const MAX_CHUNKS = 200;
+
+/**
+ * Setting (integer 0 to 12, default 4): while the current Amsterdam month is at most this, the
+ * previous year's balances are read in every full cycle instead of weekly (the old year is still
+ * being booked, review S4). 0 switches the nightly read off. Admin-editable through PUT
+ * /api/sync/settings (audited).
+ */
+export const PRIOR_YEAR_NIGHTLY_UNTIL_MONTH_KEY = "exact.prior_year_nightly_until_month";
+export const PRIOR_YEAR_NIGHTLY_UNTIL_MONTH_DEFAULT = 4;
+
+/** The stored month limit; the default for a missing, malformed or out-of-range value. */
+export async function readPriorYearNightlyUntilMonth(db: D1Database): Promise<number> {
+  const row = await db
+    .prepare("SELECT value_json FROM settings WHERE key = ?1")
+    .bind(PRIOR_YEAR_NIGHTLY_UNTIL_MONTH_KEY)
+    .first<{ value_json: string }>();
+  if (!row) return PRIOR_YEAR_NIGHTLY_UNTIL_MONTH_DEFAULT;
+  try {
+    const v: unknown = JSON.parse(row.value_json);
+    return typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 12
+      ? v
+      : PRIOR_YEAR_NIGHTLY_UNTIL_MONTH_DEFAULT;
+  } catch {
+    return PRIOR_YEAR_NIGHTLY_UNTIL_MONTH_DEFAULT;
+  }
+}
+
+/** Amsterdam calendar month (1 to 12) of an instant. */
+export const reportingMonth = (ms: number): number => Number(amsterdamParts(ms).date.slice(5, 7));
 
 /** Exact list pages hold about this many rows (assumption, ADR 0017); used for estimates only. */
 export const LEDGER_PAGE_SIZE_GUESS = 60;
@@ -707,10 +739,16 @@ export async function syncGlBalances(ctx: LedgerCtx): Promise<EntityResult> {
   const cur = years.get(thisYear);
   if (cur === undefined || cur.cycle !== cycle) due.push(thisYear);
   const prev = years.get(thisYear - 1);
+  // One small read per run, only when it can matter (the previous year has been read before).
+  let nightly = false;
+  if (prev !== undefined && prev.cycle !== cycle) {
+    ctx.meter.used += 1;
+    nightly = reportingMonth(nowMs) <= (await readPriorYearNightlyUntilMonth(ctx.db));
+  }
   if (
     prev === undefined ||
     (prev.cycle !== cycle &&
-      (ageMs(prev.completed_at, nowMs) >= LEDGER_REFRESH_MS || readWhileCurrent(prev)))
+      (nightly || ageMs(prev.completed_at, nowMs) >= LEDGER_REFRESH_MS || readWhileCurrent(prev)))
   ) {
     due.push(thisYear - 1);
   }

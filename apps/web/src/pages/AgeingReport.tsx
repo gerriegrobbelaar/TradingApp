@@ -30,6 +30,7 @@ import { describeLoadError } from "../lib/errors";
 import { NO_VALUE, formatCount, formatDate, formatMoney } from "../lib/format";
 import { reportFileBase } from "../lib/report-files";
 import { useResource } from "../lib/useResource";
+import { useSearchText } from "../lib/useSearchText";
 
 export type AgeingKind = "receivable" | "payable";
 
@@ -320,7 +321,7 @@ export function AgeingReport({ kind }: { kind: AgeingKind }) {
   const copy = COPY[kind];
   const { selected, gate } = useDivisionGate();
   const [params, setParams] = useSearchParams();
-  const q = params.get("q") ?? "";
+  const [q, setQ] = useSearchText(params, setParams);
   const sort: SortMode = params.get("sort") === "name" ? "name" : "outstanding";
   const setParam = useCallback(
     (patch: Record<string, string | null>, how: "push" | "replace" = "push") =>
@@ -411,7 +412,7 @@ export function AgeingReport({ kind }: { kind: AgeingKind }) {
             <div className="filters" role="group" aria-label="Filters">
               <SearchBox
                 value={q}
-                onChange={(v) => setParam({ q: v }, "replace")}
+                onChange={setQ}
                 label={`Search ${copy.party.toLowerCase()}s`}
               />
               <Segmented<SortMode>

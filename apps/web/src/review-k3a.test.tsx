@@ -303,7 +303,7 @@ describe("list filters in the address", () => {
     expect(p.has("relationId")).toBe(false);
     expect(p.get("sort")).toBe("due");
     expect(p.get("q")).toBe("ok");
-    await waitFor(() => expect(nav.search).toBe("?q=ok"));
+    await waitFor(() => expect(nav.search).toBe(""));
     expect(screen.queryByText(/Evil/)).toBeNull();
   });
 
@@ -344,6 +344,38 @@ describe("list filters in the address", () => {
     renderApp("/invoices?relationId=7&relationName=Somebody%20else");
     const clear = await screen.findByRole("button", { name: "Clear customer filter" });
     await waitFor(() => expect(clear.closest(".chip")?.textContent).toContain("Customer: Acme BV"));
+  });
+
+  it("keeps the search text and relation names out of the address (review S7)", async () => {
+    const calls = mockFetch({
+      ...lists(),
+      "GET /api/invoices": () => ({ body: listResponse([]) }),
+      "GET /api/relations/7": () => ({
+        body: {
+          id: 7,
+          divisionId: 1,
+          exactId: "x",
+          code: null,
+          name: "Acme BV",
+          isCustomer: true,
+          isSupplier: false,
+          country: null,
+          hasVatNumber: false,
+          hasEmail: false,
+          updatedAt: "2026-01-01T00:00:00Z",
+        },
+      }),
+    });
+    const user = userEvent.setup();
+    const nav = renderWithHistory("/invoices?relationId=7&relationName=Evil");
+    // no row carries the relation: its name is looked up by id, never read from the address
+    const clear = await screen.findByRole("button", { name: "Clear customer filter" });
+    await waitFor(() => expect(clear.closest(".chip")?.textContent).toContain("Customer: Acme BV"));
+    expect(callsTo(calls, "/api/relations/7").length).toBeGreaterThan(0);
+    await waitFor(() => expect(nav.search).toBe("?relationId=7"));
+    await user.type(screen.getByRole("searchbox", { name: "Search invoices" }), "secret");
+    await waitFor(() => expect(params(callsTo(calls, "/api/invoices").at(-1)).get("q")).toBe("secret"));
+    expect(nav.search).toBe("?relationId=7");
   });
 
   it("puts focus on the new filter after Show all items for this relation", async () => {

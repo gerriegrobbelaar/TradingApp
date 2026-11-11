@@ -129,20 +129,21 @@ describe("incremental open items setting (review S4)", () => {
   const get = async (role: string) =>
     (await (await authed("/api/sync/settings", tokens[role] as string)).json()) as {
       incrementalOpenItems: boolean;
+      priorYearNightlyUntilMonth: number;
     };
   const put = (role: string, json: unknown) =>
     authed("/api/sync/settings", tokens[role] as string, { method: "PUT", json });
 
   it("is readable by every role, changed by admins only, and audited when it changes", async () => {
     await db.prepare("DELETE FROM settings WHERE key = 'exact.incremental_open_items'").run();
-    expect(await get("viewer")).toEqual({ incrementalOpenItems: false });
+    expect(await get("viewer")).toMatchObject({ incrementalOpenItems: false });
     expect((await put("finance", { incrementalOpenItems: true })).status).toBe(403);
     expect((await put("admin", { incrementalOpenItems: "yes" })).status).toBe(400);
     expect((await put("admin", {})).status).toBe(400);
-    expect(await get("admin")).toEqual({ incrementalOpenItems: false });
+    expect(await get("admin")).toMatchObject({ incrementalOpenItems: false });
 
     expect((await put("admin", { incrementalOpenItems: true })).status).toBe(200);
-    expect(await get("viewer")).toEqual({ incrementalOpenItems: true });
+    expect(await get("viewer")).toMatchObject({ incrementalOpenItems: true });
     await put("admin", { incrementalOpenItems: true }); // unchanged: no second audit row
     expect(await auditRows("settings.exact_incremental_open_items")).toHaveLength(1);
     await put("admin", { incrementalOpenItems: false });
@@ -150,10 +151,32 @@ describe("incremental open items setting (review S4)", () => {
     expect(rows.map((r) => r.after_json)).toEqual(['{"value":true}', '{"value":false}']);
     expect(rows[0]?.before_json).toBe('{"value":false}');
     expect(rows[0]?.actor_email).toBe(ADMIN);
-    expect(await get("viewer")).toEqual({ incrementalOpenItems: false });
+    expect(await get("viewer")).toMatchObject({ incrementalOpenItems: false });
   });
 
   it("rejects anonymous callers", async () => {
     expect((await call("/api/sync/settings")).status).toBe(401);
+  });
+
+  it("holds the prior-year nightly month: default 4, admin only, validated, audited when it changes (review S4)", async () => {
+    await db.prepare("DELETE FROM settings WHERE key = 'exact.prior_year_nightly_until_month'").run();
+    expect((await get("viewer")).priorYearNightlyUntilMonth).toBe(4);
+    expect((await put("finance", { priorYearNightlyUntilMonth: 6 })).status).toBe(403);
+    for (const bad of [13, -1, 2.5, "4", null, true]) {
+      expect((await put("admin", { priorYearNightlyUntilMonth: bad })).status, String(bad)).toBe(400);
+    }
+    expect((await put("admin", { priorYearNightlyUntilMonth: 4, other: 1 })).status).toBe(400);
+    expect((await get("admin")).priorYearNightlyUntilMonth).toBe(4);
+
+    expect((await put("admin", { priorYearNightlyUntilMonth: 6 })).status).toBe(200);
+    expect((await get("viewer")).priorYearNightlyUntilMonth).toBe(6);
+    await put("admin", { priorYearNightlyUntilMonth: 6 }); // unchanged: no second audit row
+    expect(await auditRows("settings.exact_prior_year_nightly_until_month")).toHaveLength(1);
+    // both keys in one request leave the other setting alone when omitted
+    await put("admin", { priorYearNightlyUntilMonth: 0 });
+    expect((await get("viewer")).priorYearNightlyUntilMonth).toBe(0);
+    const rows = await auditRows("settings.exact_prior_year_nightly_until_month");
+    expect(rows.map((r) => r.after_json)).toEqual(['{"value":6}', '{"value":0}']);
+    expect(rows[0]?.before_json).toBe('{"value":4}');
   });
 });
