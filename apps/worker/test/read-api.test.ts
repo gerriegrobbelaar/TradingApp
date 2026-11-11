@@ -279,12 +279,19 @@ describe("division selection and isolation", () => {
     const a = await get<OpenItemListResponse>(`/api/invoices?division=${divA}`);
     expect(a.body.items.map((i) => i.invoiceNumber)).toEqual(["A-1"]);
     expect(a.body.total).toBe(1);
-    // A relation id of another division matches nothing.
-    const cross = await get<OpenItemListResponse>(
-      `/api/invoices?division=${divB}&relationId=${relA}`,
+    // A relation id of another division is refused, so a shared link cannot pose as an empty
+    // list (review K3a); the same relation in its own division works.
+    for (const path of ["/api/invoices", "/api/bills"]) {
+      const cross = await get<{ error: string }>(`${path}?division=${divB}&relationId=${relA}`);
+      expect(cross.status).toBe(404);
+      expect(cross.body).toEqual({ error: "unknown_relation" });
+    }
+    expect((await get(`/api/invoices?relationId=99999`)).status).toBe(404);
+    const own = await get<OpenItemListResponse>(
+      `/api/invoices?division=${divA}&relationId=${relA}`,
     );
-    expect(cross.body.items).toEqual([]);
-    expect(cross.body.total).toBe(0);
+    expect(own.status).toBe(200);
+    expect(own.body.items.map((i) => i.invoiceNumber)).toEqual(["A-1"]);
     const ids = (
       await db
         .prepare("SELECT id, division_id FROM open_items")
@@ -922,6 +929,39 @@ describe("overview", () => {
     expect((await get<OverviewResponse>(`/api/overview?division=${divB}`)).body.stale).toBe(true);
   });
 
+  it("gives each list the freshness of its own kind (review K3a)", async () => {
+    const now = Date.now();
+    const iso = (h: number): string => new Date(now - h * 3_600_000).toISOString();
+    await addItems([{ number: "A-1" }, { number: "B-1", kind: "bill" }]);
+    // Never read: null and stale, even though rows exist.
+    const never = await get<OpenItemListResponse>("/api/invoices");
+    expect(never.body.freshness).toEqual({
+      lastCompletedAt: null,
+      basis: ["receivables"],
+      stale: true,
+      staleAfterHours: 36,
+    });
+    // A completed run or another entity does not make the list fresh.
+    await syncState(divA, "run", iso(0.1));
+    await syncState(divA, "receivables", iso(40), "partial", "rate_limited");
+    await syncState(divA, "payables", iso(1));
+    const inv = await get<OpenItemListResponse>("/api/invoices?status=all&q=a");
+    expect(inv.body.freshness).toMatchObject({
+      lastCompletedAt: iso(40),
+      basis: ["receivables"],
+      stale: true,
+    });
+    const bills = await get<OpenItemListResponse>("/api/bills");
+    expect(bills.body.freshness).toMatchObject({
+      lastCompletedAt: iso(1),
+      basis: ["payables"],
+      stale: false,
+    });
+    // Per division.
+    const other = await get<OpenItemListResponse>(`/api/bills?division=${divB}`);
+    expect(other.body.freshness).toMatchObject({ lastCompletedAt: null, stale: true });
+  });
+
   it("gives every KPI a drill-down that returns exactly its items", async () => {
     const t = today();
     await addItems([
@@ -1110,8 +1150,9 @@ describe("query plans and volume", () => {
     const page = (await res.json()) as OpenItemListResponse;
     expect(page.items).toHaveLength(100);
     expect(page.total).toBe(5000);
-    // Session and user lookups, divisions, preference, one batch (list + totals): a fixed number.
-    expect(calls).toBeLessThanOrEqual(8);
+    // Session and user lookups, divisions, preference, one batch (list + totals + the list's
+    // freshness row, review K3a): a fixed number of prepares, still one round trip for the data.
+    expect(calls).toBeLessThanOrEqual(9);
     const listCalls = calls;
     calls = 0;
     await (await run("/api/invoices?limit=1")).json();

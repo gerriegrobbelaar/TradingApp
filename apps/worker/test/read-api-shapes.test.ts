@@ -76,6 +76,7 @@ const LIST = keysOf<OpenItemListResponse>()([
   "limit",
   "total",
   "totalsByCurrency",
+  "freshness",
 ]);
 const DETAIL = keysOf<OpenItemDetail>()([
   "division",
@@ -267,6 +268,10 @@ describe("read API response shapes match api-types.ts exactly", () => {
       const r = await get<OpenItemListResponse>(path);
       expect(keys(r)).toEqual(LIST);
       expect(keys(r.division)).toEqual(DIVISION);
+      expect(keys(r.freshness)).toEqual(FRESHNESS);
+      expect(r.freshness.basis).toEqual([
+        path.startsWith("/api/bills") ? "payables" : "receivables",
+      ]);
       expect(r.items.length).toBeGreaterThan(0);
       r.items.forEach(checkRow);
       for (const t of r.totalsByCurrency) {

@@ -487,3 +487,16 @@
     border-radius: 22px;
   }
 }
+/* Rows (review K3a): the design's --accent-soft selection made chips inside it fall below 4.5:1,
+   so a selected row uses the hover fill plus an accent bar (not colour alone: the bar is a shape),
+   and neutral chips in rows use --ink. Checked in contrast.test.ts. */
+.app .dt-table tbody tr.sel {
+  background: var(--hover);
+}
+.app .dt-table tbody tr.sel > td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent-text);
+}
+.app .dt-table .chip:not(.ok):not(.warn):not(.gold),
+.app .drill-list .chip:not(.ok):not(.warn):not(.gold) {
+  color: var(--ink);
+}

@@ -58,6 +58,8 @@ function AgeChip({ item }: { item: ApprovalItemDto }) {
   );
 }
 
+const approvalId = (r: ApprovalItemDto): number => r.id;
+
 const entryTitle = (i: ApprovalItemDto) => (i.entryNumber ? `Entry ${i.entryNumber}` : "Bill");
 
 function PdfCell({ v }: { v: boolean | null }) {
@@ -72,12 +74,20 @@ export function Approvals() {
   const [params, setParams] = useSearchParams();
   const view = isView(params.get("view")) ? (params.get("view") as View) : "pending_approval";
   const q = params.get("q") ?? "";
-  const [open, setOpen] = useState<ApprovalItemDto | null>(null);
   const divisionId = selected?.id ?? null;
-  useEffect(() => setOpen(null), [divisionId]);
+  // The open row belongs to one administration: after a switch it is not shown, not even for
+  // one render (tagged state instead of a reset effect).
+  const [sheet, setSheet] = useState<{ division: number; item: ApprovalItemDto } | null>(null);
+  const open = sheet !== null && sheet.division === divisionId ? sheet.item : null;
+  const setOpen = useCallback(
+    (item: ApprovalItemDto | null) =>
+      setSheet(item === null || divisionId === null ? null : { division: divisionId, item }),
+    [divisionId],
+  );
 
+  // Status changes are history entries (Back works); typing in the search replaces the entry.
   const setParam = useCallback(
-    (patch: Record<string, string | null>) =>
+    (patch: Record<string, string | null>, how: "push" | "replace" = "push") =>
       setParams(
         (prev) => {
           const next = new URLSearchParams(prev);
@@ -87,15 +97,23 @@ export function Approvals() {
           }
           return next;
         },
-        { replace: true },
+        { replace: how === "replace" },
       ),
     [setParams],
   );
+  // An unknown status in the address is dropped rather than sent.
+  const rawView = params.get("view");
+  useEffect(() => {
+    if (rawView !== null && !isView(rawView)) setParam({ view: null }, "replace");
+  }, [rawView, setParam]);
 
   const query = useMemo(() => ({ status: view, q: q.trim() || undefined }), [view, q]);
   const key = divisionId === null ? null : `approvals:${divisionId}:${JSON.stringify(query)}`;
-  const list = useCursorList<ApprovalItemDto, ApprovalsResponse>(key, (cursor, signal) =>
-    listApprovals({ ...query, division: divisionId, limit: PAGE, cursor }, signal),
+  const list = useCursorList<ApprovalItemDto, ApprovalsResponse>(
+    key,
+    (cursor, signal) =>
+      listApprovals({ ...query, division: divisionId, limit: PAGE, cursor }, signal),
+    approvalId,
   );
 
   // Counts come from the response; keep the last ones while another status loads so the
@@ -158,7 +176,7 @@ export function Approvals() {
         <FilterBar
           search={{
             value: q,
-            onChange: (v) => setParam({ q: v }),
+            onChange: (v) => setParam({ q: v }, "replace"),
             label: "Search approvals",
             placeholder: "Entry, supplier or reference",
           }}
@@ -211,7 +229,7 @@ export function Approvals() {
               caption="Approvals"
               columns={columns}
               rows={list.items}
-              rowKey={(r) => r.id}
+              rowKey={approvalId}
               status={divStatus === "loading" ? "loading" : status}
               onActivate={setOpen}
               activeKey={open?.id ?? null}
@@ -221,7 +239,7 @@ export function Approvals() {
               empty={
                 <EmptyState
                   title={
-                    view === "pending_approval"
+                    view === "pending_approval" && !q.trim()
                       ? "0 bills are waiting for approval."
                       : "No bills match these filters."
                   }

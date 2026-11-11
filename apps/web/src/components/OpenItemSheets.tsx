@@ -4,7 +4,7 @@ import { Chip } from "@camelthorn/ui";
 import { listOpenItems } from "../api";
 import { BUCKET_LABEL, BUCKET_TONE } from "../lib/ageing";
 import { describeLoadError } from "../lib/errors";
-import { describeDue, formatDate } from "../lib/format";
+import { describeDue, formatCount, formatDate, formatMoney } from "../lib/format";
 import { useCursorList } from "../lib/useCursorList";
 import { LoadMore } from "./DataTable";
 import { DrillSheet } from "./DrillSheet";
@@ -39,10 +39,24 @@ export function OpenItemSheet({
   );
 }
 
-function DrillRow({ item, onOpen }: { item: OpenItemRow; onOpen: () => void }) {
+function DrillRow({
+  item,
+  onOpen,
+  returnHere,
+}: {
+  item: OpenItemRow;
+  onOpen: () => void;
+  /** This row was opened last: focus comes back to it from "Back to list". */
+  returnHere: boolean;
+}) {
   return (
     <li>
-      <button type="button" className="item" onClick={onOpen}>
+      <button
+        type="button"
+        className="item"
+        onClick={onOpen}
+        {...(returnHere ? { "data-autofocus": "" } : {})}
+      >
         <span className="t">
           <b>{item.relation.name ?? "Unknown relation"}</b>
           <span>
@@ -71,20 +85,30 @@ const PAGE = 25;
  * with "Load more"), each opening its detail inside the same sheet with a way back. `summary`
  * leads with the figure the user clicked.
  */
+/** The figure the user clicked, to check the items against. */
+export interface DrillExpected {
+  currency: string;
+  count: number;
+  minor: number;
+}
+
 export function DrillDownSheet({
   title,
   hint,
   divisionId,
   summary,
+  expected,
   onClose,
 }: {
   title: string;
   hint: DrilldownHint;
   divisionId: number;
   summary: ReactNode;
+  expected?: DrillExpected;
   onClose: () => void;
 }) {
   const [itemId, setItemId] = useState<number | null>(null);
+  const [lastOpened, setLastOpened] = useState<number | null>(null);
   const key = useMemo(
     () =>
       `drill:${divisionId}:${hint.path}:${JSON.stringify(
@@ -92,13 +116,27 @@ export function DrillDownSheet({
       )}`,
     [divisionId, hint],
   );
-  const list = useCursorList<OpenItemRow, OpenItemListResponse>(key, (cursor, signal) =>
-    listOpenItems(
-      hint.path,
-      { ...hint.query, division: divisionId, sort: "due", limit: PAGE, cursor },
-      signal,
-    ),
+  const list = useCursorList<OpenItemRow, OpenItemListResponse>(
+    key,
+    (cursor, signal) =>
+      listOpenItems(
+        hint.path,
+        // The hint's filters first, then ours: division, order and paging are never the hint's.
+        { ...hint.query, division: divisionId, sort: "due", limit: PAGE, cursor },
+        signal,
+      ),
+    (r) => r.id,
   );
+  // The server's totals over ALL matching rows (not the loaded page) for the figure's currency.
+  const actual = expected
+    ? list.first?.totalsByCurrency.find((t) => t.currency === expected.currency)
+    : undefined;
+  const actualCount = actual?.count ?? 0;
+  const actualMinor = actual?.openMinor ?? 0;
+  const differs =
+    expected !== undefined &&
+    list.first !== null &&
+    (actualCount !== expected.count || actualMinor !== expected.minor);
   return (
     <DrillSheet
       open
@@ -126,14 +164,30 @@ export function DrillDownSheet({
         {list.status === "error" && (
           <ErrorNotice message={describeLoadError(list.error)} onRetry={list.reload} />
         )}
+        {list.status === "ready" && differs && expected && (
+          <p className="notice warn" role="status">
+            These items add up to {formatMoney(actualMinor, expected.currency)} in{" "}
+            {formatCount(actualCount)}, not {formatMoney(expected.minor, expected.currency)} in{" "}
+            {formatCount(expected.count)}: Exact data changed since the overview loaded. Close this
+            sheet and reload the page to see the new figures.
+          </p>
+        )}
         {list.status === "ready" && list.items.length === 0 && (
-          <EmptyState title="No items">Nothing matches this figure any more.</EmptyState>
+          <EmptyState title="0 items">Nothing matches this figure any more.</EmptyState>
         )}
         {list.status === "ready" && list.items.length > 0 && (
           <>
             <ul className="drill-list" aria-label="Items behind this figure">
               {list.items.map((i) => (
-                <DrillRow key={i.id} item={i} onOpen={() => setItemId(i.id)} />
+                <DrillRow
+                  key={i.id}
+                  item={i}
+                  returnHere={i.id === lastOpened}
+                  onOpen={() => {
+                    setLastOpened(i.id);
+                    setItemId(i.id);
+                  }}
+                />
               ))}
             </ul>
             <LoadMore

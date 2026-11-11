@@ -1,7 +1,8 @@
 import { norm } from "../test-norm";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   NO_VALUE,
+  _forceStringFormat,
   describeDue,
   formatCount,
   formatDate,
@@ -51,12 +52,66 @@ describe("formatMoney", () => {
     expect(formatMoney(Number.POSITIVE_INFINITY, "EUR")).toBe(NO_VALUE);
   });
 
-  it("falls back to two decimals for a code it does not know", () => {
-    expect(norm(formatMoney(150, "xx"))).toContain("1,50");
+  it("falls back to two decimals for a code it does not know, and still shows the code", () => {
+    expect(norm(formatMoney(150, "xx"))).toBe("xx 1,50");
+    expect(norm(formatMoney(-150, "EURO"))).toBe("EURO -1,50");
+  });
+
+  it("refuses a number that is no longer exact (beyond 2^53) instead of printing a wrong one", () => {
+    expect(formatMoney(2 ** 53 + 2, "EUR")).toBe(NO_VALUE);
+    expect(formatMoney(-(2 ** 53) - 2, "EUR")).toBe(NO_VALUE);
+  });
+
+  it("uses a no-break space between symbol and amount, so the two never wrap apart", () => {
+    expect(formatMoney(100, "EUR")).toBe(`€${String.fromCharCode(160)}1,00`);
+  });
+
+  it("negative zero is plain zero, not a credit", () => {
+    expect(norm(formatMoney(-0, "EUR"))).toBe("€ 0,00");
   });
 
   it("can use another locale", () => {
     expect(norm(formatMoney(123456, "EUR", "en-GB"))).toBe("€1,234.56");
+  });
+});
+
+describe("formatMoney without Intl string support (older engines)", () => {
+  afterEach(() => _forceStringFormat(null));
+  const cases: [bigint, string][] = [
+    [0n, "EUR"],
+    [5n, "EUR"],
+    [-1n, "EUR"],
+    [123456n, "EUR"],
+    [-123456n, "EUR"],
+    [1234n, "JPY"],
+    [-1234n, "JPY"],
+    [1n, "KWD"],
+    [-1234567n, "KWD"],
+    [999n, "USD"],
+    [100000000n, "GBP"],
+    [2n ** 60n + 1n, "EUR"],
+    [-(2n ** 60n + 1n), "EUR"],
+    [9007199254740991n, "EUR"],
+  ];
+  it("prints exactly what the string path prints, digit for digit", () => {
+    for (const [v, c] of cases) {
+      _forceStringFormat(true);
+      const expected = formatMoney(v, c);
+      _forceStringFormat(false);
+      expect(formatMoney(v, c), `${v} ${c}`).toBe(expected);
+    }
+  });
+  it("also in en-GB and for codes Intl does not know", () => {
+    for (const [v, c, locale] of [
+      [-123456n, "EUR", "en-GB"],
+      [2n ** 60n + 1n, "USD", "en-GB"],
+      [150n, "xx", "nl-NL"],
+    ] as const) {
+      _forceStringFormat(true);
+      const expected = formatMoney(v, c, locale);
+      _forceStringFormat(false);
+      expect(formatMoney(v, c, locale)).toBe(expected);
+    }
   });
 });
 
@@ -80,6 +135,21 @@ describe("dates and days", () => {
     expect(formatDate("2026-12-31T23:30:00.000Z")).toBe("1 Jan 2027");
     expect(formatDateTime("2026-07-01T10:05:00.000Z")).toContain("12:05");
     expect(formatDateTime("2026-01-01T10:05:00.000Z")).toContain("11:05");
+  });
+
+  it("never renders a date as numbers that could be read day-first or month-first", () => {
+    for (const d of ["2026-03-04", "2026-11-12", "2026-12-11"]) {
+      expect(formatDate(d)).toMatch(/^\d{1,2} [A-Z][a-z]{2} \d{4}$/);
+    }
+    expect(formatDate("2026-03-04")).toBe("4 Mar 2026");
+    expect(formatDateTime("2026-11-12T08:00:00.000Z")).toMatch(/^12 Nov 2026, 09:00$/);
+  });
+
+  it("shows a dash for an impossible calendar date instead of rolling it over", () => {
+    expect(formatDate("2026-02-31")).toBe(NO_VALUE);
+    expect(formatDate("2026-13-01")).toBe(NO_VALUE);
+    expect(formatDate("0099-01-01")).toBe(NO_VALUE);
+    expect(formatDate("2028-02-29")).toBe("29 Feb 2028");
   });
 
   it("shows an em dash for missing or invalid dates", () => {

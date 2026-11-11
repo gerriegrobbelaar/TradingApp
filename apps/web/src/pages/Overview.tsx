@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router";
 import type {
   CurrencyKpisDto,
@@ -10,7 +10,7 @@ import type {
 import { Card, Skeleton } from "@camelthorn/ui";
 import { getOverview } from "../api";
 import { useDivision } from "../division";
-import { DrillDownSheet } from "../components/OpenItemSheets";
+import { DrillDownSheet, type DrillExpected } from "../components/OpenItemSheets";
 import { EmptyState, ErrorNotice } from "../components/EmptyState";
 import { FreshnessStamp } from "../components/FreshnessStamp";
 import { Money } from "../components/Money";
@@ -22,9 +22,12 @@ import { useResource } from "../lib/useResource";
 type Side = "receivable" | "payable";
 
 interface Drill {
+  /** The administration the figure belongs to: a sheet never outlives a switch. */
+  division: number;
   title: string;
   hint: DrilldownHint;
   summary: string;
+  expected: DrillExpected;
 }
 
 const LABEL: Record<Side, Record<Exclude<KpiFigure, "noDueDate">, string>> = {
@@ -78,10 +81,14 @@ function Figure({
           {formatMoney(amount.dcMinor, dcCurrency)} in {dcCurrency}
         </p>
       )}
-      {!amount.dcComplete && <p className="cap">Some items have no amount in {dcCurrency} yet.</p>}
+      {foreign && amount.count > 0 && !amount.dcComplete && (
+        <p className="cap">Some items have no amount in {dcCurrency} yet.</p>
+      )}
     </div>
   );
 }
+
+type DrillRequest = Omit<Drill, "division">;
 
 function CurrencyBlock({
   side,
@@ -92,13 +99,19 @@ function CurrencyBlock({
   side: Side;
   k: CurrencyKpisDto;
   dcCurrency: string;
-  onDrill: (d: Drill) => void;
+  onDrill: (d: DrillRequest) => void;
 }) {
+  const expect = (amount: KpiAmountDto): DrillExpected => ({
+    currency: k.currency,
+    count: amount.count,
+    minor: amount.minor,
+  });
   const open = (figure: KpiFigure, label: string, amount: KpiAmountDto) =>
     onDrill({
       title: `${label} (${k.currency})`,
       hint: k.drilldown[figure],
       summary: `${formatMoney(amount.minor, k.currency)} in ${formatCount(amount.count)}`,
+      expected: expect(amount),
     });
   const L = LABEL[side];
   return (
@@ -146,6 +159,7 @@ function CurrencyBlock({
                   k.avgDaysOverdue === null
                     ? "Nothing is overdue"
                     : `${formatDays(k.avgDaysOverdue)} overdue on average, weighted by amount`,
+                expected: expect(k.overdue),
               })
             }
           >
@@ -199,13 +213,25 @@ export function Overview() {
   const selected = division.selected;
   const key = selected ? `overview:${selected.id}` : null;
   const r = useResource<OverviewResponse>(key, (signal) => getOverview(selected?.id ?? 0, signal));
-  const [drill, setDrill] = useState<Drill | null>(null);
-  // A sheet from another administration must never stay open after a switch.
-  useEffect(() => setDrill(null), [selected?.id]);
+  const [drillState, setDrill] = useState<Drill | null>(null);
+  // A sheet from another administration is never shown, not even for one render: the state
+  // carries its division and is ignored after a switch.
+  const drill = drillState && selected && drillState.division === selected.id ? drillState : null;
+  const openDrill = (d: DrillRequest) => {
+    if (selected) setDrill({ ...d, division: selected.id });
+  };
 
   const data = r.data;
-  const noData =
+  const empty =
     data !== null && data.kpis.receivable.length === 0 && data.kpis.payable.length === 0;
+  // Nothing open is only "no data" when the open items were never read completely.
+  const neverRead = empty && data.freshness.lastCompletedAt === null;
+  const nothingOpen = empty && !neverRead;
+  const connectAction = (
+    <Link className="btn primary" to="/settings/connections">
+      Go to connections
+    </Link>
+  );
 
   return (
     <>
@@ -242,22 +268,22 @@ export function Overview() {
       {selected && r.status === "error" && (
         <ErrorNotice message={describeLoadError(r.error)} onRetry={r.reload} />
       )}
-      {selected && r.status === "ready" && data && noData && (
+      {selected && r.status === "ready" && data && neverRead && (
         <Card>
-          <EmptyState
-            title="No data yet."
-            action={
-              <Link className="btn primary" to="/settings/connections">
-                Go to connections
-              </Link>
-            }
-          >
-            Connect Exact and run a sync. Receivables and payables show here once the first sync has
-            finished.
+          <EmptyState title="No data yet." action={connectAction}>
+            Connect Exact and run a sync. Receivables and payables show here once the first full
+            read from Exact has finished.
           </EmptyState>
         </Card>
       )}
-      {selected && data && !noData && (
+      {selected && r.status === "ready" && data && nothingOpen && (
+        <Card>
+          <EmptyState title="0 open invoices and 0 open bills.">
+            Nothing is open in Exact for this administration.
+          </EmptyState>
+        </Card>
+      )}
+      {selected && data && !empty && (
         <div className="grid-2">
           {(["receivable", "payable"] as const).map((side) => {
             const list = data.kpis[side];
@@ -269,7 +295,7 @@ export function Overview() {
                 </h2>
                 {list.length === 0 && (
                   <p className="lede">
-                    {side === "receivable" ? "No open invoices." : "No open bills."}
+                    {side === "receivable" ? "0 open invoices." : "0 open bills."}
                   </p>
                 )}
                 {list.map((k) => (
@@ -278,7 +304,7 @@ export function Overview() {
                     side={side}
                     k={k}
                     dcCurrency={data.division.currency}
-                    onDrill={setDrill}
+                    onDrill={openDrill}
                   />
                 ))}
               </Card>
@@ -286,12 +312,13 @@ export function Overview() {
           })}
         </div>
       )}
-      {drill && selected && (
+      {drill && (
         <DrillDownSheet
           title={drill.title}
           hint={drill.hint}
-          divisionId={selected.id}
+          divisionId={drill.division}
           summary={<p className="lede">{drill.summary}</p>}
+          expected={drill.expected}
           onClose={() => setDrill(null)}
         />
       )}

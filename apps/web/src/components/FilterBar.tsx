@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode, type Ref } from "react";
 import { Segmented, type SegmentedOption } from "@camelthorn/ui";
 
 function SearchIcon() {
@@ -102,15 +102,24 @@ export function ActiveFilter({
   label,
   clearLabel,
   onClear,
+  clearRef,
 }: {
   label: string;
   clearLabel: string;
   onClear: () => void;
+  /** The clear button, so a page can move focus to it after applying the filter. */
+  clearRef?: Ref<HTMLButtonElement>;
 }) {
   return (
     <span className="chip strong active-filter">
       {label}
-      <button type="button" className="chip-x" aria-label={clearLabel} onClick={onClear}>
+      <button
+        type="button"
+        className="chip-x"
+        aria-label={clearLabel}
+        onClick={onClear}
+        {...(clearRef ? { ref: clearRef } : {})}
+      >
         <span aria-hidden="true">{"×"}</span>
       </button>
     </span>

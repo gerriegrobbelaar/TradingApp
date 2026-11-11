@@ -83,7 +83,7 @@ describe("Overview", () => {
     const recv = await screen.findByRole("region", { name: "Receivables" });
     expect(recv.querySelector(".kpi.bad")).toBeNull();
     expect(within(recv).getByRole("button", { name: /^—/ })).toBeTruthy();
-    expect(screen.getByText("No open bills.")).toBeTruthy();
+    expect(screen.getByText("0 open bills.")).toBeTruthy();
   });
 
   it("notes when some items have no amount in the division currency", async () => {

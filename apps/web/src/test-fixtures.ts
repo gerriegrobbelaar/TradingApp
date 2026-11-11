@@ -112,6 +112,7 @@ export function listResponse(
     limit: 50,
     total: items.length,
     totalsByCurrency: totals,
+    freshness: { ...FRESH, basis: [items[0]?.kind === "bill" ? "payables" : "receivables"] },
     ...over,
   };
 }

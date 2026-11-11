@@ -1,12 +1,13 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
-import type { OpenItemListResponse, OpenItemRow } from "@camelthorn/core";
+import type { Freshness, OpenItemListResponse, OpenItemRow } from "@camelthorn/core";
 import { Card, Chip } from "@camelthorn/ui";
-import { listOpenItems } from "../api";
+import { ApiError, listOpenItems } from "../api";
 import { useDivision } from "../division";
 import { DataTable, KeyboardHint, LoadMore, type Column } from "../components/DataTable";
 import { EmptyState } from "../components/EmptyState";
 import { ActiveFilter, FilterBar } from "../components/FilterBar";
+import { FreshnessStamp } from "../components/FreshnessStamp";
 import { Money } from "../components/Money";
 import { itemTitle } from "../components/OpenItemDetailBody";
 import { OpenItemSheet } from "../components/OpenItemSheets";
@@ -19,6 +20,8 @@ import { useCursorList } from "../lib/useCursorList";
 export type OpenItemsView = "open" | "overdue" | "closed" | "all";
 const VIEWS: readonly OpenItemsView[] = ["open", "overdue", "closed", "all"];
 const PAGE = 50;
+
+const rowId = (r: OpenItemRow): number => r.id;
 
 const isView = (v: string | null): v is OpenItemsView =>
   v !== null && (VIEWS as readonly string[]).includes(v);
@@ -37,6 +40,10 @@ interface Copy {
   lede: string;
   party: string;
   nothing: string;
+  /** "invoices" / "bills", for sentences. */
+  plural: string;
+  /** What the freshness is about. */
+  what: string;
 }
 
 export const INVOICES_COPY: Copy = {
@@ -47,6 +54,8 @@ export const INVOICES_COPY: Copy = {
   lede: "Customer invoices from Exact, with what is still open and how late it is.",
   party: "Customer",
   nothing: "No invoices match these filters.",
+  plural: "invoices",
+  what: "Customer invoices",
 };
 
 export const PAYABLES_COPY: Copy = {
@@ -57,38 +66,50 @@ export const PAYABLES_COPY: Copy = {
   lede: "Supplier bills from Exact, with what is still open and how late it is. Read-only for now.",
   party: "Supplier",
   nothing: "No bills match these filters.",
+  plural: "bills",
+  what: "Supplier bills",
 };
 
+/**
+ * Currencies seen in this division's list responses so far, so the currency filter keeps its
+ * choices after narrowing to one. Derived during render (no effect), so the filter is there in the
+ * same render as the first page.
+ */
 function useKnownCurrencies(divisionId: number | null, seen: string[]): string[] {
-  const [known, setKnown] = useState<{ id: number | null; list: string[] }>({
-    id: divisionId,
-    list: [],
-  });
-  const key = seen.join(",");
-  useEffect(() => {
-    setKnown((k) => {
-      const base = k.id === divisionId ? k.list : [];
-      const next = Array.from(new Set([...base, ...seen])).sort();
-      if (k.id === divisionId && next.length === k.list.length) return k;
-      return { id: divisionId, list: next };
-    });
-  }, [divisionId, key]);
-  return known.id === divisionId ? known.list : [];
+  const acc = useRef<{ id: number | null; set: Set<string> }>({ id: divisionId, set: new Set() });
+  if (acc.current.id !== divisionId) acc.current = { id: divisionId, set: new Set() };
+  for (const c of seen) acc.current.set.add(c);
+  const joined = Array.from(acc.current.set).sort().join(",");
+  return useMemo(() => (joined ? joined.split(",") : []), [joined]);
 }
+
+const CURRENCY = /^[A-Za-z]{3}$/;
+const POSITIVE_ID = /^[1-9][0-9]{0,15}$/;
+/** Address parameters this page owns; anything invalid is dropped from the address. */
+const OWN = ["view", "q", "currency", "relationId", "relationName", "sort"] as const;
 
 export function OpenItemsPage({ copy }: { copy: Copy }) {
   const { selected, status: divStatus } = useDivision();
   const [params, setParams] = useSearchParams();
-  const view = isView(params.get("view")) ? (params.get("view") as OpenItemsView) : "open";
+  const rawView = params.get("view");
+  const rawCurrency = params.get("currency");
+  const rawRelation = params.get("relationId");
+  const rawSort = params.get("sort");
+  const view: OpenItemsView = isView(rawView) ? rawView : "open";
   const q = params.get("q") ?? "";
-  const currency = params.get("currency") ?? "";
-  const relationId = params.get("relationId") ?? "";
-  const relationName = params.get("relationName") ?? "";
-  const sortDir = params.get("sort") === "-due" ? "desc" : "asc";
-  const [itemId, setItemId] = useState<number | null>(null);
+  const currency =
+    rawCurrency !== null && CURRENCY.test(rawCurrency) ? rawCurrency.toUpperCase() : "";
+  const relationId = rawRelation !== null && POSITIVE_ID.test(rawRelation) ? rawRelation : "";
+  const relationName = relationId ? (params.get("relationName") ?? "") : "";
+  const sortDir = rawSort === "-due" ? "desc" : "asc";
 
+  /**
+   * Filters live in the address so a view can be shared and Back works: a discrete change
+   * (status, currency, relation, sort) is a new history entry, typing in the search box
+   * replaces the current one.
+   */
   const setParam = useCallback(
-    (patch: Record<string, string | null>) => {
+    (patch: Record<string, string | null>, how: "push" | "replace" = "push") => {
       setParams(
         (prev) => {
           const next = new URLSearchParams(prev);
@@ -98,17 +119,55 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
           }
           return next;
         },
-        { replace: true },
+        { replace: how === "replace" },
       );
     },
     [setParams],
   );
 
-  const divisionId = selected?.id ?? null;
-  // Another administration: a relation id or open sheet from the old one means nothing here.
+  // A hand-edited or stale address: drop what is not valid instead of failing the request.
+  const invalid =
+    (rawView !== null && !isView(rawView)) ||
+    (rawCurrency !== null && currency === "") ||
+    (rawRelation !== null && relationId === "") ||
+    (params.has("relationName") && relationId === "") ||
+    (rawSort !== null && rawSort !== "-due");
   useEffect(() => {
-    setItemId(null);
-  }, [divisionId]);
+    if (!invalid) return;
+    const patch: Record<string, string | null> = {};
+    for (const k of OWN) patch[k] = params.get(k);
+    if (rawView !== null && !isView(rawView)) patch["view"] = null;
+    if (currency === "") patch["currency"] = null;
+    else patch["currency"] = currency;
+    if (relationId === "") {
+      patch["relationId"] = null;
+      patch["relationName"] = null;
+    }
+    if (rawSort !== "-due") patch["sort"] = null;
+    setParam(patch, "replace");
+  }, [invalid, params, rawView, currency, relationId, rawSort, setParam]);
+
+  const divisionId = selected?.id ?? null;
+  // The open sheet belongs to one administration: after a switch it is gone in the same render
+  // (state tagged with the division, not reset by an effect a render later).
+  const [sheet, setSheet] = useState<{ division: number; id: number } | null>(null);
+  const itemId = sheet !== null && sheet.division === divisionId ? sheet.id : null;
+  const openItem = useCallback(
+    (id: number) => {
+      if (divisionId !== null) setSheet({ division: divisionId, id });
+    },
+    [divisionId],
+  );
+  // A relation filter from the previous administration means nothing in the new one.
+  const prevDivision = useRef(divisionId);
+  useEffect(() => {
+    const prev = prevDivision.current;
+    prevDivision.current = divisionId;
+    if (prev !== null && divisionId !== null && prev !== divisionId && relationId) {
+      setParam({ relationId: null, relationName: null }, "replace");
+    }
+  }, [divisionId, relationId, setParam]);
+  const crossRelation = prevDivision.current !== null && prevDivision.current !== divisionId;
 
   const query = useMemo(
     () => ({
@@ -120,10 +179,36 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
     }),
     [view, q, currency, relationId, sortDir],
   );
-  const key = divisionId === null ? null : `${copy.path}:${divisionId}:${JSON.stringify(query)}`;
-  const list = useCursorList<OpenItemRow, OpenItemListResponse>(key, (cursor, signal) =>
-    listOpenItems(copy.path, { ...query, division: divisionId, limit: PAGE, cursor }, signal),
+  // Not ready while the address is being cleaned, or while a relation filter of the previous
+  // administration is still in it (one render): never send a request for a stale filter.
+  const ready = divisionId !== null && !invalid && !(crossRelation && relationId);
+  const key = ready ? `${copy.path}:${divisionId}:${JSON.stringify(query)}` : null;
+  const list = useCursorList<OpenItemRow, OpenItemListResponse>(
+    key,
+    (cursor, signal) =>
+      listOpenItems(copy.path, { ...query, division: divisionId, limit: PAGE, cursor }, signal),
+    rowId,
   );
+
+  // Keep the last freshness of this division while another filter loads (no flicker).
+  const [lastFresh, setLastFresh] = useState<{ division: number; f: Freshness } | null>(null);
+  const firstFresh = list.first?.freshness ?? null;
+  useEffect(() => {
+    if (firstFresh && divisionId !== null) setLastFresh({ division: divisionId, f: firstFresh });
+  }, [firstFresh, divisionId]);
+  const freshness =
+    firstFresh ?? (lastFresh && lastFresh.division === divisionId ? lastFresh.f : null);
+
+  // After "Show all items for this relation" the row that opened the sheet is gone: put focus on
+  // the new filter's clear button instead of losing it to the page.
+  const clearRef = useRef<HTMLButtonElement>(null);
+  const focusClear = useRef(false);
+  useEffect(() => {
+    if (focusClear.current && relationId && clearRef.current) {
+      focusClear.current = false;
+      clearRef.current.focus();
+    }
+  });
 
   const currencies = useKnownCurrencies(divisionId, [
     ...(list.first?.totalsByCurrency.map((t) => t.currency) ?? []),
@@ -176,6 +261,16 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
   const noDivision = divStatus === "ready" && selected === null;
   const status = list.status === "ready" ? "ready" : list.status === "error" ? "error" : "loading";
   const filtered = view !== "open" || q.trim() !== "" || currency !== "" || relationId !== "";
+  const relationGone =
+    list.status === "error" &&
+    list.error instanceof ApiError &&
+    list.error.code === "unknown_relation";
+  const neverSynced = list.first !== null && list.first.freshness.lastCompletedAt === null;
+  // The chip shows the name the rows carry; the address name is only a fallback (it is text from
+  // a link and could say anything).
+  const shownRelationName =
+    list.items.find((r) => String(r.relation.id) === relationId)?.relation.name ?? relationName;
+  const clearRelation = () => setParam({ relationId: null, relationName: null });
 
   return (
     <>
@@ -184,16 +279,19 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
         title={copy.title}
         lede={copy.lede}
         tools={
-          list.first ? (
-            <span className="cap">Balances as of {formatDate(list.first.asOf)}</span>
-          ) : undefined
+          <>
+            <FreshnessStamp freshness={freshness} what={copy.what} />
+            {list.first && (
+              <span className="cap">Balances as of {formatDate(list.first.asOf)}</span>
+            )}
+          </>
         }
       />
       <Card>
         <FilterBar
           search={{
             value: q,
-            onChange: (v) => setParam({ q: v }),
+            onChange: (v) => setParam({ q: v }, "replace"),
             label: `Search ${copy.title.toLowerCase()}`,
             placeholder: "Number, name or reference",
           }}
@@ -228,9 +326,10 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
           ) : null}
           {relationId && (
             <ActiveFilter
-              label={`${copy.party}: ${relationName || `#${relationId}`}`}
+              label={`${copy.party}: ${shownRelationName || `#${relationId}`}`}
               clearLabel={`Clear ${copy.party.toLowerCase()} filter`}
-              onClear={() => setParam({ relationId: null, relationName: null })}
+              onClear={clearRelation}
+              clearRef={clearRef}
             />
           )}
         </FilterBar>
@@ -246,15 +345,27 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
           >
             Connect Exact and run a sync.
           </EmptyState>
+        ) : relationGone ? (
+          <EmptyState
+            title={`That ${copy.party.toLowerCase()} is not in ${selected?.name ?? "this administration"}.`}
+            action={
+              <button type="button" className="btn" onClick={clearRelation}>
+                Show all {copy.plural}
+              </button>
+            }
+          >
+            The link may come from another administration, or the {copy.party.toLowerCase()} was
+            removed in Exact.
+          </EmptyState>
         ) : (
           <>
             <DataTable
               caption={copy.title}
               columns={columns}
               rows={list.items}
-              rowKey={(r) => r.id}
+              rowKey={rowId}
               status={divStatus === "loading" ? "loading" : status}
-              onActivate={(r) => setItemId(r.id)}
+              onActivate={(r) => openItem(r.id)}
               activeKey={itemId}
               sort={{ key: "due", dir: sortDir }}
               onSort={() => setParam({ sort: sortDir === "asc" ? "-due" : null })}
@@ -262,11 +373,20 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
                 ? { errorMessage: describeLoadError(list.error), onRetry: list.reload }
                 : {})}
               empty={
-                <EmptyState title={copy.nothing}>
-                  {filtered
-                    ? "Clear a filter or change the search to see more."
-                    : "Nothing has been synced from Exact yet. Run a sync from Settings."}
-                </EmptyState>
+                neverSynced ? (
+                  <EmptyState title={`No ${copy.plural} read from Exact yet.`}>
+                    The first full read of this administration has not finished. They show here once
+                    it has.
+                  </EmptyState>
+                ) : filtered ? (
+                  <EmptyState title={copy.nothing}>
+                    Clear a filter or change the search to see more.
+                  </EmptyState>
+                ) : (
+                  <EmptyState title={`0 open ${copy.plural}.`}>
+                    Nothing is open in Exact for this administration.
+                  </EmptyState>
+                )
               }
               footer={totals.map((t) => (
                 <tr key={t.currency} className="totals-row">
@@ -294,9 +414,10 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
       <OpenItemSheet
         itemId={itemId}
         kind={copy.kind}
-        onClose={() => setItemId(null)}
+        onClose={() => setSheet(null)}
         onShowRelation={(id, name) => {
-          setItemId(null);
+          setSheet(null);
+          focusClear.current = true;
           setParam({ relationId: String(id), relationName: name });
         }}
       />

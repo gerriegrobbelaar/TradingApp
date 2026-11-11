@@ -10,6 +10,7 @@ import { DrillSheet } from "./DrillSheet";
 import { FilterBar } from "./FilterBar";
 import { FreshnessStamp } from "./FreshnessStamp";
 import { Money, MoneyByCurrency } from "./Money";
+import { safeExactLink } from "./OpenItemDetailBody";
 import { FRESH, NEVER, STALE } from "../test-fixtures";
 
 const axe = configureAxe({ rules: { "color-contrast": { enabled: false } } });
@@ -395,5 +396,29 @@ describe("DrillSheet", () => {
     await vi.waitFor(() =>
       expect(document.activeElement).toBe(screen.getByRole("button", { name: "Back" })),
     );
+  });
+});
+
+describe("safeExactLink", () => {
+  it("keeps https links on Exact Online hosts only", () => {
+    expect(safeExactLink("https://start.exactonline.nl/docs/x?y=1")).toBe(
+      "https://start.exactonline.nl/docs/x?y=1",
+    );
+    expect(safeExactLink("https://start.exactonline.co.uk/a")).toBe(
+      "https://start.exactonline.co.uk/a",
+    );
+    for (const bad of [
+      null,
+      "",
+      "javascript:alert(1)",
+      "http://start.exactonline.nl/a",
+      "https://start.exactonline.nl.evil.test/a",
+      "https://evil-exactonline.nl/a",
+      "https://user:pw@start.exactonline.nl/a",
+      "//start.exactonline.nl/a",
+      "not a url",
+    ]) {
+      expect(safeExactLink(bad), String(bad)).toBeNull();
+    }
   });
 });

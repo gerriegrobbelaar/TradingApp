@@ -4,7 +4,7 @@
  * currency amount (no FX conversion happens anywhere, EUR-equivalents come in Phase 6).
  * Dates are `YYYY-MM-DD` (Amsterdam calendar days); timestamps are UTC ISO-8601.
  * Error bodies are `{ error: string }` with 400 (bad query), 401, 403 (no role), 404 (unknown
- * division or row) and 503 `search_index_building` (retry after `Retry-After` seconds).
+ * division or row, or a `relationId` of another division: `unknown_relation`) and 503 `search_index_building` (retry after `Retry-After` seconds).
  * `asOf` is always today's Amsterdam date; other values are refused (400 `as_of_in_past` /
  * `as_of_in_future`). Shape tests: apps/worker/test/read-api-shapes.test.ts.
  */
@@ -84,6 +84,11 @@ export interface OpenItemListResponse {
   /** Number of rows matching the filters. */
   total: number;
   totalsByCurrency: CurrencyTotal[];
+  /**
+   * Last complete read of this kind's open items (`receivables` for /api/invoices, `payables`
+   * for /api/bills), same basis as the Overview and the ageing report (review K3a).
+   */
+  freshness: Freshness;
 }
 
 export interface OpenItemDetail {
@@ -234,37 +239,6 @@ export interface OverviewResponse {
   lastSync: SyncFreshnessEntry[];
 }
 
-// ---- approvals (task K4 owns these types; K3a declares them to build against) -----------------
-// GET /api/approvals?division=&status=pending_approval|approved|rejected|all&q=&limit=&cursor=
-
-export type ApprovalStatus = "pending_approval" | "approved" | "rejected" | "unknown";
-
-export interface ApprovalItemDto {
-  id: number;
-  exactId: string;
-  entryNumber: string | null;
-  relation: { id: number | null; name: string } | null;
-  currency: string;
-  amountMinor: number;
-  dueDate: string | null;
-  entryDate: string | null;
-  status: ApprovalStatus;
-  submittedAt: string | null;
-  ageDays: number | null;
-  hasPdf: boolean | null;
-}
-
-export interface ApprovalsResponse {
-  division: { id: number; name: string };
-  items: ApprovalItemDto[];
-  nextCursor: string | null;
-  total: number;
-  countsByStatus: Record<ApprovalStatus, number>;
-  freshness: Freshness;
-  /** False until the entity has been synced. */
-  available: boolean;
-}
-
 // ---- ledger and reports (task K2, ADR 0024) -----------------------------------------------------
 // Every ledger amount is integer minor units in the DIVISION currency (`division.currency`), at
 // that currency's scale. Nothing here is converted. Report builders live in ./reports.
@@ -387,4 +361,60 @@ export interface LedgerAccountBalancesResponse {
   /** Sum of the period amounts shown. */
   totalMinor: number;
   freshness: LedgerFreshness;
+}
+
+// ---- approvals (task K4, ADR 0025) ----------------------------------------------------------
+
+export type ApprovalStatus = "pending_approval" | "approved" | "rejected" | "unknown";
+
+/**
+ * One purchase entry as the Approvals screen shows it. No IBANs or emails. `amountMinor` is the
+ * entry total in `currency` (credit notes negative). `status` comes from the one mapping table in
+ * approvals.ts (unverified, ADR 0025; unknown codes are 'unknown'). `ageDays` is set for pending
+ * items only. `hasPdf` is null when we could not tell.
+ */
+export interface ApprovalItemDto {
+  id: number;
+  exactId: string;
+  entryNumber: string | null;
+  relation: { id: number | null; name: string } | null;
+  currency: string;
+  amountMinor: number;
+  dueDate: string | null;
+  entryDate: string | null;
+  status: ApprovalStatus;
+  submittedAt: string | null;
+  ageDays: number | null;
+  hasPdf: boolean | null;
+}
+
+/**
+ * GET /api/approvals?division=&status=pending_approval|approved|rejected|all&q=&limit=&cursor=
+ * `available` is false until the purchase entries have been read completely once (or when Exact
+ * refuses the resource); items are then empty. `countsByStatus` ignores the status filter but
+ * follows `q`.
+ */
+export interface ApprovalsResponse {
+  division: { id: number; name: string };
+  items: ApprovalItemDto[];
+  nextCursor: string | null;
+  total: number;
+  countsByStatus: Record<ApprovalStatus, number>;
+  freshness: Freshness;
+  available: boolean;
+}
+
+/** GET /api/approvals/:id */
+export interface ApprovalDetail {
+  division: { id: number; name: string };
+  item: ApprovalItemDto;
+  statusCode: number | null;
+  amountDcMinor: number | null;
+  dcCurrency: string | null;
+  modifiedAt: string | null;
+  provenance: {
+    lastSeenAt: string;
+    lastSeenSyncId: number | null;
+    missedCycles: number;
+  };
 }

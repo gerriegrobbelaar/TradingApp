@@ -77,6 +77,34 @@ describe("text contrast >= 4.5:1", () => {
   });
 });
 
+/**
+ * Chips and warning notices on the surfaces they actually sit on (review K3a): a card (both ends
+ * of the gradient) or a sheet, not the bare page. The soft fill is composited over the surface,
+ * which is composited over --bg. Table rows (hover and selection) are checked in
+ * apps/web/src/contrast.test.ts, next to the rules that style them.
+ */
+describe("text contrast >= 4.5:1 for chips and notices on cards and sheets", () => {
+  const CHIP_PAIRS: [string, string][] = [
+    ["--muted", "--fill"], // neutral chip
+    ["--ink", "--fill-2"], // strong chip (pressed filter, active filter)
+    ["--accent-text", "--accent-soft"], // ok chip
+    ["--warn-text", "--warn-soft"], // warn chip and .notice.warn
+    ["--gold", "--gold-soft"], // gold chip
+    ["--ink", "--sunken"], // .notice
+  ];
+  for (const [name, tokens] of SETS) {
+    for (const surface of ["--sheet", "--glass-1", "--glass-2"]) {
+      const surf = () => over(tok(tokens, surface), tok(tokens, "--bg"));
+      for (const [fg, fill] of CHIP_PAIRS) {
+        it(`${name}: ${fg} on ${fill} over ${surface}`, () => {
+          const bg = over(tok(tokens, fill), surf());
+          expect(contrastRatio(tok(tokens, fg), bg)).toBeGreaterThanOrEqual(4.5);
+        });
+      }
+    }
+  }
+});
+
 describe("non-text contrast >= 3:1 (WCAG 1.4.11)", () => {
   // Focus ring is `outline: 2px solid var(--accent-text)` on whatever the control sits on.
   const FOCUS_SURFACES = ["--bg", "--fill", "--fill-2", "--sunken", "--sheet", "--glass-1"];

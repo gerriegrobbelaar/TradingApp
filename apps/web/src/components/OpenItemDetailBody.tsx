@@ -22,6 +22,24 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
 
 const yesNo = (v: boolean) => (v ? "Yes" : "No");
 
+/**
+ * A deep link from the API is only used when it is an https URL on an Exact Online host
+ * (exactonline.nl and the other country domains); anything else (javascript:, another host) is
+ * not rendered.
+ */
+export function safeExactLink(raw: string | null): string | null {
+  if (!raw) return null;
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== "https:" || u.username || u.password) return null;
+    const host = u.hostname.toLowerCase();
+    if (!/(^|\.)exactonline\.[a-z]{2,3}(\.[a-z]{2})?$/.test(host)) return null;
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
 /** Display title of an item: invoice number, else entry number, else a neutral word. */
 export function itemTitle(item: {
   kind: "invoice" | "bill";
@@ -43,6 +61,7 @@ export function OpenItemDetailView({
 }) {
   const { item, relation, provenance } = detail;
   const dcCur = item.dcCurrency;
+  const exactLink = safeExactLink(detail.exactLink);
   return (
     <div className="detail">
       <p className="lede">
@@ -119,9 +138,9 @@ export function OpenItemDetailView({
         {provenance.source ? `. Source: ${SOURCE_LABEL[provenance.source]}` : ""}.
         {provenance.missedCycles > 0 && ` Missed in ${provenance.missedCycles} full reads since.`}
       </p>
-      {detail.exactLink && (
+      {exactLink && (
         <p>
-          <a href={detail.exactLink} target="_blank" rel="noreferrer">
+          <a href={exactLink} target="_blank" rel="noopener noreferrer">
             Open in Exact Online
           </a>
         </p>

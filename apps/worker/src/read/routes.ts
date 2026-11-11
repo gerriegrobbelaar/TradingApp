@@ -1,7 +1,9 @@
 /**
  * Read-only API for invoices, bills, ageing and the Overview (Phase 4, ADR 0022).
  *
- *  GET /api/invoices | /api/bills   paged open-item lists (receivables | payables)
+ *  GET /api/invoices | /api/bills   paged open-item lists (receivables | payables), with the
+ *                                   freshness of that kind; `relationId` must be a relation of
+ *                                   the division (404 unknown_relation otherwise)
  *  GET /api/open-items/:id          one stored open item with its sync provenance
  *  GET /api/relations/:id           minimal relation summary (presence flags, never IBAN/email)
  *  GET /api/reports/ageing          ageing per relation and bucket (kind, asOf)
@@ -269,10 +271,31 @@ async function listHandler(ctx: Ctx, kind: OpenItemKind): Promise<Response> {
 
   const list = buildListQuery(filter, dir, cursor, limit + 1);
   const totals = buildTotalsQuery(filter, dc);
-  const [rows, totalRows] = await db.batch<ListRow | TotalsRow>([
+  const entity: FreshnessEntity = kind === "invoice" ? "receivables" : "payables";
+  const [rows, totalRows, stateRows, relationRows] = await db.batch<
+    ListRow | TotalsRow | SyncStateRow | { id: number }
+  >([
     db.prepare(list.sql).bind(...list.binds),
     db.prepare(totals.sql).bind(...totals.binds),
+    db
+      .prepare(
+        `SELECT entity, last_status, last_completed_at, last_finished_at, last_error
+         FROM sync_state WHERE division_id = ?1 AND entity = ?2`,
+      )
+      .bind(division.id, entity),
+    // A relation filter must name a relation of THIS division (a link shared from another
+    // administration otherwise looks like an empty list): 404 unknown_relation.
+    ...(filter.relationId === null
+      ? []
+      : [
+          db
+            .prepare("SELECT id FROM relations WHERE id = ?1 AND division_id = ?2")
+            .bind(filter.relationId, division.id),
+        ]),
   ]);
+  if (filter.relationId !== null && (relationRows?.results ?? []).length === 0) {
+    throw new BadRequest("unknown_relation", 404);
+  }
   const all = (rows?.results ?? []) as ListRow[];
   const page = all.slice(0, limit);
   const last = page[page.length - 1];
@@ -286,6 +309,7 @@ async function listHandler(ctx: Ctx, kind: OpenItemKind): Promise<Response> {
     limit,
     total: totalsByCurrency.reduce((n, t) => n + t.count, 0),
     totalsByCurrency,
+    freshness: freshnessOf((stateRows?.results ?? []) as SyncStateRow[], [entity], ctx.nowMs),
   };
   return json(body);
 }

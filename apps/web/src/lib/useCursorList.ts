@@ -33,6 +33,21 @@ interface State<T, P> {
   moreError: unknown;
 }
 
+/**
+ * Append the next page, skipping rows already shown. A keyset page never overlaps the previous
+ * one, but a row whose due date changed between two requests can come back; a duplicate React key
+ * would then mix up two rows. O(page + shown) per page.
+ */
+function appendNew<T>(
+  shown: T[],
+  page: T[],
+  keyOf: ((row: T) => string | number) | undefined,
+): T[] {
+  if (!keyOf) return [...shown, ...page];
+  const seen = new Set(shown.map(keyOf));
+  return [...shown, ...page.filter((r) => !seen.has(keyOf(r)))];
+}
+
 function blank<T, P>(key: string | null, status: CursorListStatus): State<T, P> {
   return {
     key,
@@ -56,18 +71,23 @@ function blank<T, P>(key: string | null, status: CursorListStatus): State<T, P> 
 export function useCursorList<T, P extends CursorPage<T>>(
   queryKey: string | null,
   fetchPage: (cursor: string | null, signal: AbortSignal) => Promise<P>,
+  /** Row identity: a row already shown is not appended twice (rows moved between pages). */
+  keyOf?: (row: T) => string | number,
 ): CursorList<T, P> {
+  const keyRef = useRef(keyOf);
+  keyRef.current = keyOf;
   const [state, setState] = useState<State<T, P>>(() => blank(null, "idle"));
   const [tick, setTick] = useState(0);
   const fetchRef = useRef(fetchPage);
   fetchRef.current = fetchPage;
   const controller = useRef<AbortController | null>(null);
-  const moreBusy = useRef(false);
+  /** The controller whose "Load more" is in flight, so a late answer for an old key cannot clear it. */
+  const moreBusy = useRef<AbortController | null>(null);
   const latest = useRef(state);
   latest.current = state;
 
   useEffect(() => {
-    moreBusy.current = false;
+    moreBusy.current = null;
     if (queryKey === null) return;
     const ac = new AbortController();
     controller.current = ac;
@@ -88,23 +108,28 @@ export function useCursorList<T, P extends CursorPage<T>>(
   const loadMore = useCallback(() => {
     const s = latest.current;
     const ac = controller.current;
-    if (!ac || ac.signal.aborted || moreBusy.current) return;
+    if (!ac || ac.signal.aborted || moreBusy.current === ac) return;
     if (s.status !== "ready" || s.next === null || s.key === null) return;
     const { key, next } = s;
-    moreBusy.current = true;
+    moreBusy.current = ac;
     setState((c) => (c.key === key ? { ...c, loadingMore: true, moreError: null } : c));
     fetchRef.current(next, ac.signal).then(
       (p) => {
-        moreBusy.current = false;
+        if (moreBusy.current === ac) moreBusy.current = null;
         if (ac.signal.aborted) return;
         setState((c) =>
           c.key === key
-            ? { ...c, items: [...c.items, ...p.items], next: p.nextCursor, loadingMore: false }
+            ? {
+                ...c,
+                items: appendNew(c.items, p.items, keyRef.current),
+                next: p.nextCursor,
+                loadingMore: false,
+              }
             : c,
         );
       },
       (error: unknown) => {
-        moreBusy.current = false;
+        if (moreBusy.current === ac) moreBusy.current = null;
         if (ac.signal.aborted || isAbort(error)) return;
         setState((c) => (c.key === key ? { ...c, loadingMore: false, moreError: error } : c));
       },

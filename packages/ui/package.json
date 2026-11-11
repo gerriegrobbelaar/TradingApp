@@ -10,7 +10,8 @@
     "./styles.css": "./src/styles/styles.css",
     "./tokens.css": "./src/styles/tokens.css",
     "./components.css": "./src/styles/components.css",
-    "./helpers.css": "./src/styles/helpers.css"
+    "./helpers.css": "./src/styles/helpers.css",
+    "./contrast": "./src/styles/contrast.ts"
   },
   "sideEffects": [
     "*.css"

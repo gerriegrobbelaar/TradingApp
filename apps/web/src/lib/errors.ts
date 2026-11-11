@@ -6,6 +6,8 @@ const TEXT: Record<string, string> = {
   unknown_division: "That administration is no longer available. Pick another one.",
   no_division: "No administration is selected. Pick one in the top bar.",
   not_found: "That item no longer exists. Reload the list.",
+  unknown_relation:
+    "That relation is not in this administration. The link may come from another administration.",
   bad_q: "That search text is not valid. Shorten it or remove special characters.",
   forbidden: "You do not have access to this screen.",
 };

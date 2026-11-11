@@ -4,7 +4,16 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { configureAxe } from "vitest-axe";
 import { VIEWER, mockFetch, renderApp, type Call } from "./test-utils";
-import { ONE_DIVISION, TWO_DIVISIONS, detail, listResponse, row } from "./test-fixtures";
+import type { Freshness } from "@camelthorn/core";
+import {
+  FRESH,
+  NEVER,
+  ONE_DIVISION,
+  TWO_DIVISIONS,
+  detail,
+  listResponse,
+  row,
+} from "./test-fixtures";
 
 const axe = configureAxe({ rules: { "color-contrast": { enabled: false } } });
 const base = (divisions = ONE_DIVISION) => ({
@@ -222,19 +231,34 @@ describe("Invoices list", () => {
     const p = params(listCalls(calls)[0]);
     expect(p.get("overdue")).toBe("1");
     expect(p.get("q")).toBe("acme");
-    expect(p.get("currency")).toBe("usd");
+    expect(p.get("currency")).toBe("USD");
     expect(p.get("relationId")).toBe("7");
     expect(p.get("sort")).toBe("-due");
   });
 
-  it("shows an empty state that depends on whether filters are on", async () => {
-    mockFetch({ ...base(), "GET /api/invoices": () => ({ body: listResponse([]) }) });
-    const { unmount } = renderApp("/invoices");
+  it("tells never read, nothing open and nothing matching apart", async () => {
+    let fresh: Freshness = FRESH;
+    mockFetch({
+      ...base(),
+      "GET /api/invoices": () => ({ body: listResponse([], { freshness: fresh }) }),
+    });
+    // Read completely, nothing open: a number, not "not synced".
+    const first = renderApp("/invoices");
+    expect(await screen.findByText("0 open invoices.")).toBeTruthy();
+    expect(screen.getByText("Nothing is open in Exact for this administration.")).toBeTruthy();
+    expect(screen.queryByText(/not been read|read from Exact yet/)).toBeNull();
+    first.unmount();
+    // Filters on: say so.
+    const second = renderApp("/invoices?q=zzz");
     expect(await screen.findByText("No invoices match these filters.")).toBeTruthy();
-    expect(screen.getByText(/Nothing has been synced from Exact yet/)).toBeTruthy();
-    unmount();
-    renderApp("/invoices?q=zzz");
-    expect(await screen.findByText(/Clear a filter or change the search/)).toBeTruthy();
+    expect(screen.getByText(/Clear a filter or change the search/)).toBeTruthy();
+    second.unmount();
+    // Never read completely: neither "0 open" nor "no match", and the stamp says Never synced.
+    fresh = NEVER;
+    renderApp("/invoices");
+    expect(await screen.findByText("No invoices read from Exact yet.")).toBeTruthy();
+    expect(screen.queryByText("0 open invoices.")).toBeNull();
+    expect(screen.getByText("Never synced")).toBeTruthy();
   });
 
   it("shows an error with a retry", async () => {

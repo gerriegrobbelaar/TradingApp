@@ -60,6 +60,60 @@ describe("useCursorList", () => {
     expect(result.current.items).toHaveLength(3);
   });
 
+  it("does not append a row that is already shown (a row moved between pages)", async () => {
+    const pages: Page[] = [
+      { items: [{ n: 1 }, { n: 2 }], nextCursor: "1", total: 3 },
+      { items: [{ n: 2 }, { n: 3 }], nextCursor: null, total: 3 },
+    ];
+    const { fn } = pager(pages);
+    const { result } = renderHook(() => useCursorList<Item, Page>("k", fn, (i) => i.n));
+    await waitFor(() => expect(result.current.status).toBe("ready"));
+    act(() => result.current.loadMore());
+    await waitFor(() => expect(result.current.hasMore).toBe(false));
+    expect(result.current.items.map((i) => i.n)).toEqual([1, 2, 3]);
+  });
+
+  it("a late Load more answer for an old key cannot unlock Load more of the new key", async () => {
+    const pending: ((p: Page) => void)[] = [];
+    // A server that ignores the abort and answers late.
+    const fn = vi.fn((cursor: string | null) =>
+      cursor === null
+        ? Promise.resolve(P[0] as Page)
+        : new Promise<Page>((res) => {
+            pending.push(res);
+          }),
+    );
+    const { result, rerender } = renderHook(({ k }) => useCursorList<Item, Page>(k, fn), {
+      initialProps: { k: "a" },
+    });
+    await waitFor(() => expect(result.current.status).toBe("ready"));
+    act(() => result.current.loadMore()); // "a", page 2: in flight, aborted below
+    rerender({ k: "b" });
+    await waitFor(() => expect(result.current.status).toBe("ready"));
+    act(() => result.current.loadMore()); // "b", page 2: in flight
+    await act(async () => pending[0]?.(P[1] as Page)); // "a" answers now
+    act(() => result.current.loadMore()); // must still be a no-op
+    expect(fn.mock.calls.filter((c) => c[0] !== null)).toHaveLength(2);
+  });
+
+  it("handles 5,000 rows in pages of 100 without duplicates and with one request per page", async () => {
+    const pages: Page[] = Array.from({ length: 50 }, (_, p) => ({
+      items: Array.from({ length: 100 }, (_, i) => ({ n: p * 100 + i })),
+      nextCursor: p < 49 ? String(p + 1) : null,
+      total: 5000,
+    }));
+    const { fn } = pager(pages);
+    const { result } = renderHook(() => useCursorList<Item, Page>("k", fn, (i) => i.n));
+    await waitFor(() => expect(result.current.status).toBe("ready"));
+    for (let p = 1; p < 50; p++) {
+      act(() => result.current.loadMore());
+      await waitFor(() => expect(result.current.items).toHaveLength((p + 1) * 100));
+    }
+    expect(result.current.hasMore).toBe(false);
+    expect(new Set(result.current.items.map((i) => i.n)).size).toBe(5000);
+    expect(fn).toHaveBeenCalledTimes(50);
+  });
+
   it("drops the items at once and aborts the old request when the key changes", async () => {
     const { fn, calls } = pager(P);
     const { result, rerender } = renderHook(({ k }) => useCursorList<Item, Page>(k, fn), {
