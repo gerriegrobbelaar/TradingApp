@@ -32,8 +32,11 @@ let div: DivisionRef & { name: string };
 let fx: FakeExact;
 let gate: FakeGate;
 let n = 0;
-/** Exact calls before the ledger in a full run: divisions, receivables, payables, relations, IBANs. */
-const PRE = 5;
+/**
+ * Exact calls before the ledger in a full run: divisions, receivables, payables, relations, IBANs
+ * and the (empty) purchase-entry read, which runs before the ledger (review K4, ADR 0025).
+ */
+const PRE = 6;
 
 beforeEach(async () => {
   await resetSync();

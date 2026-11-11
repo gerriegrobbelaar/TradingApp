@@ -60,6 +60,26 @@ export interface FakeBalance {
   costcenter?: string | null;
   costunit?: string | null;
 }
+/**
+ * A purchase entry as Exact's purchaseentry/PurchaseEntries would send it. Times are epoch ms.
+ * `doc`: true = a document is attached, false = none, undefined = the row has no Document field.
+ */
+export interface FakePurchase {
+  n: number;
+  supplier?: number | null;
+  name?: string | null;
+  amount: number;
+  currency?: string;
+  amountDc?: number | null;
+  status: number | null;
+  entryDate: number;
+  dueDate?: number | null;
+  created?: number;
+  modified: number;
+  doc?: boolean;
+  entryNumber?: number | null;
+}
+
 export interface FakeBudget {
   account: number;
   year: number;
@@ -88,6 +108,7 @@ export class FakeExact {
   glAccounts: FakeGlAccount[] = [];
   glBalances: FakeBalance[] = [];
   glBudgets: FakeBudget[] = [];
+  purchases: FakePurchase[] = [];
   pageSize = 2;
   /** Page sizes per endpoint family when set (Exact: about 60 on list endpoints, 1,000 on sync). */
   listPageSize: number | undefined;
@@ -234,9 +255,45 @@ export class FakeExact {
             Costunit: null,
           }));
       }
+      case "/purchaseentry/PurchaseEntries":
+        return this.purchaseRows(req);
       default:
         throw new Error(`FakeExact: unexpected path ${req.path}`);
     }
+  }
+
+  /** Understands the two filters of the client (purchaseEntryFilterExpr) and $orderby=Modified. */
+  private purchaseRows(req: ExactRequest): unknown[] {
+    const filter = req.query?.["$filter"] ?? "";
+    const dt = (s: string): number => Date.parse(`${s}Z`);
+    const ms = [...filter.matchAll(/datetime'([^']+)'/g)].map((m) => dt(m[1] as string));
+    const from = ms[0] ?? 0;
+    const codes = [...filter.matchAll(/Status eq (\d+)/g)].map((m) => Number(m[1]));
+    const windowed = filter.startsWith("EntryDate ge");
+    return this.purchases
+      .filter((p) =>
+        windowed
+          ? p.entryDate >= from ||
+            p.modified >= from ||
+            (p.status !== null && codes.includes(p.status))
+          : p.modified >= from,
+      )
+      .sort((a, b) => a.modified - b.modified || a.n - b.n)
+      .map((p) => ({
+        EntryID: guid(8000 + p.n),
+        EntryNumber: p.entryNumber === undefined ? 70000 + p.n : p.entryNumber,
+        Supplier: p.supplier === null ? null : guid(p.supplier ?? 1),
+        SupplierName: p.name === undefined ? `Supplier ${p.supplier ?? 1}` : p.name,
+        Currency: p.currency ?? "EUR",
+        AmountFC: p.amount,
+        AmountDC: p.amountDc ?? null,
+        EntryDate: date(p.entryDate),
+        DueDate: p.dueDate === undefined || p.dueDate === null ? null : date(p.dueDate),
+        Status: p.status,
+        Created: date(p.created ?? p.entryDate),
+        Modified: date(p.modified),
+        ...(p.doc === undefined ? {} : { Document: p.doc ? guid(9000 + p.n) : null }),
+      }));
   }
 
   private listRow(i: FakeItem): unknown {
@@ -306,6 +363,7 @@ export async function resetSync(): Promise<void> {
     db.prepare("DELETE FROM user_prefs"),
     db.prepare("DELETE FROM sync_locks"),
     db.prepare("DELETE FROM sync_state"),
+    db.prepare("DELETE FROM purchase_entries"),
     db.prepare("DELETE FROM gl_balances"),
     db.prepare("DELETE FROM gl_budgets"),
     db.prepare("DELETE FROM gl_accounts"),

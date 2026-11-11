@@ -125,7 +125,7 @@ function dateParam(raw: string | null, name: string): string | null {
   }
 }
 
-const today = (ctx: Ctx): string => amsterdamParts(ctx.nowMs).date;
+export const today = (ctx: Ctx): string => amsterdamParts(ctx.nowMs).date;
 
 /**
  * `asOf` for lists and reports: today's Amsterdam calendar date, the only date the tables can
@@ -180,7 +180,7 @@ export function guarded(fn: (ctx: Ctx) => Promise<Response>): (ctx: Ctx) => Prom
 
 // ---- lists ----------------------------------------------------------------------------------
 
-function searchParam(raw: string | null): string[] {
+export function searchParam(raw: string | null): string[] {
   const q = (raw ?? "").trim();
   if (q.length > 100) throw new BadRequest("bad_q");
   try {
@@ -479,7 +479,7 @@ function hints(
   return out;
 }
 
-interface SyncStateRow {
+export interface SyncStateRow {
   entity: string;
   last_status: string | null;
   last_completed_at: string | null;
@@ -487,7 +487,7 @@ interface SyncStateRow {
   last_error: string | null;
 }
 
-async function syncState(db: D1Database, divisionId: number): Promise<SyncStateRow[]> {
+export async function syncState(db: D1Database, divisionId: number): Promise<SyncStateRow[]> {
   return (
     await db
       .prepare(

@@ -64,6 +64,7 @@ describe("sync entity names (S9)", () => {
         "gl_balances",
         "gl_budgets",
         "payables",
+        "purchase_entries",
         "receivables",
         "relation_ibans",
         "relations",

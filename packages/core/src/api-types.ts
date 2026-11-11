@@ -4,7 +4,8 @@
  * currency amount (no FX conversion happens anywhere, EUR-equivalents come in Phase 6).
  * Dates are `YYYY-MM-DD` (Amsterdam calendar days); timestamps are UTC ISO-8601.
  * Error bodies are `{ error: string }` with 400 (bad query), 401, 403 (no role), 404 (unknown
- * division or row, or a `relationId` of another division: `unknown_relation`) and 503 `search_index_building` (retry after `Retry-After` seconds).
+ * division or row, or a `relationId` of another division: `unknown_relation`) and 503
+ * `search_index_building` (retry after `Retry-After` seconds).
  * `asOf` is always today's Amsterdam date; other values are refused (400 `as_of_in_past` /
  * `as_of_in_future`). Shape tests: apps/worker/test/read-api-shapes.test.ts.
  */
@@ -177,7 +178,7 @@ export interface AgeingReportResponse {
 }
 
 /** The sync_state entities whose complete reads freshness is based on. */
-export type FreshnessEntity = "receivables" | "payables";
+export type FreshnessEntity = "receivables" | "payables" | "purchase_entries";
 
 export interface Freshness {
   /**
@@ -390,8 +391,9 @@ export interface ApprovalItemDto {
 
 /**
  * GET /api/approvals?division=&status=pending_approval|approved|rejected|all&q=&limit=&cursor=
- * `available` is false until the purchase entries have been read completely once (or when Exact
- * refuses the resource); items are then empty. `countsByStatus` ignores the status filter but
+ * `available` is false until the purchase entries have been read completely once (also when Exact
+ * has refused the resource from the start); items are then empty. After that, a refusal or failing
+ * reads show as `freshness.stale`, not as unavailable. `countsByStatus` ignores the status filter but
  * follows `q`.
  */
 export interface ApprovalsResponse {
@@ -402,6 +404,24 @@ export interface ApprovalsResponse {
   countsByStatus: Record<ApprovalStatus, number>;
   freshness: Freshness;
   available: boolean;
+}
+
+/**
+ * GET /api/approvals/status-codes?division= (admin only): cached entries per raw Exact Status
+ * code, to verify the unverified mapping on a real division (ADR 0025). `storedStatus` is what
+ * the rows hold, `mappedStatus` what the current table makes of the code (they differ only after
+ * a table change, until the rows are read again).
+ */
+export interface ApprovalStatusCodesResponse {
+  division: { id: number; name: string };
+  table: { statusCode: number; status: ApprovalStatus }[];
+  codes: {
+    statusCode: number | null;
+    storedStatus: ApprovalStatus;
+    mappedStatus: ApprovalStatus;
+    count: number;
+    lastSeenAt: string;
+  }[];
 }
 
 /** GET /api/approvals/:id */

@@ -71,6 +71,7 @@ export async function resetExact(): Promise<void> {
     db.prepare("DELETE FROM sync_locks"),
     db.prepare("DELETE FROM sync_state"),
     db.prepare("DELETE FROM open_items"),
+    db.prepare("DELETE FROM purchase_entries"),
     db.prepare("DELETE FROM gl_balances"),
     db.prepare("DELETE FROM gl_budgets"),
     db.prepare("DELETE FROM gl_accounts"),
