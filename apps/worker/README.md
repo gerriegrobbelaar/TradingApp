@@ -1,6 +1,7 @@
 # apps/worker
 
 Cloudflare Worker: HTTP API, webhooks, cron handler, queue consumers, Durable Objects.
+Deploying and operating it: [docs/DEPLOY.md](../../docs/DEPLOY.md).
 
 ## Sign-in configuration (CLAUDE.md 4.0, ADR 0002)
 
@@ -36,6 +37,18 @@ If any is missing, `/api/connections/exact/start` and `/callback` answer
 - `POST /api/connections/exact/disconnect` (admin, step-up): wipes the tokens.
 - Workers code calls Exact only through `createGateTransport(env, division)` (an `ExactTransport`
   backed by the `ExactGate` Durable Object).
+
+## Scheduler configuration (ADR 0020, 0021)
+
+| Name                             | Kind                              | Purpose                                                                                  |
+| -------------------------------- | --------------------------------- | ---------------------------------------------------------------------------------------- |
+| `[triggers] crons`               | `wrangler.toml`, `* * * * *`      | Scheduler tick. Schedules are edited in Settings, Schedules, never here.                 |
+| `JOBS_QUEUE`                     | queue producer, `camelthorn-jobs` | Cron tick and "Run now" enqueue runs; the Worker consumes them (`queue()`).              |
+| `camelthorn-jobs-dlq`            | dead-letter queue                 | Runs that could not be started after 3 retries. Nothing consumes it; see docs/DEPLOY.md. |
+| `JOB_LOCK` (`JobLock`, tag `v2`) | Durable Object, EU                | One no-overlap lease per job name.                                                       |
+
+Create both queues before the first deploy. The Exact sync jobs are off after install; switch them
+on in Settings, Schedules after the first-live-connection checks pass (docs/DEPLOY.md step 10).
 
 ## Auth API
 
