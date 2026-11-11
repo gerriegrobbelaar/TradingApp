@@ -8,6 +8,8 @@ import type {
 import { Card, Segmented, Skeleton } from "@camelthorn/ui";
 import { getBankAccounts, listBankTransactions } from "../api";
 import { useMe } from "../auth";
+import { useFxRates } from "../fx";
+import { sumInBase } from "../lib/fx";
 import {
   AccountCard,
   BankAmount,
@@ -20,6 +22,8 @@ import { BankTransactionSheet } from "../components/BankTransactionSheet";
 import { DataTable, KeyboardHint, LoadMore, type Column } from "../components/DataTable";
 import { EmptyState, ErrorNotice } from "../components/EmptyState";
 import { ActiveFilter, FilterBar } from "../components/FilterBar";
+import { FxStaleChip } from "../components/FxAmount";
+import { ConvertedNote } from "../components/FxTotals";
 import { PageHeader } from "../components/PageHeader";
 import {
   DIRECTION_FILTERS,
@@ -142,6 +146,35 @@ function WaitingForSync({ admin }: { admin: boolean }) {
   );
 }
 
+/**
+ * "About € X in total at today's ECB rates": each currency's balance converted once, then added.
+ * An estimate under the strip; the per-currency balances stay the real figures.
+ */
+function FxBankTotal({ data }: { data: BankAccountsResponse }) {
+  const { table, base, baseAssumed } = useFxRates();
+  if (!table || !data.totalsByCurrency.some((t) => t.currency !== base)) return null;
+  const total = sumInBase(
+    table,
+    base,
+    data.totalsByCurrency.map((t) => ({ currency: t.currency, minor: t.balanceMinor })),
+  );
+  if (total.included.length === 0) return null;
+  return (
+    <div className="fx-bank-total">
+      <p>
+        <span className="num money">About {formatMoney(total.totalMinor, base)}</span>{" "}
+        <span className="cap">in total at today&apos;s ECB rates</span>
+      </p>
+      <p className="cap">
+        <ConvertedNote total={total} className="" /> · For information only; each currency is
+        converted once, then added.
+        {baseAssumed && ` The administration currency is not known yet, so ${base} is assumed.`}
+      </p>
+      <FxStaleChip />
+    </div>
+  );
+}
+
 function Totals({ data }: { data: BankAccountsResponse }) {
   if (data.totalsByCurrency.length === 0) return null;
   return (
@@ -159,6 +192,7 @@ function Totals({ data }: { data: BankAccountsResponse }) {
       {data.totalsByCurrency.length > 1 && (
         <p className="cap">Currencies are shown separately and never added together.</p>
       )}
+      <FxBankTotal data={data} />
     </section>
   );
 }

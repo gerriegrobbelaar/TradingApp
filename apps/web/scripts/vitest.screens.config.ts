@@ -18,6 +18,7 @@ export default defineConfig({
       "scripts/r2-screens.e2e.ts",
       "scripts/r3b-screens.e2e.ts",
       "scripts/q2-screens.e2e.ts",
+      "scripts/f3-screens.e2e.ts",
     ],
     testTimeout: 300_000,
     hookTimeout: 120_000,

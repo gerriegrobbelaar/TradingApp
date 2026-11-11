@@ -7,6 +7,7 @@ import { describeLoadError } from "../lib/errors";
 import { NO_VALUE, describeDue, formatDate, formatDateTime } from "../lib/format";
 import { useResource } from "../lib/useResource";
 import { ErrorNotice } from "./EmptyState";
+import { FxAmount } from "./FxAmount";
 import { Money } from "./Money";
 
 /** Shown for an open item the last complete full read did not see (review S8). */
@@ -15,9 +16,18 @@ export const POSSIBLY_PAID_LABEL = "Possibly paid — not seen in the last sync"
 /** `list` is the nightly full read of the open-item lists, `sync` the hourly incremental read. */
 const SOURCE_LABEL = { list: "Nightly full read", sync: "Hourly update" } as const;
 
-function Row({ label, children }: { label: string; children: ReactNode }) {
+function Row({
+  label,
+  children,
+  wide = false,
+}: {
+  label: string;
+  children: ReactNode;
+  /** Long, multi-line content: the label sits above it instead of beside it. */
+  wide?: boolean;
+}) {
   return (
-    <div className="dl-row">
+    <div className={wide ? "dl-row fx-wide" : "dl-row"}>
       <dt>{label}</dt>
       <dd>{children}</dd>
     </div>
@@ -117,6 +127,21 @@ export function OpenItemDetailView({
             <Money minor={item.dcMinor} currency={dcCur} />
           )}
         </Row>
+        {item.status === "open" && item.currency !== dcCur && (
+          <Row label={`Open balance in ${dcCur} at today's ECB rate`} wide>
+            <FxAmount
+              currency={item.currency}
+              minor={item.openMinor}
+              showOriginal={false}
+              booked={{
+                minor: item.dcMinor ?? 0,
+                complete: item.dcMinor !== null,
+                kind: item.kind,
+              }}
+              note="An estimate with today's rate, not the rate on the day. For information only."
+            />
+          </Row>
+        )}
         <Row label="Amount as stored">
           <Money minor={detail.storedMinor} currency={item.currency} />
         </Row>

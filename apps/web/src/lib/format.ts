@@ -162,6 +162,11 @@ const dateFmt = new Intl.DateTimeFormat(DATE_LOCALE, {
   year: "numeric",
   timeZone: "UTC",
 });
+const dayMonthFmt = new Intl.DateTimeFormat(DATE_LOCALE, {
+  day: "numeric",
+  month: "short",
+  timeZone: "UTC",
+});
 const instantDateFmt = new Intl.DateTimeFormat(DATE_LOCALE, {
   day: "numeric",
   month: "short",
@@ -192,6 +197,13 @@ export function formatDate(value: string | null | undefined): string {
   }
   const ms = Date.parse(value);
   return Number.isFinite(ms) ? instantDateFmt.format(ms) : NO_VALUE;
+}
+
+/** "12 Nov" from a calendar date (YYYY-MM-DD, not shifted); a dash when it is not a real day. */
+export function formatDayMonth(value: string | null | undefined): string {
+  if (!value || !DATE_ONLY.test(value) || formatDate(value) === NO_VALUE) return NO_VALUE;
+  const [y, mo, d] = value.split("-").map((x) => parseInt(x, 10)) as [number, number, number];
+  return dayMonthFmt.format(new Date(Date.UTC(y, mo - 1, d)));
 }
 
 /** "12 Nov 2026, 14:05" in Amsterdam time. */

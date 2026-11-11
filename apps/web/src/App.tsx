@@ -11,6 +11,7 @@ import { Button } from "@camelthorn/ui";
 import { logout, nav } from "./api";
 import { AuthProvider, useMe } from "./auth";
 import { DivisionProvider } from "./division";
+import { FxProvider } from "./fx";
 import { TopNav } from "./components/TopNav";
 import { PLACEHOLDERS, RENAMED_PATHS } from "./routes";
 import { ToastProvider, useToast } from "./toasts";
@@ -87,32 +88,38 @@ function SignedInShell() {
   if (auth.status !== "ready") return null;
   return (
     <DivisionProvider>
-      <div className="wrap">
-        <TopNav />
-        <main ref={mainRef} id="main" tabIndex={-1} className="main">
-          <Routes>
-            <Route path="/" element={<Navigate to="/overview" replace />} />
-            <Route path="/overview" element={<Overview />} />
-            <Route path="/invoices" element={<Invoices />} />
-            <Route path="/purchases/payables" element={<Payables />} />
-            <Route path="/purchases/approvals" element={<Approvals />} />
-            <Route path="/treasury/bank" element={<Bank />} />
-            <Route path="/reporting/balance-sheet" element={<BalanceSheet />} />
-            <Route path="/reporting/profit-loss" element={<ProfitLoss />} />
-            <Route path="/reporting/creditors-ageing" element={<CreditorsAgeing />} />
-            <Route path="/reporting/receivables-ageing" element={<ReceivablesAgeing />} />
-            {RENAMED_PATHS.map((r) => (
-              <Route key={r.from} path={r.from} element={<Renamed to={r.to} />} />
-            ))}
-            {PLACEHOLDERS.map((p) => (
-              <Route key={p.to} path={p.to} element={<ComingSoon path={p.to} title={p.label} />} />
-            ))}
-            <Route path="/settings/:tab?" element={<Settings />} />
-            <Route path="*" element={<NotFound />} />
-          </Routes>
-        </main>
-        <Footer email={auth.me.email} />
-      </div>
+      <FxProvider>
+        <div className="wrap">
+          <TopNav />
+          <main ref={mainRef} id="main" tabIndex={-1} className="main">
+            <Routes>
+              <Route path="/" element={<Navigate to="/overview" replace />} />
+              <Route path="/overview" element={<Overview />} />
+              <Route path="/invoices" element={<Invoices />} />
+              <Route path="/purchases/payables" element={<Payables />} />
+              <Route path="/purchases/approvals" element={<Approvals />} />
+              <Route path="/treasury/bank" element={<Bank />} />
+              <Route path="/reporting/balance-sheet" element={<BalanceSheet />} />
+              <Route path="/reporting/profit-loss" element={<ProfitLoss />} />
+              <Route path="/reporting/creditors-ageing" element={<CreditorsAgeing />} />
+              <Route path="/reporting/receivables-ageing" element={<ReceivablesAgeing />} />
+              {RENAMED_PATHS.map((r) => (
+                <Route key={r.from} path={r.from} element={<Renamed to={r.to} />} />
+              ))}
+              {PLACEHOLDERS.map((p) => (
+                <Route
+                  key={p.to}
+                  path={p.to}
+                  element={<ComingSoon path={p.to} title={p.label} />}
+                />
+              ))}
+              <Route path="/settings/:tab?" element={<Settings />} />
+              <Route path="*" element={<NotFound />} />
+            </Routes>
+          </main>
+          <Footer email={auth.me.email} />
+        </div>
+      </FxProvider>
     </DivisionProvider>
   );
 }

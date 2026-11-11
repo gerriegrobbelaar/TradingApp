@@ -8,6 +8,7 @@ import type {
   ProfitLossResponse,
 } from "@camelthorn/core";
 import type { AgeingSort } from "../lib/ageing";
+import type { AgeingFxTotals } from "../lib/fx";
 import { exportFileName } from "../lib/report-files";
 import {
   ageingExport,
@@ -45,7 +46,8 @@ export const exportAgeing = (
   r: AgeingReportResponse,
   ctx: ExportContext,
   sort: AgeingSort = "outstanding",
-): string => downloadReport(ageingExport(r, ctx, sort), ctx);
+  fx: AgeingFxTotals | null = null,
+): string => downloadReport(ageingExport(r, ctx, sort, fx), ctx);
 export const exportBalanceSheet = (r: BalanceSheetResponse, ctx: ExportContext): string =>
   downloadReport(balanceSheetExport(r, ctx), ctx);
 export const exportProfitLoss = (r: ProfitLossResponse, ctx: ExportContext): string =>

@@ -84,9 +84,22 @@ export function PrintMeta({
 }
 
 /** Wide table inside its own focusable scroll region (no page-level sideways scroll). */
-export function ScrollRegion({ label, children }: { label: string; children: ReactNode }) {
+export function ScrollRegion({
+  label,
+  children,
+  className,
+}: {
+  label: string;
+  children: ReactNode;
+  className?: string;
+}) {
   return (
-    <div className="report-scroll" role="region" aria-label={label} tabIndex={0}>
+    <div
+      className={`report-scroll${className ? ` ${className}` : ""}`}
+      role="region"
+      aria-label={label}
+      tabIndex={0}
+    >
       {children}
     </div>
   );

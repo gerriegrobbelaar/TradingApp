@@ -9,6 +9,8 @@ import {
   type BankAccountsResponse,
   type BankTransactionDetail,
   type BankTransactionsResponse,
+  type FxHistoryResponse,
+  type FxRatesResponse,
   type LedgerAccountBalancesResponse,
   type LedgerAccountsResponse,
   type OpenItemDetail,
@@ -623,3 +625,13 @@ export const getBankTransaction = (id: number, signal?: AbortSignal) =>
   request<BankTransactionDetail>(`/api/bank/transactions/${id}`, {
     ...(signal ? { signal } : {}),
   });
+
+// ---- ECB exchange rates (Phase 6) --------------------------------------------------------------
+
+export const getFxRates = (signal?: AbortSignal) =>
+  request<FxRatesResponse>("/api/fx/rates", signal ? { signal } : {});
+export const getFxHistory = (currency: string, days: number, signal?: AbortSignal) =>
+  request<FxHistoryResponse>(
+    `/api/fx/history${queryString({ currency, days })}`,
+    signal ? { signal } : {},
+  );

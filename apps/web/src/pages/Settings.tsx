@@ -12,10 +12,11 @@ import {
 import { useSignedIn } from "../auth";
 import { PageHeader } from "../components/PageHeader";
 import { Connections } from "./Connections";
+import { FxRates } from "./FxRates";
 import { Schedules } from "./Schedules";
 import { Users } from "./Users";
 
-type Tab = "appearance" | "users" | "connections" | "schedules";
+type Tab = "appearance" | "users" | "connections" | "schedules" | "fx";
 
 const THEME_OPTIONS: SegmentedOption<ThemeMode>[] = [
   { value: "auto", label: "Auto" },
@@ -62,6 +63,7 @@ export function Settings() {
     ...(isAdmin ? [{ value: "users" as const, label: "Users" }] : []),
     { value: "connections", label: "Connections" },
     { value: "schedules", label: "Schedules" },
+    { value: "fx", label: "FX rates" },
   ];
   const current = options.find((o) => o.value === tab)?.value;
   if (!current) return <Navigate to="/settings/appearance" replace />;
@@ -71,7 +73,7 @@ export function Settings() {
       <PageHeader
         eyebrow="Settings"
         title="Settings"
-        lede="Appearance, people, connections and schedules."
+        lede="Appearance, people, connections, schedules and exchange rates."
       />
       <div className="settings-seg">
         <Segmented
@@ -85,6 +87,7 @@ export function Settings() {
       {current === "users" && <Users />}
       {current === "connections" && <Connections />}
       {current === "schedules" && <Schedules />}
+      {current === "fx" && <FxRates />}
     </>
   );
 }

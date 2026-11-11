@@ -15,6 +15,7 @@ import {
   stateNote,
 } from "./BankParts";
 import { DrillSheet } from "./DrillSheet";
+import { FxAmount } from "./FxAmount";
 import { ErrorNotice } from "./EmptyState";
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
@@ -50,6 +51,12 @@ function Body({ detail }: { detail: BankTransactionDetail }) {
         <BankAmount minor={detail.amountMinor} currency={detail.currency} state={detail.state} />{" "}
         <StateChip state={detail.state} />
       </p>
+      <FxAmount
+        currency={detail.currency}
+        minor={detail.amountMinor}
+        showOriginal={false}
+        note="Today's rate, not the rate on the day."
+      />
       {note && (
         <p className="notice warn" role="status">
           {note}

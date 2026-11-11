@@ -1,4 +1,3 @@
-import { DcLine } from "../components/DcLine";
 import { useState } from "react";
 import { Link } from "react-router";
 import type {
@@ -11,13 +10,22 @@ import type {
 import { Card, Skeleton } from "@camelthorn/ui";
 import { getOverview } from "../api";
 import { useDivision } from "../division";
+import { useFxRates } from "../fx";
 import { DrillDownSheet, type DrillExpected } from "../components/OpenItemSheets";
 import { EmptyState, ErrorNotice } from "../components/EmptyState";
 import { FreshnessStamp } from "../components/FreshnessStamp";
+import { FxDcLine } from "../components/FxAmount";
+import {
+  ConvertedAmount,
+  ConvertedNote,
+  FxEstimateIntro,
+  fxTotalTitle,
+} from "../components/FxTotals";
 import { Money } from "../components/Money";
 import { PageHeader } from "../components/PageHeader";
 import { describeLoadError } from "../lib/errors";
 import { NO_VALUE, formatCount, formatDays, formatMoney } from "../lib/format";
+import { sumInBase } from "../lib/fx";
 import { useResource } from "../lib/useResource";
 
 type Side = "receivable" | "payable";
@@ -50,6 +58,7 @@ function Figure({
   amount,
   currency,
   dcCurrency,
+  kind,
   label,
   tone,
   onOpen,
@@ -57,6 +66,7 @@ function Figure({
   amount: KpiAmountDto;
   currency: string;
   dcCurrency: string;
+  kind: "invoice" | "bill";
   label: string;
   tone?: "bad";
   onOpen: () => void;
@@ -75,12 +85,14 @@ function Figure({
           Show items
         </span>
       </button>
-      <DcLine
+      <FxDcLine
         currency={currency}
         dcCurrency={dcCurrency}
         dcMinor={amount.dcMinor}
         dcComplete={amount.dcComplete}
         count={amount.count}
+        minor={amount.minor}
+        kind={kind}
       />
     </div>
   );
@@ -120,6 +132,7 @@ function CurrencyBlock({
           amount={k.total}
           currency={k.currency}
           dcCurrency={dcCurrency}
+          kind={side === "receivable" ? "invoice" : "bill"}
           label={L.total}
           onOpen={() => open("total", L.total, k.total)}
         />
@@ -127,6 +140,7 @@ function CurrencyBlock({
           amount={k.overdue}
           currency={k.currency}
           dcCurrency={dcCurrency}
+          kind={side === "receivable" ? "invoice" : "bill"}
           label={L.overdue}
           {...(k.overdue.minor !== 0 ? { tone: "bad" as const } : {})}
           onOpen={() => open("overdue", L.overdue, k.overdue)}
@@ -135,6 +149,7 @@ function CurrencyBlock({
           amount={k.due7}
           currency={k.currency}
           dcCurrency={dcCurrency}
+          kind={side === "receivable" ? "invoice" : "bill"}
           label={L.due7}
           onOpen={() => open("due7", L.due7, k.due7)}
         />
@@ -142,6 +157,7 @@ function CurrencyBlock({
           amount={k.due30}
           currency={k.currency}
           dcCurrency={dcCurrency}
+          kind={side === "receivable" ? "invoice" : "bill"}
           label={L.due30}
           onOpen={() => open("due30", L.due30, k.due30)}
         />
@@ -186,6 +202,51 @@ function CurrencyBlock({
         </p>
       )}
     </div>
+  );
+}
+
+const HEADLINE_FIGURES = ["total", "overdue", "due7", "due30"] as const;
+
+/**
+ * "Total in € at today's ECB rates" for one side: each currency's figure is converted once, then
+ * the converted totals are added. The per-currency figures above stay the primary numbers.
+ * Shown only when a foreign currency is involved (otherwise it would repeat the figure above).
+ */
+function FxHeadline({
+  side,
+  list,
+  baseCurrency,
+}: {
+  side: Side;
+  list: CurrencyKpisDto[];
+  baseCurrency: string;
+}) {
+  const { table, base } = useFxRates();
+  if (!table || base !== baseCurrency || !list.some((k) => k.currency !== base)) return null;
+  const L = LABEL[side];
+  return (
+    <section
+      className="fx-headline"
+      aria-label={`${fxTotalTitle(base)}, ${side === "receivable" ? "receivables" : "payables"}`}
+    >
+      <h3 className="h2">{fxTotalTitle(base)}</h3>
+      <FxEstimateIntro />
+      <ul className="fx-head-list">
+        {HEADLINE_FIGURES.map((f) => {
+          const total = sumInBase(
+            table,
+            base,
+            list.map((k) => ({ currency: k.currency, minor: k[f].minor })),
+          );
+          return (
+            <li key={f}>
+              <span className="fx-head-label">{L[f]}</span>{" "}
+              <ConvertedAmount total={total} base={base} /> <ConvertedNote total={total} />
+            </li>
+          );
+        })}
+      </ul>
+    </section>
   );
 }
 
@@ -305,6 +366,7 @@ export function Overview() {
                     onDrill={openDrill}
                   />
                 ))}
+                <FxHeadline side={side} list={list} baseCurrency={data.division.currency} />
               </Card>
             );
           })}

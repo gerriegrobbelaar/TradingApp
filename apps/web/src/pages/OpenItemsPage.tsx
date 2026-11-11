@@ -8,6 +8,7 @@ import { DataTable, KeyboardHint, LoadMore, type Column } from "../components/Da
 import { EmptyState } from "../components/EmptyState";
 import { ActiveFilter, FilterBar } from "../components/FilterBar";
 import { FreshnessStamp } from "../components/FreshnessStamp";
+import { FxRowLine } from "../components/FxAmount";
 import { Money } from "../components/Money";
 import { POSSIBLY_PAID_LABEL, itemTitle } from "../components/OpenItemDetailBody";
 import { OpenItemSheet } from "../components/OpenItemSheets";
@@ -271,7 +272,10 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
               </>
             )
           ) : (
-            <Money minor={r.openMinor} currency={r.currency} />
+            <>
+              <Money minor={r.openMinor} currency={r.currency} />
+              <FxRowLine currency={r.currency} minor={r.openMinor} />
+            </>
           ),
       },
     ],

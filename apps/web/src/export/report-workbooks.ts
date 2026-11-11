@@ -11,7 +11,8 @@ import type {
 } from "@camelthorn/core";
 import { AGEING_BUCKETS } from "@camelthorn/core";
 import { BUCKET_LABEL, sortAgeingRows, type AgeingSort } from "../lib/ageing";
-import { formatDate, formatDateTime, scaleOf } from "../lib/format";
+import { formatDate, formatDateTime, formatDayMonth, scaleOf } from "../lib/format";
+import { baseLabel, type AgeingFxTotals } from "../lib/fx";
 import type { ReportSlug } from "../lib/report-files";
 import {
   BS_DIFFERENCE_LABEL,
@@ -98,10 +99,55 @@ const header = (labels: string[], rightFrom = 1): Cell[] =>
 
 // ---- ageing -------------------------------------------------------------------------------------
 
+/**
+ * The converted-total sheet: one row, a converted total per bucket (each currency converted once,
+ * then added), with the rate date and the currencies left out. Money is exact number text.
+ */
+function ageingFxSheet(
+  title: string,
+  ctx: ExportContext,
+  r: AgeingReportResponse,
+  fx: AgeingFxTotals,
+  heads: string[],
+): SheetSpec {
+  const scale = scaleOf(fx.base);
+  const label = `Total in ${baseLabel(fx.base)} at today's ECB rates`;
+  const note = `${fx.rateDate ? `ECB rates of ${formatDayMonth(fx.rateDate)}` : "ECB rates"}; for information only`;
+  const block = headerBlock(`${title}: ${label}`, ctx, `As of: ${formatDate(r.asOf)}`, [
+    `Currency: ${fx.base}`,
+    note,
+    "An estimate: each currency is converted once at today's rate, then the results are added.",
+    ...(fx.excluded.length > 0 ? [`Not included (no ECB rate): ${fx.excluded.join(", ")}`] : []),
+  ]);
+  const cell = (k: AgeingBucket | "total", style?: { bold?: boolean; total?: boolean }): Cell => {
+    const c = fx.cells[k];
+    return c.included.length === 0 || fx.counts[k] === 0
+      ? text("")
+      : money(c.totalMinor, scale, style);
+  };
+  return {
+    name: `Total in ${fx.base}`,
+    rows: [
+      ...block,
+      header(["", ...heads.slice(1, 1 + AGEING_BUCKETS.length + 1)]),
+      [
+        text(label, { total: true }),
+        ...AGEING_BUCKETS.map((b) => cell(b, { total: true })),
+        cell("total", { total: true }),
+      ],
+    ],
+    columnWidths: [40, 16, 16, 16, 16, 16, 16, 17],
+    freezeRows: block.length + 1,
+    freezeColumns: 1,
+    landscape: true,
+  };
+}
+
 export function ageingExport(
   r: AgeingReportResponse,
   ctx: ExportContext,
   sort: AgeingSort = "outstanding",
+  fx: AgeingFxTotals | null = null,
 ): ReportExport {
   const payable = r.kind === "payable";
   const title = payable ? "Creditors age analysis" : "Receivables age analysis";
@@ -138,6 +184,7 @@ export function ageingExport(
       landscape: true,
     };
   });
+  if (fx && sheets.length > 0) sheets.push(ageingFxSheet(title, ctx, r, fx, heads));
   if (sheets.length === 0) {
     const block = headerBlock(title, ctx, `As of: ${formatDate(r.asOf)}`);
     sheets.push({

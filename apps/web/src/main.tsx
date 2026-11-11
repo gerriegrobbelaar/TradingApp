@@ -4,6 +4,7 @@ import "@camelthorn/ui/styles.css";
 import "./app.css";
 import "./reports.css";
 import "./bank.css";
+import "./fx.css";
 import "./print.css";
 import { App } from "./App";
 
