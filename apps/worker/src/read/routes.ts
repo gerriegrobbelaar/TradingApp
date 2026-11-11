@@ -61,7 +61,7 @@ import {
   type TotalsRow,
 } from "./queries";
 
-const ANY_ROLE = { roles: ["admin", "finance", "approver", "viewer"] } as const;
+export const ANY_ROLE = { roles: ["admin", "finance", "approver", "viewer"] } as const;
 
 export const STALE_AFTER_HOURS = 36;
 const DEFAULT_LIMIT = 50;
@@ -79,9 +79,9 @@ export class BadRequest extends Error {
   }
 }
 
-type DivisionRow = DivisionJoin & { base_currency_read_at: string | null };
+export type DivisionRow = DivisionJoin & { base_currency_read_at: string | null };
 
-const toRef = (d: DivisionRow): DivisionRef => ({
+export const toRef = (d: DivisionRow): DivisionRef => ({
   id: d.id,
   name: d.name,
   currency: d.base_currency,
@@ -105,7 +105,7 @@ async function visibleDivisions(db: D1Database): Promise<DivisionRow[]> {
 
 const POSITIVE_INT = /^[1-9][0-9]{0,15}$/;
 
-function positiveIntParam(raw: string | null, name: string): number | null {
+export function positiveIntParam(raw: string | null, name: string): number | null {
   if (raw === null) return null;
   if (!POSITIVE_INT.test(raw)) throw new BadRequest(`bad_${name}`);
   const n = Number(raw);
@@ -141,7 +141,7 @@ export function resolveAsOf(raw: string | null, nowMs: number): string {
 
 const asOfParam = (ctx: Ctx): string => resolveAsOf(ctx.url.searchParams.get("asOf"), ctx.nowMs);
 
-async function resolveDivision(ctx: Ctx): Promise<DivisionRow> {
+export async function resolveDivision(ctx: Ctx): Promise<DivisionRow> {
   const session = ctx.session;
   if (!session) throw new BadRequest("unauthenticated");
   const divisions = await visibleDivisions(ctx.env.DB);
@@ -157,11 +157,11 @@ async function resolveDivision(ctx: Ctx): Promise<DivisionRow> {
   return found;
 }
 
-async function divisionById(db: D1Database, id: number): Promise<DivisionRow | null> {
+export async function divisionById(db: D1Database, id: number): Promise<DivisionRow | null> {
   return (await visibleDivisions(db)).find((d) => d.id === id) ?? null;
 }
 
-function guarded(fn: (ctx: Ctx) => Promise<Response>): (ctx: Ctx) => Promise<Response> {
+export function guarded(fn: (ctx: Ctx) => Promise<Response>): (ctx: Ctx) => Promise<Response> {
   return async (ctx) => {
     try {
       return await fn(ctx);

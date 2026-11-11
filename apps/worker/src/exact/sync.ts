@@ -49,6 +49,37 @@ import { auditStatement } from "../db/audit";
 import type { Env } from "../env";
 import { createGateTransport, gateName, getExactGate } from "./gate-transport";
 import {
+  LEDGER_ENTITIES,
+  isLedgerEntity,
+  syncGlAccounts,
+  syncGlBalances,
+  syncGlBudgets,
+  type LedgerEntityName,
+} from "./ledger-sync";
+import {
+  CLOSE_GUARD_FRACTION,
+  CLOSE_GUARD_MIN,
+  closeAllowed,
+  type Lease,
+  type SubrequestMeter,
+  SUBREQUEST_LIMIT,
+  SUBREQUEST_RESERVE,
+  SyncStop,
+  leaseHeld,
+  newMeter,
+  runBatches,
+  spend,
+} from "./sync-util";
+export {
+  CLOSE_GUARD_FRACTION,
+  CLOSE_GUARD_MIN,
+  SUBREQUEST_LIMIT,
+  SUBREQUEST_RESERVE,
+  closeAllowed,
+  newMeter,
+  type SubrequestMeter,
+};
+import {
   amsterdamDate,
   amsterdamParts,
   isPlausibleIban,
@@ -58,13 +89,16 @@ import {
 
 export type SyncMode = "full" | "incremental";
 export type RunStatus = "ok" | "partial" | "error" | "needs_reauth";
-export type EntityName = "divisions" | "relations" | "relation_ibans" | "receivables" | "payables";
+export type EntityName =
+  "divisions" | "relations" | "relation_ibans" | "receivables" | "payables" | LedgerEntityName;
 export const ENTITIES: readonly EntityName[] = [
   "divisions",
   "receivables",
   "payables",
   "relations",
   "relation_ibans",
+  // Ledger data for the reports (ledger-sync.ts, ADR 0023): FULL runs only, after everything else.
+  ...LEDGER_ENTITIES,
 ];
 /**
  * Every value sync_state.entity may hold: the entities plus 'run' for the whole run. The table has
@@ -89,7 +123,6 @@ const IBAN_PAGE_GUESS = 50;
 /** Pages read per chunk of a cursor-based read; progress is saved after every chunk. */
 export const DEFAULT_CHUNK_PAGES = 5;
 const MAX_CHUNKS = 200;
-const BATCH_LIMIT = 100;
 /**
  * Lease length. Longer than any run may take: manual runs stop after 20 s and scheduled ones
  * after SCHEDULED_MAX_MS (12 min) between Exact calls, and Cron Triggers end after 15 min wall
@@ -98,32 +131,6 @@ const BATCH_LIMIT = 100;
  * the newer run has seen (lease-guarded close, run_seq-guarded upserts).
  */
 export const LEASE_MS = 15 * 60 * 1000;
-
-/**
- * Subrequests one Worker invocation may make (each gate RPC and each D1 call counts). 1,000 is
- * the long-standing Workers Paid per-invocation limit; it is the conservative figure until the
- * account's actual limit is checked (ADR 0017). The run stops as `partial` (`subrequest_limit`)
- * while SUBREQUEST_RESERVE remain, which is enough for the final batch, endJob and the release.
- */
-export const SUBREQUEST_LIMIT = 1000;
-export const SUBREQUEST_RESERVE = 25;
-
-/** Shared by all runs of one invocation (the scheduler syncs several divisions in one). */
-export interface SubrequestMeter {
-  used: number;
-  limit: number;
-}
-export const newMeter = (limit = SUBREQUEST_LIMIT): SubrequestMeter => ({ used: 0, limit });
-
-/**
- * A complete FULL read closes every open item of that kind it did not see. If that would be more
- * than max(CLOSE_GUARD_MIN, CLOSE_GUARD_FRACTION of the open items of that kind), it is far more
- * likely a fault (wrong division, filter, licence, unstable paging) than a genuine mass payment:
- * nothing is closed and the entity ends `error` / `close_guard` until an admin runs a full sync
- * with `allowLargeClose`.
- */
-export const CLOSE_GUARD_MIN = 5;
-export const CLOSE_GUARD_FRACTION = 0.2;
 
 /**
  * Two-strike rule (ADR 0017): complete reads an open item must be missing from before it is
@@ -135,18 +142,6 @@ export const strikesToClose = (
   r: Pick<EntityResult, "singleRunRead">,
   opts: Pick<SyncOptions, "allowLargeClose">,
 ): 1 | 2 => (r.singleRunRead === true || opts.allowLargeClose === true ? 1 : 2);
-
-/** True when closing `stale` of `open` open items is allowed without the admin override. */
-export const closeAllowed = (stale: number, open: number): boolean =>
-  stale <= Math.max(CLOSE_GUARD_MIN, open * CLOSE_GUARD_FRACTION);
-
-/** A clean stop between Exact calls: deadline or subrequest limit. Ends the run as partial. */
-class SyncStop extends Error {
-  constructor(readonly code: "time_limit" | "subrequest_limit") {
-    super(code);
-    this.name = "SyncStop";
-  }
-}
 
 export interface DivisionRef {
   /** divisions.id */
@@ -174,6 +169,11 @@ export interface SyncOptions {
   allowLargeClose?: boolean;
   /** Full mode: read crm/BankAccounts (nightly scheduled runs). Default true; manual runs pass false. */
   readIbans?: boolean;
+  /**
+   * Full mode: read the ledger (chart of accounts, reporting balances, budgets) for the reports
+   * after everything else. Default true; the hourly incremental run never reads it (ADR 0023).
+   */
+  readLedger?: boolean;
   /**
    * Incremental mode: also read the open receivables / payables from the Timestamp sync
    * endpoints. Default: the `exact.incremental_open_items` setting, which is OFF unless an admin
@@ -275,6 +275,7 @@ interface StateRow {
   done_cycle: number | null;
   retry_count: number;
   retry_day: string | null;
+  unavailable_until: string | null;
 }
 
 type Failure = {
@@ -321,33 +322,6 @@ export const isTransientFailure = (e: unknown): boolean => classify(e).transient
 
 const iso = (ms: number): string => new Date(ms).toISOString();
 
-/** Counts one subrequest, refusing it when only the reserve would be left. */
-function spend(meter: SubrequestMeter): void {
-  if (meter.used + 1 + SUBREQUEST_RESERVE > meter.limit) throw new SyncStop("subrequest_limit");
-  meter.used += 1;
-}
-
-async function runBatches(
-  db: D1Database,
-  meter: SubrequestMeter,
-  units: D1PreparedStatement[][],
-): Promise<void> {
-  // Units (for example change + its audit row) are never split across batches.
-  let cur: D1PreparedStatement[] = [];
-  for (const unit of units) {
-    if (cur.length > 0 && cur.length + unit.length > BATCH_LIMIT) {
-      spend(meter);
-      await db.batch(cur);
-      cur = [];
-    }
-    cur.push(...unit);
-  }
-  if (cur.length > 0) {
-    spend(meter);
-    await db.batch(cur);
-  }
-}
-
 function defaultGate(env: Env, exactDivision: number): JobGate {
   // The same EU-jurisdiction object that serves the calls (ADR 0018), so the budget applies.
   const stub = getExactGate(env, gateName(exactDivision));
@@ -360,17 +334,6 @@ function defaultGate(env: Env, exactDivision: number): JobGate {
 // ---------------------------------------------------------------------------------------------
 // Statements
 // ---------------------------------------------------------------------------------------------
-
-/** The run that wrote a statement still holds the division's lease (?1 = division_id). */
-const leaseHeld = (holderParam: string, seqParam: string): string =>
-  `EXISTS (SELECT 1 FROM sync_locks WHERE division_id = ?1 AND holder = ${holderParam}
-           AND run_seq = ${seqParam})`;
-
-/** Identifies the run for the lease guard. */
-interface Lease {
-  holder: string;
-  runSeq: number;
-}
 
 const cursorStmt = (
   db: D1Database,
@@ -651,6 +614,7 @@ export async function syncDivision(
   const startedAt = iso(now());
   const budget = opts.budget ?? DEFAULT_SYNC_BUDGET;
   const readIbans = opts.mode === "full" && (opts.readIbans ?? true);
+  const readLedger = opts.mode === "full" && (opts.readLedger ?? true);
   const entities = Object.fromEntries(ENTITIES.map((e) => [e, emptyResult()])) as Record<
     EntityName,
     EntityResult
@@ -717,7 +681,7 @@ export async function syncDivision(
       .prepare(
         `SELECT entity, cursor, mode, last_status, last_error, last_started_at, last_completed_at,
                 rows_seen, cycle_seq, cycle_started_at, pass_cycle, pass_token, pass_rows,
-                pass_total, done_cycle, retry_count, retry_day
+                pass_total, done_cycle, retry_count, retry_day, unavailable_until
          FROM sync_state WHERE division_id = ?1`,
       )
       .bind(division.id)
@@ -787,6 +751,8 @@ export async function syncDivision(
         cycle,
         startedAt,
         nowIso: () => iso(now()),
+        nowMs: () => now(),
+        allowLargeClose: opts.allowLargeClose === true,
         actor,
         chunkPages,
         state,
@@ -804,6 +770,7 @@ export async function syncDivision(
         ctx.progress = 0;
         ctx.pass = null;
         if (entity === "relation_ibans" && !readIbans) continue;
+        if (isLedgerEntity(entity) && !readLedger) continue;
         if (
           opts.mode === "incremental" &&
           !incrementalOpenItems &&
@@ -927,7 +894,9 @@ export async function syncDivision(
 
     // The cycle is finished when every entity it covers is. IBANs are only part of it for runs
     // that read them (a manual full run leaves them to the nightly one).
-    const required = ENTITIES.filter((e) => e !== "relation_ibans" || readIbans);
+    const required = ENTITIES.filter(
+      (e) => (e !== "relation_ibans" || readIbans) && (!isLedgerEntity(e) || readLedger),
+    );
     const cycleComplete =
       cycle !== null && status === "ok" && required.every((e) => entities[e].cycleDone === true);
 
@@ -1009,7 +978,7 @@ export async function syncDivision(
       } else if (
         cycle !== null &&
         r.status === "error" &&
-        (entity === "receivables" || entity === "payables") &&
+        (entity === "receivables" || entity === "payables" || isLedgerEntity(entity)) &&
         r.error !== "close_guard"
       ) {
         // A saved $skiptoken that keeps failing must not be retried until the cycle expires.
@@ -1131,6 +1100,9 @@ interface Ctx {
   cycle: number | null;
   startedAt: string;
   nowIso: () => string;
+  nowMs: () => number;
+  /** Admin override of the close guard (also used by the ledger tables). */
+  allowLargeClose: boolean;
   actor: string;
   chunkPages: number;
   state: Map<string, StateRow>;
@@ -1158,6 +1130,12 @@ function runEntity(ctx: Ctx, entity: EntityName): Promise<EntityResult> {
       return ctx.mode === "full"
         ? syncOpenItemsFull(ctx, entity)
         : syncOpenItemsIncremental(ctx, entity);
+    case "gl_accounts":
+      return syncGlAccounts(ctx);
+    case "gl_balances":
+      return syncGlBalances(ctx);
+    case "gl_budgets":
+      return syncGlBudgets(ctx);
   }
 }
 

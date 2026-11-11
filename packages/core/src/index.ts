@@ -10,4 +10,5 @@ export * from "./schedule";
 export * from "./ageing";
 export * from "./kpis";
 export * from "./search";
+export * from "./reports";
 export * from "./api-types";

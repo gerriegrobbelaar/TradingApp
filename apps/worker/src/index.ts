@@ -2,6 +2,7 @@ import { registerAuthRoutes } from "./auth/routes";
 import { registerUserRoutes } from "./auth/users-routes";
 import { registerExactRoutes } from "./exact/routes";
 import { registerSyncRoutes } from "./exact/sync-routes";
+import { registerLedgerRoutes } from "./read/ledger-routes";
 import { registerReadRoutes } from "./read/routes";
 import { ensureSeeded } from "./db/seed";
 import { ensureDefaultJobs } from "./jobs/defaults";
@@ -37,6 +38,7 @@ registerUserRoutes(router);
 registerExactRoutes(router);
 registerSyncRoutes(router);
 registerReadRoutes(router);
+registerLedgerRoutes(router);
 registerJobRoutes(router);
 
 export default {

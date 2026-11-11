@@ -165,6 +165,53 @@ export interface GlBalance {
   amount: Money;
 }
 
+/**
+ * One account of the chart (`financial/GLAccounts`). Every field name here is a recollection to
+ * VERIFY with credentials (ADR 0023).
+ */
+export interface GlAccount {
+  id: string;
+  code: string | null;
+  name: string;
+  /** Exact's numeric account type (GLAccount.Type), null when absent or not a plain integer. */
+  type: number | null;
+  typeDescription: string | null;
+  /** 'D' debit or 'C' credit: the side on which the account normally carries its balance. */
+  balanceSide: "D" | "C" | null;
+  /** 'B' balance sheet, 'W' profit and loss (Dutch "winst en verlies"). */
+  balanceType: "B" | "W" | null;
+  isBlocked: boolean;
+}
+
+/**
+ * One row of `financial/ReportingBalance`: an account, a reporting year and period, in the
+ * division currency. Sign: `amount` = debit - credit (assumption, ADR 0023). `dimension` holds the
+ * row's Status and cost centre ("" when none) because Exact may split a period over them and the
+ * reports must add the parts, not keep one.
+ */
+export interface ReportingBalanceRow {
+  glAccountId: string;
+  glAccountCode: string | null;
+  reportingYear: number;
+  reportingPeriod: number;
+  amount: Money;
+  debit: Money | null;
+  credit: Money | null;
+  balanceType: "B" | "W" | null;
+  dimension: string;
+}
+
+/** One row of `budget/Budgets` (division currency). `scenario` is "" when Exact sends none. */
+export interface BudgetRow {
+  glAccountId: string;
+  glAccountCode: string | null;
+  reportingYear: number;
+  reportingPeriod: number;
+  amount: Money;
+  scenario: string;
+  dimension: string;
+}
+
 export interface SyncPage<T> {
   items: T[];
   /** Resume point: pass as `cursor` next time. Equals the input cursor when nothing changed. */
@@ -273,6 +320,41 @@ export const GL_BALANCE_FIELDS = [
   "ReportingPeriod",
   "BalanceType",
   "Amount",
+] as const;
+/**
+ * Ledger resources (ADR 0023). ALL names are recollections: VERIFY with credentials. A 400 on
+ * `$select` means one of them is wrong. `Division` is in the path, so it is not selected.
+ */
+export const GL_ACCOUNT_FIELDS = [
+  "ID",
+  "Code",
+  "Description",
+  "Type",
+  "TypeDescription",
+  "BalanceSide",
+  "BalanceType",
+  "Blocked",
+] as const;
+export const REPORTING_BALANCE_FIELDS = [
+  "GLAccount",
+  "GLAccountCode",
+  "ReportingYear",
+  "ReportingPeriod",
+  "Amount",
+  "AmountDebit",
+  "AmountCredit",
+  "BalanceType",
+  "Status",
+  "CostcenterCode",
+] as const;
+export const BUDGET_FIELDS = [
+  "GLAccount",
+  "GLAccountCode",
+  "ReportingYear",
+  "ReportingPeriod",
+  "AmountDC",
+  "BudgetScenario",
+  "Costcenter",
 ] as const;
 export const SYNC_ACCOUNT_FIELDS = [...ACCOUNT_FIELDS, "Timestamp"] as const;
 
@@ -696,6 +778,99 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
       : { items, nextToken: r.nextToken, complete: false, error: r.error };
   }
 
+  // --- ledger (ADR 0023) -------------------------------------------------------------------
+
+  function assertYear(year: number): number {
+    if (!Number.isInteger(year) || year < 1900 || year > 2200) {
+      throw new RangeError("invalid reporting year");
+    }
+    return year;
+  }
+
+  function reqYearPeriod(r: Row): { year: number; period: number } {
+    const year = intField(r, "ReportingYear");
+    const period = intField(r, "ReportingPeriod");
+    // Periods 1-12 plus opening (0) and the extra closing periods some administrations use.
+    if (year === null || period === null || period < 0 || period > 99) {
+      throw badData("Incomplete ledger row", "BAD_SHAPE");
+    }
+    return { year, period };
+  }
+
+  const balanceTypeOf = (r: Row): "B" | "W" | null => {
+    const v = trimField(r, "BalanceType")?.toUpperCase();
+    return v === "B" || v === "W" ? v : null;
+  };
+
+  /** Integer or null: an unreadable account type must not fail the whole chart. */
+  function lenientInt(r: Row, key: string): number | null {
+    try {
+      return intField(r, key);
+    } catch {
+      return null;
+    }
+  }
+
+  function mapGlAccount(r: Row): GlAccount {
+    const side = trimField(r, "BalanceSide")?.toUpperCase().slice(0, 1);
+    return {
+      id: reqGuid(r, "ID"),
+      code: trimField(r, "Code"),
+      name: (strField(r, "Description") ?? "").trim(),
+      type: lenientInt(r, "Type"),
+      typeDescription: trimField(r, "TypeDescription"),
+      balanceSide: side === "D" || side === "C" ? side : null,
+      balanceType: balanceTypeOf(r),
+      isBlocked: boolField(r, "Blocked"),
+    };
+  }
+
+  function mapReportingBalance(r: Row): ReportingBalanceRow {
+    const { year, period } = reqYearPeriod(r);
+    const status = trimField(r, "Status");
+    const cc = trimField(r, "CostcenterCode");
+    return {
+      glAccountId: reqGuid(r, "GLAccount"),
+      glAccountCode: trimField(r, "GLAccountCode"),
+      reportingYear: year,
+      reportingPeriod: period,
+      amount: moneyField(r, "Amount", divisionCurrency),
+      debit: optionalMoney(r, "AmountDebit", divisionCurrency),
+      credit: optionalMoney(r, "AmountCredit", divisionCurrency),
+      balanceType: balanceTypeOf(r),
+      dimension: status === null && cc === null ? "" : `${status ?? ""}|${cc ?? ""}`,
+    };
+  }
+
+  function mapBudget(r: Row): BudgetRow {
+    const { year, period } = reqYearPeriod(r);
+    return {
+      glAccountId: reqGuid(r, "GLAccount"),
+      glAccountCode: trimField(r, "GLAccountCode"),
+      reportingYear: year,
+      reportingPeriod: period,
+      amount: moneyField(r, "AmountDC", divisionCurrency),
+      scenario: guidOrNull(r, "BudgetScenario") ?? "",
+      dimension: trimField(r, "Costcenter") ?? "",
+    };
+  }
+
+  async function ledgerChunk<T>(
+    path: string,
+    select: readonly string[],
+    extra: Record<string, string>,
+    map: (r: Row) => T,
+    token: string | null,
+    opts: { maxPages?: number },
+  ): Promise<ListChunk<T>> {
+    const cap = opts.maxPages === undefined ? maxPages : assertMaxPages(opts.maxPages);
+    const r = await readChunk(path, select, extra, token, cap, true);
+    const items = r.rows.map(map);
+    return r.error === undefined
+      ? { items, nextToken: r.nextToken, complete: r.complete }
+      : { items, nextToken: r.nextToken, complete: false, error: r.error };
+  }
+
   // --- public API --------------------------------------------------------------------------
 
   return {
@@ -885,6 +1060,53 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
           amount: moneyField(r, "Amount", opts.currency),
         };
       });
+    },
+
+    /**
+     * The chart of accounts (`financial/GLAccounts`), a resumable chunk of up to `maxPages` pages
+     * from `token` (null = start). Same `$skiptoken` assumptions as the open-item lists.
+     */
+    async listGlAccountsChunk(
+      token: string | null,
+      opts: { maxPages?: number } = {},
+    ): Promise<ListChunk<GlAccount>> {
+      return ledgerChunk("/financial/GLAccounts", GL_ACCOUNT_FIELDS, {}, mapGlAccount, token, opts);
+    },
+
+    /**
+     * Reporting balances of one reporting year (`financial/ReportingBalance`, filtered by
+     * `ReportingYear`), amounts in the division currency at its own scale. Resumable chunk.
+     */
+    async listReportingBalancesChunk(
+      token: string | null,
+      opts: { year: number; maxPages?: number },
+    ): Promise<ListChunk<ReportingBalanceRow>> {
+      return ledgerChunk(
+        "/financial/ReportingBalance",
+        REPORTING_BALANCE_FIELDS,
+        { $filter: `ReportingYear eq ${assertYear(opts.year)}` },
+        mapReportingBalance,
+        token,
+        opts,
+      );
+    },
+
+    /**
+     * Budgets of one reporting year (`budget/Budgets`). OPTIONAL data: the module may not be
+     * licensed, so callers must treat 400/403/404 as "no budgets" (ADR 0023). Resumable chunk.
+     */
+    async listBudgetsChunk(
+      token: string | null,
+      opts: { year: number; maxPages?: number },
+    ): Promise<ListChunk<BudgetRow>> {
+      return ledgerChunk(
+        "/budget/Budgets",
+        BUDGET_FIELDS,
+        { $filter: `ReportingYear eq ${assertYear(opts.year)}` },
+        mapBudget,
+        token,
+        opts,
+      );
     },
 
     /**

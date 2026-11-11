@@ -58,7 +58,17 @@ const run = (mode: SyncMode, over: Partial<SyncOptions> = {}): Promise<SyncSumma
 describe("sync entity names (S9)", () => {
   it("has one list, with relation_ibans and without bank_accounts", () => {
     expect([...SYNC_ENTITIES].sort()).toEqual(
-      ["divisions", "payables", "receivables", "relation_ibans", "relations", "run"].sort(),
+      [
+        "divisions",
+        "gl_accounts",
+        "gl_balances",
+        "gl_budgets",
+        "payables",
+        "receivables",
+        "relation_ibans",
+        "relations",
+        "run",
+      ].sort(),
     );
     expect(isSyncEntity("relation_ibans")).toBe(true);
     expect(isSyncEntity("bank_accounts")).toBe(false);

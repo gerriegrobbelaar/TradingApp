@@ -205,7 +205,7 @@ describe("full cycles", () => {
     fx.payables = many(70, 5000);
   };
 
-  it("runs the entities in order: divisions, receivables, payables, relations, ibans", async () => {
+  it("runs the entities in order: divisions, receivables, payables, relations, ibans, ledger", async () => {
     seedTwoKinds();
     fx.banks = [{ n: 1, account: 1, iban: "NL91ABNA0417164300" }];
     await run("full");
@@ -216,6 +216,9 @@ describe("full cycles", () => {
       "/read/financial/PayablesList",
       "/sync/CRM/Accounts",
       "/crm/BankAccounts",
+      "/financial/GLAccounts",
+      "/financial/ReportingBalance",
+      "/budget/Budgets",
     ]);
   });
 

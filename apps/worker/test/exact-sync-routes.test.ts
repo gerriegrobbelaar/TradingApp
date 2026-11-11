@@ -400,7 +400,14 @@ describe("manual slices (review G1)", () => {
       // Manual full runs leave the IBANs to the nightly run.
       expect(stub.apiCalls.some((c) => c.url.pathname.endsWith("/crm/BankAccounts"))).toBe(false);
 
-      // A new run right after: 429 with a retry hint, nothing sent to Exact.
+      // A new run right after: 429 with a retry hint, nothing sent to Exact. (The mocked clock
+      // runs ahead with every reading, and a full run now also reads the ledger, so put it just
+      // after the run that finished.)
+      const started = await db
+        .prepare("SELECT last_started_at FROM sync_state WHERE division_id = ?1 AND entity = 'run'")
+        .bind(divA.id)
+        .first<{ last_started_at: string }>();
+      t = Date.parse(started?.last_started_at ?? "") + 5_000;
       const calls = stub.apiCalls.length;
       for (const mode of ["full", "incremental"]) {
         const wait = await post(fin, { mode });

@@ -9,6 +9,9 @@
  * `as_of_in_future`). Shape tests: apps/worker/test/read-api-shapes.test.ts.
  */
 import type { AgeingBucket, BucketAmounts } from "./ageing";
+import type { BalanceSheet } from "./reports/balance-sheet";
+import type { BalanceSheetSection, ProfitLossSection } from "./reports/classify";
+import type { ProfitLoss } from "./reports/profit-loss";
 
 export type OpenItemKind = "invoice" | "bill";
 export type OpenItemStatus = "open" | "closed";
@@ -229,4 +232,110 @@ export interface OverviewResponse {
     payable: CurrencyKpisDto[];
   };
   lastSync: SyncFreshnessEntry[];
+}
+
+// ---- ledger and reports (task K2, ADR 0023) -----------------------------------------------------
+// Every ledger amount is integer minor units in the DIVISION currency (`division.currency`), at
+// that currency's scale. Nothing here is converted. Report builders live in ./reports.
+
+export type LedgerEntity = "gl_accounts" | "gl_balances" | "gl_budgets";
+
+export interface LedgerFreshnessEntry {
+  /** Last COMPLETE read, or null when never. Balances and budgets: of the requested year. */
+  lastCompletedAt: string | null;
+  /** True when never read, or older than staleAfterHours. */
+  stale: boolean;
+  staleAfterHours: number;
+}
+
+export type LedgerFreshness = Record<LedgerEntity, LedgerFreshnessEntry>;
+
+/**
+ * `not_synced`: the balances of the requested year were never read from Exact. The answer is still
+ * 200, with `report: null`, so a screen can show an empty state ("Sync from Exact first") instead
+ * of an error.
+ */
+export type LedgerReportStatus = "ok" | "not_synced";
+
+export interface BalanceSheetResponse {
+  division: DivisionRef;
+  status: LedgerReportStatus;
+  year: number;
+  /** Last period included. */
+  period: number;
+  /** Null when no comparison was asked for or the compare year was never synced. */
+  compareYear: number | null;
+  /** True when a comparison was asked for but that year was never synced. */
+  compareMissing: boolean;
+  report: BalanceSheet | null;
+  freshness: LedgerFreshness;
+  budgetsAvailable: boolean;
+}
+
+export interface ProfitLossResponse {
+  division: DivisionRef;
+  status: LedgerReportStatus;
+  year: number;
+  periodTo: number;
+  /** The year of the last-year column. */
+  compareYear: number;
+  /** True when that year was never synced: its figures are then 0 only because nothing is held. */
+  compareMissing: boolean;
+  report: ProfitLoss | null;
+  /** The budget scenario used (its GUID, "" for none), or null without budgets. */
+  budgetScenario: string | null;
+  /** Every scenario that has budget rows for the year. */
+  budgetScenarios: string[];
+  freshness: LedgerFreshness;
+  /** False while Exact refuses the budget resource (not licensed); budget figures are then null. */
+  budgetsAvailable: boolean;
+}
+
+export type LedgerStatement = "balance_sheet" | "profit_loss";
+
+export interface LedgerAccountRow {
+  /** Our gl_accounts.id. */
+  id: number;
+  exactId: string;
+  code: string | null;
+  name: string;
+  type: number | null;
+  typeDescription: string | null;
+  balanceSide: "D" | "C" | null;
+  balanceType: "B" | "W" | null;
+  isBlocked: boolean;
+  /** False once Exact stopped returning the account (kept, never deleted). */
+  isActive: boolean;
+  statement: LedgerStatement;
+  /** The report section the account is shown in; "unclassified" when it cannot be placed. */
+  section: BalanceSheetSection | ProfitLossSection;
+}
+
+export interface LedgerAccountsResponse {
+  division: DivisionRef;
+  status: LedgerReportStatus;
+  accounts: LedgerAccountRow[];
+  unclassifiedCount: number;
+  freshness: LedgerFreshness;
+}
+
+export interface LedgerPeriodRow {
+  period: number;
+  /** debit - credit of the period (rows split by cost centre or status are added). */
+  amountMinor: number;
+  debitMinor: number | null;
+  creditMinor: number | null;
+  /** Stored rows added up. */
+  rows: number;
+}
+
+export interface LedgerAccountBalancesResponse {
+  division: DivisionRef;
+  status: LedgerReportStatus;
+  year: number;
+  account: LedgerAccountRow;
+  periods: LedgerPeriodRow[];
+  /** Sum of the period amounts shown. */
+  totalMinor: number;
+  freshness: LedgerFreshness;
 }

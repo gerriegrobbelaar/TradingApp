@@ -38,6 +38,35 @@ export interface FakeItem {
   fullyPaid?: boolean;
 }
 
+/** A chart account as Exact's financial/GLAccounts would send it. */
+export interface FakeGlAccount {
+  n: number;
+  code: string;
+  name: string;
+  type?: number;
+  typeDescription?: string;
+  side?: "D" | "C";
+  bt?: "B" | "W";
+  blocked?: boolean;
+}
+/** A reporting balance row; `amount` is a JSON number in major units (debit - credit). */
+export interface FakeBalance {
+  account: number;
+  year: number;
+  period: number;
+  amount: number;
+  bt?: "B" | "W";
+  status?: string | null;
+  costcenter?: string | null;
+}
+export interface FakeBudget {
+  account: number;
+  year: number;
+  period: number;
+  amount: number;
+  scenario?: string | null;
+}
+
 const date = (ms: number): string => `/Date(${ms})/`;
 
 /**
@@ -55,6 +84,9 @@ export class FakeExact {
   banks: FakeBank[] = [];
   receivables: FakeItem[] = [];
   payables: FakeItem[] = [];
+  glAccounts: FakeGlAccount[] = [];
+  glBalances: FakeBalance[] = [];
+  glBudgets: FakeBudget[] = [];
   pageSize = 2;
   /** Page sizes per endpoint family when set (Exact: about 60 on list endpoints, 1,000 on sync). */
   listPageSize: number | undefined;
@@ -89,6 +121,11 @@ export class FakeExact {
 
   pathsCalled(): string[] {
     return this.calls.map((c) => c.path);
+  }
+
+  private yearOf(req: ExactRequest): number {
+    const m = /ReportingYear eq (\d+)/.exec(req.query?.["$filter"] ?? "");
+    return m ? Number(m[1]) : 0;
   }
 
   private cursorOf(req: ExactRequest): number {
@@ -151,6 +188,48 @@ export class FakeExact {
           .filter((i) => i.ts > c)
           .sort((a, b) => a.ts - b.ts)
           .map((i) => this.syncRow(i));
+      }
+      case "/financial/GLAccounts":
+        return this.glAccounts.map((a) => ({
+          ID: guid(7000 + a.n),
+          Code: `  ${a.code}`,
+          Description: a.name,
+          Type: a.type ?? null,
+          TypeDescription: a.typeDescription ?? null,
+          BalanceSide: a.side ?? null,
+          BalanceType: a.bt ?? "B",
+          Blocked: a.blocked ?? false,
+        }));
+      case "/financial/ReportingBalance": {
+        const year = this.yearOf(req);
+        return this.glBalances
+          .filter((b) => b.year === year)
+          .map((b) => ({
+            GLAccount: guid(7000 + b.account),
+            GLAccountCode: String(b.account),
+            ReportingYear: b.year,
+            ReportingPeriod: b.period,
+            Amount: b.amount,
+            AmountDebit: b.amount > 0 ? b.amount : 0,
+            AmountCredit: b.amount < 0 ? -b.amount : 0,
+            BalanceType: b.bt ?? "B",
+            Status: b.status ?? null,
+            CostcenterCode: b.costcenter ?? null,
+          }));
+      }
+      case "/budget/Budgets": {
+        const year = this.yearOf(req);
+        return this.glBudgets
+          .filter((b) => b.year === year)
+          .map((b) => ({
+            GLAccount: guid(7000 + b.account),
+            GLAccountCode: String(b.account),
+            ReportingYear: b.year,
+            ReportingPeriod: b.period,
+            AmountDC: b.amount,
+            BudgetScenario: b.scenario ?? null,
+            Costcenter: null,
+          }));
       }
       default:
         throw new Error(`FakeExact: unexpected path ${req.path}`);
@@ -224,6 +303,10 @@ export async function resetSync(): Promise<void> {
     db.prepare("DELETE FROM user_prefs"),
     db.prepare("DELETE FROM sync_locks"),
     db.prepare("DELETE FROM sync_state"),
+    db.prepare("DELETE FROM gl_balances"),
+    db.prepare("DELETE FROM gl_budgets"),
+    db.prepare("DELETE FROM gl_accounts"),
+    db.prepare("DELETE FROM gl_sync_years"),
     db.prepare("DELETE FROM open_items"),
     db.prepare("DELETE FROM relation_bank_accounts"),
     db.prepare("DELETE FROM relations"),
