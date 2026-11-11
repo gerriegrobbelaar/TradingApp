@@ -275,7 +275,8 @@ export function registerRevolutRoutes(router: Router): void {
            SET status = 'pending', access_token_enc = ?2, refresh_token_enc = ?3, expires_at = ?4,
                revolut_environment = ?5, creates_bank_entries = ?6, payments_mode = ?7,
                bank_entries_decided_at = ?8, last_error = NULL, token_ref = NULL, updated_at = ?8,
-               pending_until = ?9, pending_ref = ?10, pending_by = ?11, pending_summary = NULL
+               pending_until = ?9, pending_ref = ?10, pending_by = ?11, pending_summary = NULL,
+               refresh_expires_at = ?12
            WHERE id = ?1 AND kind = 'revolut' AND status <> 'active'`,
         )
         .bind(
@@ -290,6 +291,9 @@ export function registerRevolutRoutes(router: Router): void {
           pendingUntil,
           ref,
           session.email,
+          tokens.refreshExpiresInS === null
+            ? null
+            : new Date(ctx.nowMs + tokens.refreshExpiresInS * 1000).toISOString(),
         ),
     ]);
     if ((staged[1]?.meta.changes ?? 0) !== 1) return back("error");
@@ -542,7 +546,9 @@ export function registerRevolutRoutes(router: Router): void {
            SET status = 'disabled', access_token_enc = NULL, refresh_token_enc = NULL, token_ref = NULL,
                expires_at = NULL, last_error = NULL, webhook_id = NULL, webhook_secret_enc = NULL,
                webhook_secret_prev_enc = NULL, pending_until = NULL, pending_ref = NULL,
-               pending_by = NULL, pending_summary = NULL,
+               pending_by = NULL, pending_summary = NULL, refresh_expires_at = NULL,
+               last_webhook_verified_at = NULL, last_webhook_rejected_at = NULL,
+               webhook_rejected_total = 0,
                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
            WHERE id = ?1 AND kind = 'revolut' AND (${live})`,
         )

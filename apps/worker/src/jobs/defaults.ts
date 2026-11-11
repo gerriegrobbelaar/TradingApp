@@ -57,7 +57,7 @@ export const DEFAULT_JOBS: readonly DefaultJob[] = [
     handler: "exact.bank_balances",
     // The Exact bank feed is daily; polling faster only wastes budget (CLAUDE.md 4.1).
     schedule: { kind: "cron", expr: "5 * * * *" },
-    enabled: false, // Phase 5
+    enabled: false, // Phase 8 (data quality): planned for the data-quality phase
     exactBudget: 20,
   },
   {

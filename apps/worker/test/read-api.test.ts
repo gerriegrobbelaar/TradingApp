@@ -76,7 +76,7 @@ function itemStmt(s: ItemSpec): D1PreparedStatement {
   return db
     .prepare(
       `INSERT INTO open_items (division_id, exact_id, kind, relation_id, relation_name, relation_iban,
-         invoice_number, reference, currency, amount_minor, open_minor, invoice_date, due_date, status,
+         invoice_number, reference, currency, stored_minor, open_minor, invoice_date, due_date, status,
          synced_at, entry_number, original_minor, open_dc_minor, dc_currency, source, last_seen_sync_id,
          missed_cycles)
        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, '2026-01-01', ?12, ?13, ?14, ?15, ?16, ?17,
@@ -396,9 +396,9 @@ describe("lists", () => {
     await addItems([{ open: 700, original: null }]);
     const r = await get<OpenItemListResponse>("/api/invoices");
     expect(r.body.items[0]).toMatchObject({ originalMinor: null, openMinor: 700 });
-    // amount_minor holds the open balance here (review N4); the detail says so.
+    // stored_minor holds the open balance here (review N4); the detail says so.
     const d = await get<OpenItemDetail>(`/api/open-items/${r.body.items[0]?.id}`);
-    expect(d.body.amountMinor).toBe(700);
+    expect(d.body.storedMinor).toBe(700);
     expect(d.body.item.originalMinor).toBeNull();
   });
 
@@ -1062,7 +1062,7 @@ describe("detail and relation", () => {
     expect(text).not.toContain("NL123456789B01");
     const d = JSON.parse(text) as OpenItemDetail;
     expect(d.item).toMatchObject({ id, originalMinor: 9000, openMinor: 4000 });
-    expect(d.amountMinor).toBe(9000);
+    expect(d.storedMinor).toBe(9000);
     expect(d.provenance).toMatchObject({ lastSeenSyncId: 7, missedCycles: 1, source: "list" });
     expect(d.exactLink).toBeNull();
     expect(d.relation).toMatchObject({

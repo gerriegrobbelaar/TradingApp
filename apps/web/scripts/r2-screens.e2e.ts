@@ -1,7 +1,8 @@
 /**
  * R2 browser checks (see vitest.screens.config.ts): screenshots of Settings, Connections with the
- * Revolut Business card at 360 and 1280 in light and dark, in four states (not connected,
- * connected, needs re-authorisation, waiting for the admin's confirmation), plus axe (with colour contrast) in the real browser. The API
+ * Revolut Business card at 360 and 1280 in light and dark, in five states (not connected, connected,
+ * needs re-authorisation, waiting for the admin's confirmation, and Revolut not configured on the
+ * deployment), plus axe (with colour contrast) in the real browser. The API
  * is mocked in the browser; the app is the production build in dist/.
  */
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -45,7 +46,7 @@ let server: Server;
 let base = "";
 let browser: Browser;
 
-type State = "none" | "connected" | "reauth" | "pending";
+type State = "none" | "connected" | "reauth" | "pending" | "unconfigured";
 const PENDING = {
   until: "2026-11-11T09:15:00.000Z",
   stagedBy: "gerrie.grobbelaar@camelthorncapital.com",
@@ -65,7 +66,7 @@ const PENDING = {
   },
 };
 const revolutRow = (state: State) =>
-  state === "none"
+  state === "none" || state === "unconfigured"
     ? []
     : state === "pending"
       ? [
@@ -111,7 +112,11 @@ function api(path: string, state: State): unknown {
     case "/api/divisions":
       return { selectedId: null, divisions: [] };
     case "/api/connections":
-      return { exactConfigured: true, revolutConfigured: true, connections: revolutRow(state) };
+      return {
+        exactConfigured: true,
+        revolutConfigured: state !== "unconfigured",
+        connections: revolutRow(state),
+      };
     case "/api/sync/settings":
       return { incrementalOpenItems: false };
     default:
@@ -176,7 +181,7 @@ afterAll(async () => {
 });
 
 describe("Settings, Connections, Revolut Business card", () => {
-  for (const state of ["none", "connected", "reauth", "pending"] as const) {
+  for (const state of ["none", "connected", "reauth", "pending", "unconfigured"] as const) {
     for (const theme of ["light", "dark"] as const) {
       for (const width of [360, 1280] as const) {
         it(`${state} ${theme} ${width}: renders, no console or CSP errors, no axe violations`, async () => {
@@ -203,7 +208,11 @@ describe("Settings, Connections, Revolut Business card", () => {
           await page.goto(`${base}/settings/connections`);
           await page.waitForSelector("#revolut-heading", { timeout: 15_000 });
           await page.waitForSelector(
-            state === "pending" ? "input[type='checkbox']" : "input[name='revolut-bank-entries']",
+            state === "pending"
+              ? "input[type='checkbox']"
+              : state === "unconfigured"
+                ? "#revolut-heading ~ * .notice, .notice.warn"
+                : "input[name='revolut-bank-entries']",
             { timeout: 15_000 },
           );
           // No page-level sideways scroll at phone width.

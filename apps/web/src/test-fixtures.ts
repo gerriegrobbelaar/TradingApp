@@ -124,7 +124,7 @@ export function detail(item: OpenItemRow, over: Partial<OpenItemDetail> = {}): O
     division: DIV_REF,
     asOf: "2026-11-11",
     item,
-    amountMinor: item.openMinor,
+    storedMinor: item.openMinor,
     rate: null,
     closedAt: null,
     openDcMinor: item.dcMinor,

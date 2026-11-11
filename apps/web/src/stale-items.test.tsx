@@ -98,7 +98,7 @@ describe("closed and all views (review S9)", () => {
     mockFetch({
       ...base(),
       "GET /api/invoices": () => ({ body: listResponse([closed]) }),
-      "GET /api/open-items/5": () => ({ body: detail(closed, { amountMinor: 12_500 }) }),
+      "GET /api/open-items/5": () => ({ body: detail(closed, { storedMinor: 12_500 }) }),
     });
     const user = userEvent.setup();
     renderApp("/invoices?view=closed");

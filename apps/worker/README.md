@@ -30,8 +30,10 @@ If any of these is missing or malformed, every route except `/api/health` answer
 Revolut Business (ADR 0031) adds `REVOLUT_CLIENT_ID`, `REVOLUT_REDIRECT_URI` (https, on the app
 origin, path `/api/connections/revolut/callback`) and `REVOLUT_ISSUER` (vars; the issuer is the host
 of the redirect URI) and the secret `REVOLUT_PRIVATE_KEY` (unencrypted PKCS#8 PEM, RSA 2048 bits or
-more). If any is missing, `/api/connections/revolut/start` and `/callback` answer
-`500 server_misconfigured` and `GET /api/connections` reports `revolutConfigured: false`.
+more). Revolut is optional as a whole: with all three vars empty (as committed) the deploy guard
+passes with a notice. If any is missing, `/api/connections/revolut/start` and `/callback` answer
+`500 server_misconfigured`, `GET /api/connections` reports `revolutConfigured: false`, the card
+says Revolut is not configured, and the Revolut jobs skip with `revolut_not_configured`.
 
 If any is missing, `/api/connections/exact/start` and `/callback` answer
 `500 server_misconfigured`; `GET /api/connections` still works and reports `exactConfigured: false`.

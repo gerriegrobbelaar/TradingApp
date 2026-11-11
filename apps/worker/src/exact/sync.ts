@@ -498,7 +498,7 @@ function openItemStmt(
   return db
     .prepare(
       `INSERT INTO open_items (division_id, exact_id, kind, relation_id, relation_name,
-         invoice_number, reference, currency, amount_minor, open_minor, invoice_date, due_date,
+         invoice_number, reference, currency, stored_minor, open_minor, invoice_date, due_date,
          status, closed_at, synced_at, entry_number, last_seen_sync_id, original_minor,
          open_dc_minor, dc_currency, rate, source, search_text)
        SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?17, ?9), ?9, ?10, ?11, ?12, ?13, ?14,
@@ -512,7 +512,7 @@ function openItemStmt(
          original_minor = CASE WHEN excluded.original_minor IS NOT NULL THEN excluded.original_minor
                                WHEN open_items.currency = excluded.currency
                                THEN open_items.original_minor ELSE NULL END,
-         amount_minor = COALESCE(excluded.original_minor,
+         stored_minor = COALESCE(excluded.original_minor,
                                  CASE WHEN open_items.currency = excluded.currency
                                       THEN open_items.original_minor END,
                                  excluded.open_minor),

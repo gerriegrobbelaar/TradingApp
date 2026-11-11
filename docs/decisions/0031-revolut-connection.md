@@ -50,7 +50,24 @@ route and the Bank screen are R3.
 - Access and refresh tokens and the webhook signing secrets are AES-GCM encrypted with the existing
   helper; the AAD is `revolut:<connection id>:<access|refresh|webhook_secret|webhook_secret_prev>`.
   A refresh always re-encrypts the refresh token with the current `TOKEN_ENC_KEY` (even when Revolut did
-  not rotate it), so a key rotation completes after one refresh cycle.
+  not rotate it), so a key rotation completes after one refresh cycle. The webhook signing secrets are re-encrypted
+  with the current key at the same moment (the gate's refresh calls `reencryptWebhookSecrets`) and
+  lazily when a delivery had to be verified with a secret still under the previous key; each rewrite
+  is a compare-and-swap on the old ciphertext and is not audited (the plaintext does not change).
+  Without this, dropping `TOKEN_ENC_KEY_PREVIOUS` would make every delivery fail verification.
+  A failed rewrite leaves the old ciphertext (still readable while the previous key is configured)
+  and is retried on the next refresh or delivery; the AAD stays the column's own. A secret that
+  cannot be decrypted with either key is reported to admins as `webhookSecretReadable: false` in
+  `GET /api/connections` (null = could not be checked); "Register webhook again" replaces it (the
+  unreadable value is discarded, and audited as `droppedUnreadablePrevious`, instead of kept as the
+  previous secret). Only a genuinely unreadable value is discarded: a malformed configured key or
+  a D1 error makes the registration fail and keeps the stored secret.
+  `TOKEN_ENC_KEY_PREVIOUS` can be removed only after one refresh of each connection AND one
+  verified webhook delivery (or a refresh, which also rewrites the webhook secrets) under the new
+  key (the Revolut access token lives about 40 minutes and the poll job refreshes it, so waiting an
+  hour after the "Last delivery" stamp moved is enough). Afterwards `webhookSecretReadable: true`
+  confirms it; if it shows false, put the old key back as `TOKEN_ENC_KEY_PREVIOUS` (nothing stored
+  was changed by dropping it) and wait for the next refresh.
 - Config: vars `REVOLUT_CLIENT_ID`, `REVOLUT_REDIRECT_URI`, `REVOLUT_ISSUER`; secret
   `REVOLUT_PRIVATE_KEY` (PKCS#8 PEM). `REVOLUT_ISSUER` must be the host of `REVOLUT_REDIRECT_URI` and the
   redirect URI must be on the app origin at `/api/connections/revolut/callback` (checked at runtime
@@ -87,8 +104,9 @@ route and the Bank screen are R3.
 - Request validation: a strict allow-list of method + path + API version, anchored regexes, no
   trailing slash, no percent-encoding, UUID account ids (`GET /accounts`, `/accounts/{uuid}`,
   `/accounts/{uuid}/bank-details`, `/transactions`, `/transaction/{id}`, `/counterparties`; on API
-  2.0 only `POST /webhooks` and `DELETE /webhooks/{uuid}`: reading a webhook returns its signing
-  secret, and rotation is not built yet). A created subscription must point at this app's own
+  2.0 `POST /webhooks`, `DELETE /webhooks/{uuid}` and, only for the job id `revolut-webhook-recover`,
+  `GET /webhooks` (a list can hold signing secrets, so it is never stored or logged). Listing, recovery
+  and rotation ("Register webhook" with `replace: true`) are built, see ADR 0033). A created subscription must point at this app's own
   webhook URL (`<redirect URI origin>/api/webhooks/revolut`), checked in the gate. The host is fixed by the connection's environment
   (`b2b.revolut.com` or `sandbox-b2b.revolut.com`), redirects are never followed, caller headers are
   limited to `content-type` and `accept`. **Payment endpoints (`/pay`, `/payment-drafts`, `/transfer`,
@@ -158,6 +176,18 @@ route and the Bank screen are R3.
 8. Webhook management paths and payloads on API 2.0 as listed in the allow-list (R3 verifies).
 9. Whether a `TransactionStateChanged` for a transfer carries leg ids (the schema allows both).
 
+## Refresh-token expiry (review N8)
+
+`connections.refresh_expires_at` (nullable, migration 0016) is set when a token response carries a
+refresh lifetime (`refresh_token_expires_in`, whole seconds, 1 s to 10 years; anything else is
+ignored) and kept when a later response omits it, unless that response rotated the refresh
+token (a new token's expiry is then unknown: cleared). `needs_reauth` and disconnect clear it. `GET /api/connections` returns it as
+`refreshExpiresAt` (null = unknown) for Phase 8's "expiring connection" rule.
+**Open item:** Revolut's documentation we have names no refresh-token lifetime; the often-quoted
+90-day re-consent for Business API access is unverified. Until a live sandbox connection shows
+whether the answer carries a lifetime, the field stays null and the only signal is a
+`needs_reauth` after `invalid_grant`. Ask Revolut / check in the sandbox before Phase 8.
+
 ## Consequences
 
 - One more Durable Object class and migration tag; the deploy guard checks the binding, `v3`, the
@@ -165,5 +195,20 @@ route and the Bank screen are R3.
 - R1's `packages/revolut` (`buildClientAssertion`, `buildAuthorizeUrl`, `buildTokenRequestBody`,
   `parseTokenResponse` returning `expiresInSeconds` and an optional `refreshToken`) is used through one
   adapter, `apps/worker/src/revolut/oauth.ts`; the account check uses R1's client through the gate.
-- `REVOLUT_REDIRECT_URI` must be https (R1's consent URL builder and Revolut require it), so local
-  development of the connect flow needs an https tunnel.
+- `REVOLUT_REDIRECT_URI` must be https (R1's consent URL builder and Revolut require it). The
+  connect flow also needs `RevolutGate`, whose EU jurisdiction workerd does not implement, so it
+  cannot be tried locally even through a tunnel: use staging (docs/DEPLOY.md).
+
+## Revolut is optional as a whole (review S5)
+
+A deployment may leave `REVOLUT_CLIENT_ID`, `REVOLUT_REDIRECT_URI` and `REVOLUT_ISSUER` all empty.
+The deploy guard then passes with a notice ("Revolut is not configured: ..."); with only some of
+the three set (compared after trimming, as the Worker reads them; a non-string value counts as set
+and is refused) it fails and names them. Staging and production are judged separately and may not
+share `REVOLUT_CLIENT_ID` or `REVOLUT_REDIRECT_URI`. The `RevolutGate` binding, migration `v3` and the refusal of a
+private key in `wrangler.toml` stay mandatory. At runtime the Revolut connect routes answer `500
+server_misconfigured` (disconnect stays a working no-op), the webhook endpoint answers its uniform
+401 (no connection), the bank API answers `available: false`, `GET /api/connections` reports `revolutConfigured: false` (the card says
+"Revolut is not configured on this deployment" and offers no Connect button), and the Revolut jobs
+skip with `revolut_not_configured` before they touch the database or the network. The environment
+(production or sandbox) on the connect card is no longer preselected (review N6).

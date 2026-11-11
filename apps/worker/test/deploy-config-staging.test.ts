@@ -95,7 +95,7 @@ GOOGLE_CLIENT_ID = "123-abc.apps.googleusercontent.com"
 OAUTH_REDIRECT_URI = "https://staging.camelthorncapital.com/api/auth/callback"
 EXACT_CLIENT_ID = "11111111-2222-3333-4444-555555555555"
 EXACT_REDIRECT_URI = "https://staging.camelthorncapital.com/api/connections/exact/callback"
-REVOLUT_CLIENT_ID = "aaaaaaaa-1111-2222-3333-444444444444"
+REVOLUT_CLIENT_ID = "bbbbbbbb-1111-2222-3333-444444444444"
 REVOLUT_REDIRECT_URI = "https://staging.camelthorncapital.com/api/connections/revolut/callback"
 REVOLUT_ISSUER = "staging.camelthorncapital.com"
 
@@ -505,6 +505,11 @@ describe("M1 review: wrangler's inheritance rules, read with a real TOML parser"
       ["[vars]\n", '[vars]\nTEST_MIGRATIONS = "x"\n'],
       ["[vars]\n", '[vars]\nTOKEN_ENC_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="\n'],
       ["[vars]\n", '[vars]\nSESSION_SECRET = "x"\n'],
+      // the test pool's "old" key (vitest.config.ts) must never become a deployed variable
+      [
+        "[vars]\n",
+        '[vars]\nTOKEN_ENC_KEY_PREVIOUS = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8="\n',
+      ],
     ];
     for (const [from, to] of cases) {
       const t = ready.replace(from, to);
@@ -544,7 +549,7 @@ describe("M1 review: wrangler's inheritance rules, read with a real TOML parser"
 });
 
 describe("M1 review: the committed file once filled in", () => {
-  it("passes for production and staging when only the placeholders are replaced", () => {
+  it("passes for production and staging when only the required placeholders are replaced (Revolut optional)", () => {
     let n = 0;
     const filled = committed
       .replace(
@@ -557,10 +562,6 @@ describe("M1 review: the committed file once filled in", () => {
       )
       .replace(/GOOGLE_CLIENT_ID = ""/g, 'GOOGLE_CLIENT_ID = "1-a.apps.googleusercontent.com"')
       .replace(/EXACT_CLIENT_ID = ""/g, 'EXACT_CLIENT_ID = "11111111-2222-3333-4444-555555555555"')
-      .replace(
-        /REVOLUT_CLIENT_ID = ""/g,
-        'REVOLUT_CLIENT_ID = "aaaaaaaa-1111-2222-3333-444444444444"',
-      )
       .replace(/app\.example\.com/g, "finance.camelthorncapital.com")
       .replace(/staging\.example\.com/g, "staging.camelthorncapital.com")
       .replace(

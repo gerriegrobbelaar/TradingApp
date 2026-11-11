@@ -1,6 +1,11 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { MAX_WEBHOOK_BODY_BYTES, parseWebhookEvent, verifyRevolutWebhook } from "../src/webhook";
+import {
+  checkRevolutWebhookHeaders,
+  MAX_WEBHOOK_BODY_BYTES,
+  parseWebhookEvent,
+  verifyRevolutWebhook,
+} from "../src/webhook";
 
 const SECRET = "wsk_test_secret_value";
 const NOW = 1_700_000_000_000;
@@ -404,5 +409,43 @@ describe("parseWebhookEvent", () => {
     expect(parseWebhookEvent(bytes)).toEqual(expected);
     expect(parseWebhookEvent(bytes.buffer.slice(0) as ArrayBuffer)).toEqual(expected);
     expect(parseWebhookEvent(`\uFEFF${BODY}`)).toEqual(expected);
+  });
+});
+
+describe("checkRevolutWebhookHeaders (the verifier's header step, usable before the body)", () => {
+  const h = (signatureHeader: string | null, timestampHeader: string | null, nowMs = NOW) =>
+    checkRevolutWebhookHeaders({ signatureHeader, timestampHeader, nowMs });
+  const sig = `v1=${"a".repeat(64)}`;
+  it("returns the trimmed timestamp and every well-formed v1 candidate", () => {
+    expect(h(` v0=${"b".repeat(64)}, ${sig} ,v1=zz`, ` ${TS} `)).toEqual({
+      ok: true,
+      ts: TS,
+      signatures: ["a".repeat(64)],
+    });
+  });
+  it.each([
+    [null, TS, "missing_header"],
+    [sig, "  ", "missing_header"],
+    [sig, String(NOW / 1000), "bad_timestamp"],
+    [sig, String(NOW + 300_001), "timestamp_out_of_range"],
+    ["v1=abc", TS, "malformed"],
+    [Array(6).fill(sig).join(","), TS, "malformed"],
+  ] as const)("%s / %s -> %s", (s, t, reason) => {
+    expect(h(s, t)).toEqual({ ok: false, reason });
+  });
+  it("accepts the window edges exactly like the verifier", () => {
+    expect(h(sig, String(NOW + 300_000)).ok).toBe(true);
+    expect(h(sig, String(NOW - 300_000)).ok).toBe(true);
+  });
+  it("refuses a bad clock or tolerance like the verifier", () => {
+    expect(() => h(sig, TS, Number.NaN)).toThrow(RangeError);
+    expect(() =>
+      checkRevolutWebhookHeaders({
+        signatureHeader: sig,
+        timestampHeader: TS,
+        nowMs: NOW,
+        toleranceMs: 300_001,
+      }),
+    ).toThrow(RangeError);
   });
 });

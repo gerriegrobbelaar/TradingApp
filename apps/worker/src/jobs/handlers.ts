@@ -3,14 +3,42 @@
  * yet are registered WITHOUT a `run`: the runner records them as `skipped` with code
  * `not_implemented` (never an error, never a silent success), and "Run now" is refused for them.
  */
+import { loadRevolutConfig } from "../revolut/config";
 import { runRevolutBackfill, runRevolutSync } from "../revolut/sync";
 import { FULL_SYNC_MAX_ATTEMPTS, runExactSync } from "./exact-handlers";
-import type { HandlerDef } from "./types";
+import type { HandlerDef, JobContext, HandlerResult } from "./types";
 
 const MIN = 60_000;
 const HOUR = 60 * MIN;
 
 const later = (phase: string) => ({ phase, maxAttempts: 1 });
+
+/**
+ * Revolut is optional as a whole (review S5): a deployment without the Revolut settings skips the
+ * Revolut jobs with `revolut_not_configured` (names of the missing settings only) instead of
+ * touching the connection, the gate or the network.
+ */
+export function whenRevolutConfigured(
+  run: (ctx: JobContext) => Promise<HandlerResult>,
+): (ctx: JobContext) => Promise<HandlerResult> {
+  return async (ctx) => {
+    let origin = "";
+    try {
+      origin = new URL(ctx.env.OAUTH_REDIRECT_URI).origin;
+    } catch {
+      // The app origin is unknown: the Revolut settings cannot be valid either.
+    }
+    const cfg = loadRevolutConfig(ctx.env, origin);
+    if (!cfg.ok) {
+      return {
+        status: "skipped",
+        code: "revolut_not_configured",
+        summary: { missing: cfg.missing },
+      };
+    }
+    return run(ctx);
+  };
+}
 
 /**
  * Schedule limits, lateness and who may run each job by hand. See the handler contract in
@@ -29,7 +57,7 @@ export const HANDLERS: Record<string, HandlerDef> = {
     // CLAUDE.md 4.1: every 10 minutes, configurable 5 to 15.
     scheduleRules: { allowedIntervalMinutes: [5, 15] },
     maxLatenessMs: 30 * MIN,
-    run: runRevolutSync,
+    run: whenRevolutConfigured(runRevolutSync),
   },
   "revolut.backfill": {
     title: "Revolut backfill",
@@ -42,13 +70,14 @@ export const HANDLERS: Record<string, HandlerDef> = {
     // A daily job: never more often than every 12 hours (a daily cron is 23 h on the spring day).
     scheduleRules: { minIntervalMinutes: 12 * 60 },
     maxLatenessMs: 6 * HOUR,
-    run: runRevolutBackfill,
+    run: whenRevolutConfigured(runRevolutBackfill),
   },
   "exact.bank_balances": {
     title: "Bank balances from Exact",
-    description: "Reads the ING and Rabobank balances that Exact imported.",
+    description:
+      "Reads the ING and Rabobank balances that Exact imported. Planned for the data-quality phase (Phase 8): the rule 'Exact balance differs from bank balance' needs it.",
     usesExact: true,
-    ...later("Phase 5, Revolut connection"),
+    ...later("Phase 8, Data quality"),
     // The Exact bank feed is daily; faster polling only wastes budget.
     scheduleRules: { minIntervalMinutes: 30 },
     maxLatenessMs: 2 * HOUR,

@@ -1,4 +1,6 @@
 import { env, runInDurableObject } from "cloudflare:test";
+import { resetHousekeepingState } from "../src/revolut/webhook-housekeeping";
+import { resetWebhookHealthState } from "../src/revolut/webhook-health";
 import { vi } from "vitest";
 import type { RevolutRequest } from "@camelthorn/revolut";
 import { decryptToken, encryptToken } from "../src/crypto/token-crypto";
@@ -74,8 +76,12 @@ export function stubRevolut(): RevolutStub {
 
 /** Wipes Revolut-related rows (audit_log is append-only and left alone). */
 export async function resetRevolut(): Promise<void> {
+  // Per-isolate throttles of the webhook health writes and the housekeeping (module state).
+  resetWebhookHealthState();
+  resetHousekeepingState();
   await db.batch([
     db.prepare("DELETE FROM webhook_events"),
+    db.prepare("DELETE FROM webhook_rejections"),
     db.prepare("DELETE FROM revolut_sync_state"),
     db.prepare("DELETE FROM revolut_quarantine"),
     db.prepare("DELETE FROM revolut_counterparties"),

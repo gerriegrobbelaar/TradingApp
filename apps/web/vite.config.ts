@@ -6,5 +6,10 @@ export default defineConfig({
   server: {
     proxy: { "/api": { target: "http://localhost:8787", changeOrigin: false } },
   },
-  test: { environment: "jsdom", setupFiles: ["./src/test-setup.ts"] },
+  test: {
+    environment: "jsdom",
+    setupFiles: ["./src/test-setup.ts"],
+    // The heaviest screens take 2.5 to 3.1 s unloaded; 5 s flaked under parallel load.
+    testTimeout: 15000,
+  },
 });

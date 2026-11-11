@@ -201,6 +201,18 @@ export function formatDateTime(value: string | null | undefined): string {
   return Number.isFinite(ms) ? dateTimeFmt.format(ms) : NO_VALUE;
 }
 
+/** "just now", "3 min ago", "2 h ago", "4 days ago". Future times count as just now. */
+export function formatAgo(value: string | null | undefined, nowMs: number = Date.now()): string {
+  const ms = value ? Date.parse(value) : NaN;
+  if (!Number.isFinite(ms)) return NO_VALUE;
+  const mins = Math.floor((nowMs - ms) / 60_000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) return `${hours} h ago`;
+  return `${Math.floor(hours / 24)} days ago`;
+}
+
 /** "1 day", "12 days". */
 export function formatDays(days: number): string {
   const n = Math.abs(Math.round(days));

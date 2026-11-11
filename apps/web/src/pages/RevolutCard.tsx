@@ -8,14 +8,16 @@ import {
   disconnectRevolut,
   me as fetchMe,
   nav,
+  registerRevolutWebhook,
   revolutStartUrl,
   stepUp,
   type ConnectionRow,
   type RevolutEnvironment,
   type RevolutPaymentsMode,
   type RevolutPending,
+  type RevolutWebhookHealth,
 } from "../api";
-import { formatCount, formatDateTime } from "../lib/format";
+import { formatAgo, formatCount, formatDateTime } from "../lib/format";
 import { useToast } from "../toasts";
 
 type RevolutState =
@@ -124,10 +126,12 @@ interface Props {
 export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Props) {
   const toast = useToast();
   const requiredId = useId();
+  const envRequiredId = useId();
   const state = revolutState(row);
   const label = STATE_LABEL[state];
   const live = row?.revolut;
-  const [env, setEnv] = useState<RevolutEnvironment>("production");
+  // No default: production vs sandbox is an explicit choice (review N6).
+  const [env, setEnv] = useState<RevolutEnvironment | null>(null);
   const [bank, setBank] = useState<boolean | null>(null);
   const [mode, setMode] = useState<RevolutPaymentsMode>("drafts");
   const [dialog, setDialog] = useState<Dialog>(null);
@@ -153,11 +157,18 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
   // What the form shows: the saved values for a connection, else the admin's pending choice.
   const shownBank = connected ? (live?.createsBankEntries ?? null) : bank;
   const shownMode = connected ? (live?.paymentsMode ?? "drafts") : mode;
-  const shownEnv = connected ? (live?.environment ?? "production") : env;
+  // A saved connection keeps its environment; one without a recorded environment (an older row)
+  // must have it chosen again before re-authorising, never silently assumed.
+  const savedEnv = connected ? (live?.environment ?? null) : null;
+  const shownEnv: RevolutEnvironment | null = savedEnv ?? env;
   const needsBankChoice = shownBank === null;
+  const needsEnvChoice = shownEnv === null;
+  const choosesEnv = savedEnv === null;
+  // Nothing to set up and nothing connected: Revolut is not used on this deployment.
+  const unavailable = !configured && state === "not_connected" && !pending;
 
   async function connect() {
-    if (shownBank === null) return;
+    if (shownBank === null || shownEnv === null) return;
     setBusy(true);
     try {
       const current = await fetchMe();
@@ -186,6 +197,24 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
     } catch (e) {
       if (e instanceof StepUpRequired) setDialog("stepup");
       else setSheetError(describeError(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function registerWebhookAgain(replace: boolean) {
+    setBusy(true);
+    try {
+      const r = await registerRevolutWebhook(replace);
+      toast.show(
+        r.status === "already_registered"
+          ? "The webhook was already registered."
+          : "Webhook registered.",
+      );
+      await onChanged();
+    } catch (e) {
+      if (e instanceof StepUpRequired) setDialog("stepup");
+      else toast.show("Could not register the webhook. Try again.");
     } finally {
       setBusy(false);
     }
@@ -243,8 +272,12 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
             </p>
             {!configured && (
               <p className="notice warn">
-                Revolut Business is not set up on the server yet. Ask whoever deploys the app to add
-                the Revolut client ID, private key and redirect settings.
+                {unavailable
+                  ? "Revolut is not configured on this deployment. "
+                  : "Revolut Business is not set up on the server. "}
+                {isAdmin || !unavailable
+                  ? "Whoever deploys the app must add the Revolut client ID, private key and redirect settings before it can be connected."
+                  : "Ask an admin."}
               </p>
             )}
             {state === "credentials_rejected" && (
@@ -288,8 +321,11 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
               />
             )}
 
-            {!pending && !connected && isAdmin && (
-              <fieldset className="choices">
+            {!pending && choosesEnv && isAdmin && !unavailable && (
+              <fieldset
+                className="choices"
+                aria-describedby={needsEnvChoice ? envRequiredId : undefined}
+              >
                 <legend>Environment</legend>
                 {(["production", "sandbox"] as const).map((v) => (
                   <label key={v} className="choice">
@@ -304,11 +340,19 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
                     <span>{ENV_LABEL[v]}</span>
                   </label>
                 ))}
+                {needsEnvChoice && (
+                  <p className="stamp" id={envRequiredId}>
+                    Choose the environment before you can connect.
+                  </p>
+                )}
               </fieldset>
             )}
 
-            {!pending && (
-              <fieldset className="choices">
+            {!pending && !unavailable && (
+              <fieldset
+                className="choices"
+                aria-describedby={!connected && isAdmin && needsBankChoice ? requiredId : undefined}
+              >
                 <legend>Who creates bank entries in Exact?</legend>
                 {BANK_OPTIONS.map((o) => (
                   <label key={String(o.value)} className="choice">
@@ -337,7 +381,7 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
               </fieldset>
             )}
 
-            {!pending && (
+            {!pending && !unavailable && (
               <fieldset className="choices">
                 <legend>Payments mode</legend>
                 {MODE_OPTIONS.map((o) => (
@@ -366,6 +410,20 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
               </fieldset>
             )}
 
+            {connected && live?.webhook && (
+              <WebhookHealth
+                health={live.webhook}
+                unreadable={isAdmin && live.webhook.secretReadable === false}
+                // The server registers only for an active connection (needs_reauth: reconnect first).
+                canRegister={isAdmin && row?.status === "active"}
+                busy={busy}
+                onRegister={(replace, e) => {
+                  remember(e);
+                  void registerWebhookAgain(replace);
+                }}
+              />
+            )}
+
             {connected && (
               <section aria-label="Revolut accounts">
                 <h3 className="sub-h">Accounts</h3>
@@ -373,13 +431,22 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
               </section>
             )}
 
-            {pending ? null : isAdmin ? (
+            {pending || unavailable ? null : isAdmin ? (
               <div className="chips" ref={actions}>
                 {(state === "not_connected" || state === "needs_reauth") && (
                   <Button
                     variant="primary"
-                    disabled={busy || !configured || needsBankChoice}
-                    aria-describedby={needsBankChoice && !connected ? requiredId : undefined}
+                    disabled={busy || !configured || needsBankChoice || needsEnvChoice}
+                    aria-describedby={
+                      needsEnvChoice || (!connected && needsBankChoice)
+                        ? [
+                            needsEnvChoice ? envRequiredId : null,
+                            !connected && needsBankChoice ? requiredId : null,
+                          ]
+                            .filter(Boolean)
+                            .join(" ")
+                        : undefined
+                    }
                     onClick={(e) => {
                       remember(e);
                       void connect();
@@ -488,6 +555,56 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
 }
 
 const shortTime = (iso: string): string => formatDateTime(iso);
+
+/**
+ * The webhook channel: when a signed delivery last arrived, how many were refused, and, for admins,
+ * whether the stored signing secret can still be read (a dropped TOKEN_ENC_KEY makes it unreadable).
+ */
+function WebhookHealth({
+  health,
+  unreadable,
+  canRegister,
+  busy,
+  onRegister,
+}: {
+  health: RevolutWebhookHealth;
+  unreadable: boolean;
+  canRegister: boolean;
+  busy: boolean;
+  onRegister: (replace: boolean, e: { currentTarget: HTMLElement }) => void;
+}) {
+  const rejected = health.rejectedLast24h;
+  return (
+    <section aria-label="Webhook">
+      <h3 className="sub-h">Payment notifications</h3>
+      {!health.registered && (
+        <p role="alert" className="notice warn">
+          The webhook is not registered, so new payments only appear after the next sync.
+        </p>
+      )}
+      {unreadable && (
+        <p role="alert" className="notice warn">
+          The webhook signing secret cannot be read. Register the webhook again.
+        </p>
+      )}
+      {health.registered && (
+        <p className="stamp">
+          {health.lastVerifiedAt
+            ? `Last delivery ${formatAgo(health.lastVerifiedAt)}`
+            : "No verified delivery yet"}
+        </p>
+      )}
+      {rejected > 0 && <p className="notice warn">{`${rejected} rejected in the last 24 h`}</p>}
+      {canRegister && (!health.registered || unreadable) && (
+        <div className="chips">
+          <Button disabled={busy} onClick={(e) => onRegister(unreadable, e)}>
+            {unreadable ? "Register webhook again" : "Register webhook"}
+          </Button>
+        </div>
+      )}
+    </section>
+  );
+}
 
 function Fact({ label, children }: { label: string; children: ReactNode }) {
   return (

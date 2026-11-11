@@ -84,7 +84,7 @@ const DETAIL = keysOf<OpenItemDetail>()([
   "division",
   "asOf",
   "item",
-  "amountMinor",
+  "storedMinor",
   "rate",
   "closedAt",
   "openDcMinor",
@@ -229,7 +229,7 @@ beforeEach(async () => {
       db
         .prepare(
           `INSERT INTO open_items (division_id, exact_id, kind, relation_id, relation_name,
-             relation_iban, invoice_number, currency, amount_minor, open_minor, due_date, status,
+             relation_iban, invoice_number, currency, stored_minor, open_minor, due_date, status,
              synced_at, source)
            VALUES (?1, ?2, ?3, ?4, ?5, 'NL91ABNA0417164300', ?6, ?7, ?8, ?8, ?9, 'open',
              '2026-01-01T00:00:00.000Z', 'list')`,

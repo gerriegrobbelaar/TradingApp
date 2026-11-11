@@ -97,6 +97,8 @@ describe("register webhook", () => {
     expect(await loadWebhookSecretSet(env, connId)).toEqual({
       current: WEBHOOK_SECRET,
       previous: null,
+      stale: false,
+      previousUnreadable: false,
     });
     const row = await db
       .prepare("SELECT webhook_id, webhook_secret_enc FROM connections WHERE id = ?1")
@@ -291,6 +293,8 @@ describe("replacing the subscription (rotation)", () => {
     expect(await loadWebhookSecretSet(env, connId)).toEqual({
       current: "wsk_rotated_secret",
       previous: WEBHOOK_SECRET,
+      stale: false,
+      previousUnreadable: false,
     });
     expect((await conn()).webhook_id).toBe(NEW_ID);
   });

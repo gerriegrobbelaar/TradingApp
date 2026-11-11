@@ -59,9 +59,17 @@ describe("Settings, Connections: Revolut Business", () => {
     );
     expect((connect as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByText("Required before you can connect.")).toBeTruthy();
+    // No environment is preselected either (review N6): production vs sandbox is chosen.
+    expect(radio(/^Production/).checked).toBe(false);
+    expect(radio(/^Sandbox/).checked).toBe(false);
+    expect(screen.getByText("Choose the environment before you can connect.")).toBeTruthy();
 
     await user.click(radio(/^Revolut's own Exact integration \(or someone else\) creates them/));
+    // The answer alone is not enough: the environment is still open.
+    expect((connect as HTMLButtonElement).disabled).toBe(true);
+    await user.click(radio(/^Production/));
     expect((connect as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByText("Choose the environment before you can connect.")).toBeNull();
     await user.click(connect);
     await vi.waitFor(() =>
       expect(assign).toHaveBeenCalledWith(
@@ -96,6 +104,7 @@ describe("Settings, Connections: Revolut Business", () => {
     const user = userEvent.setup();
     renderApp("/settings/connections");
     await screen.findByRole("button", { name: "Connect Revolut Business" });
+    await user.click(radio(/^Production/));
     await user.click(radio(/^Revolut's own Exact integration \(or someone else\) creates them/));
     await user.click(screen.getByRole("button", { name: "Connect Revolut Business" }));
     const sheet = await screen.findByRole("dialog", { name: "Confirm it's you" });
@@ -263,12 +272,88 @@ describe("Settings, Connections: Revolut Business", () => {
     ).toBe(true);
   });
 
-  it("disables Connect and says why when the server is not configured", async () => {
+  it("asks for the environment again when a connection needing re-authorisation has none recorded", async () => {
+    mockFetch({
+      ...ME_OK(ADMIN),
+      ...list(
+        body([
+          row({
+            status: "needs_reauth",
+            revolut: { environment: null, createsBankEntries: false, paymentsMode: "drafts" },
+          }),
+        ]),
+      ),
+    });
+    const assign = vi.spyOn(api.nav, "assign").mockImplementation(() => undefined);
+    const user = userEvent.setup();
+    renderApp("/settings/connections");
+    await ready();
+    const btn = (await card().findByRole("button", {
+      name: "Re-authorise Revolut Business",
+    })) as HTMLButtonElement;
+    // Never assumed: the button waits for an explicit choice and says why.
+    expect(btn.disabled).toBe(true);
+    const hint = card().getByText("Choose the environment before you can connect.");
+    expect(btn.getAttribute("aria-describedby")).toBe(hint.id);
+    expect(radio(/^Production/).checked).toBe(false);
+    expect(radio(/^Sandbox/).checked).toBe(false);
+    await user.click(radio(/^Sandbox/));
+    expect(btn.disabled).toBe(false);
+    expect(btn.getAttribute("aria-describedby")).toBeNull();
+    expect(assign).not.toHaveBeenCalled();
+  });
+
+  it("ties the required hints to Connect and to their fieldsets", async () => {
+    mockFetch({ ...ME_OK(ADMIN), ...list(NONE) });
+    const user = userEvent.setup();
+    const { container } = renderApp("/settings/connections");
+    const connect = await screen.findByRole("button", { name: "Connect Revolut Business" });
+    const envHint = screen.getByText("Choose the environment before you can connect.");
+    const bankHint = screen.getByText("Required before you can connect.");
+    expect(connect.getAttribute("aria-describedby")?.split(" ")).toEqual([envHint.id, bankHint.id]);
+    expect(
+      screen.getByRole("group", { name: "Environment" }).getAttribute("aria-describedby"),
+    ).toBe(envHint.id);
+    expect(
+      screen
+        .getByRole("group", { name: "Who creates bank entries in Exact?" })
+        .getAttribute("aria-describedby"),
+    ).toBe(bankHint.id);
+    expect(await axe(container)).toHaveNoViolations();
+    await user.click(radio(/^Sandbox/));
+    expect(connect.getAttribute("aria-describedby")).toBe(bankHint.id);
+    expect(
+      screen.getByRole("group", { name: "Environment" }).getAttribute("aria-describedby"),
+    ).toBeNull();
+  });
+
+  it("shows admins a plain notice instead of a Connect button when Revolut is not configured", async () => {
     mockFetch({ ...ME_OK(ADMIN), ...list(body([], { revolutConfigured: false })) });
     renderApp("/settings/connections");
-    const btn = await screen.findByRole("button", { name: "Connect Revolut Business" });
-    expect((btn as HTMLButtonElement).disabled).toBe(true);
-    expect(card().getByText(/not set up on the server yet/)).toBeTruthy();
+    await ready();
+    expect(await card().findByText(/Revolut is not configured on this deployment/)).toBeTruthy();
+    expect(card().queryByRole("button")).toBeNull();
+    expect(card().queryByRole("radio")).toBeNull();
+    expect(card().queryByText("Required before you can connect.")).toBeNull();
+  });
+
+  it("the not-configured card has no axe violations, for admins and viewers", async () => {
+    for (const me of [ADMIN, VIEWER]) {
+      mockFetch({ ...ME_OK(me), ...list(body([], { revolutConfigured: false })) });
+      const { container, unmount } = renderApp("/settings/connections");
+      await ready();
+      await card().findByText(/Revolut is not configured on this deployment/);
+      expect(await axe(container)).toHaveNoViolations();
+      unmount();
+    }
+  });
+
+  it("shows non-admins the same notice without buttons", async () => {
+    mockFetch({ ...ME_OK(VIEWER), ...list(body([], { revolutConfigured: false })) });
+    renderApp("/settings/connections");
+    await ready();
+    expect(await card().findByText(/Revolut is not configured on this deployment/)).toBeTruthy();
+    expect(card().queryByRole("button")).toBeNull();
   });
 
   it("shows non-admins the saved choices read-only, with no buttons", async () => {

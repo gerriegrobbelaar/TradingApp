@@ -40,7 +40,7 @@ async function seedDomain(): Promise<void> {
       "INSERT INTO bank_transactions (id, connection_id, bank_account_id, external_id, state, amount_minor, currency, booked_at) VALUES (1, 1, 1, 'tx1', 'completed', 1250, 'EUR', '2026-01-01T00:00:00Z')",
     ),
     db.prepare(
-      "INSERT INTO open_items (id, division_id, exact_id, kind, currency, amount_minor, open_minor, synced_at) VALUES (1, 1, 'e1', 'bill', 'EUR', 1250, 1250, '2026-01-01T00:00:00Z')",
+      "INSERT INTO open_items (id, division_id, exact_id, kind, currency, stored_minor, open_minor, synced_at) VALUES (1, 1, 'e1', 'bill', 'EUR', 1250, 1250, '2026-01-01T00:00:00Z')",
     ),
   ]);
 }

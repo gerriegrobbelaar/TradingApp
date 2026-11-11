@@ -126,6 +126,37 @@ export async function decryptToken(
   throw new TokenCryptoError("no matching key");
 }
 
+/** The id a key stamps into its ciphertexts (first 4 bytes of SHA-256 over the raw key, hex). */
+export async function keyIdOf(keyB64: string): Promise<string> {
+  return (await loadKey(keyB64)).id;
+}
+
+/**
+ * True when `blob` was encrypted with exactly this key (compared by key id; the value is not
+ * decrypted). A malformed blob is "not encrypted with it".
+ */
+export async function isEncryptedWith(keyB64: string, blob: string): Promise<boolean> {
+  const parts = blob.split(".");
+  if (parts.length !== 4 || parts[0] !== VERSION) return false;
+  return parts[1] === (await keyIdOf(keyB64));
+}
+
+/**
+ * True when `e` says the STORED VALUE cannot be read with the configured keys (malformed, under a
+ * key that is no longer configured, wrong key or tampered, including a value moved to another
+ * column or connection: the AAD no longer matches). False for anything else, notably a malformed
+ * configured key (our configuration) or a non-crypto error such as a D1 failure: those say
+ * nothing about the stored value and must never make a caller discard it.
+ */
+export function isUnreadableValue(e: unknown): boolean {
+  return (
+    e instanceof TokenCryptoError &&
+    (e.reason === "bad format" ||
+      e.reason === "decryption failed" ||
+      e.reason === "no matching key")
+  );
+}
+
 /** Keys to try when decrypting, current first. */
 export function keyring(env: {
   TOKEN_ENC_KEY?: string;
