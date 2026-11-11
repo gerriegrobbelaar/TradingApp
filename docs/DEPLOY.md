@@ -891,8 +891,11 @@ Schedules.
 
 `bank.match` is switched **on** after a fresh install (every 10 minutes at :02, :12, ...). It reads
 completed Revolut transactions and open invoices and bills from D1 and writes **suggestions** for
-the review queue. It never writes to Exact or Revolut in this release (the booking step is a later
-task). Existing databases get the job when the new release starts (default jobs version 3).
+the review queue. Matching itself never writes to Exact or Revolut. A separate booking step exists
+(job `exact.book_matches`, Settings, Matching, Booking in Exact): it is **OFF by default and fails
+closed**, so a fresh or upgraded install writes nothing to Exact until an administrator verifies
+the write path and enables it (step 0, item 18). Revolut is never written to by matching or
+booking. Existing databases get the job when the new release starts (default jobs version 3).
 
 - **Automatic matching is off.** Turn it on only after reviewing suggestions for a while:
   `PUT /api/matching/config` with `{"autoEnabled":true,"confirm":"ENABLE AUTOMATIC MATCHING"}`
@@ -917,11 +920,10 @@ task). Existing databases get the job when the new release starts (default jobs 
 - First-live checks of migration 0022 (staging first, then production), because the trigger
   behaviour is only tested on Miniflare:
   1. After `wrangler d1 migrations apply <db> --remote`, `SELECT name FROM sqlite_master WHERE
-     type = 'trigger' ORDER BY name` lists nine triggers (`bank_account_map_guard_delete`,
-     `bank_account_map_guard_update`, `bank_transactions_guard_matched`,
-     `bank_transactions_guard_status`, `match_allocations_guard`,
-     `match_allocations_guard_update`, `matches_guard_immutable`, `matches_guard_insert`,
-     `matches_guard_update`). If wrangler split a trigger body, the migration fails; do not hand-edit.
+     type = 'trigger' ORDER BY name` lists exactly the triggers created by migrations
+     0022/0023/0024/0025 and not dropped later; the authoritative list and a hash of each body is
+     `apps/worker/test/fixtures/trigger-hashes.json` (do not rely on a number written here). If
+     wrangler split a trigger body, the migration fails; do not hand-edit.
   2. On staging only: with a test line and an invoice smaller than it, a manual match whose
      allocation passes the open balance returns 409 `item_changed` and leaves NO `matches` row and
      no `match.manual` audit row (D1 batch rollback on a trigger abort).
@@ -1068,6 +1070,10 @@ encrypted Exact tokens, IBANs and the audit log: store them as sensitive.
    (**unverified** on this account).
 4. If data is damaged, stop the jobs (above), take an export, then use Time Travel (above) to
    restore to just before the apply.
+5. Any migration that rebuilds a guarded table (create new, copy, drop old, rename) must recreate
+   that table's triggers in the same file: dropping a table silently drops its triggers, and the
+   guards (matching, booking, settlement) then no longer exist. Compare the trigger list with
+   `apps/worker/test/fixtures/trigger-hashes.json` after every such migration.
 
 ---
 
