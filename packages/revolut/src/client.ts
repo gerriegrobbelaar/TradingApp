@@ -62,6 +62,23 @@ function parseStamp(raw: string): Stamp {
   return { ms, micro: Number(frac.slice(3, 6)) };
 }
 
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** A caller-supplied bound: "YYYY-MM-DD" (midnight UTC) or a full ISO date-time with zone. */
+function parseBound(v: string, name: string): Stamp {
+  const text = DATE_ONLY_RE.test(v) ? `${v}T00:00:00Z` : v;
+  const m = TS_RE.exec(text);
+  const ms = m ? Date.parse(text.replace(/\.(\d{3})\d*/, ".$1")) : Number.NaN;
+  if (m === null || Number.isNaN(ms)) {
+    throw new RangeError(`${name} must be YYYY-MM-DD or an ISO date-time with a zone`);
+  }
+  return parseStamp(text);
+}
+
+function microsOf(s: Stamp): number {
+  return s.ms * 1000 + s.micro;
+}
+
 /** Newest first; ties broken by id so the order is total and stable. */
 function compareNewestFirst(a: { stamp: Stamp; id: string }, b: { stamp: Stamp; id: string }) {
   if (a.stamp.ms !== b.stamp.ms) return b.stamp.ms - a.stamp.ms;
@@ -79,6 +96,9 @@ export interface TransactionCursor {
   seen: { id: string; ms: number }[];
 }
 
+/** A cursor carries at most this many seen ids (more means paging could not advance anyway). */
+const MAX_CURSOR_SEEN = 2 * 1000;
+
 export interface ListTransactionsOptions {
   /** ISO date-time, inclusive lower bound on created_at. */
   from?: string;
@@ -89,6 +109,13 @@ export interface ListTransactionsOptions {
   /** Rows wanted per chunk, 1..1000. */
   count: number;
   cursor?: TransactionCursor | null;
+  /**
+   * Treat a page with fewer rows than requested as the end of the walk. Default false: the walk
+   * then ends only on a short page with no new rows, which costs one extra call per walk but
+   * stays complete if Revolut caps `count` lower than documented or returns short pages early.
+   * Switch on only after the sandbox confirmed the behaviour (ADR 0030).
+   */
+  trustShortPage?: boolean;
 }
 
 export interface TransactionChunk {
@@ -114,16 +141,33 @@ export interface RevolutClient {
   deleteWebhook(id: string): Promise<void>;
 }
 
-function retryAfterMs(headers: Record<string, string>, nowMs: number): number {
+/** Longest wait we pass on from Retry-After; longer values are capped (the gate re-checks). */
+export const MAX_RETRY_AFTER_MS = 15 * 60_000;
+/** IMF-fixdate, the only HTTP-date form servers should send (RFC 9110 5.6.7). */
+const HTTP_DATE_RE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+
+/**
+ * Retry-After as milliseconds: delta-seconds or an HTTP-date. Missing or garbage values (negative,
+ * fractional, other date forms) give the 60 s default; the result is clamped to
+ * [0, MAX_RETRY_AFTER_MS]. A date in the past gives 0.
+ */
+export function retryAfterMs(headers: Record<string, string>, nowMs: number): number {
   let v: string | undefined;
   for (const [k, val] of Object.entries(headers)) if (k.toLowerCase() === "retry-after") v = val;
   if (v === undefined) return DEFAULT_RETRY_AFTER_MS;
   const t = v.trim();
-  if (/^\d+(?:\.\d+)?$/.test(t)) return Math.round(Number(t) * 1000);
-  const date = Date.parse(t);
-  return Number.isNaN(date) ? DEFAULT_RETRY_AFTER_MS : Math.max(0, date - nowMs);
+  let ms: number;
+  if (/^\d{1,10}$/.test(t)) ms = Number(t) * 1000;
+  else if (/^\d+$/.test(t)) ms = MAX_RETRY_AFTER_MS;
+  else if (HTTP_DATE_RE.test(t) && !Number.isNaN(Date.parse(t))) ms = Date.parse(t) - nowMs;
+  else return DEFAULT_RETRY_AFTER_MS;
+  return Math.min(MAX_RETRY_AFTER_MS, Math.max(0, ms));
 }
 
+/**
+ * The message for an error response: only the `message` field of a JSON body, redacted. A body
+ * that is not JSON is never quoted (HTML error pages, and bodies that may hold secrets).
+ */
 function errorDetail(body: string): { message: string; code?: string } {
   try {
     const row = asRow(parseJsonRawNumbers(body));
@@ -135,12 +179,28 @@ function errorDetail(body: string): { message: string; code?: string } {
     if (code !== null && /^[\w.-]{1,40}$/.test(code)) out.code = code;
     return out;
   } catch {
-    return { message: sanitizeForMessage(body.slice(0, 200)) };
+    return { message: "non-JSON response body" };
   }
 }
 
-function assertIsoDateTime(v: string, name: string): void {
-  if (Number.isNaN(Date.parse(v))) throw new RangeError(`${name} must be an ISO date-time`);
+function assertCursor(c: TransactionCursor): void {
+  if (
+    typeof c !== "object" ||
+    c === null ||
+    typeof c.toIso !== "string" ||
+    !Array.isArray(c.seen) ||
+    c.seen.length > MAX_CURSOR_SEEN ||
+    !c.seen.every((e) => typeof e?.id === "string" && e.id !== "" && Number.isSafeInteger(e.ms))
+  ) {
+    throw new RangeError("cursor is not a transaction cursor");
+  }
+  parseBound(c.toIso, "cursor.toIso");
+}
+
+function laterUpdate(a: RevolutTransaction, b: RevolutTransaction): RevolutTransaction {
+  const ta = a.updatedAt === undefined ? Number.NaN : Date.parse(a.updatedAt);
+  const tb = b.updatedAt === undefined ? Number.NaN : Date.parse(b.updatedAt);
+  return tb > ta ? b : a;
 }
 
 export function createRevolutClient(
@@ -210,18 +270,40 @@ export function createRevolutClient(
     throw badData("Expected a list from Revolut", "BAD_SHAPE");
   }
 
+  /**
+   * One chunk of a newest-first walk over /transactions. Completeness argument (ADR 0030):
+   * Revolut returns the newest `requested` rows with created_at <= `to`, newest first. Every row
+   * strictly newer than the page's oldest row is therefore in this page or an earlier one. The
+   * next bound is one millisecond past the oldest row (capped at the current bound), so the rows
+   * that share the oldest row's timestamp come back whether `to` is inclusive or exclusive and
+   * whatever their sub-millisecond part; the ones already returned are recognised by id (`seen`)
+   * and `requested` grows by their number. A full page with no new row means more rows share
+   * those two milliseconds than one call can carry: PAGING_STUCK, never a silent skip. A page
+   * that is not newest first is PAGING_ORDER.
+   *
+   * Not a snapshot: a row returned again later (at the boundary) with a newer state is dropped
+   * as already seen; within one response the row with the later `updated_at` wins. Consumers
+   * upsert by (transaction id, leg id) keeping the newest `updated_at`, and webhooks plus the next
+   * run deliver state changes. Rows created after a walk started (above its first page) are
+   * picked up by the next walk.
+   */
   async function listTransactionsChunk(opts: ListTransactionsOptions): Promise<TransactionChunk> {
     if (!Number.isInteger(opts.count) || opts.count < 1 || opts.count > MAX_TRANSACTIONS_PER_CALL) {
       throw new RangeError("count must be an integer between 1 and 1000");
     }
-    if (opts.from !== undefined) assertIsoDateTime(opts.from, "from");
-    if (opts.to !== undefined) assertIsoDateTime(opts.to, "to");
+    const fromStamp = opts.from === undefined ? undefined : parseBound(opts.from, "from");
+    const userTo = opts.to === undefined ? undefined : parseBound(opts.to, "to");
+    if (fromStamp !== undefined && userTo !== undefined && microsOf(fromStamp) > microsOf(userTo)) {
+      throw new RangeError("from must not be after to");
+    }
     const cursor = opts.cursor ?? null;
+    if (cursor !== null) assertCursor(cursor);
     const seenIds = new Set((cursor?.seen ?? []).map((s) => s.id));
     // Ask for enough extra rows to cover the already-seen ones that can come back at the boundary.
     const requested = Math.min(MAX_TRANSACTIONS_PER_CALL, opts.count + seenIds.size);
     const toIso = cursor?.toIso ?? opts.to;
-    const toMs = toIso === undefined ? Number.POSITIVE_INFINITY : parseStamp(toIso).ms;
+    const toStamp = toIso === undefined ? undefined : parseBound(toIso, "to");
+    const toMicros = toStamp === undefined ? Number.POSITIVE_INFINITY : microsOf(toStamp);
 
     const query: Record<string, string> = { count: String(requested) };
     if (opts.from !== undefined) query["from"] = opts.from;
@@ -230,32 +312,41 @@ export function createRevolutClient(
     if (opts.type !== undefined) query["type"] = opts.type;
 
     const raw = rows(await get("/transactions", query));
-    const exhausted = raw.length < requested;
+    const short = raw.length < requested;
 
     interface Entry {
       tx: RevolutTransaction;
       stamp: Stamp;
       id: string;
     }
-    const inWindow: Entry[] = [];
+    const byId = new Map<string, Entry>();
+    let previous = Number.POSITIVE_INFINITY;
     for (const r of raw) {
       const tx = mapTransaction(r);
       const stamp = parseStamp(tx.createdAt);
-      if (stamp.ms > toMs) continue; // outside the requested window: ignore
-      inWindow.push({ tx, stamp, id: tx.id });
+      const at = microsOf(stamp);
+      if (at > previous) {
+        throw new RevolutApiError(
+          200,
+          "Revolut returned transactions out of order",
+          "PAGING_ORDER",
+        );
+      }
+      previous = at;
+      if (at > toMicros) continue; // outside the requested window: ignore
+      const known = byId.get(tx.id);
+      byId.set(
+        tx.id,
+        known === undefined
+          ? { tx, stamp, id: tx.id }
+          : { ...known, tx: laterUpdate(known.tx, tx) },
+      );
     }
-    inWindow.sort(compareNewestFirst);
-
-    const fresh: Entry[] = [];
-    const inResponse = new Set<string>();
-    for (const e of inWindow) {
-      if (inResponse.has(e.id)) continue;
-      inResponse.add(e.id);
-      if (!seenIds.has(e.id)) fresh.push(e);
-    }
+    const inWindow = [...byId.values()].sort(compareNewestFirst);
+    const fresh = inWindow.filter((e) => !seenIds.has(e.id));
     if (fresh.length === 0) {
-      if (exhausted) return { transactions: [], nextCursor: null };
-      // A full page made only of rows already returned: more rows share one millisecond than a
+      if (short) return { transactions: [], nextCursor: null };
+      // A full page made only of rows already returned: more rows share the boundary than a
       // call can carry. Failing loudly beats skipping rows.
       throw new RevolutApiError(
         200,
@@ -264,28 +355,32 @@ export function createRevolutClient(
       );
     }
     const result = fresh.map((e) => e.tx);
-    if (exhausted) return { transactions: result, nextCursor: null };
+    if (short && opts.trustShortPage === true) return { transactions: result, nextCursor: null };
 
     const oldest = inWindow[inWindow.length - 1];
     /* c8 ignore next */
     if (oldest === undefined) return { transactions: result, nextCursor: null };
-    // Inclusive bound that still covers the oldest row's whole millisecond (micros included).
-    const nextToMs = oldest.stamp.ms + (oldest.stamp.micro > 0 ? 1 : 0);
+    // One millisecond past the oldest row, never above the current bound.
+    const candidateMs = oldest.stamp.ms + 1;
+    const capped = toStamp !== undefined && candidateMs * 1000 > toMicros;
+    const nextToIso = capped && toIso !== undefined ? toIso : new Date(candidateMs).toISOString();
+    const nextToMs = capped && toStamp !== undefined ? toStamp.ms : candidateMs;
     const nextSeen = new Map<string, number>();
     for (const s of cursor?.seen ?? []) nextSeen.set(s.id, s.ms);
     for (const e of fresh) nextSeen.set(e.id, e.stamp.ms);
+    // Only rows at or below the next bound can come back.
     const keep: { id: string; ms: number }[] = [];
-    for (const [id, ms] of nextSeen) if (ms >= oldest.stamp.ms) keep.push({ id, ms });
-    return {
-      transactions: result,
-      nextCursor: { toIso: new Date(nextToMs).toISOString(), seen: keep },
-    };
+    for (const [id, ms] of nextSeen) if (ms <= nextToMs) keep.push({ id, ms });
+    return { transactions: result, nextCursor: { toIso: nextToIso, seen: keep } };
   }
 
   async function* transactionChunks(
     opts: Omit<ListTransactionsOptions, "cursor">,
     maxChunks = 1000,
   ): AsyncGenerator<RevolutTransaction[], void, undefined> {
+    if (!Number.isInteger(maxChunks) || maxChunks < 1 || maxChunks > 100_000) {
+      throw new RangeError("maxChunks must be an integer between 1 and 100000");
+    }
     let cursor: TransactionCursor | null = null;
     for (let i = 0; i < maxChunks; i++) {
       const chunk: TransactionChunk = await listTransactionsChunk({ ...opts, cursor });
@@ -368,8 +463,14 @@ export function createRevolutClient(
         body: JSON.stringify({ url, events }),
         apiVersion: "2.0",
       });
-      const row = asRow(parseJsonRawNumbers(res.body));
-      return { ...mapWebhook(row), signingSecret: reqStr(row, "signing_secret") };
+      // The body holds the signing secret: any failure here gets a fixed message, never the body.
+      try {
+        const row = asRow(parseJsonRawNumbers(res.body));
+        const signingSecret = reqStr(row, "signing_secret");
+        return { ...mapWebhook(row), signingSecret };
+      } catch {
+        throw badData("Revolut returned an unusable webhook response", "BAD_WEBHOOK_RESPONSE");
+      }
     },
 
     async deleteWebhook(id) {

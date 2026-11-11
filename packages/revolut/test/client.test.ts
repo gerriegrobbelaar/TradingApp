@@ -6,12 +6,25 @@ import {
   createRevolutClient,
   isFinalState,
   mapTransactionState,
+  retryAfterMs,
+  type ListTransactionsOptions,
   type RevolutRequest,
+  type RevolutTransaction,
   type RevolutTransport,
+  type TransactionChunk,
+  type TransactionCursor,
 } from "../src/index";
 import { mapAccount, mapTransaction } from "../src/models";
 import { parseJsonRawNumbers, minorOf } from "../src/json";
-import { fakeTransactionsServer, ok, scripted, status, type FakeTx } from "./helpers";
+import {
+  fakeTransactionsServer,
+  micros,
+  ok,
+  scripted,
+  status,
+  type FakeServerOptions,
+  type FakeTx,
+} from "./helpers";
 
 const base = { connectionId: 1, jobId: "job-1", priority: "job" as const };
 const raw = (x: unknown): unknown => parseJsonRawNumbers(JSON.stringify(x));
@@ -31,10 +44,65 @@ describe("money conversion", () => {
     ["-1234", "JPY", -1234],
     ["1.234", "KWD", 1234],
     ["-0.001", "BHD", -1],
-    ["2.675", "EUR", 268],
     ["1e2", "EUR", 10000],
+    ["1234.50", "EUR", 123450],
+    ["1234.500000", "EUR", 123450],
+    ["-0.00", "EUR", 0],
+    ["-0", "EUR", 0],
+    ["0", "EUR", 0],
+    ["1.5E1", "EUR", 1500],
+    ["150e-2", "EUR", 150],
+    ["1E+3", "JPY", 1000],
+    ["12000e-3", "JPY", 12],
+    ["-90071992547409.91", "EUR", -9007199254740991],
+    ["1.2345", "CLF", 12345],
+    ["10", "XYZ", 1000], // unknown ISO code: scale 2, like core
   ])("%s %s -> %i minor units", (raw, cur, minor) => {
     expect(minorOf(raw, cur, "amount")).toBe(minor);
+  });
+
+  it("fails loudly on more decimals than the currency has (never rounds)", () => {
+    for (const [raw, cur] of [
+      ["2.675", "EUR"],
+      ["0.005", "EUR"],
+      ["1e-7", "EUR"],
+      ["-0.001", "EUR"],
+      ["1.5", "JPY"],
+      ["1.2345", "KWD"],
+      ["0.0000000001", "USD"],
+    ] as const) {
+      expect(() => minorOf(raw, cur, "amount"), `${raw} ${cur}`).toThrow(/Unexpected amount/);
+    }
+  });
+
+  it("rejects out-of-range values and odd currencies", () => {
+    for (const raw of [
+      "90071992547409.92",
+      "1e300",
+      "1e99999",
+      "",
+      ".",
+      "-",
+      "e5",
+      "1.2.3",
+      "NaN",
+      "Infinity",
+      "0x10",
+      "1_000",
+    ]) {
+      expect(() => minorOf(raw, "EUR", "amount"), raw).toThrow(RevolutApiError);
+    }
+    expect(() => minorOf("1", "EURO", "amount")).toThrow(RevolutApiError);
+  });
+
+  it("accepts amounts sent as JSON strings or numbers alike", () => {
+    const parsed = parseJsonRawNumbers('{"a": -12.30, "b": "-12.30", "c": -1.23e1}') as Record<
+      string,
+      string
+    >;
+    expect(minorOf(parsed["a"] ?? "", "EUR", "a")).toBe(-1230);
+    expect(minorOf(parsed["b"] ?? "", "EUR", "b")).toBe(-1230);
+    expect(minorOf(parsed["c"] ?? "", "EUR", "c")).toBe(-1230);
   });
 
   it("rejects garbage without echoing it", () => {
@@ -88,6 +156,58 @@ describe("states", () => {
     expect(isFinalState("declined")).toBe(true);
     expect(isFinalState("pending")).toBe(false);
     expect(isFinalState("unknown")).toBe(false);
+  });
+
+  it("normalises case and surrounding whitespace only; lookalikes stay unknown and non-final", () => {
+    expect(mapTransactionState(" COMPLETED\n")).toBe("completed");
+    expect(mapTransactionState("\tReverted ")).toBe("reverted");
+    for (const v of [
+      "created",
+      "cancelled",
+      "complete",
+      "completed\u200b",
+      "com pleted",
+      "",
+      null,
+      {},
+      ["completed"],
+      true,
+    ]) {
+      const st = mapTransactionState(v);
+      expect(st, String(v)).toBe("unknown");
+      expect(isFinalState(st)).toBe(false);
+    }
+  });
+
+  it("never puts an IBAN or amount text into a mapping error", () => {
+    const tx = {
+      id: "t",
+      created_at: "2024-05-01T00:00:00Z",
+      legs: [
+        {
+          leg_id: "l",
+          amount: "NL91ABNA0417164300",
+          currency: "EUR",
+          counterparty: { iban: "NL91ABNA0417164300" },
+        },
+      ],
+    };
+    const err = (() => {
+      try {
+        mapTransaction(raw(tx));
+      } catch (e) {
+        return e as Error;
+      }
+      return null;
+    })();
+    expect(err).toBeInstanceOf(RevolutApiError);
+    expect(`${err?.message} ${err?.stack ?? ""}`).not.toMatch(/ABNA|0417164300/);
+    const badIban = {
+      ...tx,
+      legs: [{ ...tx.legs[0], amount: 1, counterparty: { iban: ["NL91ABNA0417164300"] } }],
+    };
+    expect(() => mapTransaction(raw(badIban))).toThrow(/Unexpected type for iban/);
+    expect(() => mapTransaction(raw(badIban))).not.toThrow(/ABNA/);
   });
 });
 
@@ -493,7 +613,7 @@ describe("counterparties and webhooks", () => {
     await expect(c.createWebhook("http://a.b/c")).rejects.toThrow(RangeError);
     await expect(c.createWebhook("https://a.b/c", [])).rejects.toThrow(RangeError);
     await expect(c.deleteWebhook("")).rejects.toThrow(RangeError);
-    await expect(c.createWebhook("https://a.b/c")).rejects.toThrow(/Missing signing_secret/);
+    await expect(c.createWebhook("https://a.b/c")).rejects.toThrow(/unusable webhook response/);
   });
 
   it("never puts the signing secret into an error", async () => {
@@ -503,6 +623,25 @@ describe("counterparties and webhooks", () => {
       .createWebhook("https://a.b/c")
       .catch((e: unknown) => e)) as Error;
     expect(err.message).not.toContain("wsk_topsecret");
+    // A 2xx body we cannot use (bad JSON, missing id, wrong types) never surfaces either.
+    for (const body of [
+      '{"signing_secret":"wsk_topsecret"',
+      '{"signing_secret":"wsk_topsecret"}',
+      '{"id":"w","url":"https://a.b/c","signing_secret":["wsk_topsecret"]}',
+      '{"id":"w","url":7,"signing_secret":"wsk_topsecret"}',
+      "wsk_topsecret",
+    ]) {
+      const e = (await client(scripted([ok(body)]).transport)
+        .createWebhook("https://a.b/c")
+        .catch((x: unknown) => x)) as Error;
+      expect(e).toBeInstanceOf(RevolutApiError);
+      expect(`${e.message} ${e.stack ?? ""}`).not.toContain("wsk_topsecret");
+    }
+    // Nor does a non-JSON error body.
+    const raw = (await client(scripted([status(500, "secret wsk_topsecret here")]).transport)
+      .createWebhook("https://a.b/c")
+      .catch((x: unknown) => x)) as Error;
+    expect(raw.message).not.toContain("wsk_topsecret");
   });
 });
 
@@ -593,6 +732,7 @@ describe("transactions paging", () => {
       to: "2024-05-02T00:00:00.000Z",
       accountId: "acc-1",
       type: "card_payment",
+      trustShortPage: true,
     });
     expect(chunk.nextCursor).toBeNull();
     expect(chunk.transactions.map((t) => t.id)).toEqual(["t001", "t000"]);
@@ -616,7 +756,8 @@ describe("transactions paging", () => {
     const { calls } = await collect(data, 2);
     expect(calls.map((c) => c.query?.["count"])).toEqual(["2", "4", "6", "8"]);
     // each subsequent call carries a `to` that includes the boundary millisecond
-    expect(calls[1]?.query?.["to"]).toBe("2024-05-01T10:00:00.500Z");
+    // (one millisecond past it, so an exclusive `to` would be complete too)
+    expect(calls[1]?.query?.["to"]).toBe("2024-05-01T10:00:00.501Z");
   });
 
   it("throws PAGING_STUCK instead of skipping rows when 1000+ rows share one millisecond", async () => {
@@ -640,9 +781,9 @@ describe("transactions paging", () => {
     const { transport } = scripted([
       ok(
         JSON.stringify([
-          row("a", "2024-05-01T10:00:00.500Z"),
-          row("a", "2024-05-01T10:00:00.500Z"),
           row("future", "2024-05-02T00:00:00.000Z"),
+          row("a", "2024-05-01T10:00:00.500Z"),
+          row("a", "2024-05-01T10:00:00.500Z"),
         ]),
       ),
     ]);
@@ -693,5 +834,259 @@ describe("transactions paging", () => {
       for await (const chunk of client(transport).transactionChunks({ count: 1 }, 3)) void chunk;
     };
     await expect(walk()).rejects.toMatchObject({ code: "PAGING_LIMIT" });
+  });
+});
+
+describe("transactions paging under adversarial servers", () => {
+  const T = "2024-05-01T10:00:00.";
+  let seed = 987;
+  const rnd = (n: number) => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return seed % n;
+  };
+  const randomData = (n: number): FakeTx[] =>
+    Array.from({ length: n }, (_, i) => ({
+      id: `r${String(i).padStart(4, "0")}`,
+      createdAt: `${T}${100 + rnd(5)}${String(rnd(3) * 333).padStart(3, "0")}Z`,
+    }));
+
+  async function walk(
+    data: FakeTx[],
+    count: number,
+    server: FakeServerOptions = {},
+    extra: Partial<ListTransactionsOptions> = {},
+  ) {
+    const srv = fakeTransactionsServer(data, server);
+    const out: RevolutTransaction[] = [];
+    for await (const chunk of client(srv.transport).transactionChunks({ count, ...extra })) {
+      out.push(...chunk);
+    }
+    return { ids: out.map((t) => t.id), txs: out, calls: srv.calls };
+  }
+  const sorted = (d: FakeTx[]) => d.map((x) => x.id).sort();
+
+  it("is complete whether `to` is inclusive or exclusive", async () => {
+    for (let round = 0; round < 20; round++) {
+      const data = randomData(1 + rnd(50));
+      const count = 1 + rnd(8);
+      for (const exclusiveTo of [false, true]) {
+        const { ids } = await walk(data, count, { exclusiveTo });
+        expect([...ids].sort(), `round ${round} exclusive=${exclusiveTo}`).toEqual(sorted(data));
+        expect(new Set(ids).size).toBe(ids.length);
+      }
+    }
+  });
+
+  it("is complete when the server caps count lower or returns short pages early", async () => {
+    for (let round = 0; round < 20; round++) {
+      const data = randomData(5 + rnd(50));
+      const count = 2 + rnd(8);
+      // A cap works as long as it is larger than the rows sharing one boundary (here at most 2).
+      const spaced = Array.from({ length: 5 + rnd(50) }, (_, i) => ({
+        id: `p${String(i).padStart(3, "0")}`,
+        createdAt: new Date(Date.UTC(2024, 4, 1) + Math.floor(i / 2) * 7).toISOString(),
+      }));
+      const capped = await walk(spaced, count + 3, { maxCount: count + 2 });
+      expect([...capped.ids].sort(), `cap round ${round}`).toEqual(sorted(spaced));
+      const early = await walk(data, count, { randomShort: () => rnd(count) });
+      expect([...early.ids].sort(), `short round ${round}`).toEqual(sorted(data));
+    }
+    // With trustShortPage the first capped page would end the walk: that is why it is opt-in.
+    const data = randomData(30);
+    const trusting = await walk(data, 10, { maxCount: 5 }, { trustShortPage: true });
+    expect(trusting.ids.length).toBeLessThan(30);
+  });
+
+  it("costs one confirming call at the end by default", async () => {
+    const data = randomData(3);
+    expect((await walk(data, 10)).calls).toHaveLength(2);
+    expect((await walk(data, 10, {}, { trustShortPage: true })).calls).toHaveLength(1);
+  });
+
+  it("keeps the cursor small: only ids at the boundary are carried", async () => {
+    const data = Array.from({ length: 50 }, (_, i) => ({
+      id: `s${i}`,
+      createdAt: new Date(Date.UTC(2024, 4, 1) + i * 10).toISOString(),
+    }));
+    const srv = fakeTransactionsServer(data);
+    const c = client(srv.transport);
+    let cursor: TransactionCursor | null = null;
+    const ids: string[] = [];
+    for (let i = 0; i < 20; i++) {
+      const chunk: TransactionChunk = await c.listTransactionsChunk({ count: 5, cursor });
+      ids.push(...chunk.transactions.map((t) => t.id));
+      if (chunk.nextCursor === null) break;
+      expect(chunk.nextCursor.seen.length).toBeLessThanOrEqual(1);
+      cursor = chunk.nextCursor;
+    }
+    expect(ids).toHaveLength(50);
+    // and the cursor survives a JSON round trip (queue message)
+    expect(JSON.parse(JSON.stringify(cursor))).toEqual(cursor);
+  });
+
+  it("never widens the window above the caller's `to`", async () => {
+    const data: FakeTx[] = [
+      { id: "above", createdAt: `${T}500900Z` },
+      { id: "a", createdAt: `${T}500300Z` },
+      { id: "b", createdAt: `${T}500300Z` },
+      { id: "c", createdAt: `${T}500100Z` },
+    ];
+    const { ids, calls } = await walk(data, 1, {}, { to: `${T}500500Z` });
+    expect([...ids].sort()).toEqual(["a", "b", "c"]);
+    for (const call of calls) {
+      expect(micros(call.query?.["to"] ?? "")).toBeLessThanOrEqual(micros(`${T}500500Z`));
+    }
+  });
+
+  it("supports from without to and date-only bounds", async () => {
+    const data: FakeTx[] = [
+      { id: "new", createdAt: "2024-05-02T00:00:00.000Z" },
+      { id: "mid", createdAt: "2024-05-01T12:00:00.000Z" },
+      { id: "old", createdAt: "2024-04-30T23:59:59.999Z" },
+    ];
+    const { ids, calls } = await walk(data, 10, {}, { from: "2024-05-01T00:00:00Z" });
+    expect(ids).toEqual(["new", "mid"]);
+    expect(calls[0]?.query?.["to"]).toBeUndefined();
+    const c = client(fakeTransactionsServer(data).transport);
+    const chunk = await c.listTransactionsChunk({
+      count: 10,
+      from: "2024-05-01",
+      to: "2024-05-02",
+      trustShortPage: true,
+    });
+    expect(chunk.transactions.map((t) => t.id)).toEqual(["new", "mid"]);
+    await expect(
+      c.listTransactionsChunk({ count: 1, from: "2024-05-02", to: "2024-05-01" }),
+    ).rejects.toThrow(/from must not be after to/);
+    for (const bad of ["2024-05-01T10:00:00", "March 7", "2024-5-1", "1714557600000"]) {
+      await expect(c.listTransactionsChunk({ count: 1, from: bad }), bad).rejects.toThrow(
+        RangeError,
+      );
+    }
+  });
+
+  it("fails loudly on a page that is not newest first", async () => {
+    const row = (id: string, at: string) => ({ id, state: "completed", created_at: at, legs: [] });
+    const { transport } = scripted([
+      ok(JSON.stringify([row("old", `${T}100Z`), row("new", `${T}200Z`)])),
+    ]);
+    await expect(client(transport).listTransactionsChunk({ count: 5 })).rejects.toMatchObject({
+      code: "PAGING_ORDER",
+    });
+  });
+
+  it("keeps the later updated_at when a response repeats an id, and never yields an id twice", async () => {
+    const row = (state: string, updated: string) => ({
+      id: "dup",
+      state,
+      created_at: `${T}100Z`,
+      updated_at: updated,
+      legs: [],
+    });
+    const { transport } = scripted([
+      ok(
+        JSON.stringify([
+          row("pending", "2024-05-01T10:00:01Z"),
+          row("completed", "2024-05-01T10:05:00Z"),
+          row("pending", "2024-05-01T10:00:02Z"),
+        ]),
+      ),
+    ]);
+    const chunk = await client(transport).listTransactionsChunk({ count: 5, trustShortPage: true });
+    expect(chunk.transactions.map((t) => t.state)).toEqual(["completed"]);
+
+    // A row seen in chunk 1 that changes state before chunk 2 is not yielded again (documented:
+    // consumers upsert by updated_at and the webhook / next run carry the change).
+    const data: FakeTx[] = [
+      { id: "x1", createdAt: `${T}300Z` },
+      { id: "x2", createdAt: `${T}200Z`, state: "pending" },
+      { id: "x3", createdAt: `${T}200Z` },
+      { id: "x4", createdAt: `${T}100Z` },
+    ];
+    const res = await walk(data, 2, {
+      mutate: (call, d) => {
+        const x2 = d.find((t) => t.id === "x2");
+        if (call === 2 && x2 !== undefined) {
+          x2.state = "completed";
+          x2.updatedAt = "2024-05-01T11:00:00.000Z";
+        }
+      },
+    });
+    expect([...res.ids].sort()).toEqual(["x1", "x2", "x3", "x4"]);
+  });
+
+  it("validates cursors and maxChunks", async () => {
+    const c = client(scripted([]).transport);
+    for (const cursor of [
+      { toIso: "nope", seen: [] },
+      { toIso: "2024-05-01T00:00:00Z", seen: [{ id: "", ms: 1 }] },
+      { toIso: "2024-05-01T00:00:00Z", seen: [{ id: "a", ms: 1.5 }] },
+      { toIso: "2024-05-01T00:00:00Z", seen: "x" },
+      {
+        toIso: "2024-05-01T00:00:00Z",
+        seen: Array.from({ length: 2001 }, (_, i) => ({ id: `i${i}`, ms: 1 })),
+      },
+    ]) {
+      await expect(
+        c.listTransactionsChunk({ count: 1, cursor: cursor as unknown as TransactionCursor }),
+      ).rejects.toThrow(/cursor/);
+    }
+    for (const maxChunks of [0, -1, 1.5, 100_001]) {
+      const gen = c.transactionChunks({ count: 1 }, maxChunks);
+      await expect(gen.next()).rejects.toThrow(/maxChunks/);
+    }
+  });
+
+  it("throws PAGING_STUCK rather than skipping when the boundary holds more than a call", async () => {
+    // 1001 rows in two adjacent milliseconds: a full page of repeats eventually.
+    const data = Array.from({ length: 1001 }, (_, i) => ({
+      id: `z${i}`,
+      createdAt: i % 2 === 0 ? `${T}500Z` : `${T}501Z`,
+    }));
+    const err = await walk(data, 1000).catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: "PAGING_STUCK" });
+  });
+});
+
+describe("Retry-After parsing", () => {
+  it.each([
+    ["7", 7000],
+    ["0", 0],
+    ["  12 ", 12_000],
+    ["99999999", 900_000],
+    ["99999999999999999999", 900_000],
+    ["-5", 60_000],
+    ["1.5", 60_000],
+    ["soon", 60_000],
+    ["", 60_000],
+    ["2024-05-01T00:00:10Z", 60_000],
+    ["Thu, 01 Jan 1970 00:00:10 GMT", 6000],
+    ["Thu, 01 Jan 1970 00:00:01 GMT", 0],
+    ["Fri, 01 Jan 2100 00:00:00 GMT", 900_000],
+  ])("%j -> %i ms", (value, ms) => {
+    expect(retryAfterMs({ "Retry-After": value }, 4000)).toBe(ms);
+  });
+
+  it("defaults when absent and finds the header in any case", () => {
+    expect(retryAfterMs({}, 0)).toBe(60_000);
+    expect(retryAfterMs({ "RETRY-AFTER": "3" }, 0)).toBe(3000);
+  });
+
+  it("does not retry 429 inside the client, even for GET", async () => {
+    const s = scripted([status(429, "", { "Retry-After": "1" }), ok("[]")]);
+    await expect(client(s.transport).listAccounts()).rejects.toBeInstanceOf(
+      RevolutRateLimitedError,
+    );
+    expect(s.calls).toHaveLength(1);
+  });
+
+  it("does not retry 4xx and passes transport errors through on retries too", async () => {
+    const s = scripted([status(404, '{"message":"not found"}'), ok("[]")]);
+    await expect(client(s.transport).listAccounts()).rejects.toMatchObject({ status: 404 });
+    expect(s.calls).toHaveLength(1);
+    const boom = new Error("gate down");
+    const t = scripted([status(502), boom]);
+    await expect(client(t.transport).listAccounts()).rejects.toBe(boom);
+    expect(t.calls).toHaveLength(2);
   });
 });

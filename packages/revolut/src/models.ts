@@ -335,9 +335,11 @@ export interface RevolutCreatedWebhook extends RevolutWebhook {
 
 export function mapWebhook(raw: unknown): RevolutWebhook {
   const r = asRow(raw);
+  const url = reqStr(r, "url");
+  if (!/^https:\/\/\S+$/.test(url)) throw badData("Unexpected webhook url", "BAD_SHAPE");
   return {
     id: reqStr(r, "id"),
-    url: reqStr(r, "url"),
+    url,
     events: arrField(r, "events").filter((e): e is string => typeof e === "string"),
   };
 }

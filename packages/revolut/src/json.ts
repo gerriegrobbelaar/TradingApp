@@ -103,14 +103,36 @@ export function objField(row: Row, key: string): Row | undefined {
   return asRow(v);
 }
 
+const AMOUNT_RE = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d{1,4}))?$/;
+
 /**
- * Decimal major-unit amount (Revolut sends 1234.5 or -10) to integer minor units at the
- * currency's ISO 4217 scale. Rounding only if more decimals than the scale arrive: half away
- * from zero (core/money.ts).
+ * Fraction digits a decimal string really needs (trailing zeros and the exponent applied), or
+ * null when it is not a decimal. "1234.50" -> 1, "1e-7" -> 7, "12E3" -> 0, "-0.00" -> 0.
+ */
+function neededScale(raw: string): number | null {
+  const m = AMOUNT_RE.exec(raw.trim());
+  if (!m) return null;
+  const intDigits = m[2] ?? "";
+  const fracDigits = m[3] ?? "";
+  if (intDigits.length + fracDigits.length === 0) return null;
+  const exp = m[4] === undefined ? 0 : Number(m[4]);
+  const significant = (intDigits + fracDigits).replace(/0+$/, "");
+  return Math.max(0, significant.length - (intDigits.length + exp));
+}
+
+/**
+ * Decimal major-unit amount (Revolut sends 1234.5, -10 or "1234.50") to integer minor units at
+ * the currency's ISO 4217 scale (core `currencyScale`; currencies without an exception use 2).
+ * Revolut amounts are exact decimals, so MORE decimals than the currency has is an error
+ * (BAD_SHAPE), never rounded: "0.005" EUR, "1e-7" EUR and "1.5" JPY all fail loudly. Beyond
+ * Number.MAX_SAFE_INTEGER minor units also fails. "-0.00" is 0.
  */
 export function minorOf(raw: string, currency: string, key: string): number {
   try {
-    return parseMinor(raw, currencyScale(currency));
+    const scale = currencyScale(currency);
+    const needed = neededScale(raw);
+    if (needed === null || needed > scale) throw new RangeError("excess precision");
+    return parseMinor(raw, scale);
   } catch {
     throw badData(`Unexpected amount for ${key}`, "BAD_SHAPE");
   }

@@ -253,3 +253,196 @@ describe("sanitizeForMessage", () => {
     expect(sanitizeForMessage("-----BEGIN PRIVATE KEY-----\nAAAA")).toBe("[redacted key]");
   });
 });
+
+describe("adversarial auth inputs", () => {
+  const opts = { issuer: "app.example.com", clientId: "client-123", now: NOW };
+  const keyBody = pkcs8.replace(/-----[A-Z ]+-----|\s/g, "");
+
+  async function verifies(jwt: string): Promise<boolean> {
+    const [h, p, s] = jwt.split(".");
+    const v = createVerify("RSA-SHA256");
+    v.update(`${h}.${p}`);
+    return v.verify(publicPem, Buffer.from(s ?? "", "base64url"));
+  }
+
+  it("parses PEMs with CRLF, literal \\r\\n, extra blank lines and surrounding whitespace", async () => {
+    for (const pem of [
+      pkcs8.replace(/\n/g, "\r\n"),
+      pkcs8.replace(/\n/g, "\\r\\n"),
+      pkcs8.replace(/\n/g, "\\n"),
+      `\n\n  ${pkcs8.replace(/\n/g, "\n\n")}  \n`,
+      pkcs8.replace(/\n/g, "\n   "),
+    ]) {
+      expect(await verifies(await buildClientAssertion({ ...opts, privateKeyPem: pem }))).toBe(
+        true,
+      );
+    }
+  });
+
+  it("refuses EC, Ed25519 and short RSA keys clearly", async () => {
+    const ec = generateKeyPairSync("ec", { namedCurve: "P-256" }).privateKey;
+    const ed = generateKeyPairSync("ed25519").privateKey;
+    const small = generateKeyPairSync("rsa", { modulusLength: 1024 }).privateKey;
+    const cases: [string, RegExp][] = [
+      [ec.export({ type: "pkcs8", format: "pem" }).toString(), /EC and Ed25519/],
+      [ec.export({ type: "sec1", format: "pem" }).toString(), /must be an RSA key/],
+      [ed.export({ type: "pkcs8", format: "pem" }).toString(), /EC and Ed25519/],
+      [small.export({ type: "pkcs8", format: "pem" }).toString(), /at least 2048 bits/],
+      [
+        privateKey
+          .export({ type: "pkcs8", format: "pem", cipher: "aes-256-cbc", passphrase: "pw" })
+          .toString(),
+        /encrypted/,
+      ],
+    ];
+    for (const [pem, re] of cases) {
+      const err = await buildClientAssertion({ ...opts, privateKeyPem: pem }).catch(
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(RangeError);
+      expect(String(err)).toMatch(re);
+      const body = pem.split("\n")[1] ?? "never";
+      expect(String(err)).not.toContain(body.slice(0, 20));
+    }
+  });
+
+  it("never echoes key material in any error (fuzzed PEMs and options)", async () => {
+    const fake = `-----BEGIN PRIVATE KEY-----\nFAKEKEYMATERIALxyz${"A".repeat(60)}\n-----END PRIVATE KEY-----`;
+    const mutations = [
+      fake,
+      fake.replace("BEGIN", "BEGlN"),
+      fake.slice(0, 60),
+      `${fake}trailing`,
+      `prefix${fake}`,
+      fake.replace("FAKE", "FA KE!"),
+      pkcs8.slice(0, pkcs8.length - 40),
+      pkcs8.replace(keyBody.slice(10, 20), "!!!!!!!!!!"),
+      pkcs1.replace(/\n/g, "\\n"),
+      `${pkcs8}\n${pkcs8}`,
+    ];
+    for (const privateKeyPem of mutations) {
+      for (const extra of [{}, { issuer: "https://bad" }, { ttlSeconds: -1 }, { jti: "\n" }]) {
+        const err = await buildClientAssertion({ ...opts, ...extra, privateKeyPem }).catch(
+          (e: unknown) => e,
+        );
+        if (typeof err === "string") continue; // a valid key produced a JWT
+        const text = `${String(err)} ${(err as Error).stack ?? ""}`;
+        expect(text).not.toContain("FAKEKEYMATERIAL");
+        expect(text).not.toContain(keyBody.slice(0, 24));
+        expect(text).not.toContain(keyBody.slice(-24));
+      }
+    }
+  });
+
+  it("emits base64url without padding and a fresh jti every time", async () => {
+    const jtis = new Set<string>();
+    for (let i = 0; i < 20; i++) {
+      const jwt = await buildClientAssertion({
+        ...opts,
+        clientId: `c${"x".repeat(i)}`, // varies the payload length to hit every padding case
+        privateKeyPem: pkcs8,
+      });
+      expect(jwt).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
+      const claims = decode(jwt.split(".")[1] ?? "");
+      expect(claims["exp"]).toBe((claims["iat"] as number) + 300);
+      jtis.add(String(claims["jti"]));
+    }
+    expect(jtis.size).toBe(20);
+  });
+
+  it("validates issuer, client id and jti strictly", async () => {
+    for (const issuer of [
+      "",
+      "-a.example",
+      "a..example",
+      "a.example.",
+      "user@a.example",
+      "a.example:99999x",
+      "a example",
+      "a.example\n",
+      "*.example",
+    ]) {
+      await expect(
+        buildClientAssertion({ ...opts, issuer, privateKeyPem: pkcs8 }),
+        issuer,
+      ).rejects.toThrow(/host only/);
+    }
+    for (const clientId of ["", " ", "a b", "a\nb", "é"]) {
+      await expect(
+        buildClientAssertion({ ...opts, clientId, privateKeyPem: pkcs8 }),
+      ).rejects.toThrow(/clientId/);
+    }
+    await expect(buildClientAssertion({ ...opts, jti: "", privateKeyPem: pkcs8 })).rejects.toThrow(
+      /jti/,
+    );
+    await expect(
+      buildClientAssertion({ ...opts, ttlSeconds: 1.5, privateKeyPem: pkcs8 }),
+    ).rejects.toThrow(/ttlSeconds/);
+    await expect(
+      buildClientAssertion({ ...opts, now: Number.POSITIVE_INFINITY, privateKeyPem: pkcs8 }),
+    ).rejects.toThrow(/now/);
+  });
+
+  it("encodes the consent URL so nothing can inject parameters", () => {
+    const url = new URL(
+      buildAuthorizeUrl({
+        clientId: "cid",
+        redirectUri: "https://app.example.com/cb?a=1&client_id=evil",
+        state: "x&client_id=evil&redirect_uri=https://evil#frag",
+      }),
+    );
+    expect(url.origin + url.pathname).toBe("https://business.revolut.com/app-confirm");
+    expect(url.searchParams.getAll("client_id")).toEqual(["cid"]);
+    expect(url.searchParams.getAll("redirect_uri")).toEqual([
+      "https://app.example.com/cb?a=1&client_id=evil",
+    ]);
+    expect(url.searchParams.get("state")).toBe("x&client_id=evil&redirect_uri=https://evil#frag");
+    expect(url.hash).toBe("");
+    for (const redirectUri of [
+      "https://user:pw@app.example.com/cb",
+      "https://app.example.com/cb#x",
+      "https://app.example.com/c b",
+      "https://app.example.com/cb\n",
+      "https://",
+      "javascript:alert(1)//https://x",
+      " https://app.example.com/cb",
+    ]) {
+      expect(
+        () => buildAuthorizeUrl({ clientId: "c", redirectUri, state: "s" }),
+        redirectUri,
+      ).toThrow(/redirectUri/);
+    }
+    for (const state of ["a\u0000b", "a\nb", "\uD800", "x".repeat(1025)]) {
+      expect(() =>
+        buildAuthorizeUrl({ clientId: "c", redirectUri: "https://x.example", state }),
+      ).toThrow(/state/);
+    }
+    expect(() =>
+      buildAuthorizeUrl({ clientId: "c\nd", redirectUri: "https://x.example", state: "s" }),
+    ).toThrow(/clientId/);
+  });
+
+  it("refuses odd token responses without echoing them", () => {
+    for (const body of [
+      '{"access_token":"SECRET TOKEN","expires_in":60}',
+      '{"access_token":"SECRETTOKEN\\r\\nX-Evil: 1","expires_in":60}',
+      '{"access_token":"SECRETTOKEN","expires_in":-5}',
+      '{"access_token":"SECRETTOKEN","expires_in":1e3}',
+      '{"access_token":"SECRETTOKEN","expires_in":99999999}',
+      '{"access_token":"SECRETTOKEN","expires_in":"soon"}',
+      '{"access_token":"SECRETTOKEN","expires_in":60,"refresh_token":"SECRETTOKEN two"}',
+      '{"access_token":["SECRETTOKEN"],"expires_in":60}',
+      '{"access_token":"SECRETTOKEN","expires_in":true}',
+      '{"access_token":"","expires_in":60}',
+    ]) {
+      let msg = "";
+      try {
+        parseTokenResponse(body);
+      } catch (e) {
+        msg = `${String(e)} ${(e as Error).stack ?? ""}`;
+      }
+      expect(msg, body).toMatch(/unusable token response/);
+      expect(msg).not.toContain("SECRETTOKEN");
+    }
+  });
+});
