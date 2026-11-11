@@ -9,6 +9,8 @@ import {
   STATE_CONFLICT_BADGE,
   STATE_CONFLICT_TEXT,
   describeMatchError,
+  NOT_BOOKED,
+  deferredChipText,
   exactStateLabel,
   ignoreReasonLabel,
   reviewReasonLabel,
@@ -23,6 +25,7 @@ import { ErrorNotice } from "../EmptyState";
 import { CandidateCard } from "./CandidateCard";
 import { MatchChooser } from "./MatchChooser";
 import { ErrorLine, StepUpNotice, useMatchRole } from "./MatchParts";
+import { PreviewSheet } from "./PreviewSheet";
 import { UndoPanel } from "./UndoPanel";
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
@@ -55,6 +58,9 @@ export function MatchedPanel({
   onStale: (message: string) => void;
 }) {
   const review = reviewReasonLabel(match.reviewReason);
+  const { isAdmin } = useMatchRole();
+  const [previewing, setPreviewing] = useState(false);
+  const deferred = typeof match.deferredCode === "string" && match.deferredCode !== "";
   return (
     <section className="mt-matched" aria-labelledby="mt-matched-h">
       <h3 id="mt-matched-h" className="h3">
@@ -72,7 +78,16 @@ export function MatchedPanel({
         <Row label="When">{formatDateTime(match.createdAt)}</Row>
         {match.score !== null && <Row label="Score">{match.score}</Row>}
         {match.ledgerAccountCode && <Row label="Ledger account">{match.ledgerAccountCode}</Row>}
-        <Row label="In Exact">{exactStateLabel(match.exactState)}</Row>
+        <Row label="In Exact">
+          {exactStateLabel(match.exactState)}
+          {match.bookedManually === true && " (booked by a person in Exact)"}
+          {deferred && match.status === "live" && match.exactState === NOT_BOOKED && (
+            <>
+              {" "}
+              <Chip>{deferredChipText(match.deferredCode as string)}</Chip>
+            </>
+          )}
+        </Row>
         {match.note && <Row label="Note">{match.note}</Row>}
       </dl>
       {match.allocations.length > 0 && (
@@ -93,6 +108,20 @@ export function MatchedPanel({
         </ul>
       )}
       <UndoPanel match={match} canAct={canAct} onDone={onDone} onStale={onStale} />
+      {isAdmin && match.status === "live" && match.exactState === NOT_BOOKED && (
+        <>
+          <div className="stack-row">
+            <Button size="sm" onClick={() => setPreviewing(true)}>
+              Preview booking…
+            </Button>
+          </div>
+          <PreviewSheet
+            open={previewing}
+            fixedMatchId={match.id}
+            onClose={() => setPreviewing(false)}
+          />
+        </>
+      )}
     </section>
   );
 }

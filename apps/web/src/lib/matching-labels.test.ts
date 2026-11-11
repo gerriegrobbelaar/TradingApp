@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 import { describe, expect, it } from "vitest";
-import { BLOCK_CODES, REASON_CODES, explainBlock } from "@camelthorn/core";
+import { BLOCK_CODES, BOOKING_VERIFY_CHECKS, REASON_CODES, explainBlock } from "@camelthorn/core";
 import { ApiError, StepUpRequired } from "../api";
 import {
   BLOCK_LABELS,
@@ -13,6 +13,13 @@ import {
   blockLabels,
   BLOCKER_FALLBACK,
   BOOKING_BLOCKERS,
+  BOOKING_DEFERRAL_CODES,
+  DEFERRAL_FALLBACK,
+  DEFERRAL_TEXT,
+  VERIFY_CHECK_TEXT,
+  deferralReason,
+  deferredChipText,
+  verifyCheckLabel,
   NO_PAYMENT,
   blockerText,
   bookingSentence,
@@ -202,6 +209,10 @@ describe("booking wording", () => {
     expect([...BOOKING_BLOCKERS].sort()).toEqual(
       [
         "bank_entries_undecided",
+        "control_accounts_missing",
+        "journal_unmapped",
+        "mode_changed",
+        "no_division_allowed",
         "no_exact_connection",
         "not_verified",
         "protocol_changed",
@@ -225,5 +236,67 @@ describe("booking wording", () => {
     for (const s of BOOKING_STATUS_ORDER) expect(BOOKING_STATUS[s].label).toBeTruthy();
     expect(exactStateLabel("not_booked")).toBe("Not booked in Exact");
     expect(exactStateLabel("mystery")).toBe("Handled in Exact");
+  });
+});
+
+describe("booking deferral reasons (a deferred match is calm, never an error)", () => {
+  // Deliberately NOT derived from the worker: this list is the contract the web labels cover.
+  const EXPECTED = [
+    "control_account_unknown",
+    "bank_balance_unknown",
+    "ledger_account_unknown",
+    "relation_code_unknown",
+    "item_entry_number_unknown",
+    "journal_unmapped",
+    "fee_not_supported_v1",
+    "already_settled_in_exact",
+    "items_changed",
+    "preflight_inconclusive",
+    "bank_balance_changed",
+    "bank_line_changed",
+    "partial_match_not_supported_v1",
+  ];
+
+  it("labels every deferral code, and only those", () => {
+    expect([...BOOKING_DEFERRAL_CODES].sort()).toEqual([...EXPECTED].sort());
+    expect(Object.keys(DEFERRAL_TEXT).sort()).toEqual([...EXPECTED].sort());
+    for (const code of EXPECTED) {
+      const chip = deferredChipText(code);
+      expect(chip, code).toMatch(/^Cannot be booked yet: [a-zA-Z]/);
+      expect(chip, code).not.toMatch(/[a-z]+_[a-z]+/);
+      expect(chip, code).not.toContain("!");
+      expect(deferralReason(code), code).not.toBe(DEFERRAL_FALLBACK);
+    }
+    expect(new Set(EXPECTED.map(deferralReason)).size).toBe(EXPECTED.length);
+  });
+
+  it("uses one fixed sentence for an unknown code and never echoes it", () => {
+    for (const odd of ["brand_new", "", "__proto__", "constructor", "NL91ABNA0417164300"]) {
+      expect(deferralReason(odd)).toBe(DEFERRAL_FALLBACK);
+      expect(deferredChipText(odd)).toBe(`Cannot be booked yet: ${DEFERRAL_FALLBACK}`);
+    }
+  });
+});
+
+describe("verification checks (one instruction per core code)", () => {
+  it("has a label and an instruction for every check in core, and nothing else", () => {
+    expect(Object.keys(VERIFY_CHECK_TEXT).sort()).toEqual([...BOOKING_VERIFY_CHECKS].sort());
+    for (const c of BOOKING_VERIFY_CHECKS) {
+      const t = VERIFY_CHECK_TEXT[c];
+      expect(t.label, c).toMatch(/^[A-Z]/);
+      expect(t.how, c).toMatch(/^[A-Z].*\.$/);
+      expect(t.label + t.how, c).not.toMatch(/[a-z]+_[a-z]+/);
+      expect(t.label + t.how, c).not.toContain("!");
+      expect(verifyCheckLabel(c)).toBe(t.label);
+    }
+  });
+
+  it("an unknown recorded check gets one calm sentence", () => {
+    expect(verifyCheckLabel("future_check")).toBe("A check this version does not know");
+    expect(verifyCheckLabel("__proto__")).toBe("A check this version does not know");
+  });
+
+  it("the checks error has a sentence", () => {
+    expect(describeMatchError(new ApiError(400, "checks_incomplete"))).toMatch(/Tick every check/);
   });
 });

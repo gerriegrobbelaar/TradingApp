@@ -5,6 +5,7 @@
  */
 import type {
   BookingStatus,
+  BookingVerifyCheck,
   MatchBlockedReason,
   MatchIgnoreReason,
   MatchTxDto,
@@ -208,6 +209,17 @@ export const ERROR_TEXT: Record<string, string> = {
   // booking routes (M7c): codes not known here fall back to a calm general sentence
   not_verified: "The Exact write path is not verified yet.",
   blocked: "Booking cannot be switched on until the listed blockers are fixed.",
+  checks_incomplete:
+    "Tick every check first. Each one must be done on the test administration before the write path counts as verified.",
+  bad_checks: "Tick every check first. Each one must be done on the test administration.",
+  bad_receivable_gl_account: "That debtors control account code is not valid.",
+  bad_payable_gl_account: "That creditors control account code is not valid.",
+  bad_opening_balance:
+    "That opening balance is not valid. Type digits with at most the currency's decimals.",
+  bad_booking_from: "That date and time is not valid.",
+  bad_divisions: "Pick at least one administration that exists.",
+  bad_max_per_run: "That number of matches per run is not valid.",
+  bad_match_ids: "Pick between one and three matches.",
   // general
   not_found: "That item no longer exists. The list is refreshed.",
   forbidden: "You do not have permission to do this.",
@@ -326,13 +338,17 @@ export const OUTBOX_ACTIONABLE: readonly BookingStatus[] = [
   "manual_required",
 ];
 
-/** The blocker codes GET /api/booking/settings can return (fixed with M7c). */
+/** The blocker codes GET /api/booking/settings can return (M7c, extended by the Phase 7 review). */
 export const BOOKING_BLOCKERS = [
   "not_verified",
   "protocol_changed",
   "bank_entries_undecided",
   "no_exact_connection",
   "writes_disabled",
+  "control_accounts_missing",
+  "journal_unmapped",
+  "no_division_allowed",
+  "mode_changed",
 ] as const;
 export type BookingBlocker = (typeof BOOKING_BLOCKERS)[number];
 
@@ -343,6 +359,13 @@ const BLOCKER_TEXT: Record<BookingBlocker, string> = {
     "It is not decided who creates the bank entries in Exact (Settings, Connections).",
   no_exact_connection: "Exact is not connected, or the connection needs to be renewed.",
   writes_disabled: "Writes to Exact are switched off for this installation.",
+  control_accounts_missing:
+    "A bank account has no debtors or creditors control account. Fill them in under Account map below.",
+  journal_unmapped:
+    "A bank account has no Exact journal or bank ledger account. Map it under Account map below.",
+  no_division_allowed: "No administration is allowed for booking yet. Pick at least one.",
+  mode_changed:
+    "Who creates the bank entries changed since you verified. Verify the write path again.",
 };
 
 /** Never echoes the server's text: an unknown code gets one fixed sentence. */
@@ -352,4 +375,96 @@ export function blockerText(b: string): string {
   return Object.prototype.hasOwnProperty.call(BLOCKER_TEXT, b)
     ? BLOCKER_TEXT[b as BookingBlocker]
     : BLOCKER_FALLBACK;
+}
+
+/**
+ * Why a match cannot be booked yet (`deferredCode` on a match; the executor leaves it not booked
+ * and tries again later). A fixed list here, deliberately NOT derived from the worker: a new code
+ * the worker sends gets the fallback sentence until it is added.
+ */
+export const BOOKING_DEFERRAL_CODES = [
+  "control_account_unknown",
+  "bank_balance_unknown",
+  "ledger_account_unknown",
+  "relation_code_unknown",
+  "item_entry_number_unknown",
+  "journal_unmapped",
+  "fee_not_supported_v1",
+  "already_settled_in_exact",
+  "items_changed",
+  "preflight_inconclusive",
+  "bank_balance_changed",
+  "bank_line_changed",
+  "partial_match_not_supported_v1",
+] as const;
+export type BookingDeferralCode = (typeof BOOKING_DEFERRAL_CODES)[number];
+
+export const DEFERRAL_TEXT: Record<BookingDeferralCode, string> = {
+  control_account_unknown: "the debtors or creditors control account is not filled in",
+  bank_balance_unknown: "the opening balance of the journal in Exact is not known",
+  ledger_account_unknown: "the ledger account does not exist in Exact",
+  relation_code_unknown: "the customer or supplier code is not known yet",
+  item_entry_number_unknown: "the invoice entry number from Exact is not known yet",
+  journal_unmapped: "the bank account has no Exact journal or bank ledger account",
+  fee_not_supported_v1: "the bank line has a fee, which is not booked automatically yet",
+  already_settled_in_exact: "Exact already shows this invoice as settled",
+  items_changed: "an invoice changed in Exact after the match",
+  preflight_inconclusive: "Exact could not be checked just now",
+  bank_balance_changed: "the bank journal in Exact changed since the match",
+  bank_line_changed: "the bank line changed after the match",
+  partial_match_not_supported_v1: "a part payment is not booked automatically yet",
+};
+
+export const DEFERRAL_FALLBACK = "something else is missing";
+
+export function deferralReason(code: string): string {
+  return Object.prototype.hasOwnProperty.call(DEFERRAL_TEXT, code)
+    ? DEFERRAL_TEXT[code as BookingDeferralCode]
+    : DEFERRAL_FALLBACK;
+}
+
+/** The calm chip text for a deferred match. */
+export function deferredChipText(code: string): string {
+  return `Cannot be booked yet: ${deferralReason(code)}`;
+}
+
+// ---- verifying the write path (one tick per check, DEPLOY.md step 0 item 18) -----------------
+
+/** One instruction per check of core BOOKING_VERIFY_CHECKS (the type forces completeness). */
+export const VERIFY_CHECK_TEXT: Record<BookingVerifyCheck, { label: string; how: string }> = {
+  probe_zero_for_random_ref: {
+    label: "The duplicate probe finds nothing for a random reference",
+    how: "In the test journal, a bank-line search for a reference that does not exist returns zero lines, and exactly one for the real test reference. If it returns lines for a random reference, stop.",
+  },
+  bank_entry_sign: {
+    label: "The bank entry has the right sign",
+    how: "You posted a 0.01 euro bank entry on the test journal and saw one line with the correct sign, date and reference in Exact.",
+  },
+  matchset_signs_and_control_account: {
+    label: "The match uses the right signs and control account",
+    how: "You uploaded one match of the test invoice against that bank line and checked the signs and the debtors control account in Exact.",
+  },
+  balance_chain: {
+    label: "The balance chain continues",
+    how: "The newest entry in the journal shows the closing balance that the next entry must open with.",
+  },
+  matchset_readback: {
+    label: "The read-back shows the invoice as paid",
+    how: "After the match, the receivables list shows the test invoice as paid, and the bank entry alone did not already settle it.",
+  },
+  lost_answer_drill: {
+    label: "The lost-answer drill passed",
+    how: "You blocked the network right after sending: the row ended as outcome unknown, the next run did not send again, and Retry found the entry instead of making a second one.",
+  },
+  preview_matches_manual_payload: {
+    label: "Preview booking matches what you sent by hand",
+    how: "The bodies shown by Preview booking are the same as the ones you posted by hand in the checks above.",
+  },
+};
+
+/** The plain label of a recorded check; an unknown code keeps one calm sentence. */
+export function verifyCheckLabel(code: string): string {
+  return Object.prototype.hasOwnProperty.call(VERIFY_CHECK_TEXT, code)
+    ? VERIFY_CHECK_TEXT[code as BookingVerifyCheck].label
+    : "A check this version does not know";
 }

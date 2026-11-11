@@ -9,6 +9,7 @@ import { NO_VALUE, formatDateTime, formatMoney } from "../../lib/format";
 import {
   ALREADY_BOOKED_TEXT,
   NOT_BOOKED,
+  deferredChipText,
   exactStateLabel,
   reviewReasonLabel,
 } from "../../lib/matching-labels";
@@ -128,6 +129,10 @@ export function AutoMatchedList({
                 </Chip>
               )}
               {review && m.status === "live" && <Chip tone="warn">Needs a check</Chip>}
+              {m.status === "live" &&
+                m.exactState === NOT_BOOKED &&
+                typeof m.deferredCode === "string" &&
+                m.deferredCode !== "" && <Chip>{deferredChipText(m.deferredCode)}</Chip>}
             </span>
           );
         },

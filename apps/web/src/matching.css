@@ -165,6 +165,72 @@
   border-color: var(--accent-text);
   border-style: dashed;
 }
+.app .mt-checks {
+  border: 1px solid var(--control-line);
+  border-radius: 14px;
+  margin: 0;
+  padding: 10px 12px;
+  min-width: 0;
+}
+.app .mt-checks legend {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 0 6px;
+}
+.app .mt-check-list,
+.app .mt-ticked,
+.app .mt-plan {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.app .mt-plan {
+  list-style: decimal;
+  padding-left: 22px;
+}
+.app .mt-check {
+  align-items: flex-start;
+  height: auto;
+  min-height: 32px;
+}
+.app .mt-check input {
+  margin-top: 3px;
+  flex: none;
+}
+.app .mt-block {
+  display: block;
+}
+.app .mt-code {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.app .mt-pre {
+  margin: 0;
+  padding: 10px 12px;
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--fill);
+  border: 1px solid var(--control-line);
+  border-radius: 14px;
+}
+.app .mt-preview-item {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px 0;
+  border-top: 1px solid var(--control-line);
+}
 .app .mt-pattern-row {
   flex-wrap: wrap;
 }

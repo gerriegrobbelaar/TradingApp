@@ -17,6 +17,9 @@ export function TypedPhraseSheet({
   phrase,
   confirmLabel,
   note,
+  extra,
+  extraReady = true,
+  extraDirty = false,
   onClose,
   onConfirm,
   onDone,
@@ -29,6 +32,12 @@ export function TypedPhraseSheet({
   confirmLabel: string;
   /** Ask for a written note; `required` keeps the button disabled while it is empty. */
   note?: { label: string; required: boolean };
+  /** More inputs shown before the note (tick boxes, pickers); the caller owns their state. */
+  extra?: ReactNode;
+  /** The extra inputs are complete; the confirm button stays disabled until they are. */
+  extraReady?: boolean;
+  /** The extra inputs hold something that closing would lose. */
+  extraDirty?: boolean;
   onClose: () => void;
   onConfirm: (v: { phrase: string; note: string }) => Promise<unknown>;
   onDone: () => void;
@@ -45,7 +54,7 @@ export function TypedPhraseSheet({
   }, [open, clear]);
   const noteOk = !note || !note.required || text.trim() !== "";
   // Exact, case-sensitive, NOT trimmed (core phraseMatches; the server compares with === too).
-  const ready = (phrase === undefined || phraseMatches(typed, phrase)) && noteOk;
+  const ready = (phrase === undefined || phraseMatches(typed, phrase)) && noteOk && extraReady;
   async function go() {
     const r = await run(() => onConfirm({ phrase: typed, note: text.trim() }));
     if (r?.ok) onDone();
@@ -55,10 +64,11 @@ export function TypedPhraseSheet({
       open={open}
       title={title}
       onClose={onClose}
-      dirty={!state.busy && (typed !== "" || text.trim() !== "")}
+      dirty={!state.busy && (typed !== "" || text.trim() !== "" || extraDirty)}
     >
       <div className="mt-phrase">
         {intro}
+        {extra}
         {note && (
           <label className="field">
             {note.label}

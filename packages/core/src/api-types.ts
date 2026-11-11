@@ -780,6 +780,10 @@ export interface MatchDto {
   /** Live and not booked in Exact yet. */
   undoAvailable: boolean;
   allocations: MatchAllocationDto[];
+  /** Booking is deferred for this match, with a code (U1; absent = not deferred). */
+  deferredCode?: string | null;
+  /** A person booked it in Exact by hand (U1). */
+  bookedManually?: boolean;
 }
 
 export interface MatchQueueItem {
@@ -900,6 +904,8 @@ export interface MatchAccountMapDto {
   /** Control accounts the MatchSet names (M7c); null = booking stops with control_account_unknown. */
   receivableGlAccountCode?: string | null;
   payableGlAccountCode?: string | null;
+  /** Opening balance of an empty journal as a decimal string in the account's currency (U1). */
+  openingBalanceMinor?: string | null;
   updatedAt: string | null;
   updatedBy: string | null;
 }
@@ -919,6 +925,8 @@ export interface MatchAccountMapRequest {
   /** Optional (M7c): ledger accounts of the debtors and creditors control accounts. */
   receivableGlAccountCode?: string | null;
   payableGlAccountCode?: string | null;
+  /** Minor units as a decimal string, or null to clear (U1). */
+  openingBalanceMinor?: string | null;
 }
 
 export interface MatchPatternDto {
@@ -993,6 +1001,13 @@ export interface MatchStatsResponse {
   autoEnabled: boolean;
   /** Active Revolut accounts without an Exact administration mapping. */
   unmappedAccounts: number;
+  /** Booking counters (U1/U2); absent on an older worker. */
+  manual_required?: number;
+  outcome_unknown?: number;
+  waiting_for_bank_line?: number;
+  deferred?: number;
+  bookedWithConflict?: number;
+  staleSettlements?: number;
 }
 
 // ---- Booking in Exact (Phase 7, M7c). Fixed shapes shared with the web (M7d). -----------------------
@@ -1038,11 +1053,31 @@ export interface BookingOutboxResponse {
 
 export interface BookingSettingsResponse {
   enabled: boolean;
-  verified: { at: string; by: string; note: string; protocolVersion: string } | null;
+  verified: {
+    at: string;
+    by: string;
+    note: string;
+    protocolVersion: string;
+    /** The checks that were ticked, and the mode (createsBankEntries) verified for (U1). */
+    checks?: string[];
+    createsBankEntries?: boolean | null;
+  } | null;
   protocolVersion: string;
   protocolChanged: boolean;
   createsBankEntries: boolean | null;
+  /**
+   * not_verified, protocol_changed, bank_entries_undecided, no_exact_connection, writes_disabled,
+   * control_accounts_missing, journal_unmapped, no_division_allowed, mode_changed (U1).
+   */
   blockers: string[];
+  /** Only matches created at or after this UTC instant are booked (U1). */
+  bookingFrom?: string | null;
+  /** Live matches older than `bookingFrom`, which will NOT be booked (U1). */
+  backlogCount?: number;
+  /** Divisions (divisions.id) booking is allowed for; empty = none (U1). */
+  divisions?: number[];
+  /** Matches booked per run; 1 is the canary default (U1). */
+  maxPerRun?: number;
 }
 
 // ---- Booking request shapes (M7c, ADR 0044). One definition, shared with the web (M7d). ------
@@ -1054,12 +1089,35 @@ export interface BookingSettingsRequest {
   enabled: boolean;
   confirm: string;
   note?: string;
+  /** U1: watermark (UTC ISO), division allow-list and per-run cap; raising maxPerRun needs step-up. */
+  bookingFrom?: string;
+  divisions?: number[];
+  maxPerRun?: number;
 }
 
 /** POST /api/booking/verify (admin, step-up): confirm = BOOKING_VERIFY_PHRASE (confirm-phrases.ts). */
 export interface BookingVerifyRequest {
   note: string;
   confirm: string;
+  /** Must equal BOOKING_VERIFY_CHECKS (U1); the server answers 400 checks_incomplete otherwise. */
+  checks?: string[];
+}
+
+/** POST /api/booking/preview (admin, step-up): nothing is sent to Exact (U1). */
+export interface BookingPreviewRequest {
+  matchIds: number[];
+}
+export interface BookingPreviewItem {
+  matchId: number;
+  bankEntryBody: unknown;
+  matchSetXml: string | null;
+  hashes: { bankEntry?: string; matchSet?: string };
+  wouldDefer: { code: string } | null;
+  plan: string[];
+  reads: Record<string, unknown>;
+}
+export interface BookingPreviewResponse {
+  items: BookingPreviewItem[];
 }
 
 /** POST /api/booking/outbox/:id/resolve (admin, step-up) */

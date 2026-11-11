@@ -4,7 +4,10 @@
  */
 import type {
   BookingOutboxResponse,
+  BookingPreviewRequest,
+  BookingPreviewResponse,
   BookingSettingsResponse,
+  BookingVerifyRequest,
   MatchAccountMapRequest,
   MatchAccountMapResponse,
   MatchAutoResponse,
@@ -138,11 +141,26 @@ export const getBookingSettings = (signal?: AbortSignal) =>
  * direction and sends `{enabled: false}` only: no phrase, no step-up (orchestrator decision M7d).
  */
 export type BookingSettingsPut =
-  { enabled: false } | { enabled: true; confirm: string; note?: string };
+  | { enabled: false }
+  | {
+      enabled: true;
+      confirm: string;
+      note?: string;
+      /** UTC ISO: only matches created at or after it are booked. */
+      bookingFrom?: string;
+      /** Divisions (divisions.id) booking is allowed for; at least one. */
+      divisions?: number[];
+      /** Matches booked per run (1 = canary); raising it needs a fresh sign-in. */
+      maxPerRun?: number;
+    };
 export const putBookingSettings = (body: BookingSettingsPut) =>
   request<BookingSettingsResponse>("/api/booking/settings", { method: "PUT", body });
-export const verifyBookingPath = (body: { note: string; confirm: string }) =>
+export const verifyBookingPath = (body: BookingVerifyRequest) =>
   request<BookingSettingsResponse>("/api/booking/verify", { method: "POST", body });
+
+/** Admin, fresh sign-in. Builds the real bodies and hashes; NOTHING is sent to Exact. */
+export const previewBooking = (body: BookingPreviewRequest) =>
+  request<BookingPreviewResponse>("/api/booking/preview", { method: "POST", body });
 
 export const getBookingOutbox = (
   params: { status?: BookingStatus | undefined; limit?: number; cursor?: string | null },

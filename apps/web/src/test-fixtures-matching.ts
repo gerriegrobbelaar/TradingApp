@@ -1,5 +1,6 @@
 import { AUTO_MATCH_CONFIRM_PHRASE } from "@camelthorn/core";
 import type {
+  BookingPreviewItem,
   BookingOutboxItemDto,
   BookingOutboxResponse,
   BookingSettingsResponse,
@@ -194,6 +195,9 @@ export function accountMap(over: Partial<MatchAccountMapResponse> = {}): MatchAc
         divisionName: "Camelthorn B.V.",
         journalCode: "RB1",
         bankGlAccountCode: "1210",
+        receivableGlAccountCode: "1300",
+        payableGlAccountCode: "1600",
+        openingBalanceMinor: null,
         updatedAt: "2026-11-01T00:00:00.000Z",
         updatedBy: "gerrie@camelthorncapital.com",
       },
@@ -231,6 +235,24 @@ export function pattern(over: Partial<MatchPatternDto> = {}): MatchPatternDto {
     enabled: true,
     createdBy: "gerrie@camelthorncapital.com",
     updatedAt: "2026-11-01T00:00:00.000Z",
+    ...over,
+  };
+}
+
+/** A preview answer for one match (POST /api/booking/preview). Nothing in it is a full IBAN. */
+export function previewItem(over: Partial<BookingPreviewItem> = {}): BookingPreviewItem {
+  return {
+    matchId: 50,
+    bankEntryBody: {
+      Journal: "RB1",
+      Currency: "EUR",
+      BankEntryLines: [{ GLAccount: "1300", AmountFC: 1234, YourRef: "rv-abc123" }],
+    },
+    matchSetXml: "<eExact><MatchSets><MatchSet><MatchLines/></MatchSet></MatchSets></eExact>",
+    hashes: { bankEntry: "a".repeat(64), matchSet: "b".repeat(64) },
+    wouldDefer: null,
+    plan: ["Read the journal balance", "Post one bank entry", "Upload one match"],
+    reads: { probeLines: 0 },
     ...over,
   };
 }
