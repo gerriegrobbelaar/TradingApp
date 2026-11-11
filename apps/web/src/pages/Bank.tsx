@@ -299,7 +299,7 @@ export function Bank() {
     getMatchStats(signal),
   );
   const statsData = stats.status === "ready" ? stats.data : null;
-  const reloadStats = stats.reload;
+  const reloadStats = stats.refresh;
   const goTab = (next: BankTab) => {
     const patch: Record<string, string | null> = { tab: next === "transactions" ? null : next };
     if (next !== "review") patch["queue"] = null;

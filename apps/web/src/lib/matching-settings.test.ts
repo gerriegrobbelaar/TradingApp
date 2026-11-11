@@ -1,11 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_MATCH_CONFIG, unsafeRegexReason, validateMatchConfig } from "@camelthorn/core";
+import {
+  DEFAULT_MATCH_CONFIG,
+  REGEX_PROBLEM_CODES,
+  safeRegexTest,
+  unsafeRegexReason,
+  validateMatchConfig,
+} from "@camelthorn/core";
 import { TUNABLES } from "../test-fixtures-matching";
 import {
   EMPTY_PATTERN,
   checkPattern,
   checkTunables,
   plainProblem,
+  REGEX_PROBLEM,
   regexProblem,
   testPattern,
   toForm,
@@ -136,6 +143,26 @@ describe("ledger pattern regexes use the core safe subset", () => {
     }
     expect(regexProblem("^revolut")).toBeNull();
     expect(regexProblem("fee|commission")).toBeNull();
+  });
+
+  it("has its own sentence for exactly the reason codes core exports (review M7d)", () => {
+    expect(Object.keys(REGEX_PROBLEM).sort()).toEqual([...REGEX_PROBLEM_CODES].sort());
+    expect(new Set(Object.values(REGEX_PROBLEM)).size).toBe(REGEX_PROBLEM_CODES.length);
+  });
+
+  it("refuses exponential patterns before the test box can run them (cannot hang the tab)", () => {
+    const evil = "(?:a|aa)".repeat(24) + "b";
+    expect(regexProblem(evil)).toMatch(/too many optional parts/);
+    const f: PatternForm = {
+      ...EMPTY_PATTERN,
+      name: "x",
+      ledgerAccountCode: "1",
+      referenceRegex: evil,
+    };
+    const t0 = Date.now();
+    expect(testPattern(f, "a".repeat(5000))).toEqual([]);
+    expect(safeRegexTest(evil, "a".repeat(5000))).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(100);
   });
 
   it("has a plain message for every reason core can give", () => {

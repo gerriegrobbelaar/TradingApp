@@ -2,8 +2,8 @@ import { useMemo, useState } from "react";
 import type { OpenItemListResponse, OpenItemRow } from "@camelthorn/core";
 import { Segmented, Skeleton } from "@camelthorn/ui";
 import { listOpenItems } from "../../api";
-import { useDivision } from "../../division";
 import { describeLoadError } from "../../lib/errors";
+import { maskIbanLike } from "../../lib/mask";
 import { NO_VALUE, formatDate, formatMoney } from "../../lib/format";
 import { useResource } from "../../lib/useResource";
 import { FilterChip, SearchBox } from "../FilterBar";
@@ -13,17 +13,24 @@ type Kind = "invoice" | "bill";
 const PATH = { invoice: "/api/invoices", bill: "/api/bills" } as const;
 
 /**
- * Search the open items of ONE administration to add to a manual match. Money in normally pays
- * invoices and money out pays bills; credit notes are the other way round, so both lists are
- * offered. The server checks the administration, currency, direction and free balance again.
+ * Search the open items of the bank line's OWN administration (MatchTxDto.divisionId: no selector,
+ * so a line cannot be matched across administrations by mistake) to add to a manual match. Money
+ * in normally pays invoices and money out pays bills; credit notes are the other way round, so
+ * both lists are offered. The server checks the administration, currency, direction and free
+ * balance again.
  */
 export function ItemPicker({
+  divisionId,
+  divisionName,
   txDirection,
   txCurrency,
   taken,
   firstRelation,
   onAdd,
 }: {
+  divisionId: number;
+  /** For the sentence only; null when the switcher does not know it. */
+  divisionName: string | null;
   txDirection: "in" | "out";
   txCurrency: string;
   /** Open item ids already in the allocation list. */
@@ -32,21 +39,17 @@ export function ItemPicker({
   firstRelation: { id: number; name: string | null } | null;
   onAdd: (item: OpenItemRow) => void;
 }) {
-  const { divisions, selected } = useDivision();
-  const choices = divisions.filter((d) => d.syncEnabled);
-  const [divisionId, setDivisionId] = useState<string>(selected ? String(selected.id) : "");
   const [kind, setKind] = useState<Kind>(txDirection === "in" ? "invoice" : "bill");
   const [q, setQ] = useState("");
   const [onlyRelation, setOnlyRelation] = useState(false);
   const relationId = onlyRelation && firstRelation ? firstRelation.id : null;
 
-  const key =
-    divisionId === "" ? null : `picker:${divisionId}:${kind}:${q.trim()}:${String(relationId)}`;
+  const key = `picker:${divisionId}:${kind}:${q.trim()}:${String(relationId)}`;
   const res = useResource<OpenItemListResponse>(key, (signal) =>
     listOpenItems(
       PATH[kind],
       {
-        division: divisionId,
+        division: String(divisionId),
         status: "open",
         currency: txCurrency,
         q: q.trim() || undefined,
@@ -64,22 +67,6 @@ export function ItemPicker({
   return (
     <div className="mt-picker">
       <div className="mt-picker-bar">
-        {choices.length > 1 && (
-          <label className="field">
-            Administration
-            <select
-              className="input"
-              value={divisionId}
-              onChange={(e) => setDivisionId(e.target.value)}
-            >
-              {choices.map((d) => (
-                <option key={d.id} value={d.id}>
-                  {d.name}
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
         <Segmented
           label="Open items"
           value={kind}
@@ -102,12 +89,9 @@ export function ItemPicker({
         )}
       </div>
       <p className="cap">
-        Open items in {txCurrency} of the administration this bank account belongs to. The server
-        checks this again.
+        Open items in {txCurrency} of {divisionName ?? "the administration"}, the administration
+        this bank account is linked to. The server checks this again.
       </p>
-      {divisionId === "" && (
-        <p className="notice warn">Pick an administration in the top bar first.</p>
-      )}
       {res.status === "error" && (
         <ErrorNotice message={describeLoadError(res.error)} onRetry={res.reload} />
       )}
@@ -121,15 +105,15 @@ export function ItemPicker({
         </div>
       )}
       {res.status === "ready" && rows.length === 0 && (
-        <p className="cap">No open items found. Change the search or the administration.</p>
+        <p className="cap">No open items found. Change the search.</p>
       )}
       {rows.length > 0 && (
         <ul className="mt-picker-list" aria-label="Open items found">
           {rows.map((it) => (
             <li key={it.id} className="mt-picker-row">
               <span className="mt-picker-main">
-                <strong>{it.invoiceNumber ?? `item ${it.id}`}</strong>{" "}
-                <span className="cap">{it.relation.name ?? NO_VALUE}</span>
+                <strong>{maskIbanLike(it.invoiceNumber) ?? `item ${it.id}`}</strong>{" "}
+                <span className="cap">{maskIbanLike(it.relation.name) ?? NO_VALUE}</span>
                 <span className="cap">
                   Due {formatDate(it.dueDate)} · open{" "}
                   <span className="num money">{formatMoney(it.openMinor, it.currency)}</span>
@@ -140,7 +124,7 @@ export function ItemPicker({
               <button
                 type="button"
                 className="btn sm"
-                aria-label={`Add ${it.invoiceNumber ?? `item ${it.id}`}`}
+                aria-label={`Add ${maskIbanLike(it.invoiceNumber) ?? `item ${it.id}`}`}
                 onClick={() => onAdd(it)}
               >
                 Add

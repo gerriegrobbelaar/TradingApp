@@ -16,6 +16,7 @@ import type {
   MatchDetailResponse,
   MatchIgnoreRequest,
   MatchIgnoreResponse,
+  MatchItemBalancesResponse,
   MatchPatternDto,
   MatchPatternRequest,
   MatchPatternsResponse,
@@ -26,9 +27,17 @@ import type {
   MatchUndoResponse,
   BookingStatus,
 } from "@camelthorn/core";
-import { queryString, request, type QueryParams } from "./api";
+import { queryString, request as rawRequest, type QueryParams } from "./api";
+import { maskDeep } from "./lib/mask";
 
 const sig = (signal?: AbortSignal) => (signal ? { signal } : {});
+
+/**
+ * Every matching and booking answer has each string IBAN-masked before any component sees it
+ * (review M7d): the worker masks too, this makes a full IBAN in the DOM impossible either way.
+ */
+const request = async <T>(path: string, init?: Parameters<typeof rawRequest>[1]): Promise<T> =>
+  maskDeep(await rawRequest<T>(path, init));
 
 // ---- reads (any signed-in role) ---------------------------------------------------------------
 
@@ -61,6 +70,13 @@ export const getMatchAuto = (
 
 export const getMatchDetail = (id: number, signal?: AbortSignal) =>
   request<MatchDetailResponse>(`/api/matching/transactions/${id}`, sig(signal));
+
+/** What is still free on open items (Exact open balance minus live matches here), up to 20 ids. */
+export const getItemBalances = (ids: readonly number[], signal?: AbortSignal) =>
+  request<MatchItemBalancesResponse>(
+    `/api/matching/items?ids=${ids.map((i) => String(i)).join(",")}`,
+    sig(signal),
+  );
 
 // ---- matching actions (finance, admin) --------------------------------------------------------
 
@@ -117,7 +133,13 @@ export const deletePattern = (id: number) =>
 
 export const getBookingSettings = (signal?: AbortSignal) =>
   request<BookingSettingsResponse>("/api/booking/settings", sig(signal));
-export const putBookingSettings = (body: { enabled: boolean; confirm: string; note?: string }) =>
+/**
+ * Switching booking ON needs the typed phrase (and a fresh sign-in); switching it OFF is the safe
+ * direction and sends `{enabled: false}` only: no phrase, no step-up (orchestrator decision M7d).
+ */
+export type BookingSettingsPut =
+  { enabled: false } | { enabled: true; confirm: string; note?: string };
+export const putBookingSettings = (body: BookingSettingsPut) =>
   request<BookingSettingsResponse>("/api/booking/settings", { method: "PUT", body });
 export const verifyBookingPath = (body: { note: string; confirm: string }) =>
   request<BookingSettingsResponse>("/api/booking/verify", { method: "POST", body });

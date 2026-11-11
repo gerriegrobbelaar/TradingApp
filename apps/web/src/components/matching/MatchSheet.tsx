@@ -52,7 +52,7 @@ export function MatchedPanel({
   currency: string;
   canAct: boolean;
   onDone: () => void;
-  onStale: () => void;
+  onStale: (message: string) => void;
 }) {
   const review = reviewReasonLabel(match.reviewReason);
   return (
@@ -106,15 +106,20 @@ function ConflictPanel({
   txId: number;
   isAdmin: boolean;
   onDone: () => void;
-  onStale: () => void;
+  onStale: (message: string) => void;
 }) {
   const [note, setNote] = useState("");
   const [confirming, setConfirming] = useState(false);
-  const { state, run } = useAction();
+  const { state, run, clear: clearState } = useAction();
   async function clear() {
     const r = await run(() => clearConflict(txId, { note: note.trim() }));
     if (r?.ok) onDone();
-    else if (r && isStale(r.error)) onStale();
+    else if (r && isStale(r.error)) {
+      const message = describeMatchError(r.error);
+      clearState();
+      setConfirming(false);
+      onStale(message);
+    }
   }
   return (
     <section className="mt-conflict" aria-labelledby="mt-conflict-h">
@@ -177,14 +182,18 @@ function IgnoredPanel({
   detail: MatchDetailResponse;
   canAct: boolean;
   onDone: () => void;
-  onStale: () => void;
+  onStale: (message: string) => void;
 }) {
   const ig = detail.transaction.ignore;
-  const { state, run } = useAction();
+  const { state, run, clear } = useAction();
   async function unignore() {
     const r = await run(() => unignoreTransaction(detail.transaction.id));
     if (r?.ok) onDone();
-    else if (r && isStale(r.error)) onStale();
+    else if (r && isStale(r.error)) {
+      const message = describeMatchError(r.error);
+      clear();
+      onStale(message);
+    }
   }
   return (
     <section className="mt-ignored" aria-labelledby="mt-ignored-h">
@@ -253,11 +262,13 @@ function Body({
   id,
   onChanged,
   onClose,
+  onDirty,
 }: {
   id: number;
   /** Something changed on the server: refetch the queue and the counts. */
   onChanged: () => void;
   onClose: () => void;
+  onDirty: (dirty: boolean) => void;
 }) {
   const toast = useToast();
   const { canAct, isAdmin } = useMatchRole();
@@ -266,13 +277,12 @@ function Body({
     getMatchDetail(id, signal),
   );
   // The booking setting only changes the wording; if it cannot be read the wording stays neutral.
-  const bookingRes = useResource<BookingSettingsResponse | null>(
-    canAct ? "booking-settings" : null,
-    (signal) =>
-      getBookingSettings(signal).catch((e: unknown) => {
-        if (signal.aborted) throw e;
-        return null;
-      }),
+  // Readable by every signed-in role (viewers see the same sentence, they just cannot act).
+  const bookingRes = useResource<BookingSettingsResponse | null>("booking-settings", (signal) =>
+    getBookingSettings(signal).catch((e: unknown) => {
+      if (signal.aborted) throw e;
+      return null;
+    }),
   );
   const booking = bookingRes.data;
 
@@ -281,16 +291,17 @@ function Body({
     onChanged();
     onClose();
   };
+  // Quiet: the sheet keeps what is shown (and any typed amounts) until the new state arrives.
   const stale = (message: string) => {
     setNotice(message);
     onChanged();
-    res.reload();
+    res.refresh();
   };
 
   if (res.status === "error") {
     return <ErrorNotice message={describeMatchError(res.error)} onRetry={res.reload} />;
   }
-  if (res.status !== "ready" || !res.data || (canAct && bookingRes.status === "loading")) {
+  if (res.status !== "ready" || !res.data || bookingRes.status === "loading") {
     return <Loading />;
   }
   const detail = res.data;
@@ -311,9 +322,7 @@ function Body({
           currency={tx.currency}
           canAct={canAct}
           onDone={() => done("Undid the match. The line is back in the review list.")}
-          onStale={() =>
-            stale("This match changed in the meantime. The sheet shows the latest state.")
-          }
+          onStale={stale}
         />
       )}
       {!match && tx.matchStatus === "ignored" && (
@@ -321,9 +330,7 @@ function Body({
           detail={detail}
           canAct={canAct}
           onDone={() => done("Unignored. The line is back in the review list.")}
-          onStale={() =>
-            stale("This line changed in the meantime. The sheet shows the latest state.")
-          }
+          onStale={stale}
         />
       )}
       {!match && tx.stateConflict && (
@@ -331,9 +338,7 @@ function Body({
           txId={tx.id}
           isAdmin={isAdmin}
           onDone={() => done("Cleared the conflict. The line can be matched again.")}
-          onStale={() =>
-            stale("This line changed in the meantime. The sheet shows the latest state.")
-          }
+          onStale={stale}
         />
       )}
       {!match && !tx.mapped && (
@@ -354,6 +359,7 @@ function Body({
           canAct={canAct}
           onDone={done}
           onStale={stale}
+          onDirty={onDirty}
         />
       )}
       {!match && (tx.stateConflict || !tx.mapped) && detail.candidates.length > 0 && (
@@ -384,9 +390,21 @@ export function MatchSheet({
   onClose: () => void;
   onChanged: () => void;
 }) {
+  const [dirty, setDirty] = useState(false);
   return (
-    <DrillSheet open={id !== null} title="Match bank line" onClose={onClose} viewKey={String(id)}>
-      {id !== null && <Body key={id} id={id} onChanged={onChanged} onClose={onClose} />}
+    <DrillSheet
+      open={id !== null}
+      title="Match bank line"
+      onClose={() => {
+        setDirty(false);
+        onClose();
+      }}
+      viewKey={String(id)}
+      dirty={dirty}
+    >
+      {id !== null && (
+        <Body key={id} id={id} onChanged={onChanged} onClose={onClose} onDirty={setDirty} />
+      )}
     </DrillSheet>
   );
 }

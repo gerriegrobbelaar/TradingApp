@@ -176,10 +176,13 @@ export function matchingApi(
     case "/api/booking/settings":
       if (scene.booking === "ready") return booking({ enabled: true, verified: VERIFIED });
       if (scene.booking === "blocked") {
+        // Switched on, but the write format changed since it was verified: blocked.
         return booking({
+          enabled: true,
           verified: VERIFIED,
           protocolChanged: true,
-          blockers: ["protocol_changed"],
+          blockers: ["protocol_changed", "bank_entries_undecided"],
+          createsBankEntries: null,
         });
       }
       return booking();
@@ -202,19 +205,37 @@ export function matchingApi(
         ],
         { failed: 1, verified: 1, outcome_unknown: 1 },
       );
+    case "/api/matching/items": {
+      // Free balances of the picker's items (review M7d): open in Exact, nothing matched here yet.
+      const ids = (search.get("ids") ?? "").split(",").filter((x) => x !== "");
+      return {
+        items: PICKER_ROWS.filter((r) => ids.includes(String(r.id))).map((r) => ({
+          openItemId: r.id,
+          divisionId: 1,
+          kind: r.kind,
+          currency: r.currency,
+          status: r.status,
+          openMinor: r.openMinor,
+          matchedMinor: 0,
+          freeMinor: r.openMinor < 0 ? -r.openMinor : r.openMinor,
+        })),
+      };
+    }
     default:
       return null;
   }
 }
 
+const PICKER_ROWS = [
+  row({ id: 21, invoiceNumber: "INV-21", openMinor: 100000 }),
+  row({ id: 22, invoiceNumber: "INV-22", openMinor: 50000 }),
+];
+
 /** The open-item lists of the manual-match picker (only the m7d suite asks for them). */
 export function pickerApi(path: string): unknown {
   switch (path) {
     case "/api/invoices":
-      return listResponse([
-        row({ id: 21, invoiceNumber: "INV-21", openMinor: 100000 }),
-        row({ id: 22, invoiceNumber: "INV-22", openMinor: 50000 }),
-      ]);
+      return listResponse(PICKER_ROWS);
     case "/api/bills":
       return listResponse([]);
     default:

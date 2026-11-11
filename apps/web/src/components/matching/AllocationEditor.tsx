@@ -14,6 +14,7 @@ export interface PickedItem extends AllocItem {
  */
 export function AllocationEditor({
   picked,
+  rows,
   check,
   txAmountMinor,
   currency,
@@ -21,6 +22,8 @@ export function AllocationEditor({
   onRemove,
 }: {
   picked: readonly PickedItem[];
+  /** The same rows with the server's free balances merged in (same order as `picked`). */
+  rows: readonly AllocItem[];
   check: AllocationCheck;
   txAmountMinor: number;
   currency: string;
@@ -33,7 +36,12 @@ export function AllocationEditor({
       <ul className="mt-alloc-list" aria-label="Amounts per invoice">
         {picked.map((p, i) => {
           const row = check.rows[i];
+          const live = rows[i];
           const errId = `alloc-err-${p.openItemId}`;
+          const hintId = `alloc-hint-${p.openItemId}`;
+          const open = live?.openMinor ?? p.openMinor;
+          const absOpen = open < 0n ? -open : open;
+          const free = live?.freeMinor ?? null;
           return (
             <li key={p.openItemId} className="mt-alloc-row">
               <div className="mt-alloc-head">
@@ -56,15 +64,22 @@ export function AllocationEditor({
                   className="input num"
                   inputMode="decimal"
                   autoComplete="off"
+                  spellCheck={false}
+                  maxLength={24}
                   value={p.text}
                   aria-invalid={row?.error ? true : undefined}
-                  {...(row?.error ? { "aria-describedby": errId } : {})}
+                  aria-describedby={row?.error ? `${hintId} ${errId}` : hintId}
                   onChange={(e) => onText(p.openItemId, e.target.value)}
                 />
               </label>
-              <span className="cap">
-                Open {formatMoney(p.openMinor, p.currency)}
-                {p.openMinor < 0n && " (credit note)"}
+              <span id={hintId} className="cap">
+                Open in Exact {formatMoney(open, p.currency)}
+                {open < 0n && " (credit note)"}
+                {free === null
+                  ? " · checking what is still free…"
+                  : free === absOpen
+                    ? ""
+                    : ` · ${formatMoney(absOpen - free, p.currency)} already matched here · ${formatMoney(free, p.currency)} free`}
               </span>
               {row?.error && (
                 <span id={errId} role="alert" className="cap bad">

@@ -171,7 +171,7 @@ export function AutoMatchedList({
   const tableStatus =
     list.status === "ready" ? "ready" : list.status === "error" ? "error" : "loading";
   const changed = () => {
-    list.reload();
+    list.refresh();
     onChanged();
   };
 
@@ -236,9 +236,9 @@ export function AutoMatchedList({
                 setUndoing(null);
                 changed();
               }}
-              onStale={() => {
+              onStale={(message) => {
                 setUndoing(null);
-                toast.show("This match changed in the meantime. The list is refreshed.");
+                toast.show(`${message} The list is refreshed.`);
                 changed();
               }}
             />

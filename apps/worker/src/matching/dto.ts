@@ -42,12 +42,13 @@ export interface TxSqlRow {
   ignored_by: string | null;
   ignored_at: string | null;
   mapped: number;
+  division_id: number | null;
 }
 
 export const TX_SELECT = `SELECT t.id, t.bank_account_id, a.name AS account_name, t.created_at,
   t.completed_at, t.amount_minor, t.currency, t.type, t.reference, t.description,
   t.counterparty_name, t.counterparty_iban, t.match_status, t.state_conflict, t.ignored_reason,
-  t.ignored_note, t.ignored_by, t.ignored_at, (m.id IS NOT NULL) AS mapped
+  t.ignored_note, t.ignored_by, t.ignored_at, (m.id IS NOT NULL) AS mapped, m.division_id
   FROM bank_transactions t
   LEFT JOIN bank_accounts a ON a.id = t.bank_account_id
   LEFT JOIN bank_account_exact_map m ON m.bank_account_id = t.bank_account_id`;
@@ -68,6 +69,7 @@ export function toTxDto(r: TxSqlRow): MatchTxDto {
     counterpartyIbanMasked: r.counterparty_iban === null ? null : maskIban(r.counterparty_iban),
     matchStatus: r.match_status as MatchStatus,
     mapped: r.mapped === 1,
+    divisionId: r.mapped === 1 ? r.division_id : null,
     stateConflict: r.state_conflict === 1,
     ignore:
       r.match_status === "ignored" && r.ignored_reason !== null

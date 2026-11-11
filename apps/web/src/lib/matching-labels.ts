@@ -136,7 +136,10 @@ export function txIsActionable(tx: MatchTxDto): boolean {
 
 // ---- server refusals ---------------------------------------------------------------------------
 
-/** The refusal codes of the matching and booking routes, in plain words. */
+/**
+ * The refusal codes of the matching routes (apps/worker/src/matching/routes.ts), in plain words.
+ * A test reads the worker source and fails when a code the routes can return has no entry here.
+ */
 export const ERROR_TEXT: Record<string, string> = {
   // 409: the data changed while the sheet was open
   already_matched: "This bank line was matched in the meantime. The sheet shows the latest state.",
@@ -145,7 +148,7 @@ export const ERROR_TEXT: Record<string, string> = {
     "Revolut changed this bank line after it was final. An administrator must check it first.",
   item_has_live_match: "Another match already uses this invoice.",
   item_changed:
-    "An invoice changed while you were working: it was paid, closed or matched elsewhere. Check the list again.",
+    "An invoice changed while you were working: it was paid, closed or matched elsewhere. Check the amounts again.",
   different_relation:
     "This invoice belongs to a different customer or supplier than the sender's account. Tick the box to confirm.",
   already_undone: "This match was already undone.",
@@ -168,7 +171,8 @@ export const ERROR_TEXT: Record<string, string> = {
   currency_mismatch: "The invoice currency differs from the bank line.",
   direction_mismatch:
     "An invoice here settles money in the other direction (for example a credit note on a payment).",
-  allocation_exceeds_open: "An amount is more than what is still open on that invoice.",
+  allocation_exceeds_open:
+    "An amount is more than what is still free on that invoice (open in Exact, minus matches already recorded here). The amounts were checked again.",
   allocation_sum_mismatch: "The amounts must add up to the bank line exactly.",
   duplicate_item: "An invoice appears twice. Combine the amounts into one line.",
   allocations_or_ledger: "Choose invoices or a ledger account, not both.",
@@ -179,18 +183,36 @@ export const ERROR_TEXT: Record<string, string> = {
   bad_config: "These settings are not valid. Check the highlighted values.",
   unknown_division: "That administration is not available for matching.",
   unknown_account: "That bank account does not exist.",
-  // booking
+  // 400: a value the server refused
+  bad_request: "That request was not valid. Check the values and try again.",
+  bad_note: "The note is missing or too long (up to 200 characters).",
+  bad_reason: "The reason is missing or too long (up to 200 characters).",
+  bad_ledger_account: "That ledger account code is not valid.",
+  bad_allocations: "The amounts are not valid.",
+  bad_confirm: "The confirmation was not valid. Try again.",
+  bad_transaction: "That bank line is not valid. Close the sheet and open it again.",
+  bad_type: "The payment type is not valid. Use one lower-case word.",
+  bad_direction: "The direction is not valid.",
+  bad_max_amount: "The maximum amount is not valid.",
+  bad_enabled: "The on/off value was not valid. Try again.",
+  bad_auto_enabled: "The on/off value was not valid. Try again.",
+  bad_account: "That bank account is not valid.",
+  bad_division: "That administration is not valid.",
+  bad_journal_code: "That journal code is not valid.",
+  bad_gl_account: "That bank ledger account code is not valid.",
+  bad_ids: "The invoices could not be checked. Remove one and try again.",
+  bad_status: "That filter is not valid.",
+  bad_q: "That search is too long or not valid.",
+  bad_limit: "That page size is not valid.",
+  bad_cursor: "The list moved. It is shown from the start again.",
+  // booking routes (M7c): codes not known here fall back to a calm general sentence
   not_verified: "The Exact write path is not verified yet.",
   blocked: "Booking cannot be switched on until the listed blockers are fixed.",
   // general
   not_found: "That item no longer exists. The list is refreshed.",
   forbidden: "You do not have permission to do this.",
-  bad_request: "That request was not valid. Check the values and try again.",
   unauthenticated: "Your session ended. Sign in again to continue.",
-  bad_note: "The note is missing or too long (up to 200 characters).",
-  bad_reason: "The reason is missing or too long (up to 200 characters).",
-  bad_ledger_account: "That ledger account code is not valid.",
-  bad_allocations: "The amounts are not valid.",
+  csrf: "The request was refused. Reload the page and try again.",
 };
 
 /** A refusal that means "the data moved": show it, then refresh the sheet and the queue. */
@@ -216,21 +238,40 @@ export function describeMatchError(e: unknown): string {
 // ---- booking in Exact --------------------------------------------------------------------------
 
 /**
- * The sentence in every confirmation that says what happens in Exact. `null` means the booking
- * setting could not be read (a person without access, or a failed request): the wording then
- * does not promise either way.
+ * What the booking setting means for a new match: `off` (nothing goes to Exact), `blocked` (on, but
+ * something stops it right now), `ready` (on and nothing blocks it), `unknown` (the setting could
+ * not be read). One function for the confirmation wording and the Settings chip.
+ */
+export type BookingState = "off" | "blocked" | "ready" | "unknown";
+
+export function bookingState(
+  s: { enabled: boolean; blockers: readonly string[]; protocolChanged?: boolean } | null,
+): BookingState {
+  if (s === null) return "unknown";
+  if (!s.enabled) return "off";
+  return s.blockers.length > 0 || s.protocolChanged === true ? "blocked" : "ready";
+}
+
+/** Recording a match never moves money; every confirmation says so. */
+export const NO_PAYMENT = "No money is paid or moved.";
+
+/**
+ * The sentence in every match confirmation that says what happens in Exact, keyed off the real
+ * `enabled` + `blockers` state. Readable by every role (the booking settings GET is open to all).
  */
 export function bookingSentence(
-  s: { enabled: boolean; blockers: readonly string[] } | null,
+  s: { enabled: boolean; blockers: readonly string[]; protocolChanged?: boolean } | null,
 ): string {
-  if (s === null) {
-    return "This is recorded in the app. Whether it is then booked in Exact depends on a setting an administrator controls.";
+  switch (bookingState(s)) {
+    case "unknown":
+      return `This is recorded in the app. The booking setting could not be read, so it is not certain whether it is then booked in Exact. ${NO_PAYMENT}`;
+    case "off":
+      return `This is recorded in the app only. Nothing is booked in Exact, because booking in Exact is off. ${NO_PAYMENT}`;
+    case "blocked":
+      return `This is recorded in the app. Booking in Exact is on but blocked right now, so nothing is booked yet; once it is unblocked it is booked in Exact automatically afterwards and cannot be undone here. ${NO_PAYMENT}`;
+    case "ready":
+      return `This is recorded in the app, then booked in Exact automatically afterwards and cannot be undone here. ${NO_PAYMENT}`;
   }
-  if (!s.enabled) return "This is recorded in the app only; nothing is booked in Exact yet.";
-  if (s.blockers.length > 0) {
-    return "This is recorded in the app. Booking in Exact is switched on but blocked right now; once it is unblocked, booking happens automatically and cannot be undone here.";
-  }
-  return "Booking in Exact happens automatically afterwards and cannot be undone here.";
 }
 
 export const BOOKING_STATUS: Record<
@@ -285,21 +326,30 @@ export const OUTBOX_ACTIONABLE: readonly BookingStatus[] = [
   "manual_required",
 ];
 
-const BLOCKER_TEXT: Record<string, string> = {
+/** The blocker codes GET /api/booking/settings can return (fixed with M7c). */
+export const BOOKING_BLOCKERS = [
+  "not_verified",
+  "protocol_changed",
+  "bank_entries_undecided",
+  "no_exact_connection",
+  "writes_disabled",
+] as const;
+export type BookingBlocker = (typeof BOOKING_BLOCKERS)[number];
+
+const BLOCKER_TEXT: Record<BookingBlocker, string> = {
   not_verified: "The Exact write path has not been verified on a test administration.",
-  protocol_changed: "The Exact write format changed since it was verified.",
-  creates_bank_entries_unknown:
+  protocol_changed: "The Exact write format changed since it was verified. Verify it again.",
+  bank_entries_undecided:
     "It is not decided who creates the bank entries in Exact (Settings, Connections).",
-  no_account_map: "No bank account is linked to an administration yet.",
-  exact_not_connected: "Exact is not connected.",
-  revolut_not_connected: "Revolut is not connected.",
+  no_exact_connection: "Exact is not connected, or the connection needs to be renewed.",
+  writes_disabled: "Writes to Exact are switched off for this installation.",
 };
 
-/** A blocker from the server as a sentence (known codes mapped, unknown ones made readable). */
+/** Never echoes the server's text: an unknown code gets one fixed sentence. */
+export const BLOCKER_FALLBACK = "Something else blocks booking. An administrator can check it.";
+
 export function blockerText(b: string): string {
-  if (Object.prototype.hasOwnProperty.call(BLOCKER_TEXT, b)) return BLOCKER_TEXT[b] as string;
-  const words = b.replace(/[_-]+/g, " ").trim();
-  if (words === "") return "Something blocks booking.";
-  const s = words.charAt(0).toUpperCase() + words.slice(1);
-  return /[.!?]$/.test(s) ? s : `${s}.`;
+  return Object.prototype.hasOwnProperty.call(BLOCKER_TEXT, b)
+    ? BLOCKER_TEXT[b as BookingBlocker]
+    : BLOCKER_FALLBACK;
 }

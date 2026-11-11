@@ -86,7 +86,9 @@ an unsafe config). Limits: `autoMatchMinScore` 95-100 (CLAUDE.md 4.2), gap 1-100
 Ledger patterns need an id (unique), a ledger account code, at least one test, positive `maxAmountMinor`, and regexes
 from the safe subset: at most 200 characters, flags `iu`, no backreferences or lookaround, no quantified group that
 contains a quantifier or an alternation (`(a+)+`, `(a|b)*`), at most 2 unbounded quantifiers, repeats up to 50. Inputs
-are cut to 256 characters. A regex outside the subset never matches.
+are cut to 256 characters. A regex outside the subset never matches. Amended by review M7d (ADR 0043): a backtracking
+budget, the product of the choices of every bounded quantifier and alternation at most 2^(12 - 5 x unbounded quantifiers)
+(`too_complex`), because long runs of optional atoms or alternations stayed inside the rules and were exponential.
 
 ## Explanations
 Plain English, amount first. Invoice numbers, pattern descriptions and codes from outside are cleaned (control and

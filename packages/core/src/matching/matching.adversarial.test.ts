@@ -1133,6 +1133,47 @@ describe("config validation and regex safety", () => {
       expect(unsafeRegexReason(re), re).toBeNull();
     }
   });
+  it("refuses exponential sequences of bounded choices (backtracking budget, review M7d)", () => {
+    const optional = "a?".repeat(30) + "a".repeat(30);
+    const alternation = "(?:a|aa)".repeat(24) + "b";
+    const mixed = "\\s*x\\s*" + "(?:y|z)".repeat(3);
+    for (const re of [
+      optional,
+      alternation,
+      mixed,
+      "a{0,50}a{0,50}a{0,50}b",
+      "a*" + "b?".repeat(10),
+    ]) {
+      expect(unsafeRegexReason(re), re).toBe("too_complex");
+      const t0 = Date.now();
+      expect(safeRegexTest(re, "a".repeat(255) + "c")).toBe(false);
+      expect(Date.now() - t0).toBeLessThan(50);
+    }
+    // Ordinary patterns stay allowed.
+    for (const re of [
+      "^card\\s*payment\\s*fee?",
+      "(?:bank|card|atm) (?:fee|charge)s?",
+      "^revolut (?:business )?fee",
+      "a{0,50}b",
+      "a?".repeat(12),
+    ]) {
+      expect(unsafeRegexReason(re), re).toBeNull();
+    }
+    expect(unsafeRegexReason("a?".repeat(13))).toBe("too_complex");
+  });
+  it("every allowed pattern near the budget stays fast on adversarial input", () => {
+    const t0 = Date.now();
+    for (const re of [
+      "a?".repeat(12) + "a".repeat(12) + "b",
+      "(?:a|aa)".repeat(12) + "b",
+      "a*" + "a?".repeat(7) + "b",
+      "a*a+(?:a|aa)(?:a|aa)b",
+    ]) {
+      expect(unsafeRegexReason(re), re).toBeNull();
+      safeRegexTest(re, "a".repeat(300));
+    }
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
   it("an allowed worst case stays fast on the capped input", () => {
     const t0 = Date.now();
     for (let i = 0; i < 5; i++) safeRegexTest("a*a+b", "a".repeat(10_000));

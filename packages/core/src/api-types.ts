@@ -747,6 +747,11 @@ export interface MatchTxDto {
   matchStatus: MatchStatus;
   /** The bank account has an Exact administration mapping (matching needs it). */
   mapped: boolean;
+  /**
+   * The Exact administration (divisions.id) the bank account is mapped to: the only one whose open
+   * items this line can be matched to. Null exactly when `mapped` is false (review M7d).
+   */
+  divisionId: number | null;
   stateConflict: boolean;
   ignore: { reason: MatchIgnoreReason; note: string | null; by: string; at: string } | null;
 }
@@ -939,6 +944,29 @@ export interface MatchPatternRequest {
   direction?: "in" | "out" | null;
   maxAmountMinor?: number | null;
   enabled?: boolean;
+}
+
+/**
+ * GET /api/matching/items?ids=1,2 (any role; up to 20 ids): what is still FREE on open items for a
+ * manual match, i.e. the open balance from Exact minus the live matches in this app (the same
+ * number the server checks on POST /api/matching/matches). Unknown ids are left out.
+ */
+export interface MatchItemBalanceDto {
+  openItemId: number;
+  divisionId: number;
+  kind: "invoice" | "bill";
+  currency: string;
+  status: string;
+  /** Signed open balance from Exact (credit notes negative). */
+  openMinor: number;
+  /** Sum of live in-app allocations on this item (a magnitude, never negative). */
+  matchedMinor: number;
+  /** max(0, |openMinor| - matchedMinor): the most a new allocation may take. */
+  freeMinor: number;
+}
+
+export interface MatchItemBalancesResponse {
+  items: MatchItemBalanceDto[];
 }
 
 /** GET /api/matching/stats */

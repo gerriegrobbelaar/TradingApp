@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { phraseMatches } from "@camelthorn/core";
 import { Button } from "@camelthorn/ui";
 import { useAction } from "../../lib/useAction";
 import { DrillSheet } from "../DrillSheet";
@@ -43,13 +44,19 @@ export function TypedPhraseSheet({
     }
   }, [open, clear]);
   const noteOk = !note || !note.required || text.trim() !== "";
-  const ready = (phrase === undefined || typed === phrase) && noteOk;
+  // Exact, case-sensitive, NOT trimmed (core phraseMatches; the server compares with === too).
+  const ready = (phrase === undefined || phraseMatches(typed, phrase)) && noteOk;
   async function go() {
     const r = await run(() => onConfirm({ phrase: typed, note: text.trim() }));
     if (r?.ok) onDone();
   }
   return (
-    <DrillSheet open={open} title={title} onClose={onClose}>
+    <DrillSheet
+      open={open}
+      title={title}
+      onClose={onClose}
+      dirty={!state.busy && (typed !== "" || text.trim() !== "")}
+    >
       <div className="mt-phrase">
         {intro}
         {note && (

@@ -170,7 +170,9 @@ export function AccountMapCard() {
       <h2 className="h2">Account map</h2>
       <p className="lede">
         A bank line is matched only when its account is linked to an administration, a journal and a
-        bank ledger account. Unmapped accounts are skipped.
+        bank ledger account. Unmapped accounts are skipped. A change affects future matching only:
+        matches already recorded keep their administration (a change of administration is refused
+        while live matches use the account).
       </p>
       {res.status === "error" && (
         <ErrorNotice message={describeLoadError(res.error)} onRetry={res.reload} />

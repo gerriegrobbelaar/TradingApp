@@ -204,7 +204,7 @@ export function ReviewQueue({
         id={sheetId}
         onClose={() => setSheetId(null)}
         onChanged={() => {
-          list.reload();
+          list.refresh();
           onChanged();
         }}
       />

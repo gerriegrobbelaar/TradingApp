@@ -11,8 +11,12 @@ import {
   REVIEW_REASON_LABELS,
   blockLabel,
   blockLabels,
+  BLOCKER_FALLBACK,
+  BOOKING_BLOCKERS,
+  NO_PAYMENT,
   blockerText,
   bookingSentence,
+  bookingState,
   describeMatchError,
   exactStateLabel,
   isStale,
@@ -116,14 +120,21 @@ describe("server refusals in plain words", () => {
       const text = describeMatchError(new ApiError(code.startsWith("bad_") ? 400 : 409, code));
       expect(text, code).toMatch(/^[A-Z]/);
       expect(text, code).not.toContain(code);
-      if (!code.startsWith("bad_")) expect(ERROR_TEXT[code], code).toBeTruthy();
+      // Every code has its OWN sentence, bad_* included (review M7d): a new code fails here.
+      expect(Object.prototype.hasOwnProperty.call(ERROR_TEXT, code), code).toBe(true);
+    }
+  });
+
+  it("finds the codes added by review M7d in the worker source (the scan is not empty-handed)", () => {
+    for (const c of ["bad_ids", "item_changed", "allocation_exceeds_open", "has_live_matches"]) {
+      expect(codes, c).toContain(c);
     }
   });
 
   it("maps the codes the brief names", () => {
     const say = (status: number, code: string) => describeMatchError(new ApiError(status, code));
     expect(say(409, "item_has_live_match")).toMatch(/already uses this invoice/);
-    expect(say(422, "allocation_exceeds_open")).toMatch(/more than what is still open/);
+    expect(say(422, "allocation_exceeds_open")).toMatch(/more than what is still free/);
     expect(say(422, "allocation_sum_mismatch")).toMatch(/add up to the bank line/);
     expect(say(409, "tx_state_conflict")).toMatch(/administrator must check/);
     expect(say(422, "division_inactive")).toMatch(/not being synced/);
@@ -152,21 +163,61 @@ describe("server refusals in plain words", () => {
 });
 
 describe("booking wording", () => {
-  it("says what happens in Exact for each setting", () => {
-    expect(bookingSentence({ enabled: false, blockers: [] })).toBe(
-      "This is recorded in the app only; nothing is booked in Exact yet.",
-    );
-    expect(bookingSentence({ enabled: true, blockers: [] })).toBe(
-      "Booking in Exact happens automatically afterwards and cannot be undone here.",
-    );
-    expect(bookingSentence({ enabled: true, blockers: ["not_verified"] })).toMatch(/blocked/);
-    expect(bookingSentence(null)).toMatch(/depends on a setting/);
+  const off = { enabled: false, blockers: [] as string[] };
+  const ready = { enabled: true, blockers: [] as string[] };
+  const blocked = { enabled: true, blockers: ["not_verified"] };
+  const protocol = { enabled: true, blockers: [] as string[], protocolChanged: true };
+  const offButBlocked = { enabled: false, blockers: ["writes_disabled"] };
+
+  it("keys the state off enabled + blockers (matrix)", () => {
+    expect(bookingState(null)).toBe("unknown");
+    expect(bookingState(off)).toBe("off");
+    expect(bookingState(offButBlocked)).toBe("off");
+    expect(bookingState(ready)).toBe("ready");
+    expect(bookingState(blocked)).toBe("blocked");
+    expect(bookingState(protocol)).toBe("blocked");
   });
 
-  it("turns blockers into sentences", () => {
-    expect(blockerText("not_verified")).toMatch(/not been verified/);
-    expect(blockerText("some_new_thing")).toBe("Some new thing.");
-    expect(blockerText("")).toBe("Something blocks booking.");
+  it("only the ready state promises booking now; every state says no money moves", () => {
+    expect(bookingSentence(ready)).toBe(
+      "This is recorded in the app, then booked in Exact automatically afterwards and cannot be undone here. No money is paid or moved.",
+    );
+    expect(bookingSentence(off)).toBe(
+      "This is recorded in the app only. Nothing is booked in Exact, because booking in Exact is off. No money is paid or moved.",
+    );
+    expect(bookingSentence(offButBlocked)).toBe(bookingSentence(off));
+    expect(bookingSentence(blocked)).toMatch(/on but blocked right now, so nothing is booked yet/);
+    expect(bookingSentence(protocol)).toBe(bookingSentence(blocked));
+    expect(bookingSentence(null)).toMatch(/could not be read/);
+    for (const s of [null, off, ready, blocked, protocol]) {
+      expect(bookingSentence(s)).toContain(NO_PAYMENT);
+      expect(bookingSentence(s)).not.toMatch(/\bpaid\b(?! or moved)/);
+    }
+    for (const s of [null, off, blocked]) {
+      expect(bookingSentence(s)).not.toMatch(/^This is recorded in the app, then booked/);
+    }
+  });
+
+  it("labels exactly the fixed blocker codes, and never echoes an unknown one", () => {
+    expect([...BOOKING_BLOCKERS].sort()).toEqual(
+      [
+        "bank_entries_undecided",
+        "no_exact_connection",
+        "not_verified",
+        "protocol_changed",
+        "writes_disabled",
+      ].sort(),
+    );
+    const texts = BOOKING_BLOCKERS.map(blockerText);
+    expect(new Set(texts).size).toBe(BOOKING_BLOCKERS.length);
+    for (const t of texts) {
+      expect(t).not.toBe(BLOCKER_FALLBACK);
+      expect(t).toMatch(/^[A-Z].*\.$/);
+      expect(t).not.toMatch(/[a-z]+_[a-z]+/);
+    }
+    for (const odd of ["some_new_thing", "", "__proto__", "NL91ABNA0417164300", "<b>x</b>"]) {
+      expect(blockerText(odd)).toBe(BLOCKER_FALLBACK);
+    }
   });
 
   it("labels every status and the Exact state", () => {

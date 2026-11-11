@@ -111,7 +111,7 @@ export function IgnoredList({
     rowId,
   );
   const changed = () => {
-    list.reload();
+    list.refresh();
     onChanged();
   };
   const columns = useMemo<Column<MatchQueueItem>[]>(
@@ -145,7 +145,7 @@ export function IgnoredList({
           ]
         : []),
     ],
-    [canAct, list.reload, onChanged],
+    [canAct, list.refresh, onChanged],
   );
   const tableStatus =
     list.status === "ready" ? "ready" : list.status === "error" ? "error" : "loading";

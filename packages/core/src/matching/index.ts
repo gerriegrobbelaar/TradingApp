@@ -7,6 +7,8 @@ export {
   MAX_PATTERN_LENGTH,
   MAX_REGEX_INPUT,
   MIN_AUTO_SCORE,
+  REGEX_PROBLEM_CODES,
+  type RegexProblemCode,
   assertMatchConfig,
   compileSafeRegex,
   safeRegexTest,

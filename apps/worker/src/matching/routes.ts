@@ -35,6 +35,7 @@ import {
   type MatchPatternDto,
   type MatchPatternsResponse,
   type MatchQueueResponse,
+  type MatchItemBalancesResponse,
   type MatchStatsResponse,
   type MatchTunablesDto,
   type MatchUndoResponse,
@@ -319,6 +320,54 @@ async function detailHandler(ctx: Ctx): Promise<Response> {
     transaction: toTxDto(tx),
     candidates: (await loadSuggestions(db, [id])).get(id) ?? [],
     match: matchId === null ? null : ((await loadMatches(db, [matchId])).get(matchId) ?? null),
+  };
+  return json(body);
+}
+
+const MAX_BALANCE_IDS = 20;
+
+/** Free balances of open items for the manual-match editor (see MatchItemBalancesResponse). */
+async function itemBalancesHandler(ctx: Ctx): Promise<Response> {
+  const raw = ctx.url.searchParams.get("ids") ?? "";
+  const parts = raw === "" ? [] : raw.split(",");
+  if (parts.length < 1 || parts.length > MAX_BALANCE_IDS) throw new BadRequest("bad_ids");
+  const ids: number[] = [];
+  for (const p of parts) {
+    if (!/^[1-9]\d{0,12}$/.test(p)) throw new BadRequest("bad_ids");
+    ids.push(Number(p));
+  }
+  const unique = [...new Set(ids)];
+  const marks = unique.map((_, i) => `?${i + 1}`).join(", ");
+  const rows = (
+    await ctx.env.DB.prepare(
+      `SELECT oi.id, oi.division_id, oi.kind, oi.currency, oi.status, oi.open_minor,
+              COALESCE((SELECT SUM(a.allocated_minor) FROM match_allocations a
+                          JOIN matches m ON m.id = a.match_id
+                         WHERE a.open_item_id = oi.id AND m.undone_at IS NULL), 0) AS allocated
+       FROM open_items oi WHERE oi.id IN (${marks}) ORDER BY oi.id`,
+    )
+      .bind(...unique)
+      .all<{
+        id: number;
+        division_id: number;
+        kind: "invoice" | "bill";
+        currency: string;
+        status: string;
+        open_minor: number;
+        allocated: number;
+      }>()
+  ).results;
+  const body: MatchItemBalancesResponse = {
+    items: rows.map((r) => ({
+      openItemId: r.id,
+      divisionId: r.division_id,
+      kind: r.kind,
+      currency: r.currency,
+      status: r.status,
+      openMinor: r.open_minor,
+      matchedMinor: r.allocated,
+      freeMinor: r.status === "open" ? Math.max(0, Math.abs(r.open_minor) - r.allocated) : 0,
+    })),
   };
   return json(body);
 }
@@ -1181,6 +1230,7 @@ export function registerMatchingRoutes(router: Router): void {
   router.add("GET", "/api/matching/auto", ANY_ROLE, safely(autoHandler));
   router.add("GET", "/api/matching/stats", ANY_ROLE, safely(statsHandler));
   router.add("GET", "/api/matching/transactions/:id", ANY_ROLE, safely(detailHandler));
+  router.add("GET", "/api/matching/items", ANY_ROLE, safely(itemBalancesHandler));
   router.add("POST", "/api/matching/matches", FINANCE, safely(createMatchHandler));
   router.add("POST", "/api/matching/matches/:id/undo", FINANCE, safely(undoHandler));
   router.add("POST", "/api/matching/transactions/:id/ignore", FINANCE, safely(ignoreHandler));

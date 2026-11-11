@@ -7,7 +7,11 @@
  *  - at most 200 characters, compiles with flags `iu`;
  *  - no backreferences (`\1`, `\k<name>`) and no lookaround (`(?=`, `(?!`, `(?<=`, `(?<!`);
  *  - no quantified group that itself contains a quantifier or an alternation (`(a+)+`, `(a|b)*`);
- *  - at most 2 unbounded quantifiers (`*`, `+`, `{n,}`), bounded repeats at most {0,50}.
+ *  - at most 2 unbounded quantifiers (`*`, `+`, `{n,}`), bounded repeats at most {0,50};
+ *  - a backtracking budget (review M7d): the product of the choices of every bounded quantifier
+ *    (`?` is 2, `{2,5}` is 4) and every alternation (`a|b|c` is 3) must stay at or below
+ *    2^(12 - 5 x unbounded quantifiers), so 4096, 128 or 4. Without it, `a?a?a?...aaa` or `(?:a|aa)(?:a|aa)...b` stay
+ *    inside the rules above but take exponential time (seconds to minutes in V8).
  * Inputs are cut to 256 characters before testing, which keeps the worst case polynomial and small.
  */
 import type { LedgerPattern, MatchConfig } from "./types";
@@ -31,38 +35,70 @@ export const MAX_PATTERN_LENGTH = 200;
 export const MAX_REGEX_INPUT = 256;
 const MAX_UNBOUNDED = 2;
 const MAX_REPEAT = 50;
+/** log2 of the allowed product of bounded choices with no unbounded quantifier; each one costs 7. */
+const CHOICE_BUDGET_LOG2 = 12;
+const UNBOUNDED_COST_LOG2 = 5;
+
+/** Every reason unsafeRegexReason can return (the web labels each one). */
+export const REGEX_PROBLEM_CODES = [
+  "empty",
+  "too_long",
+  "repeat_too_large",
+  "nested_quantifier",
+  "backreference",
+  "lookaround",
+  "too_many_unbounded_quantifiers",
+  "too_complex",
+  "trailing_escape",
+  "bad_escape",
+  "unclosed_class",
+  "bad_group",
+  "unbalanced",
+  "nothing_to_repeat",
+  "invalid",
+] as const;
+export type RegexProblemCode = (typeof REGEX_PROBLEM_CODES)[number];
 /** CLAUDE.md 4.2: auto-match only when the top score is at least 95. */
 export const MIN_AUTO_SCORE = 95;
 export const MAX_TOLERANCE_MINOR = 100n;
 
 /** Reason the regex is outside the safe subset, or null when it is acceptable. */
-export function unsafeRegexReason(src: string): string | null {
+export function unsafeRegexReason(src: string): RegexProblemCode | null {
   if (src.length === 0) return "empty";
   if (src.length > MAX_PATTERN_LENGTH) return "too_long";
   interface Frame {
     quant: boolean;
     alt: boolean;
+    /** Number of `|` directly in this group. */
+    bars: number;
   }
-  const stack: Frame[] = [{ quant: false, alt: false }];
+  const stack: Frame[] = [{ quant: false, alt: false, bars: 0 }];
   let unbounded = 0;
+  /** Product of bounded choices, saturated far above any budget (integers, no overflow). */
+  let choices = 1;
+  const SATURATE = 2 ** CHOICE_BUDGET_LOG2 + 1;
+  const times = (k: number): void => {
+    choices = Math.min(SATURATE, choices * Math.max(1, k));
+  };
   let i = 0;
-  /** Parses a quantifier at i; returns [length, unbounded, max] or null. */
-  const quantAt = (at: number): [number, boolean] | null | "bad" => {
+  /** Parses a quantifier at i; returns [length, unbounded, choices] or null. */
+  const quantAt = (at: number): [number, boolean, number] | null | "bad" => {
     const c = src[at];
-    if (c === "*" || c === "+") return [1, true];
-    if (c === "?") return [1, false];
+    if (c === "*" || c === "+") return [1, true, 1];
+    if (c === "?") return [1, false, 2];
     if (c === "{") {
       const m = /^\{(\d+)(,(\d*))?\}/.exec(src.slice(at));
       if (!m) return null;
       const min = Number(m[1]);
-      if (m[2] === undefined) return min > MAX_REPEAT ? "bad" : [m[0].length, false];
-      if (m[3] === undefined || m[3] === "") return [m[0].length, true];
-      return Number(m[3]) > MAX_REPEAT ? "bad" : [m[0].length, false];
+      if (m[2] === undefined) return min > MAX_REPEAT ? "bad" : [m[0].length, false, 1];
+      if (m[3] === undefined || m[3] === "") return [m[0].length, true, 1];
+      const max = Number(m[3]);
+      return max > MAX_REPEAT ? "bad" : [m[0].length, false, max - min + 1];
     }
     return null;
   };
   /** After an atom ending at i (exclusive), consume an optional quantifier. */
-  const afterAtom = (atomHasQuantOrAlt: boolean): string | null => {
+  const afterAtom = (atomHasQuantOrAlt: boolean): RegexProblemCode | null => {
     const q = quantAt(i);
     if (q === "bad") return "repeat_too_large";
     if (q === null) return null;
@@ -70,6 +106,7 @@ export function unsafeRegexReason(src: string): string | null {
     i += q[0];
     if (src[i] === "?") i++; // lazy
     if (q[1]) unbounded++;
+    else times(q[2]);
     const top = stack[stack.length - 1];
     if (top) top.quant = true;
     if (quantAt(i) !== null) return "nested_quantifier";
@@ -109,7 +146,7 @@ export function unsafeRegexReason(src: string): string | null {
           return "lookaround";
         }
       }
-      stack.push({ quant: false, alt: false });
+      stack.push({ quant: false, alt: false, bars: 0 });
       i++;
       if (src[i] === "?") {
         // (?: or (?<name>
@@ -125,6 +162,7 @@ export function unsafeRegexReason(src: string): string | null {
     if (c === ")") {
       const g = stack.pop();
       if (!g || stack.length === 0) return "unbalanced";
+      times(g.bars + 1);
       i++;
       const r = afterAtom(g.quant || g.alt);
       if (r) return r;
@@ -134,7 +172,10 @@ export function unsafeRegexReason(src: string): string | null {
     }
     if (c === "|") {
       const top = stack[stack.length - 1];
-      if (top) top.alt = true;
+      if (top) {
+        top.alt = true;
+        top.bars++;
+      }
       i++;
       continue;
     }
@@ -145,6 +186,8 @@ export function unsafeRegexReason(src: string): string | null {
   }
   if (stack.length !== 1) return "unbalanced";
   if (unbounded > MAX_UNBOUNDED) return "too_many_unbounded_quantifiers";
+  times((stack[0] as Frame).bars + 1);
+  if (choices > 2 ** (CHOICE_BUDGET_LOG2 - UNBOUNDED_COST_LOG2 * unbounded)) return "too_complex";
   try {
     new RegExp(src, "iu");
   } catch {

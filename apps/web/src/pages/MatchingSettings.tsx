@@ -19,7 +19,8 @@ function Summary() {
     <Card>
       <h2 className="h2">Matching</h2>
       <p className="lede">
-        Only administrators can change or see the details of matching. This is the current state.
+        Only administrators can change matching or see its thresholds, patterns and account map.
+        This is the current state.
       </p>
       {res.status === "error" && (
         <ErrorNotice message={describeLoadError(res.error)} onRetry={res.reload} />
@@ -97,7 +98,7 @@ function AdminCards() {
         </>
       )}
       <PatternsCard />
-      <BookingCard />
+      <BookingCard isAdmin />
     </>
   );
 }
@@ -105,5 +106,12 @@ function AdminCards() {
 /** Settings, Matching: administrators edit; everyone else sees the current state. */
 export function MatchingSettings() {
   const me = useSignedIn();
-  return me.roles.includes("admin") ? <AdminCards /> : <Summary />;
+  if (me.roles.includes("admin")) return <AdminCards />;
+  // Everyone signed in may read the booking setting and queue (no buttons without admin).
+  return (
+    <>
+      <Summary />
+      <BookingCard isAdmin={false} />
+    </>
+  );
 }

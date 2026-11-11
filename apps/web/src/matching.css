@@ -221,3 +221,21 @@
     padding: 10px;
   }
 }
+
+/* Sheet: "Discard what you typed?" (packages/ui Sheet, review M7d) */
+.sheet-discard {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.sheet-discard p {
+  margin: 0;
+}
+.sheet-discard-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}

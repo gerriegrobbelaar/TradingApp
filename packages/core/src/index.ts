@@ -16,6 +16,7 @@ export * from "./approvals";
 export * from "./schedule-rules";
 export * from "./redact";
 export * from "./bank-tx";
+export * from "./confirm-phrases";
 export { sha256Hex } from "./sha256";
 
 export * from "./decimal";

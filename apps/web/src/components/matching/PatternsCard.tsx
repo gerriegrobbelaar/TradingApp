@@ -1,11 +1,17 @@
 import { useMemo, useState } from "react";
-import type { MatchPatternDto, MatchPatternsResponse } from "@camelthorn/core";
+import {
+  MAX_PATTERN_LENGTH,
+  MAX_REGEX_INPUT,
+  type MatchPatternDto,
+  type MatchPatternsResponse,
+} from "@camelthorn/core";
 import { Button, Card, Chip, Skeleton } from "@camelthorn/ui";
 import { createPattern, deletePattern, getPatterns, updatePattern } from "../../api-matching";
 import { describeLoadError } from "../../lib/errors";
 import {
   EMPTY_PATTERN,
   checkPattern,
+  regexProblem,
   testPattern,
   type PatternForm,
 } from "../../lib/matching-settings";
@@ -49,7 +55,8 @@ function PatternSheet({
   onSaved: () => void;
 }) {
   const toast = useToast();
-  const [form, setForm] = useState<PatternForm>(() => (editing ? formOf(editing) : EMPTY_PATTERN));
+  const initial = useMemo(() => (editing ? formOf(editing) : EMPTY_PATTERN), [editing]);
+  const [form, setForm] = useState<PatternForm>(initial);
   const [text, setText] = useState("");
   const { state, run } = useAction();
   const check = useMemo(() => checkPattern(form), [form]);
@@ -69,6 +76,8 @@ function PatternSheet({
     }
   }
 
+  const dirty = JSON.stringify(form) !== JSON.stringify(initial) || text !== "";
+
   const field = (key: keyof PatternForm, label: string, hint?: string, mono = false) => (
     <label className="field">
       {label}
@@ -76,6 +85,7 @@ function PatternSheet({
         className={`input${mono ? " mt-mono" : ""}`}
         autoComplete="off"
         spellCheck={false}
+        maxLength={mono ? MAX_PATTERN_LENGTH : 80}
         value={String(form[key])}
         aria-invalid={errors[key] ? true : undefined}
         onChange={(e) => set(key, e.target.value as never)}
@@ -90,6 +100,7 @@ function PatternSheet({
       title={editing ? "Edit ledger pattern" : "Add ledger pattern"}
       onClose={onClose}
       viewKey={String(editing?.id ?? "new")}
+      dirty={dirty && !state.busy}
     >
       <form
         className="mt-form"
@@ -99,9 +110,10 @@ function PatternSheet({
         }}
       >
         <p className="cap">
-          A pattern books a bank line to a ledger account when every condition you fill in fits.
-          Patterns use a safe subset of regular expressions: no back-references, no look-ahead and
-          no nested repeats.
+          A pattern suggests a ledger account for a bank line when every condition you fill in fits.
+          Patterns use a safe subset of regular expressions: no back-references, no look-ahead, no
+          nested repeats and only a few optional parts. A change affects future matching runs only;
+          matches already recorded stay as they are.
         </p>
         {field("name", "Name", "For example Bank costs")}
         {field("ledgerAccountCode", "Ledger account code", "For example 4500")}
@@ -146,9 +158,16 @@ function PatternSheet({
               className="input"
               value={text}
               autoComplete="off"
-              onChange={(e) => setText(e.target.value)}
+              spellCheck={false}
+              maxLength={MAX_REGEX_INPUT}
+              aria-describedby="mt-test-hint"
+              onChange={(e) => setText(e.target.value.slice(0, MAX_REGEX_INPUT))}
             />
           </label>
+          <p id="mt-test-hint" className="cap">
+            Tested in this browser with the same safe rules as the server, on the first{" "}
+            {MAX_REGEX_INPUT} characters. Nothing is saved.
+          </p>
           <ul aria-label="Test results" role="status" className="mt-test-results">
             {text !== "" && results.length === 0 && (
               <li className="cap">Fill in a valid name or reference pattern to test it.</li>
@@ -206,7 +225,8 @@ export function PatternsCard() {
       </div>
       <p className="lede">
         Patterns suggest a ledger account for lines without an invoice, such as bank fees. They are
-        only suggestions unless you allow automatic ledger matches in the thresholds.
+        only suggestions unless you allow automatic ledger matches in the thresholds. A change
+        affects future matching runs only.
       </p>
       {state.needsStepUp && <StepUpNotice />}
       {state.error && <ErrorLine>{state.error}</ErrorLine>}
@@ -233,6 +253,14 @@ export function PatternsCard() {
                 <span className="cap">ledger account {p.ledgerAccountCode}</span>{" "}
                 <Chip tone={p.enabled ? "ok" : "neutral"}>{p.enabled ? "On" : "Off"}</Chip>
                 <p className="cap mt-mono">{conditions(p)}</p>
+                {[p.counterpartyNameRegex, p.referenceRegex].some(
+                  (r) => r !== null && r !== "" && regexProblem(r) !== null,
+                ) && (
+                  <p role="note" className="notice warn">
+                    This pattern is outside the safe rules now, so matching does not run until it is
+                    edited or deleted.
+                  </p>
+                )}
               </div>
               <div className="stack-row">
                 <Button size="sm" aria-label={`Edit ${p.name}`} onClick={() => openSheet(p)}>
@@ -241,7 +269,7 @@ export function PatternsCard() {
                 <ConfirmButton
                   label="Delete"
                   ariaLabel={`Delete ${p.name}`}
-                  question={`Delete ${p.name}?`}
+                  question={`Delete ${p.name}? Future runs stop suggesting it; recorded matches stay.`}
                   confirmLabel="Yes, delete"
                   busy={state.busy}
                   onConfirm={() => void remove(p)}

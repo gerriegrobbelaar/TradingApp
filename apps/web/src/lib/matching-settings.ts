@@ -5,6 +5,7 @@
  */
 import {
   DEFAULT_MATCH_CONFIG,
+  type RegexProblemCode,
   safeRegexTest,
   unsafeRegexReason,
   validateMatchConfig,
@@ -184,7 +185,8 @@ export function checkTunables(form: TunablesForm): TunablesCheck {
 
 // ---- ledger patterns ---------------------------------------------------------------------------
 
-const REGEX_PROBLEM: Record<string, string> = {
+/** Every core reason has a sentence (the Record type fails the build when core adds one). */
+export const REGEX_PROBLEM: Record<RegexProblemCode, string> = {
   empty: "Type a pattern, or leave this empty.",
   too_long: "The pattern is too long (200 characters at most).",
   repeat_too_large: "A repeat count is too large (50 at most).",
@@ -193,6 +195,8 @@ const REGEX_PROBLEM: Record<string, string> = {
   backreference: "Back-references such as \\1 are not allowed.",
   lookaround: "Look-ahead and look-behind groups are not allowed.",
   too_many_unbounded_quantifiers: "Use at most two open-ended repeats (*, + or {n,}).",
+  too_complex:
+    "This pattern has too many optional parts or choices, which can make matching very slow. Simplify it.",
   trailing_escape: "The pattern ends with a lone backslash.",
   bad_escape: "An escape sequence is not complete.",
   unclosed_class: "A character class [ ... ] is not closed.",
@@ -206,7 +210,9 @@ const REGEX_PROBLEM: Record<string, string> = {
 export function regexProblem(src: string): string | null {
   const why = unsafeRegexReason(src);
   if (why === null) return null;
-  return REGEX_PROBLEM[why] ?? "This pattern is not allowed. Simplify it.";
+  return Object.prototype.hasOwnProperty.call(REGEX_PROBLEM, why)
+    ? REGEX_PROBLEM[why]
+    : "This pattern is not allowed. Simplify it.";
 }
 
 export interface PatternForm {

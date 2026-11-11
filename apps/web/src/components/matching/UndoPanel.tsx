@@ -2,7 +2,12 @@ import { useState } from "react";
 import type { MatchDto } from "@camelthorn/core";
 import { Button } from "@camelthorn/ui";
 import { undoMatch } from "../../api-matching";
-import { ALREADY_BOOKED_TEXT, NOT_BOOKED, isStale } from "../../lib/matching-labels";
+import {
+  ALREADY_BOOKED_TEXT,
+  NOT_BOOKED,
+  describeMatchError,
+  isStale,
+} from "../../lib/matching-labels";
 import { useAction } from "../../lib/useAction";
 import { ErrorLine, StepUpNotice } from "./MatchParts";
 
@@ -25,12 +30,12 @@ export function UndoPanel({
   canAct: boolean;
   /** The match was undone. */
   onDone: () => void;
-  /** The server said the data moved (409 and the like): refresh. */
-  onStale: () => void;
+  /** The server said the data moved (409 and the like): say why, then refresh. */
+  onStale: (message: string) => void;
 }) {
   const [reason, setReason] = useState("");
   const [confirming, setConfirming] = useState(false);
-  const { state, run } = useAction();
+  const { state, run, clear } = useAction();
   if (!canAct) return null;
   if (!canUndo(match)) {
     return (
@@ -52,7 +57,13 @@ export function UndoPanel({
   async function confirm() {
     const r = await run(() => undoMatch(match.id, { reason: text }));
     if (r?.ok) onDone();
-    else if (r && isStale(r.error)) onStale();
+    else if (r && isStale(r.error)) {
+      // The caller shows the sentence once (and refreshes); no second copy here.
+      const message = describeMatchError(r.error);
+      clear();
+      setConfirming(false);
+      onStale(message);
+    }
   }
 
   return (
@@ -79,7 +90,8 @@ export function UndoPanel({
         <div className="mt-confirm" role="group" aria-label="Confirm undo">
           <p>
             Undo this match? The bank line goes back to the review list and its invoices are open
-            again. Reason: {text}
+            again in this app. Nothing changes in Exact, because this match is not booked there.
+            Reason: {text}
           </p>
           {state.needsStepUp && <StepUpNotice />}
           {state.error && <ErrorLine>{state.error}</ErrorLine>}

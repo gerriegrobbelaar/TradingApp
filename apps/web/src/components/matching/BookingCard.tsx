@@ -1,9 +1,11 @@
 import { useMemo, useState } from "react";
-import type {
-  BookingOutboxItemDto,
-  BookingOutboxResponse,
-  BookingSettingsResponse,
-  BookingStatus,
+import {
+  BOOKING_ENABLE_PHRASE,
+  BOOKING_VERIFY_PHRASE,
+  type BookingOutboxItemDto,
+  type BookingOutboxResponse,
+  type BookingSettingsResponse,
+  type BookingStatus,
 } from "@camelthorn/core";
 import { Button, Card, Chip, Skeleton } from "@camelthorn/ui";
 import {
@@ -21,7 +23,9 @@ import {
   BOOKING_STATUS_ORDER,
   OUTBOX_ACTIONABLE,
   blockerText,
+  bookingState,
 } from "../../lib/matching-labels";
+import { maskIbanLike } from "../../lib/mask";
 import { useAction } from "../../lib/useAction";
 import { useCursorList } from "../../lib/useCursorList";
 import { useResource } from "../../lib/useResource";
@@ -31,15 +35,19 @@ import { EmptyState, ErrorNotice } from "../EmptyState";
 import { ErrorLine, StepUpNotice } from "./MatchParts";
 import { TypedPhraseSheet } from "./TypedPhraseSheet";
 
-export const VERIFY_PHRASE = "I VERIFIED THE EXACT WRITE PATH ON A TEST DIVISION";
-export const ENABLE_PHRASE = "ENABLE EXACT BOOKING";
+/** The phrases live in core (one source for the worker, the web and the tests). */
+export const VERIFY_PHRASE = BOOKING_VERIFY_PHRASE;
+export const ENABLE_PHRASE = BOOKING_ENABLE_PHRASE;
 
 export type BookingChip = "off" | "blocked" | "ready";
 
-/** Off: not switched on. Blocked: something must be fixed. Ready: switched on and nothing blocks it. */
+/**
+ * Off: not switched on (blockers only matter for switching it on). Blocked: on, but something
+ * stops it. Ready: on and nothing blocks it. The same rule as the confirmation wording.
+ */
 export function bookingChip(s: BookingSettingsResponse): BookingChip {
-  if (s.blockers.length > 0 || s.protocolChanged) return "blocked";
-  return s.enabled ? "ready" : "off";
+  const st = bookingState(s);
+  return st === "unknown" ? "off" : st;
 }
 
 const CHIP_TEXT: Record<BookingChip, { label: string; tone: "neutral" | "warn" | "ok" }> = {
@@ -99,7 +107,7 @@ function ResolveSheet({
         <>
           <p>
             {item
-              ? `${formatMoney(magnitude(item.amountMinor), item.currency)} from ${item.counterpartyName ?? "a bank line"}, ${item.kind === "bank_entry" ? "bank entry" : "match in Exact"}.`
+              ? `${formatMoney(magnitude(item.amountMinor), item.currency)} from ${maskIbanLike(item.counterpartyName) ?? "a bank line"}, ${item.kind === "bank_entry" ? "bank entry" : "match in Exact"}.`
               : ""}
           </p>
           <p>{t?.body}</p>
@@ -116,7 +124,7 @@ function ResolveSheet({
   );
 }
 
-function Outbox() {
+function Outbox({ canResolve }: { canResolve: boolean }) {
   const toast = useToast();
   const [status, setStatus] = useState<BookingStatus | "all">("all");
   const [resolving, setResolving] = useState<{
@@ -141,8 +149,10 @@ function Outbox() {
         header: "Bank line",
         render: (r) => (
           <span className="tx-state">
-            <span>{r.counterpartyName ?? "No counterparty"}</span>
-            <span className="cap">{r.itemLabels.join(", ") || NO_VALUE}</span>
+            <span>{maskIbanLike(r.counterpartyName) ?? "No counterparty"}</span>
+            <span className="cap">
+              {r.itemLabels.map((l) => maskIbanLike(l) ?? "").join(", ") || NO_VALUE}
+            </span>
           </span>
         ),
       },
@@ -169,8 +179,12 @@ function Outbox() {
               <Chip tone={s.tone}>{s.label}</Chip>
               <span className="cap">{s.hint}</span>
               {r.attempts > 1 && <span className="cap">{r.attempts} attempts</span>}
-              {r.lastErrorCode && <span className="cap">Error code: {r.lastErrorCode}</span>}
-              {r.exactRef && <span className="cap">Exact reference {r.exactRef}</span>}
+              {r.lastErrorCode && (
+                <span className="cap">Error code: {maskIbanLike(r.lastErrorCode)}</span>
+              )}
+              {r.exactRef && (
+                <span className="cap">Exact reference {maskIbanLike(r.exactRef)}</span>
+              )}
             </span>
           );
         },
@@ -179,13 +193,13 @@ function Outbox() {
         key: "actions",
         header: "Actions",
         render: (r) =>
-          OUTBOX_ACTIONABLE.includes(r.status) ? (
+          canResolve && OUTBOX_ACTIONABLE.includes(r.status) ? (
             <span className="stack-row">
               {(["retry", "booked_manually", "give_up"] as const).map((res) => (
                 <Button
                   key={res}
                   size="sm"
-                  aria-label={`${RESOLUTION_TEXT[res].button}: ${r.counterpartyName ?? `line ${r.transactionId}`}`}
+                  aria-label={`${RESOLUTION_TEXT[res].button}: ${maskIbanLike(r.counterpartyName) ?? `line ${r.transactionId}`}`}
                   onClick={() => setResolving({ item: r, resolution: res })}
                 >
                   {RESOLUTION_TEXT[res].button}…
@@ -197,7 +211,7 @@ function Outbox() {
           ),
       },
     ],
-    [],
+    [canResolve],
   );
   const tableStatus =
     list.status === "ready" ? "ready" : list.status === "error" ? "error" : "loading";
@@ -262,7 +276,7 @@ function Outbox() {
         onDone={() => {
           setResolving(null);
           toast.show("Recorded. The booking queue is refreshed.");
-          list.reload();
+          list.refresh();
         }}
       />
     </section>
@@ -274,8 +288,9 @@ function Outbox() {
 /**
  * Booking in Exact (M7c). Nothing is booked from this screen: it switches the backend path on or
  * off. Verifying the write path and switching it on each need a fresh sign-in and a typed phrase.
+ * Everyone signed in may read the setting and the queue; only an administrator gets the buttons.
  */
-export function BookingCard() {
+export function BookingCard({ isAdmin }: { isAdmin: boolean }) {
   const toast = useToast();
   const res = useResource<BookingSettingsResponse>("booking-settings", (s) =>
     getBookingSettings(s),
@@ -284,7 +299,7 @@ export function BookingCard() {
   const { state, run } = useAction();
 
   async function disable() {
-    const r = await run(() => putBookingSettings({ enabled: false, confirm: "" }));
+    const r = await run(() => putBookingSettings({ enabled: false }));
     if (r?.ok) {
       toast.show("Booking in Exact is off.");
       res.reload();
@@ -348,7 +363,7 @@ export function BookingCard() {
             {s.verified && (
               <div className="dl-row">
                 <dt>Verification note</dt>
-                <dd>{s.verified.note}</dd>
+                <dd>{maskIbanLike(s.verified.note)}</dd>
               </div>
             )}
             <div className="dl-row">
@@ -362,23 +377,30 @@ export function BookingCard() {
           </dl>
           {state.needsStepUp && <StepUpNotice />}
           {state.error && <ErrorLine>{state.error}</ErrorLine>}
-          <div className="stack-row">
-            <Button onClick={() => setSheet("verify")}>Verify write path…</Button>
-            {s.enabled ? (
-              <Button disabled={state.busy} onClick={() => void disable()}>
-                Disable booking
-              </Button>
-            ) : (
-              <Button
-                variant="primary"
-                disabled={s.blockers.length > 0 || s.protocolChanged || s.verified === null}
-                onClick={() => setSheet("enable")}
-              >
-                Enable booking…
-              </Button>
-            )}
-          </div>
-          {!s.enabled && s.verified === null && (
+          {!isAdmin && (
+            <p className="cap" role="note">
+              Only an administrator can verify the write path or switch booking on or off.
+            </p>
+          )}
+          {isAdmin && (
+            <div className="stack-row">
+              <Button onClick={() => setSheet("verify")}>Verify write path…</Button>
+              {s.enabled ? (
+                <Button disabled={state.busy} onClick={() => void disable()}>
+                  Disable booking
+                </Button>
+              ) : (
+                <Button
+                  variant="primary"
+                  disabled={s.blockers.length > 0 || s.protocolChanged || s.verified === null}
+                  onClick={() => setSheet("enable")}
+                >
+                  Enable booking…
+                </Button>
+              )}
+            </div>
+          )}
+          {isAdmin && !s.enabled && s.verified === null && (
             <p className="cap">
               Verify the write path first. Booking cannot be enabled before that.
             </p>
@@ -434,7 +456,7 @@ export function BookingCard() {
           res.reload();
         }}
       />
-      <Outbox />
+      <Outbox canResolve={isAdmin} />
     </Card>
   );
 }

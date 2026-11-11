@@ -1,3 +1,4 @@
+import { AUTO_MATCH_CONFIRM_PHRASE } from "@camelthorn/core";
 import type {
   BookingOutboxItemDto,
   BookingOutboxResponse,
@@ -10,13 +11,16 @@ import type {
   MatchConfigResponse,
   MatchDetailResponse,
   MatchDto,
+  MatchItemBalancesResponse,
   MatchPatternDto,
   MatchQueueItem,
   MatchQueueResponse,
   MatchStatsResponse,
   MatchTunablesDto,
   MatchTxDto,
+  OpenItemListResponse,
 } from "@camelthorn/core";
+import type { Call } from "./test-utils";
 
 export const TUNABLES: MatchTunablesDto = {
   autoMatchMinScore: 95,
@@ -32,6 +36,7 @@ export const TUNABLES: MatchTunablesDto = {
 };
 
 export function mtx(over: Partial<MatchTxDto> = {}): MatchTxDto {
+  const mapped = over.mapped ?? true;
   return {
     id: 1,
     accountId: 1,
@@ -47,6 +52,8 @@ export function mtx(over: Partial<MatchTxDto> = {}): MatchTxDto {
     counterpartyIbanMasked: "NL91****4300",
     matchStatus: "suggested",
     mapped: true,
+    // The line's administration: division 1 when mapped (review M7d), never set when not.
+    divisionId: mapped ? 1 : null,
     stateConflict: false,
     ignore: null,
     ...over,
@@ -170,7 +177,7 @@ export function config(over: Partial<MatchConfigResponse> = {}): MatchConfigResp
     configErrors: [],
     updatedAt: null,
     updatedBy: null,
-    autoConfirmPhrase: "ENABLE AUTOMATIC MATCHING",
+    autoConfirmPhrase: AUTO_MATCH_CONFIRM_PHRASE,
     ...over,
   };
 }
@@ -283,4 +290,59 @@ export function outbox(
     total: items.length,
     countsByStatus: { ...ZERO_COUNTS, ...counts },
   };
+}
+
+type Reply = { status?: number; body?: unknown };
+type Handlers = Record<string, (c: Call) => Reply>;
+
+/**
+ * Serves GET /api/matching/items (review M7d) from the open items the test's own /api/invoices and
+ * /api/bills handlers returned, so the free balance always matches what the picker showed.
+ * `matched` is what live in-app matches already use per item id (default nothing). A handler for
+ * the items route that the test sets itself wins.
+ */
+export function withItemBalances(h: Handlers, matched: Record<number, number> = {}): Handlers {
+  const seen = new Map<number, OpenItemListResponse["items"][number]>();
+  const remember =
+    (fn: ((c: Call) => Reply) | undefined) =>
+    (c: Call): Reply => {
+      const r = fn ? fn(c) : { status: 404, body: { error: "not_found" } };
+      const items = (r.body as Partial<OpenItemListResponse> | undefined)?.items;
+      if (Array.isArray(items)) for (const it of items) seen.set(it.id, it);
+      return r;
+    };
+  const out: Handlers = { ...h };
+  for (const k of ["GET /api/invoices", "GET /api/bills"]) {
+    if (h[k]) out[k] = remember(h[k]);
+  }
+  if (!h["GET /api/matching/items"]) {
+    out["GET /api/matching/items"] = (c) => {
+      const ids = (new URL(c.url, "http://x").searchParams.get("ids") ?? "")
+        .split(",")
+        .filter((x) => x !== "")
+        .map((x) => Number(x));
+      const body: MatchItemBalancesResponse = {
+        items: ids.flatMap((id) => {
+          const it = seen.get(id);
+          if (!it) return [];
+          const abs = it.openMinor < 0 ? -it.openMinor : it.openMinor;
+          const used = matched[id] ?? 0;
+          return [
+            {
+              openItemId: id,
+              divisionId: 1,
+              kind: it.kind,
+              currency: it.currency,
+              status: it.status,
+              openMinor: it.openMinor,
+              matchedMinor: used,
+              freeMinor: it.status === "open" ? Math.max(0, abs - used) : 0,
+            },
+          ];
+        }),
+      };
+      return { body };
+    };
+  }
+  return out;
 }

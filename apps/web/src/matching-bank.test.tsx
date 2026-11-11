@@ -347,8 +347,8 @@ describe("To review", () => {
     expect(within(dialog).queryByRole("button", { name: /Match to/ })).toBeNull();
     expect(within(dialog).queryByRole("radio")).toBeNull();
     expect(calls.filter((c) => c.method !== "GET")).toEqual([]);
-    // a viewer never asks for the booking setting
-    expect(calls_(calls, "/api/booking/settings")).toHaveLength(0);
+    // The booking setting is readable by every role (orchestrator decision M7d): same wording rules.
+    expect(calls_(calls, "/api/booking/settings").length).toBeGreaterThan(0);
   });
 });
 

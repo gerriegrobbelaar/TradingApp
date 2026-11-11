@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { MatchConfigResponse } from "@camelthorn/core";
+import { AUTO_MATCH_CONFIRM_PHRASE, type MatchConfigResponse } from "@camelthorn/core";
 import { Button, Card, Chip } from "@camelthorn/ui";
 import { disableAutoMatching, putMatchConfig } from "../../api-matching";
 import { useAction } from "../../lib/useAction";
@@ -7,8 +7,8 @@ import { useToast } from "../../toasts";
 import { ErrorLine, StepUpNotice } from "./MatchParts";
 import { TypedPhraseSheet } from "./TypedPhraseSheet";
 
-/** The phrase the server also requires; the one it sends is used when present. */
-export const AUTO_PHRASE = "ENABLE AUTOMATIC MATCHING";
+/** The phrase the server also requires (core); the one the server sends wins when present. */
+export const AUTO_PHRASE = AUTO_MATCH_CONFIRM_PHRASE;
 
 /**
  * Automatic matching: off by default. Switching it on needs a fresh sign-in and the typed phrase;

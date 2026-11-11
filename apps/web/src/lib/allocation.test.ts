@@ -10,14 +10,18 @@ import {
   type AllocItem,
 } from "./allocation";
 
-const it1 = (over: Partial<AllocItem> = {}): AllocItem => ({
-  openItemId: 1,
-  kind: "invoice",
-  currency: "EUR",
-  openMinor: 123400n,
-  text: "1234,00",
-  ...over,
-});
+const it1 = (over: Partial<AllocItem> = {}): AllocItem => {
+  const base = {
+    openItemId: 1,
+    kind: "invoice" as const,
+    currency: "EUR",
+    openMinor: 123400n,
+    text: "1234,00",
+    ...over,
+  };
+  const abs = base.openMinor < 0n ? -base.openMinor : base.openMinor;
+  return { ...base, freeMinor: "freeMinor" in over ? (over.freeMinor ?? null) : abs };
+};
 
 describe("parseAmount", () => {
   it("reads decimal text at the currency's scale", () => {
@@ -66,6 +70,90 @@ describe("parseAmount", () => {
     // 2^53 + 1 would round to 2^53 as a float: refused, never silently changed
     expect(parseAmount("90071992547409,93", "EUR")).toEqual({ ok: false, error: "too_large" });
     expect(parseAmount("99999999999999999999", "EUR")).toEqual({ ok: false, error: "too_large" });
+  });
+});
+
+describe("parseAmount: hostile text (review M7d)", () => {
+  it("refuses non-ASCII digits, direction marks, inner spaces and exponent forms", () => {
+    for (const bad of [
+      "١٢٣", // Arabic-Indic
+      "１２３", // full-width
+      "12\u200f34",
+      "\u200e1234",
+      "\u202e1234",
+      "12\u00a034",
+      "1e3",
+      "1E3",
+      "Infinity",
+      "NaN",
+      "1_000",
+      "1'000",
+      "12..5",
+      "12,,5",
+      "1,2,3",
+      "١,٥",
+    ]) {
+      expect(parseAmount(bad, "EUR").ok, JSON.stringify(bad)).toBe(false);
+    }
+  });
+  it("ignores surrounding whitespace (incl. no-break space) only", () => {
+    expect(parseAmount("\u00a0 12,50 \t", "EUR")).toEqual({ ok: true, minor: 1250n });
+  });
+  it("refuses very long text before any BigInt work", () => {
+    expect(parseAmount("1".repeat(100_000), "EUR")).toEqual({ ok: false, error: "too_large" });
+    expect(parseAmount("0".repeat(30) + "1", "EUR")).toEqual({ ok: false, error: "too_large" });
+  });
+  it("documents the grouping rule: 1,500 is refused for EUR and JPY, 1.5 for KWD", () => {
+    expect(parseAmount("1,500", "EUR")).toEqual({ ok: false, error: "decimals" });
+    expect(parseAmount("1.500", "EUR")).toEqual({ ok: false, error: "decimals" });
+    expect(parseAmount("1,500", "JPY")).toEqual({ ok: false, error: "decimals" });
+    expect(parseAmount("1,500", "KWD")).toEqual({ ok: true, minor: 1500n });
+  });
+});
+
+describe("checkAllocations: free balance from the server (review M7d)", () => {
+  it("caps each amount at what is still free, not at the Exact open balance", () => {
+    const c = checkAllocations(100000, "EUR", [
+      it1({ openMinor: 150000n, freeMinor: 90000n, text: "1000" }),
+    ]);
+    expect(c.request).toBeNull();
+    expect(norm(c.rows[0]?.error ?? "")).toMatch(
+      /still free .*open in Exact.*already matched here/,
+    );
+    const ok = checkAllocations(90000, "EUR", [
+      it1({ openMinor: 150000n, freeMinor: 90000n, text: "900" }),
+    ]);
+    expect(ok.request).toEqual([{ openItemId: 1, allocatedMinor: 90000 }]);
+    const oneOver = checkAllocations(90001, "EUR", [
+      it1({ openMinor: 150000n, freeMinor: 90000n, text: "900,01" }),
+    ]);
+    expect(oneOver.request).toBeNull();
+  });
+  it("submits nothing while a free balance is still being checked", () => {
+    const c = checkAllocations(123400, "EUR", [it1({ freeMinor: null })]);
+    expect(c.request).toBeNull();
+    expect(c.message).toMatch(/Checking/);
+  });
+  it("a closed item takes no amount", () => {
+    const c = checkAllocations(123400, "EUR", [it1({ status: "closed", freeMinor: 0n })]);
+    expect(c.request).toBeNull();
+    expect(c.rows[0]?.error).toMatch(/closed/);
+  });
+  it("a credit note's free balance is a magnitude", () => {
+    const c = checkAllocations(-20000, "EUR", [
+      it1({ kind: "invoice", openMinor: -30000n, freeMinor: 20000n, text: "200" }),
+    ]);
+    expect(c.request).toEqual([{ openItemId: 1, allocatedMinor: 20000 }]);
+  });
+  it("sums above 2^53 across rows are exact in BigInt and refused", () => {
+    const max = 9007199254740991n;
+    const c = checkAllocations(9007199254740991, "EUR", [
+      it1({ openItemId: 1, openMinor: max, text: "90071992547409,91" }),
+      it1({ openItemId: 2, openMinor: max, text: "0,01" }),
+    ]);
+    expect(c.sumMinor).toBe(max + 1n);
+    expect(c.differenceMinor).toBe(-1n);
+    expect(c.request).toBeNull();
   });
 });
 

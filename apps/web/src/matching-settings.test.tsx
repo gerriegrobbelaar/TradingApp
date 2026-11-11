@@ -7,6 +7,12 @@ import { configureAxe } from "vitest-axe";
 import { ADMIN, VIEWER, mockFetch, renderApp, type Call } from "./test-utils";
 import { nav, type Me } from "./api";
 import {
+  AUTO_MATCH_CONFIRM_PHRASE,
+  BOOKING_ENABLE_PHRASE,
+  BOOKING_VERIFY_PHRASE,
+} from "@camelthorn/core";
+import { BLOCKER_FALLBACK } from "./lib/matching-labels";
+import {
   accountMap,
   booking,
   config,
@@ -76,18 +82,41 @@ describe("the Matching tab", () => {
     expect(await axe(view.container)).toHaveNoViolations();
   });
 
-  it("shows other roles only the current state and asks for nothing else", async () => {
-    const calls = mockFetch(base({}, FINANCE));
-    renderApp("/settings/matching");
-    expect(await screen.findByRole("heading", { level: 2, name: "Matching" })).toBeTruthy();
-    expect(await screen.findByText("Bank accounts without an administration")).toBeTruthy();
-    expect(screen.queryByRole("heading", { level: 2, name: "Account map" })).toBeNull();
-    expect(screen.queryByRole("button", { name: /Enable|Save|Add pattern/ })).toBeNull();
-    expect(of(calls, "/api/matching/config")).toHaveLength(0);
-    expect(of(calls, "/api/matching/patterns")).toHaveLength(0);
-    expect(of(calls, "/api/booking/settings")).toHaveLength(0);
-    expect(calls.filter((c) => c.method !== "GET")).toEqual([]);
-  });
+  const APPROVER: Me = { ...ADMIN, email: "a@camelthorncapital.com", roles: ["approver"] };
+  for (const me of [FINANCE, APPROVER, VIEWER]) {
+    it(`${me.roles.join()}: the current state and the booking card read-only, no admin reads, no buttons`, async () => {
+      const calls = mockFetch(
+        base(
+          {
+            "GET /api/booking/settings": () => ({ body: booking({ enabled: true }) }),
+            "GET /api/booking/outbox": () => ({
+              body: outbox([outboxItem({ status: "failed" })]),
+            }),
+          },
+          me,
+        ),
+      );
+      renderApp("/settings/matching");
+      expect(await screen.findByRole("heading", { level: 2, name: "Matching" })).toBeTruthy();
+      expect(await screen.findByText("Bank accounts without an administration")).toBeTruthy();
+      expect(screen.queryByRole("heading", { level: 2, name: "Account map" })).toBeNull();
+      // Booking in Exact: readable by every role (orchestrator decision M7d), no actions.
+      await screen.findByRole("heading", { level: 2, name: "Booking in Exact" });
+      await screen.findByRole("table", { name: "Booking queue" });
+      expect(await screen.findByText(/Only an administrator can verify/)).toBeTruthy();
+      expect(
+        screen.queryByRole("button", {
+          name: /Enable|Disable|Verify|Save|Add pattern|Retry|Booked manually|Give up/,
+        }),
+      ).toBeNull();
+      expect(of(calls, "/api/matching/config")).toHaveLength(0);
+      expect(of(calls, "/api/matching/patterns")).toHaveLength(0);
+      expect(of(calls, "/api/matching/account-map")).toHaveLength(0);
+      expect(of(calls, "/api/booking/settings").length).toBeGreaterThan(0);
+      expect(of(calls, "/api/booking/outbox").length).toBeGreaterThan(0);
+      expect(calls.filter((c) => c.method !== "GET")).toEqual([]);
+    });
+  }
 
   it("viewers see the same summary and unmapped accounts are counted", async () => {
     mockFetch(
@@ -334,26 +363,26 @@ describe("automatic matching switch", () => {
     await user.click(within(c).getByRole("button", { name: "Enable automatic matching…" }));
     const dialog = await screen.findByRole("dialog", { name: "Enable automatic matching" });
     const go = within(dialog).getByRole("button", { name: "Enable automatic matching" });
-    const input = within(dialog).getByLabelText(/Type “ENABLE AUTOMATIC MATCHING” to confirm/);
+    const input = within(dialog).getByLabelText(`Type “${AUTO_MATCH_CONFIRM_PHRASE}” to confirm`);
     expect((go as HTMLButtonElement).disabled).toBe(true);
     for (const wrong of [
-      "enable automatic matching",
-      "ENABLE AUTOMATIC MATCHING ",
-      "ENABLE AUTOMATIC",
-      " ENABLE AUTOMATIC MATCHING",
+      AUTO_MATCH_CONFIRM_PHRASE.toLowerCase(),
+      `${AUTO_MATCH_CONFIRM_PHRASE} `,
+      AUTO_MATCH_CONFIRM_PHRASE.slice(0, -1),
+      ` ${AUTO_MATCH_CONFIRM_PHRASE}`,
     ]) {
       await user.clear(input);
       await user.type(input, wrong);
       expect((go as HTMLButtonElement).disabled, wrong).toBe(true);
     }
     await user.clear(input);
-    await user.type(input, "ENABLE AUTOMATIC MATCHING");
+    await user.type(input, AUTO_MATCH_CONFIRM_PHRASE);
     expect((go as HTMLButtonElement).disabled).toBe(false);
     await user.click(go);
     expect(await within(dialog).findByText(/Nothing was changed/)).toBeTruthy();
     expect(of(calls, "/api/matching/config", "PUT")[0]?.body).toEqual({
       autoEnabled: true,
-      confirm: "ENABLE AUTOMATIC MATCHING",
+      confirm: AUTO_MATCH_CONFIRM_PHRASE,
     });
     await user.click(within(dialog).getByRole("button", { name: "Sign in again" }));
     expect(assign).toHaveBeenCalled();
@@ -410,7 +439,7 @@ describe("automatic matching switch", () => {
       }),
     );
     const dialog = await screen.findByRole("dialog");
-    await user.type(within(dialog).getByLabelText(/to confirm/), "ENABLE AUTOMATIC MATCHING");
+    await user.type(within(dialog).getByLabelText(/to confirm/), AUTO_MATCH_CONFIRM_PHRASE);
     await user.click(within(dialog).getByRole("button", { name: "Enable automatic matching" }));
     expect(await within(dialog).findByText(/stored matching settings are not valid/)).toBeTruthy();
   });
@@ -507,6 +536,16 @@ describe("ledger patterns", () => {
     expect(await within(dialog).findByText(/outside the safe subset/)).toBeTruthy();
   });
 
+  it("flags a stored pattern that the safe rules refuse now", async () => {
+    await open({
+      "GET /api/matching/patterns": () => ({
+        body: { patterns: [pattern({ referenceRegex: "(?:a|aa)".repeat(20) })] },
+      }),
+    });
+    const c = card("Ledger patterns");
+    expect(await within(c).findByText(/outside the safe rules now/)).toBeTruthy();
+  });
+
   it("a new pattern starts empty each time", async () => {
     const user = userEvent.setup();
     await open();
@@ -515,6 +554,9 @@ describe("ledger patterns", () => {
     let dialog = await screen.findByRole("dialog");
     await user.type(within(dialog).getByLabelText(/^Name/), "Leftover");
     await user.keyboard("{Escape}");
+    // typed text: the sheet asks first (review M7d)
+    await user.click(within(dialog).getByRole("button", { name: "Discard and close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     await user.click(within(c).getByRole("button", { name: "Add pattern…" }));
     dialog = await screen.findByRole("dialog");
     expect((within(dialog).getByLabelText(/^Name/) as HTMLInputElement).value).toBe("");
@@ -543,32 +585,43 @@ describe("booking in Exact", () => {
     ).toBeTruthy();
   });
 
-  it("Blocked: lists the blockers in plain words and warns when the write format changed", async () => {
+  it("Off with blockers: lists them in plain words, warns when the write format changed, cannot enable", async () => {
     await open({
       "GET /api/booking/settings": () => ({
         body: booking({
           verified,
           protocolChanged: true,
-          blockers: ["protocol_changed", "creates_bank_entries_unknown"],
+          blockers: ["protocol_changed", "bank_entries_undecided", "something_new"],
           createsBankEntries: null,
         }),
       }),
     });
     const c = card("Booking in Exact");
-    expect(await within(c).findByText("Blocked")).toBeTruthy();
+    expect(await within(c).findByText("Off", { selector: ".chip" })).toBeTruthy();
     expect(
-      within(c).getByText("The Exact write format changed since it was verified."),
+      within(c).getByText("The Exact write format changed since it was verified. Verify it again."),
     ).toBeTruthy();
     expect(
       within(c).getByText(/The Exact write format changed since you verified it/),
     ).toBeTruthy();
     expect(within(c).getByText(/not decided who creates the bank entries/)).toBeTruthy();
-    expect(
-      within(c).getByText(/Not decided yet|Who creates the bank entries in Exact is not decided/),
-    ).toBeTruthy();
+    expect(within(c).getByText(BLOCKER_FALLBACK)).toBeTruthy();
+    expect(c.textContent).not.toContain("something_new");
     expect(
       (within(c).getByRole("button", { name: "Enable booking…" }) as HTMLButtonElement).disabled,
     ).toBe(true);
+  });
+
+  it("On but blocked: the chip says Blocked and Disable is still offered", async () => {
+    await open({
+      "GET /api/booking/settings": () => ({
+        body: booking({ enabled: true, verified, blockers: ["no_exact_connection"] }),
+      }),
+    });
+    const c = card("Booking in Exact");
+    expect(await within(c).findByText("Blocked")).toBeTruthy();
+    expect(within(c).getByText(/Exact is not connected/)).toBeTruthy();
+    expect(within(c).getByRole("button", { name: "Disable booking" })).toBeTruthy();
   });
 
   it("Ready: shows who verified it and offers Disable", async () => {
@@ -593,7 +646,7 @@ describe("booking in Exact", () => {
     await user.click(await within(c).findByRole("button", { name: "Verify write path…" }));
     const dialog = await screen.findByRole("dialog", { name: "Verify the Exact write path" });
     const go = within(dialog).getByRole("button", { name: "Record the verification" });
-    const phrase = "I VERIFIED THE EXACT WRITE PATH ON A TEST DIVISION";
+    const phrase = BOOKING_VERIFY_PHRASE;
     const input = within(dialog).getByLabelText(`Type “${phrase}” to confirm`);
     await user.type(input, phrase);
     expect((go as HTMLButtonElement).disabled).toBe(true); // note still empty
@@ -626,26 +679,34 @@ describe("booking in Exact", () => {
     await user.click(await within(c).findByRole("button", { name: "Enable booking…" }));
     const dialog = await screen.findByRole("dialog", { name: "Enable booking in Exact" });
     const go = within(dialog).getByRole("button", { name: "Enable booking" });
-    const input = within(dialog).getByLabelText("Type “ENABLE EXACT BOOKING” to confirm");
+    const input = within(dialog).getByLabelText(`Type “${BOOKING_ENABLE_PHRASE}” to confirm`);
     expect((go as HTMLButtonElement).disabled).toBe(true);
-    await user.type(input, "ENABLE EXACT BOOKIN");
-    expect((go as HTMLButtonElement).disabled).toBe(true);
-    await user.type(input, "G");
+    for (const near of [
+      BOOKING_ENABLE_PHRASE.slice(0, -1),
+      BOOKING_ENABLE_PHRASE.toLowerCase(),
+      ` ${BOOKING_ENABLE_PHRASE}`,
+      `${BOOKING_ENABLE_PHRASE} `,
+      BOOKING_ENABLE_PHRASE.replace(" ", "  "),
+    ]) {
+      await user.clear(input);
+      await user.type(input, near);
+      expect((go as HTMLButtonElement).disabled, JSON.stringify(near)).toBe(true);
+    }
+    await user.clear(input);
+    await user.type(input, BOOKING_ENABLE_PHRASE);
     expect((go as HTMLButtonElement).disabled).toBe(false);
     await user.click(go);
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(of(calls, "/api/booking/settings", "PUT")[0]?.body).toEqual({
       enabled: true,
-      confirm: "ENABLE EXACT BOOKING",
+      confirm: BOOKING_ENABLE_PHRASE,
     });
     expect(await within(c).findByText("Ready")).toBeTruthy();
     await user.click(within(c).getByRole("button", { name: "Disable booking" }));
     expect(screen.queryByRole("dialog")).toBeNull();
     await waitFor(() => expect(of(calls, "/api/booking/settings", "PUT")).toHaveLength(2));
-    expect(of(calls, "/api/booking/settings", "PUT")[1]?.body).toEqual({
-      enabled: false,
-      confirm: "",
-    });
+    // Switching off sends no phrase and needs no fresh sign-in (orchestrator decision M7d).
+    expect(of(calls, "/api/booking/settings", "PUT")[1]?.body).toEqual({ enabled: false });
     expect(await within(c).findByText("Off", { selector: ".chip" })).toBeTruthy();
   });
 
@@ -659,7 +720,7 @@ describe("booking in Exact", () => {
       await within(card("Booking in Exact")).findByRole("button", { name: "Enable booking…" }),
     );
     const dialog = await screen.findByRole("dialog");
-    await user.type(within(dialog).getByLabelText(/to confirm/), "ENABLE EXACT BOOKING");
+    await user.type(within(dialog).getByLabelText(/to confirm/), BOOKING_ENABLE_PHRASE);
     await user.click(within(dialog).getByRole("button", { name: "Enable booking" }));
     expect(
       await within(dialog).findByText(/cannot be switched on until the listed blockers/),

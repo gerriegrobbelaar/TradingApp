@@ -18,6 +18,7 @@ const isMatching = (name: string) =>
   /^\.\/lib\/matching-[\w-]+\.ts$/.test(name) ||
   name.startsWith("./components/matching/") ||
   name === "./api-matching.ts" ||
+  name === "./lib/mask.ts" ||
   name === "./pages/MatchingSettings.tsx";
 
 const files = Object.fromEntries(

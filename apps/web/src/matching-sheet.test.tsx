@@ -7,7 +7,8 @@ import { configureAxe } from "vitest-axe";
 import { ADMIN, VIEWER, mockFetch, renderApp, type Call } from "./test-utils";
 import { nav, type Me } from "./api";
 import { accounts } from "./test-fixtures-bank";
-import { ONE_DIVISION, listResponse, row } from "./test-fixtures";
+import { ONE_DIVISION, TWO_DIVISIONS, listResponse, row } from "./test-fixtures";
+import { bookingSentence } from "./lib/matching-labels";
 import {
   alloc,
   autoItem,
@@ -19,6 +20,7 @@ import {
   mtx,
   queue,
   stats,
+  withItemBalances,
 } from "./test-fixtures-matching";
 
 const axe = configureAxe({ rules: { "color-contrast": { enabled: false } } });
@@ -29,17 +31,20 @@ const of = (calls: Call[], path: string, method = "GET") =>
   calls.filter((c) => c.method === method && c.url.split("?")[0] === path);
 
 type H = Record<string, (c: Call) => { status?: number; body?: unknown }>;
-function base(me: Me = FINANCE, over: H = {}): H {
-  return {
-    "GET /api/auth/me": () => ({ body: me }),
-    "GET /api/divisions": () => ({ body: ONE_DIVISION }),
-    "GET /api/bank/accounts": () => ({ body: accounts() }),
-    "GET /api/matching/stats": () => ({ body: stats() }),
-    "GET /api/matching/queue": () => ({ body: queue([item()]) }),
-    "GET /api/matching/transactions/1": () => ({ body: detail() }),
-    "GET /api/booking/settings": () => ({ body: booking() }),
-    ...over,
-  };
+function base(me: Me = FINANCE, over: H = {}, matched: Record<number, number> = {}): H {
+  return withItemBalances(
+    {
+      "GET /api/auth/me": () => ({ body: me }),
+      "GET /api/divisions": () => ({ body: ONE_DIVISION }),
+      "GET /api/bank/accounts": () => ({ body: accounts() }),
+      "GET /api/matching/stats": () => ({ body: stats() }),
+      "GET /api/matching/queue": () => ({ body: queue([item()]) }),
+      "GET /api/matching/transactions/1": () => ({ body: detail() }),
+      "GET /api/booking/settings": () => ({ body: booking() }),
+      ...over,
+    },
+    matched,
+  );
 }
 async function openSheet(user: ReturnType<typeof userEvent.setup>, who = "Acme B.V.") {
   const t = await screen.findByRole("table", { name: "Bank lines to review" });
@@ -236,7 +241,7 @@ describe("matching a candidate", () => {
     expect(of(calls, "/api/matching/matches", "POST")).toHaveLength(0); // nothing sent yet
     const text = within(dialog).getByTestId("confirm-text");
     expect(norm(text.textContent)).toBe(
-      "Match € 1.234,00 to INV-2024-001 (Acme B.V.). This is recorded in the app only; nothing is booked in Exact yet.",
+      "Match € 1.234,00 to INV-2024-001 (Acme B.V.). This is recorded in the app only. Nothing is booked in Exact, because booking in Exact is off. No money is paid or moved.",
     );
     await user.click(within(dialog).getByRole("button", { name: "Record this match" }));
     await waitFor(() => expect(of(calls, "/api/matching/matches", "POST")).toHaveLength(1));
@@ -281,38 +286,61 @@ describe("matching a candidate", () => {
     expect(of(calls, "/api/matching/matches", "POST")).toHaveLength(1);
   });
 
-  it("the wording follows the booking setting: on, blocked, and unreadable", async () => {
+  it("the wording follows the real booking state: a matrix of off / blocked / ready / unreadable for finance and admin", async () => {
     const user = userEvent.setup();
-    const cases: [H, RegExp][] = [
+    const states: [string, () => { status?: number; body?: unknown }, string][] = [
+      ["off", () => ({ body: booking({ enabled: false }) }), bookingSentence(booking())],
       [
-        { "GET /api/booking/settings": () => ({ body: booking({ enabled: true }) }) },
-        /Booking in Exact happens automatically afterwards and cannot be undone here\.$/,
+        "off with blockers",
+        () => ({ body: booking({ enabled: false, blockers: ["not_verified"] }) }),
+        bookingSentence(booking()),
       ],
       [
-        {
-          "GET /api/booking/settings": () => ({
-            body: booking({ enabled: true, blockers: ["not_verified"] }),
-          }),
-        },
-        /switched on but blocked right now/,
+        "ready",
+        () => ({ body: booking({ enabled: true }) }),
+        bookingSentence(booking({ enabled: true })),
       ],
       [
-        { "GET /api/booking/settings": () => ({ status: 403, body: { error: "forbidden" } }) },
-        /depends on a setting an administrator controls/,
+        "blocked",
+        () => ({ body: booking({ enabled: true, blockers: ["no_exact_connection"] }) }),
+        bookingSentence(booking({ enabled: true, blockers: ["x"] })),
       ],
+      [
+        "protocol changed",
+        () => ({ body: booking({ enabled: true, protocolChanged: true }) }),
+        bookingSentence(booking({ enabled: true, blockers: ["x"] })),
+      ],
+      ["unreadable", () => ({ status: 500, body: { error: "boom" } }), bookingSentence(null)],
     ];
-    for (const [over, re] of cases) {
-      mockFetch(base(FINANCE, over));
-      const { unmount } = renderApp("/treasury/bank?tab=review");
-      const dialog = await openSheet(user);
-      await pick(user, dialog);
-      await user.click(matchSelected(dialog));
-      expect(norm(within(dialog).getByTestId("confirm-text").textContent)).toMatch(re);
-      expect(within(dialog).getByTestId("confirm-text").textContent).not.toMatch(
-        /nothing is booked in Exact yet/,
-      );
-      unmount();
+    for (const me of [FINANCE, ADMIN]) {
+      for (const [name, reply, sentence] of states) {
+        mockFetch(base(me, { "GET /api/booking/settings": reply }));
+        const { unmount } = renderApp("/treasury/bank?tab=review");
+        const dialog = await openSheet(user);
+        await pick(user, dialog);
+        await user.click(matchSelected(dialog));
+        const text = norm(within(dialog).getByTestId("confirm-text").textContent);
+        expect(text, `${me.roles.join()} ${name}`).toBe(
+          `Match € 1.234,00 to INV-2024-001 (Acme B.V.). ${norm(sentence)}`,
+        );
+        const promisesBooking =
+          /then booked in Exact automatically afterwards and cannot be undone here/;
+        if (name === "ready") expect(text).toMatch(promisesBooking);
+        else expect(text, name).not.toMatch(promisesBooking);
+        expect(text).toContain("No money is paid or moved.");
+        unmount();
+      }
     }
+  });
+
+  it("a viewer's sheet reads the booking setting too (open to every role) but offers no action", async () => {
+    const user = userEvent.setup();
+    const calls = mockFetch(base(VIEWER));
+    renderApp("/treasury/bank?tab=review");
+    const dialog = await openSheet(user);
+    expect(of(calls, "/api/booking/settings").length).toBeGreaterThan(0);
+    expect(within(dialog).queryByRole("radio")).toBeNull();
+    expect(within(dialog).queryByRole("button", { name: /Match to selected/ })).toBeNull();
   });
 
   it("Back returns to the candidates without sending anything", async () => {
@@ -324,6 +352,39 @@ describe("matching a candidate", () => {
     await user.click(matchSelected(dialog));
     await user.click(within(dialog).getByRole("button", { name: "Back" }));
     expect(within(dialog).getAllByRole("radio")).toHaveLength(1);
+    expect(calls.filter((c) => c.method === "POST")).toEqual([]);
+  });
+
+  it("keyboard only: J/Enter opens, Space picks, the confirmation takes focus, Back returns it, Escape closes", async () => {
+    const user = userEvent.setup();
+    const calls = mockFetch(base());
+    renderApp("/treasury/bank?tab=review");
+    const t = await screen.findByRole("table", { name: "Bank lines to review" });
+    await waitFor(() => expect(t.querySelector(".sk-row")).toBeNull());
+    (document.activeElement as HTMLElement | null)?.blur();
+    await user.keyboard("j");
+    await user.keyboard("{Enter}");
+    const dialog = await screen.findByRole("dialog", { name: "Match bank line" });
+    await within(dialog).findByText("Counterparty");
+    const radio = within(dialog).getAllByRole("radio")[0] as HTMLElement;
+    radio.focus();
+    await user.keyboard(" ");
+    expect((radio as HTMLInputElement).checked).toBe(true);
+    // "j" typed inside the sheet does nothing to the list behind it
+    await user.keyboard("j");
+    matchSelected(dialog).focus();
+    await user.keyboard("{Enter}");
+    const heading = within(dialog).getByRole("heading", { name: "Check before you record this" });
+    expect(document.activeElement).toBe(heading);
+    await user.tab();
+    await user.tab();
+    expect(document.activeElement?.textContent).toBe("Back");
+    await user.keyboard("{Enter}");
+    expect(document.activeElement).toBe(
+      within(dialog).getByRole("heading", { name: "Candidates, best first" }),
+    );
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(calls.filter((c) => c.method === "POST")).toEqual([]);
   });
 
@@ -430,7 +491,7 @@ describe("matching a candidate", () => {
     [409, "tx_ignored", /ignored in the meantime/],
     [409, "tx_state_conflict", /An administrator must check it first/],
     [409, "item_changed", /paid, closed or matched elsewhere/],
-    [422, "allocation_exceeds_open", /more than what is still open/],
+    [422, "allocation_exceeds_open", /more than what is still free/],
     [422, "allocation_sum_mismatch", /add up to the bank line exactly/],
     [422, "division_inactive", /not being synced/],
     [422, "currency_mismatch", /currency of the invoice|invoice currency differs/i],
@@ -637,17 +698,201 @@ describe("matching another invoice", () => {
     ).toBe(false);
   });
 
-  it("tells you to pick an administration when none is selected", async () => {
+  it("searches only the line's own administration, without a selector, whatever the switcher shows", async () => {
     const user = userEvent.setup();
-    mockFetch(
-      picker({ "GET /api/divisions": () => ({ body: { selectedId: null, divisions: [] } }) }),
+    const calls = mockFetch(
+      picker({
+        "GET /api/divisions": () => ({ body: { ...TWO_DIVISIONS, selectedId: 2 } }),
+        "GET /api/matching/transactions/1": () => ({
+          body: detail({ divisionId: 1, matchStatus: "unmatched" }, []),
+        }),
+      }),
     );
     renderApp("/treasury/bank?tab=review");
     const dialog = await openSheet(user);
     await user.click(within(dialog).getByRole("button", { name: "Match to another invoice…" }));
+    await within(dialog).findByText("INV-21");
+    expect(within(dialog).queryByLabelText("Administration")).toBeNull();
+    for (const c of of(calls, "/api/invoices")) expect(params(c).get("division")).toBe("1");
+    expect(norm(dialog.textContent)).toContain("of Alpha BV, the administration");
+  });
+
+  it("checks the free balance with the server: an amount already matched elsewhere in the app is refused before review", async () => {
+    const user = userEvent.setup();
+    const calls = mockFetch(
+      base(
+        FINANCE,
+        {
+          "GET /api/invoices": () => ({ body: listResponse(items) }),
+          "GET /api/bills": () => ({ body: listResponse([]) }),
+        },
+        { 21: 50000 },
+      ),
+    );
+    renderApp("/treasury/bank?tab=review");
+    const dialog = await openSheet(user);
+    await user.click(within(dialog).getByRole("button", { name: "Match to another invoice…" }));
+    await within(dialog).findByText("INV-21");
+    await user.click(within(dialog).getByRole("button", { name: "Add INV-21" }));
+    await waitFor(() => expect(of(calls, "/api/matching/items").length).toBeGreaterThan(0));
+    expect(params(of(calls, "/api/matching/items")[0]).get("ids")).toBe("21");
+    await waitFor(() =>
+      expect(norm(dialog.textContent)).toContain(
+        "More than the € 500,00 still free (€ 1.000,00 open in Exact, € 500,00 already matched here).",
+      ),
+    );
+    expect(norm(dialog.textContent)).toContain("€ 500,00 already matched here · € 500,00 free");
     expect(
-      await within(dialog).findByText("Pick an administration in the top bar first."),
+      (within(dialog).getByRole("button", { name: "Review this match" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+  });
+
+  it("re-reads the balances right before the confirmation and stays in the editor when one moved", async () => {
+    const user = userEvent.setup();
+    let matchedElsewhere = 0;
+    const calls = mockFetch(
+      base(FINANCE, {
+        "GET /api/invoices": () => ({ body: listResponse(items) }),
+        "GET /api/bills": () => ({ body: listResponse([]) }),
+        "GET /api/matching/items": () => ({
+          body: {
+            items: [
+              {
+                openItemId: 21,
+                divisionId: 1,
+                kind: "invoice",
+                currency: "EUR",
+                status: "open",
+                openMinor: 200000,
+                matchedMinor: matchedElsewhere,
+                freeMinor: 200000 - matchedElsewhere,
+              },
+            ],
+          },
+        }),
+      }),
+    );
+    renderApp("/treasury/bank?tab=review");
+    const dialog = await openSheet(user);
+    await user.click(within(dialog).getByRole("button", { name: "Match to another invoice…" }));
+    await within(dialog).findByText("INV-21");
+    await user.click(within(dialog).getByRole("button", { name: "Add INV-21" }));
+    const input = within(dialog).getByLabelText("Amount for INV-21 (EUR)");
+    await user.clear(input);
+    await user.type(input, "1234,00");
+    await waitFor(() =>
+      expect(
+        (within(dialog).getByRole("button", { name: "Review this match" }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(false),
+    );
+    matchedElsewhere = 190000; // another person matched most of it meanwhile
+    const before = of(calls, "/api/matching/items").length;
+    await user.click(within(dialog).getByRole("button", { name: "Review this match" }));
+    expect(
+      await within(dialog).findByText(
+        "An invoice changed in the meantime. Check the amounts below.",
+      ),
     ).toBeTruthy();
+    expect(of(calls, "/api/matching/items").length).toBe(before + 1);
+    expect(within(dialog).queryByTestId("confirm-text")).toBeNull();
+    expect(
+      (within(dialog).getByLabelText("Amount for INV-21 (EUR)") as HTMLInputElement).value,
+    ).toBe("1234,00");
+    expect(calls.filter((c) => c.method === "POST")).toEqual([]);
+  });
+
+  it("a 422 from the server on submit goes back to the editor with the typed amounts kept", async () => {
+    const user = userEvent.setup();
+    const calls = mockFetch(
+      picker({
+        "POST /api/matching/matches": () => ({
+          status: 422,
+          body: { error: "allocation_exceeds_open" },
+        }),
+      }),
+    );
+    renderApp("/treasury/bank?tab=review");
+    const dialog = await openSheet(user);
+    await user.click(within(dialog).getByRole("button", { name: "Match to another invoice…" }));
+    await within(dialog).findByText("INV-21");
+    await user.click(within(dialog).getByRole("button", { name: "Add INV-21" }));
+    await user.click(within(dialog).getByRole("button", { name: "Add INV-22" }));
+    await waitFor(() =>
+      expect(
+        (within(dialog).getByRole("button", { name: "Review this match" }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(false),
+    );
+    await user.click(within(dialog).getByRole("button", { name: "Review this match" }));
+    await user.click(await within(dialog).findByRole("button", { name: "Record this match" }));
+    expect(await within(dialog).findByText(/more than what is still free/)).toBeTruthy();
+    expect(
+      (within(dialog).getByLabelText("Amount for INV-22 (EUR)") as HTMLInputElement).value,
+    ).toBe("234.00");
+    expect(of(calls, "/api/matching/matches", "POST")).toHaveLength(1);
+  });
+
+  it("Escape while typing an amount asks before throwing the allocations away", async () => {
+    const user = userEvent.setup();
+    mockFetch(picker());
+    renderApp("/treasury/bank?tab=review");
+    const dialog = await openSheet(user);
+    await user.click(within(dialog).getByRole("button", { name: "Match to another invoice…" }));
+    await within(dialog).findByText("INV-21");
+    await user.click(within(dialog).getByRole("button", { name: "Add INV-21" }));
+    const input = within(dialog).getByLabelText("Amount for INV-21 (EUR)");
+    await user.click(input);
+    await user.keyboard("{Escape}");
+    expect(screen.getByRole("dialog", { name: "Match bank line" })).toBe(dialog);
+    expect(
+      within(dialog).getByRole("alertdialog", { name: /Discard what you typed/ }),
+    ).toBeTruthy();
+    await user.keyboard("{Escape}"); // = keep editing
+    expect(within(dialog).queryByRole("alertdialog")).toBeNull();
+    expect(
+      (within(dialog).getByLabelText("Amount for INV-21 (EUR)") as HTMLInputElement).value,
+    ).toBe("1000.00");
+    await user.click(
+      within(dialog).getAllByRole("button", { name: "Close" }).at(-1) as HTMLElement,
+    );
+    await user.click(within(dialog).getByRole("button", { name: "Discard and close" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("a double click on Record sends one request; the server's 409 for a repeat is a refresh, not a duplicate", async () => {
+    const user = userEvent.setup();
+    let posts = 0;
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => (release = r));
+    const calls = mockFetch(
+      base(FINANCE, {
+        "POST /api/matching/matches": () => {
+          posts++;
+          return posts === 1
+            ? { status: 201, body: { match: match() } }
+            : { status: 409, body: { error: "already_matched" } };
+        },
+      }),
+    );
+    const inner = globalThis.fetch;
+    vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+      if (init?.method === "POST") await gate;
+      return inner(url, init);
+    });
+    renderApp("/treasury/bank?tab=review");
+    const dialog = await openSheet(user);
+    await pick(user, dialog);
+    await user.click(matchSelected(dialog));
+    const rec = within(dialog).getByRole("button", { name: "Record this match" });
+    await user.click(rec);
+    await user.click(rec);
+    await user.dblClick(rec);
+    expect((rec as HTMLButtonElement).disabled).toBe(true);
+    release?.();
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(of(calls, "/api/matching/matches", "POST")).toHaveLength(1);
   });
 });
 
@@ -679,21 +924,21 @@ describe("booking to a ledger account", () => {
     renderApp("/treasury/bank?tab=review");
     const dialog = await openSheet(user);
     expect(within(dialog).getByText("Known ledger pattern")).toBeTruthy();
-    await user.click(within(dialog).getByRole("button", { name: "Book to ledger account…" }));
+    await user.click(within(dialog).getByRole("button", { name: "Match to a ledger account…" }));
     const input = within(dialog).getByLabelText("Ledger account code");
     await user.type(input, "45 00");
     expect(within(dialog).getByRole("alert").textContent).toMatch(
       /letters, digits, dots or hyphens/,
     );
     expect(
-      (within(dialog).getByRole("button", { name: "Review this booking" }) as HTMLButtonElement)
+      (within(dialog).getByRole("button", { name: "Review this match" }) as HTMLButtonElement)
         .disabled,
     ).toBe(true);
     await user.click(within(dialog).getByRole("button", { name: "Use 4500" }));
     expect((input as HTMLInputElement).value).toBe("4500");
-    await user.click(within(dialog).getByRole("button", { name: "Review this booking" }));
+    await user.click(within(dialog).getByRole("button", { name: "Review this match" }));
     expect(norm(within(dialog).getByTestId("confirm-text").textContent)).toBe(
-      "Book € 15,00 to ledger account 4500. This is recorded in the app only; nothing is booked in Exact yet.",
+      "Match € 15,00 to ledger account 4500 instead of an invoice. This is recorded in the app only. Nothing is booked in Exact, because booking in Exact is off. No money is paid or moved.",
     );
     await user.click(within(dialog).getByRole("button", { name: "Record this match" }));
     await waitFor(() => expect(of(calls, "/api/matching/matches", "POST")).toHaveLength(1));
@@ -725,7 +970,7 @@ describe("booking to a ledger account", () => {
     await pick(user, dialog);
     await user.click(matchSelected(dialog));
     expect(norm(within(dialog).getByTestId("confirm-text").textContent)).toMatch(
-      /^Book € 15,00 to ledger account 4500\./,
+      /^Match € 15,00 to ledger account 4500 instead of an invoice\./,
     );
     await user.click(within(dialog).getByRole("button", { name: "Record this match" }));
     await waitFor(() =>
@@ -988,7 +1233,7 @@ describe("role matrix", () => {
   const ACTIONS = [
     "Match to selected",
     "Match to another invoice…",
-    "Book to ledger account…",
+    "Match to a ledger account…",
     "Ignore…",
   ];
   const cases: [string, Me, boolean][] = [
@@ -1014,6 +1259,46 @@ describe("role matrix", () => {
       expect(calls.filter((c) => c.method !== "GET")).toEqual([]);
     });
   }
+
+  it("uses the same rule as the server: matching writes are finance|admin, clearing a conflict admin", () => {
+    const src =
+      Object.values(
+        import.meta.glob("../../worker/src/matching/routes.ts", {
+          query: "?raw",
+          import: "default",
+          eager: true,
+        }) as Record<string, string>,
+      )[0] ?? "";
+    expect(src).toMatch(/const FINANCE = \{ roles: \["finance", "admin"\] \} as const;/);
+    for (const route of [
+      '"POST", "/api/matching/matches", FINANCE',
+      '"POST", "/api/matching/matches/:id/undo", FINANCE',
+      '"POST", "/api/matching/transactions/:id/ignore", FINANCE',
+      '"POST", "/api/matching/transactions/:id/unignore", FINANCE',
+    ]) {
+      expect(src.replace(/\s+/g, " "), route).toContain(route);
+    }
+    expect(src.replace(/\s+/g, " ")).toContain(
+      '"POST", "/api/matching/transactions/:id/clear-conflict", ADMIN_STEP_UP',
+    );
+  });
+
+  it("a 403 from the server (roles changed meanwhile) is said plainly and nothing is pretended", async () => {
+    const user = userEvent.setup();
+    mockFetch(
+      base(FINANCE, {
+        "POST /api/matching/matches": () => ({ status: 403, body: { error: "forbidden" } }),
+      }),
+    );
+    renderApp("/treasury/bank?tab=review");
+    const dialog = await openSheet(user);
+    await pick(user, dialog);
+    await user.click(matchSelected(dialog));
+    await user.click(within(dialog).getByRole("button", { name: "Record this match" }));
+    expect(await within(dialog).findByText("You do not have permission to do this.")).toBeTruthy();
+    expect(screen.queryByText(/Recorded the match/)).toBeNull();
+    expect(screen.getByRole("dialog")).toBe(dialog);
+  });
 
   it("a view-only person never gets a write action anywhere on the Bank matching tabs", async () => {
     const user = userEvent.setup();
