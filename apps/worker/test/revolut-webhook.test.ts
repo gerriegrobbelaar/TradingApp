@@ -348,7 +348,11 @@ describe("webhook endpoint: size, queue failures and other requests", () => {
       new Request("https://app.test/api/webhooks/revolut", {
         method: "POST",
         body: "{}",
-        headers: { "content-length": "9".repeat(30) },
+        headers: {
+          "content-length": "9".repeat(30),
+          "revolut-signature": "v1=" + "0".repeat(64),
+          "revolut-request-timestamp": String(Date.now()),
+        },
       }),
       envWithQueue(queue),
     );
@@ -495,6 +499,8 @@ describe("webhook secrets: rotation overlap", () => {
     expect(await loadWebhookSecretSet(env, connId)).toEqual({
       current: "wsk_new_secret_value",
       previous: WEBHOOK_SECRET,
+      stale: false,
+      previousUnreadable: false,
     });
     // signed with the OLD secret: accepted, overlap stays
     expect((await deliver({ ...valid("tx-1"), secret: WEBHOOK_SECRET })).status).toBe(200);
@@ -504,6 +510,8 @@ describe("webhook secrets: rotation overlap", () => {
     expect(await loadWebhookSecretSet(env, connId)).toEqual({
       current: "wsk_new_secret_value",
       previous: null,
+      stale: false,
+      previousUnreadable: false,
     });
     const audit = await db
       .prepare(
@@ -533,6 +541,8 @@ describe("webhook secrets: rotation overlap", () => {
     expect(await loadWebhookSecretSet(env, connId)).toEqual({
       current: "wsk_new_secret_value",
       previous: WEBHOOK_SECRET,
+      stale: false,
+      previousUnreadable: false,
     });
     expect(await retired()).toBe(before);
   });

@@ -149,6 +149,30 @@ describe("token refresh", () => {
     expect((await storedTokens(id)).refresh).toBe("ref-1");
   });
 
+  it("forced refresh is not 'too young' when the clock ticks between reads (load flake)", async () => {
+    // Under load a millisecond could pass between the authority's two clock reads, so a token
+    // whose age is unknown (earliest refresh = now) looked one millisecond too young, slept 2 s and
+    // retried with the old token. Every now() call here advances the clock: deterministic.
+    const id = await seedConnection({ expiresInMs: 3600_000 });
+    await runInDurableObject(gateStub(`exact-token:${id}`), (gate: ExactGate) => {
+      let t = Date.now();
+      gate.now = () => (t += 1);
+      gate.sleep = async () => {
+        throw new Error("must not wait");
+      };
+    });
+    stub.api = (_c, n) =>
+      n === 1 ? new Response("", { status: 401 }) : Response.json({ d: { results: [] } });
+    const res = await go(freshDivision());
+    expect(res.status).toBe(200);
+    expect(stub.tokenCalls).toHaveLength(1);
+    expect(stub.apiCalls.map((c) => c.headers.authorization)).toEqual([
+      "Bearer acc-0",
+      "Bearer acc-1",
+    ]);
+    expect((await storedTokens(id)).refresh).toBe("ref-1");
+  });
+
   it("a second 401 on a token that was old enough to refresh is an auth error", async () => {
     await seedConnection({ expiresInMs: 3600_000 });
     stub.api = () => new Response("", { status: 401 });

@@ -27,6 +27,22 @@ export interface TokenSet {
   /** Null when the endpoint sent none: a refresh normally does not rotate the refresh token. */
   refreshToken: string | null;
   expiresInS: number;
+  /**
+   * Lifetime of the refresh token in seconds when the endpoint says so (`refresh_token_expires_in`),
+   * else null = unknown. Revolut's documentation names none (ADR 0031 open item), so this is
+   * parsed defensively and only stored when present.
+   */
+  refreshExpiresInS: number | null;
+}
+
+/** 1 second .. 10 years; anything else is treated as "not told". */
+const MAX_REFRESH_LIFETIME_S = 10 * 366 * 86_400;
+function refreshLifetime(obj: Record<string, unknown>): number | null {
+  const v = obj["refresh_token_expires_in"];
+  const n = typeof v === "string" && /^\d{1,10}$/.test(v.trim()) ? Number(v) : v;
+  return typeof n === "number" && Number.isSafeInteger(n) && n >= 1 && n <= MAX_REFRESH_LIFETIME_S
+    ? n
+    : null;
 }
 
 /**
@@ -155,7 +171,12 @@ async function post(
   if (grant.kind === "authorization_code" && refreshToken === null) {
     throw new TokenEndpointError("malformed");
   }
-  return { accessToken: parsed.accessToken, refreshToken, expiresInS: parsed.expiresInSeconds };
+  return {
+    accessToken: parsed.accessToken,
+    refreshToken,
+    expiresInS: parsed.expiresInSeconds,
+    refreshExpiresInS: refreshLifetime(obj),
+  };
 }
 
 export const exchangeCode = (

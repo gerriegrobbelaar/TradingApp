@@ -35,6 +35,7 @@ import type { Env } from "../env";
 import { getEuObject } from "../eu-object";
 import { isTransientFailure, type SyncDeps } from "../exact/sync";
 import { processRevolutEvent, type EventDeps } from "../revolut/events";
+import { HOUSEKEEPING_MINUTE, housekeepWebhookEvents } from "../revolut/webhook-housekeeping";
 import { handlerFor } from "./handlers";
 import { HEARTBEAT_MS } from "./overhead";
 import { latenessMs } from "./period";
@@ -178,6 +179,15 @@ export async function tickScheduler(env: Env, nowMs: number = Date.now()): Promi
     if (amsterdamParts(nowMs).minute === 17) await pruneRuns(db, nowMs);
   } catch (e) {
     console.error("job sweep failed", e instanceof Error ? e.name : "unknown");
+  }
+  // Webhook tables: stale queued rows and retention (revolut/webhook-housekeeping.ts). Only on
+  // the tick of minute 3, 13, 23, ...: the other nine ticks of ten send no statement at all,
+  // whichever isolate runs them (cron ticks often land on fresh isolates, so the in-memory
+  // throttle alone would cost one claim statement per tick). Its failure never affects the jobs.
+  if (Math.floor(nowMs / 60_000) % 10 === HOUSEKEEPING_MINUTE) {
+    await housekeepWebhookEvents(env, nowMs).catch((e: unknown) =>
+      console.error("webhook housekeeping failed", e instanceof Error ? e.name : "unknown"),
+    );
   }
   return result;
 }

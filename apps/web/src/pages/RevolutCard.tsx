@@ -8,14 +8,16 @@ import {
   disconnectRevolut,
   me as fetchMe,
   nav,
+  registerRevolutWebhook,
   revolutStartUrl,
   stepUp,
   type ConnectionRow,
   type RevolutEnvironment,
   type RevolutPaymentsMode,
   type RevolutPending,
+  type RevolutWebhookHealth,
 } from "../api";
-import { formatCount, formatDateTime } from "../lib/format";
+import { formatAgo, formatCount, formatDateTime } from "../lib/format";
 import { useToast } from "../toasts";
 
 type RevolutState =
@@ -195,6 +197,24 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
     } catch (e) {
       if (e instanceof StepUpRequired) setDialog("stepup");
       else setSheetError(describeError(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function registerWebhookAgain(replace: boolean) {
+    setBusy(true);
+    try {
+      const r = await registerRevolutWebhook(replace);
+      toast.show(
+        r.status === "already_registered"
+          ? "The webhook was already registered."
+          : "Webhook registered.",
+      );
+      await onChanged();
+    } catch (e) {
+      if (e instanceof StepUpRequired) setDialog("stepup");
+      else toast.show("Could not register the webhook. Try again.");
     } finally {
       setBusy(false);
     }
@@ -390,6 +410,20 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
               </fieldset>
             )}
 
+            {connected && live?.webhook && (
+              <WebhookHealth
+                health={live.webhook}
+                unreadable={isAdmin && live.webhook.secretReadable === false}
+                // The server registers only for an active connection (needs_reauth: reconnect first).
+                canRegister={isAdmin && row?.status === "active"}
+                busy={busy}
+                onRegister={(replace, e) => {
+                  remember(e);
+                  void registerWebhookAgain(replace);
+                }}
+              />
+            )}
+
             {connected && (
               <section aria-label="Revolut accounts">
                 <h3 className="sub-h">Accounts</h3>
@@ -521,6 +555,56 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
 }
 
 const shortTime = (iso: string): string => formatDateTime(iso);
+
+/**
+ * The webhook channel: when a signed delivery last arrived, how many were refused, and, for admins,
+ * whether the stored signing secret can still be read (a dropped TOKEN_ENC_KEY makes it unreadable).
+ */
+function WebhookHealth({
+  health,
+  unreadable,
+  canRegister,
+  busy,
+  onRegister,
+}: {
+  health: RevolutWebhookHealth;
+  unreadable: boolean;
+  canRegister: boolean;
+  busy: boolean;
+  onRegister: (replace: boolean, e: { currentTarget: HTMLElement }) => void;
+}) {
+  const rejected = health.rejectedLast24h;
+  return (
+    <section aria-label="Webhook">
+      <h3 className="sub-h">Payment notifications</h3>
+      {!health.registered && (
+        <p role="alert" className="notice warn">
+          The webhook is not registered, so new payments only appear after the next sync.
+        </p>
+      )}
+      {unreadable && (
+        <p role="alert" className="notice warn">
+          The webhook signing secret cannot be read. Register the webhook again.
+        </p>
+      )}
+      {health.registered && (
+        <p className="stamp">
+          {health.lastVerifiedAt
+            ? `Last delivery ${formatAgo(health.lastVerifiedAt)}`
+            : "No verified delivery yet"}
+        </p>
+      )}
+      {rejected > 0 && <p className="notice warn">{`${rejected} rejected in the last 24 h`}</p>}
+      {canRegister && (!health.registered || unreadable) && (
+        <div className="chips">
+          <Button disabled={busy} onClick={(e) => onRegister(unreadable, e)}>
+            {unreadable ? "Register webhook again" : "Register webhook"}
+          </Button>
+        </div>
+      )}
+    </section>
+  );
+}
 
 function Fact({ label, children }: { label: string; children: ReactNode }) {
   return (

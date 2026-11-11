@@ -63,6 +63,45 @@ function bodyBytes(raw: string | ArrayBuffer | Uint8Array): Uint8Array | null {
   return b.length > MAX_WEBHOOK_BODY_BYTES ? null : b;
 }
 
+export type WebhookHeaderCheck =
+  | { ok: true; ts: string; signatures: string[] }
+  | {
+      ok: false;
+      reason: "missing_header" | "bad_timestamp" | "timestamp_out_of_range" | "malformed";
+    };
+
+/**
+ * The header-only part of `verifyRevolutWebhook` (presence, 13-digit millisecond timestamp inside
+ * the window, at least one well-formed `v1=` candidate, at most MAX_WEBHOOK_SIGNATURES entries).
+ * Needs neither the body nor the secret, so an HTTP layer can refuse a bad request before it reads
+ * the body or loads a secret. The verifier calls exactly this function, so the two can never
+ * disagree: whatever passes the verifier passes this check.
+ */
+export function checkRevolutWebhookHeaders(opts: {
+  signatureHeader: string | null | undefined;
+  timestampHeader: string | null | undefined;
+  nowMs: number;
+  toleranceMs?: number;
+}): WebhookHeaderCheck {
+  if (!Number.isFinite(opts.nowMs)) throw new RangeError("nowMs must be epoch milliseconds");
+  const tolerance = opts.toleranceMs ?? DEFAULT_WEBHOOK_TOLERANCE_MS;
+  if (!Number.isFinite(tolerance) || tolerance < 0 || tolerance > DEFAULT_WEBHOOK_TOLERANCE_MS) {
+    throw new RangeError("toleranceMs must be between 0 and 300000");
+  }
+  const { signatureHeader, timestampHeader } = opts;
+  if (blank(signatureHeader) || blank(timestampHeader)) {
+    return { ok: false, reason: "missing_header" };
+  }
+  const ts = timestampHeader.trim();
+  if (!TS_MS_RE.test(ts)) return { ok: false, reason: "bad_timestamp" };
+  if (Math.abs(opts.nowMs - Number(ts)) > tolerance) {
+    return { ok: false, reason: "timestamp_out_of_range" };
+  }
+  const signatures = parseSignatures(signatureHeader);
+  if (signatures === null || signatures.length === 0) return { ok: false, reason: "malformed" };
+  return { ok: true, ts, signatures };
+}
+
 /**
  * Verify a Revolut webhook (v2) BEFORE parsing the body. Never parses the body.
  *
@@ -100,24 +139,11 @@ export async function verifyRevolutWebhook(opts: {
   if (typeof opts.signingSecret !== "string" || opts.signingSecret.trim() === "") {
     throw new RangeError("signingSecret is required");
   }
-  if (!Number.isFinite(opts.nowMs)) throw new RangeError("nowMs must be epoch milliseconds");
-  const tolerance = opts.toleranceMs ?? DEFAULT_WEBHOOK_TOLERANCE_MS;
-  if (!Number.isFinite(tolerance) || tolerance < 0 || tolerance > DEFAULT_WEBHOOK_TOLERANCE_MS) {
-    throw new RangeError("toleranceMs must be between 0 and 300000");
-  }
-  const { signatureHeader, timestampHeader } = opts;
-  if (blank(signatureHeader) || blank(timestampHeader)) {
-    return { ok: false, reason: "missing_header" };
-  }
-  const ts = timestampHeader.trim();
-  if (!TS_MS_RE.test(ts)) return { ok: false, reason: "bad_timestamp" };
-  if (Math.abs(opts.nowMs - Number(ts)) > tolerance) {
-    return { ok: false, reason: "timestamp_out_of_range" };
-  }
+  const headers = checkRevolutWebhookHeaders(opts);
+  if (!headers.ok) return headers;
   const body = bodyBytes(opts.rawBody);
   if (body === null) return { ok: false, reason: "malformed" };
-  const signatures = parseSignatures(signatureHeader);
-  if (signatures === null || signatures.length === 0) return { ok: false, reason: "malformed" };
+  const { ts, signatures } = headers;
 
   const prefix = new TextEncoder().encode(`v1.${ts}.`);
   const payload = new Uint8Array(prefix.length + body.length);

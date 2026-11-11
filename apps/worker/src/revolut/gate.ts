@@ -38,6 +38,7 @@ import {
   isLivePending,
   loadRevolutById,
   markNeedsReauth,
+  reencryptWebhookSecrets,
   type RevolutConnectionRow,
 } from "./store";
 import { toWire, type GateResult } from "./wire";
@@ -129,6 +130,8 @@ interface PendingTokens {
   accessEnc: string;
   refreshEnc: string;
   expiresAt: number;
+  /** When Revolut said the refresh token expires (ms), if it did. */
+  refreshExpiresAt?: number | null;
 }
 const pendingKey = (id: number): string => `pending:${id}`;
 const clientRejectsKey = (id: number): string => `client-rejects:${id}`;
@@ -321,14 +324,28 @@ export class RevolutGate extends DurableObject<Env> {
     accessEnc: string,
     refreshEnc: string,
     expiresAtMs: number,
+    refreshExpiresAtMs: number | null = null,
+    // A NEW refresh token without a stated expiry: the stored expiry belonged to the old one, so it
+    // is cleared (unknown) rather than kept. Without rotation it is kept.
+    rotated = false,
   ): Promise<boolean> {
     const r = await this.env.DB.prepare(
       `UPDATE connections
        SET access_token_enc = ?3, refresh_token_enc = ?4, expires_at = ?5, last_error = NULL,
+           refresh_expires_at = CASE WHEN ?6 IS NOT NULL THEN ?6
+                                     WHEN ?7 = 1 THEN NULL ELSE refresh_expires_at END,
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
        WHERE id = ?1 AND kind = 'revolut' AND status = 'active' AND refresh_token_enc = ?2`,
     )
-      .bind(connectionId, oldRefreshEnc, accessEnc, refreshEnc, new Date(expiresAtMs).toISOString())
+      .bind(
+        connectionId,
+        oldRefreshEnc,
+        accessEnc,
+        refreshEnc,
+        new Date(expiresAtMs).toISOString(),
+        refreshExpiresAtMs === null ? null : new Date(refreshExpiresAtMs).toISOString(),
+        rotated ? 1 : 0,
+      )
       .run();
     return r.meta.changes === 1;
   }
@@ -343,6 +360,8 @@ export class RevolutGate extends DurableObject<Env> {
         pending.accessEnc,
         pending.refreshEnc,
         pending.expiresAt,
+        pending.refreshExpiresAt ?? null,
+        true, // only a rotated pair is ever stashed
       );
     } catch {
       return pending; // D1 still failing: keep it
@@ -526,6 +545,8 @@ export class RevolutGate extends DurableObject<Env> {
       // token is still good, so a failed write costs only a repeat refresh later.
       const issuedAt = this.now();
       const expiresAt = issuedAt + tokens.expiresInS * 1000;
+      const refreshExpiresAt =
+        tokens.refreshExpiresInS === null ? null : issuedAt + tokens.refreshExpiresInS * 1000;
       const rotated = tokens.refreshToken !== null;
       let persisted = false;
       let stashed = false;
@@ -550,6 +571,8 @@ export class RevolutGate extends DurableObject<Env> {
               accessEnc,
               refreshEnc,
               expiresAt,
+              refreshExpiresAt,
+              rotated,
             );
           } catch {
             persisted = await this.persistTokens(
@@ -558,11 +581,19 @@ export class RevolutGate extends DurableObject<Env> {
               accessEnc,
               refreshEnc,
               expiresAt,
+              refreshExpiresAt,
+              rotated,
             );
           }
         } catch {
           if (rotated) {
-            const stash: PendingTokens = { baseRefreshEnc, accessEnc, refreshEnc, expiresAt };
+            const stash: PendingTokens = {
+              baseRefreshEnc,
+              accessEnc,
+              refreshEnc,
+              expiresAt,
+              refreshExpiresAt,
+            };
             await this.ctx.storage.put(pendingKey(row.id), stash);
             stashed = true;
           }
@@ -585,6 +616,9 @@ export class RevolutGate extends DurableObject<Env> {
       }
       this.clientRejectedUntil = 0;
       this.issued = { issuedAt, expiresAt };
+      // A TOKEN_ENC_KEY rotation also moves the webhook signing secrets to the current key now
+      // (review S3). Best effort: it never fails or delays the token result beyond one read.
+      await reencryptWebhookSecrets(this.env, row.id).catch(() => undefined);
       try {
         if (!stashed) await this.ctx.storage.delete(pendingKey(row.id));
         await this.ctx.storage.delete(clientRejectsKey(row.id));

@@ -3,6 +3,10 @@
  *
  * Public (no cookie), exempt from the CSRF-header rule because every request authenticates itself
  * with an HMAC signature. The order is fixed:
+ *   0. the cheap header checks (both headers present, timestamp 13 digits and inside the 5-minute
+ *      window, signature header well formed): a failure answers the uniform 401 BEFORE the body is
+ *      read and without touching D1 reads (review N1). The rejection is counted by a throttled,
+ *      bucketed write (webhook-health.ts), never one row per request;
  *   1. size cap (413 when Content-Length is too large; the body is always read as a counted
  *      stream and cancelled past the cap, whatever Content-Length says);
  *   2. raw BYTES of the body (never text()), the connection's signing secrets (current, previous);
@@ -22,6 +26,7 @@
  * nothing here calls Revolut.
  */
 import {
+  checkRevolutWebhookHeaders,
   MAX_WEBHOOK_BODY_BYTES,
   parseWebhookEvent,
   verifyRevolutWebhook,
@@ -30,12 +35,24 @@ import type { Env } from "../env";
 import type { RevolutEventMessage } from "../jobs/types";
 import { json, type Ctx, type Router } from "../router";
 import { REVOLUT_WEBHOOK_PATH } from "./config";
-import { loadRevolutConnection, loadWebhookSecretSet, retirePreviousWebhookSecret } from "./store";
+import {
+  loadRevolutConnection,
+  loadWebhookSecretSet,
+  reencryptWebhookSecrets,
+  retirePreviousWebhookSecret,
+} from "./store";
+import { logRejection, recordRejection, recordVerified } from "./webhook-health";
 
 /** Revolut's own limit, the verifier's limit and ours are the same number. */
 export const MAX_BODY_BYTES = MAX_WEBHOOK_BODY_BYTES;
 /** A queued row nobody processed for this long is re-enqueued by a redelivery. */
 export const REQUEUE_AFTER_MS = 5 * 60_000;
+/**
+ * A row still `unparsed` (the first delivery died between the insert and the parse) is only taken
+ * over by a redelivery older than this, so two overlapping deliveries of one body cannot both
+ * enqueue it (review N2).
+ */
+export const UNPARSED_CLAIM_AFTER_MS = 60_000;
 /**
  * How often repeated deliveries may re-enqueue one row (enqueue_failed, never parsed, or stale
  * queued). Revolut retries 3 more times; a replay of a captured delivery inside the 5-minute
@@ -105,7 +122,7 @@ async function sha256HexBytes(bytes: ArrayBuffer): Promise<string> {
 }
 
 /** Sends the one queue message for a webhook row. False (never throws) when the queue refuses. */
-async function enqueueEvent(
+export async function enqueueEvent(
   env: Pick<Env, "JOBS_QUEUE">,
   webhookEventId: number,
 ): Promise<boolean> {
@@ -119,6 +136,21 @@ async function enqueueEvent(
   }
 }
 
+/**
+ * The header checks of R1's verifier, run before the body is read or D1 is asked anything. It is
+ * the verifier's own `checkRevolutWebhookHeaders` (same window, 13-digit rule, `v1=` candidates
+ * and their cap), so it can never refuse a delivery the verifier would accept. Returns the
+ * verifier's reason code, or null when the headers are usable (the signature is checked later).
+ */
+export function precheckHeaders(request: Request, nowMs: number): string | null {
+  const r = checkRevolutWebhookHeaders({
+    signatureHeader: request.headers.get("revolut-signature"),
+    timestampHeader: request.headers.get("revolut-request-timestamp"),
+    nowMs,
+  });
+  return r.ok ? null : r.reason;
+}
+
 interface EventRow {
   id: number;
   status: string;
@@ -128,6 +160,17 @@ interface EventRow {
 
 async function webhook(ctx: Ctx): Promise<Response> {
   const { env, request } = ctx;
+  const reject = async (reason: string): Promise<Response> => {
+    // The reason code only, no body, no headers, no signature (CLAUDE.md 5). Logged sampled and
+    // counted through a throttled bucketed write: an unauthenticated caller cannot flood either.
+    logRejection(ctx.nowMs, reason);
+    await recordRejection(env, ctx.nowMs, reason).catch(() => undefined);
+    return unauthorized();
+  };
+
+  const early = precheckHeaders(request, ctx.nowMs);
+  if (early !== null) return reject(early);
+
   const declared = request.headers.get("content-length");
   // Declared too large: refuse before reading anything (any digit string longer than the cap's).
   if (declared !== null && /^\d+$/.test(declared.trim()) && Number(declared) > MAX_BODY_BYTES) {
@@ -135,12 +178,6 @@ async function webhook(ctx: Ctx): Promise<Response> {
   }
   const body = await readBody(request);
   if (body === null) return tooLarge();
-
-  const reject = (reason: string): Response => {
-    // The reason only, no body, no headers, no signature (CLAUDE.md 5).
-    console.warn("revolut webhook rejected", reason);
-    return unauthorized();
-  };
 
   // Everything before the signature check answers the same 401, including a database or
   // decryption error: an unauthenticated caller must not be able to tell the causes apart.
@@ -151,7 +188,7 @@ async function webhook(ctx: Ctx): Promise<Response> {
     return reject("connection_unreadable");
   }
   if (!conn || !ACCEPTING.includes(conn.status)) return reject("no_accepting_connection");
-  let secrets: { current: string | null; previous: string | null };
+  let secrets: Awaited<ReturnType<typeof loadWebhookSecretSet>>;
   try {
     secrets = await loadWebhookSecretSet(env, conn.id);
   } catch {
@@ -190,10 +227,16 @@ async function webhook(ctx: Ctx): Promise<Response> {
   }
   if (verifiedWith === null) return reject(lastReason);
 
+  await recordVerified(env, conn.id, ctx.nowMs);
+
   // Rotation: the new secret verified, so the overlap with the previous one is over.
-  if (verifiedWith.current && secrets.previous !== null) {
+  // An overlap secret nobody can read any more (its key was dropped) is retired the same way.
+  if (verifiedWith.current && (secrets.previous !== null || secrets.previousUnreadable)) {
     await retirePreviousWebhookSecret(env.DB, conn.id).catch(() => undefined);
   }
+  // A secret still under the previous TOKEN_ENC_KEY is moved to the current key now (review S3).
+  // Never throws; a failed write leaves the old, still readable ciphertext for the next try.
+  if (secrets.stale) await reencryptWebhookSecrets(env, conn.id);
 
   const hash = await sha256HexBytes(body);
   const db = env.DB;
@@ -238,7 +281,11 @@ async function webhook(ctx: Ctx): Promise<Response> {
       claimed = await claim("status = 'error' AND error_code = 'enqueue_failed'");
     } else if (row.status === "queued" && row.event_type === UNPARSED) {
       // Never parsed (the first delivery died between the insert and the parse): handle again.
-      claimed = await claim(`status = 'queued' AND event_type = '${UNPARSED}'`);
+      const cutUnparsed = new Date(ctx.nowMs - UNPARSED_CLAIM_AFTER_MS).toISOString();
+      claimed = await claim(
+        `status = 'queued' AND event_type = '${UNPARSED}' AND received_at < ?3`,
+        cutUnparsed,
+      );
     } else if (row.status === "queued") {
       const cut = new Date(ctx.nowMs - REQUEUE_AFTER_MS).toISOString();
       claimed = await claim("status = 'queued' AND received_at < ?3", cut);
