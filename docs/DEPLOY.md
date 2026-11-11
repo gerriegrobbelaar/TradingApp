@@ -791,6 +791,17 @@ each deploy and when Settings, Schedules shows repeated failures.
   customer data.
 - `wrangler tail` is for short sessions only.
 
+### Protecting the Revolut webhook path
+
+`POST /api/webhooks/revolut` is public by design (Revolut cannot sign in). A request with a fresh
+13-digit timestamp and any well-formed `v1=` signature passes the cheap header check and costs two
+database reads plus one HMAC before it is rejected, and the app cannot avoid that because it needs
+the secret to verify. The app bounds what it writes (one rejection batch per reason per minute per
+isolate, ADR 0033), but the real mitigation is at the edge. Add a Cloudflare rate-limiting rule on
+the zone for this path, for example **60 requests per minute per IP, block for 10 minutes**
+(Security, WAF, Rate limiting rules; the exact menu names are **unverified**). Do not put Cloudflare
+Access in front of this path.
+
 ### Rotating secrets
 
 - `TOKEN_ENC_KEY` covers **everything the app encrypts**: the Exact tokens, the Revolut access and
@@ -800,19 +811,20 @@ each deploy and when Settings, Schedules shows repeated failures.
      (`secret put` for both), then deploy.
   2. Wait for a refresh cycle: Exact and Revolut tokens are rewritten with the current key when
      they refresh, within about an hour while the connections are used (a Revolut access token
-     lives about 40 minutes). The Revolut webhook signing secrets move to the current key at the
-     Revolut gate's token refresh and when a delivery uses them (review S3, task Q2; **if Q2 has not
-     been merged into the build you deploy, they are only readable while the previous key exists**:
-     then keep `TOKEN_ENC_KEY_PREVIOUS` and re-register the webhook, Settings, Connections,
-     "Register webhook", before step 4). Send a EUR 0.01 sandbox payment to have a delivery.
+     lives about 40 minutes). The Revolut webhook signing secrets are rewritten with the current
+     key at the Revolut gate's next token refresh and when a delivery is verified with a secret
+     still under the previous key (implemented in review S3 / task Q2; **not yet run on a real
+     deployment, verify on staging**). Send a EUR 0.01 sandbox payment to have a delivery.
   3. Check before deleting: the Connections screen shows both connections as Connected with no
-     error and does not report the Revolut webhook secret as unreadable, and `webhook_events` has a
-     recent `processed` row.
+     error and does not report the Revolut webhook secret as unreadable (admins see this; "unknown"
+     is not the same as unreadable), and `webhook_events` has a recent `processed` row. There is no
+     count of values still under the old key, so this check is the signal.
   4. Only then `pnpm exec wrangler secret delete TOKEN_ENC_KEY_PREVIOUS`.
-  Deleting the previous key too early makes a token or webhook secret unreadable: Exact and Revolut
-  then need reconnecting, and a webhook secret that cannot be decrypted makes every delivery fail
-  signature verification (the poll and the daily backfill still catch up). If the key is lost
-  without a previous copy, reconnect Exact and Revolut (Settings, Connections).
+  Deleting the previous key too early is recoverable: stored values are never changed by dropping a
+  key, so put the old key back as `TOKEN_ENC_KEY_PREVIOUS` and wait for the next refresh or
+  delivery. While a webhook secret is unreadable every delivery fails signature verification (the
+  poll and the daily backfill still catch up). Only if the key is truly lost without a copy do
+  Exact and Revolut need reconnecting (Settings, Connections).
 - `GOOGLE_CLIENT_SECRET`: create a new secret on the Google OAuth client, `secret put`, then remove
   the old one in Google.
 - `REVOLUT_PRIVATE_KEY`: create a new key pair and certificate (step 0), upload the certificate in
