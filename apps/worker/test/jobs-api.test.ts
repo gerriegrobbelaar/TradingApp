@@ -93,6 +93,7 @@ describe("GET /api/jobs", () => {
     const body = await list();
     expect(body.jobs.map((j) => j.name)).toEqual([
       "revolut.sync",
+      "revolut.backfill",
       "exact.bank_balances",
       "ecb.fx_import",
       "dq.checks",
@@ -113,8 +114,19 @@ describe("GET /api/jobs", () => {
       nextRunAt: null,
     });
     expect(full.scheduleText).toBeTruthy();
-    const later = byName(body, "revolut.sync");
+    const later = byName(body, "dq.checks");
     expect(later).toMatchObject({ enabled: false, implemented: false, nextRunAt: null });
+    // The Revolut jobs are built (R3a) and ship switched off until the first live checks.
+    for (const name of ["revolut.sync", "revolut.backfill"]) {
+      expect(byName(body, name)).toMatchObject({
+        enabled: false,
+        implemented: true,
+        usesExact: false,
+        defaultEnabled: false,
+        disabledReason: "awaiting_live_verification",
+        nextRunAt: null,
+      });
+    }
     expect(body.maxExactBudget).toBe(MAX_EXACT_BUDGET);
     expect(body.scheduler.queueConfigured).toBe(true);
     expect(body.scheduler.lastTickAt).toBeNull();
@@ -449,7 +461,7 @@ describe("POST /api/jobs/:id/run (Run now)", () => {
   });
 
   it("refuses a job whose phase is not built, even when it is enabled", async () => {
-    const id = await jobId("revolut.sync");
+    const id = await jobId("dq.checks");
     for (const enabled of [false, true]) {
       await db
         .prepare("UPDATE jobs SET enabled = ?2 WHERE id = ?1")

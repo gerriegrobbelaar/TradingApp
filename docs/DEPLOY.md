@@ -480,6 +480,32 @@ sync panel on the test division.
     - `$skiptoken` paging with this filter and order, the page size (60?), and that `Document`
       holds a GUID when a PDF is attached.
 
+### First-live checklist: Revolut webhook, sync and backfill (task R3a, ADR 0032)
+
+The webhook URL is `<app origin>/api/webhooks/revolut`. It must be **public https** (Revolut calls
+it from the internet; a `wrangler dev` or tunnel URL works for tests, `workers.dev` is off). No
+variable to set: it is derived from `REVOLUT_REDIRECT_URI`. Confirming the connection (Settings,
+Connections) registers the subscription and queues the 90-day backfill; if Connections says the
+webhook is not registered, use "Register webhook" (admin, fresh sign-in).
+
+1. After confirming, `GET /api/connections` shows `revolut.webhookRegistered: true`; `last_error` is
+   empty. In Revolut Business (Settings, APIs, Webhooks) one subscription points at the URL above.
+2. Send a test payment (EUR 0.01 between two own accounts) and watch `webhook_events`:
+   `SELECT id, event_type, status, error_code, received_at, processed_at FROM webhook_events ORDER BY id DESC LIMIT 5`
+   (`wrangler d1 execute ... --remote`). Expect `processed` within seconds and rows in
+   `bank_transactions` (`source = 'webhook'`, two rows for a transfer). A 401 in the Revolut
+   delivery log means the signature check failed: record the exact header names, the timestamp unit
+   (we expect epoch milliseconds in `Revolut-Request-Timestamp`) and the signed-payload format, and
+   fix ADR 0030/0032 and `packages/revolut` together.
+3. Verify the assumptions of ADR 0032 (payload shape, whether `TransactionStateChanged` fires for
+   every state, retry timing, the rate limit) and note the answers there.
+4. Run "Run now" on `revolut.backfill`, then switch on `revolut.sync` (Settings, Schedules). Check
+   the Bank screen shows balances and that `revolut_sync_state` has `last_status = 'ok'` for
+   `accounts` and `transactions`. The daily backfill result reports `missing`: a number above zero
+   on ordinary days means webhooks or the poll missed transactions.
+5. Dead letters: events that exhaust their retries end as `webhook_events.status = 'error'`; the
+   poll and backfill still pick the transaction up.
+
 ## Staging first
 
 `wrangler.toml` has a complete `[env.staging]` block (ADR 0029): Worker `camelthorn-finance-staging`,

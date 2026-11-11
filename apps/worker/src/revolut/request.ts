@@ -5,7 +5,7 @@
  * the connection's Revolut API host. Anything not listed is refused: that includes the token
  * endpoint (only the gate talks to it), every payment endpoint (/pay, /payment-drafts,
  * /transfer, /counterparty creation: payments are Phase 9, behind four-eyes controls) and every
- * webhook call except creating and deleting the subscription.
+ * webhook call except creating and deleting the subscription (and listing them, for one job id).
  */
 import { RevolutApiError, type RevolutRequest } from "@camelthorn/revolut";
 import { revolutApiHost, type RevolutEnvironment } from "./config";
@@ -16,10 +16,15 @@ const UUID = "[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-
 /** A transaction id or a client-chosen request id (Revolut accepts both on /transaction/{id}). */
 const TX_ID = "[A-Za-z0-9_-]{1,100}";
 
+/** The one job id that may list webhook subscriptions (see ALLOWED). */
+export const WEBHOOK_RECOVER_JOB_ID = "revolut-webhook-recover";
+
 interface Allowed {
   version: "1.0" | "2.0";
   methods: readonly string[];
   re: RegExp;
+  /** When set, only these job ids (with priority 'user') may use the entry. */
+  onlyJobs?: readonly string[];
 }
 
 const ALLOWED: readonly Allowed[] = [
@@ -34,6 +39,17 @@ const ALLOWED: readonly Allowed[] = [
   // that needs them adds them here with a review. The gate also checks that a created
   // subscription points at this app's own webhook URL.
   { version: "2.0", methods: ["POST"], re: /^\/webhooks$/ },
+  // Listing subscriptions exists for ONE purpose (review R2, task R3a): recovering from a lost
+  // creation response, where Revolut has a subscription for our URL whose signing secret we never
+  // received. Only the admin-triggered recovery (job id above, priority 'user') may call it, and
+  // its caller keeps ids and URLs only: a response may carry signing secrets and is never stored
+  // or logged.
+  {
+    version: "2.0",
+    methods: ["GET"],
+    re: /^\/webhooks$/,
+    onlyJobs: [WEBHOOK_RECOVER_JOB_ID],
+  },
   { version: "2.0", methods: ["DELETE"], re: new RegExp(`^/webhooks/${UUID}$`) },
 ];
 
@@ -63,9 +79,13 @@ export function validateRequest(req: RevolutRequest): void {
   }
   if (typeof req.path !== "string" || req.path.length > 300) throw bad("path");
   const version = versionOf(req);
-  const entry = ALLOWED.find((a) => a.version === version && a.re.test(req.path));
-  if (!entry) throw bad("path");
-  if (!entry.methods.includes(req.method)) throw bad("method");
+  const byPath = ALLOWED.filter((a) => a.version === version && a.re.test(req.path));
+  if (byPath.length === 0) throw bad("path");
+  const entry = byPath.find((a) => a.methods.includes(req.method));
+  if (!entry) throw bad("method");
+  if (entry.onlyJobs && (!entry.onlyJobs.includes(req.jobId) || req.priority !== "user")) {
+    throw bad("job_id");
+  }
   for (const [k, v] of Object.entries(req.query ?? {})) {
     if (!QUERY_KEY_RE.test(k) || typeof v !== "string" || v.length > MAX_QUERY_VALUE) {
       throw bad("query");

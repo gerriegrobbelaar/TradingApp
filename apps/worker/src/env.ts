@@ -1,6 +1,6 @@
 import type { ExactGate } from "./exact/gate";
 import type { RevolutGate } from "./revolut/gate";
-import type { JobMessage } from "./jobs/types";
+import type { QueueMessage } from "./jobs/types";
 import type { JobLock } from "./jobs/job-lock";
 
 export interface Env {
@@ -41,5 +41,5 @@ export interface Env {
   /** One JobLock per job name ("job:<name>"): the no-overlap lease (CLAUDE.md 4.1). */
   JOB_LOCK: DurableObjectNamespace<JobLock>;
   /** Cloudflare Queue the cron tick and "Run now" enqueue job runs on; the Worker consumes it. */
-  JOBS_QUEUE: Queue<JobMessage>;
+  JOBS_QUEUE: Queue<QueueMessage>;
 }

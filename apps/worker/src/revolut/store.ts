@@ -283,3 +283,68 @@ export async function loadWebhookSecrets(
   }
   return out;
 }
+
+/**
+ * The webhook signing secrets as a pair, so the caller knows WHICH one verified. `current` is the
+ * newest; `previous` is kept only for the rotation overlap. Never logged.
+ */
+export async function loadWebhookSecretSet(
+  env: { DB: D1Database; TOKEN_ENC_KEY: string; TOKEN_ENC_KEY_PREVIOUS?: string },
+  connectionId: number,
+): Promise<{ current: string | null; previous: string | null }> {
+  const row = await env.DB.prepare(
+    `SELECT webhook_secret_enc, webhook_secret_prev_enc FROM connections
+     WHERE id = ?1 AND kind = 'revolut'`,
+  )
+    .bind(connectionId)
+    .first<{ webhook_secret_enc: string | null; webhook_secret_prev_enc: string | null }>();
+  return {
+    current: row?.webhook_secret_enc
+      ? await decryptToken(
+          keyring(env),
+          row.webhook_secret_enc,
+          aad(connectionId, "webhook_secret"),
+        )
+      : null,
+    previous: row?.webhook_secret_prev_enc
+      ? await decryptToken(
+          keyring(env),
+          row.webhook_secret_prev_enc,
+          aad(connectionId, "webhook_secret_prev"),
+        )
+      : null,
+  };
+}
+
+/**
+ * Drops the previous webhook secret once a delivery verified with the new one (the rotation
+ * overlap is over). One batch with its audit row; a no-op when there is no previous secret.
+ */
+export async function retirePreviousWebhookSecret(
+  db: D1Database,
+  connectionId: number,
+): Promise<boolean> {
+  const results = await db.batch([
+    auditStatement(
+      db,
+      {
+        actorEmail: "system",
+        action: "connection.revolut_webhook_prev_secret_retired",
+        entity: "connection",
+        entityId: connectionId,
+      },
+      {
+        sql: "EXISTS (SELECT 1 FROM connections WHERE id = ?7 AND kind = 'revolut' AND webhook_secret_prev_enc IS NOT NULL)",
+        binds: [connectionId],
+      },
+    ),
+    db
+      .prepare(
+        `UPDATE connections SET webhook_secret_prev_enc = NULL,
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id = ?1 AND kind = 'revolut' AND webhook_secret_prev_enc IS NOT NULL`,
+      )
+      .bind(connectionId),
+  ]);
+  return (results[1]?.meta.changes ?? 0) === 1;
+}

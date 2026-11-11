@@ -53,6 +53,15 @@ const OUR_IBAN = "GB33REVO00996912345678";
 
 /** Revolut's answers for our own business: two accounts, bank details with IBAN and holder. */
 function ourAccounts(c: ApiCall): Response {
+  // Confirming also registers the webhook subscription (task R3a).
+  if (c.url.pathname === "/api/2.0/webhooks" && c.method === "POST") {
+    return Response.json({
+      id: WEBHOOK,
+      url: "https://app.test/api/webhooks/revolut",
+      events: ["TransactionCreated", "TransactionStateChanged"],
+      signing_secret: "wsk_connect_test_secret",
+    });
+  }
   if (c.url.pathname === "/api/1.0/accounts") {
     return Response.json([
       { id: ACC_EUR, name: "Main", currency: "EUR", balance: 1234.5, state: "active" },
@@ -287,7 +296,7 @@ describe("GET /api/connections/revolut/callback", () => {
 
     const ok = await confirm({ ref: await pendingRef(), ownAccount: true });
     expect(ok.status).toBe(200);
-    expect(await ok.json()).toEqual({ ok: true });
+    expect(await ok.json()).toMatchObject({ ok: true });
 
     const form = stub.tokenCalls[0];
     expect(form?.get("grant_type")).toBe("authorization_code");
@@ -321,6 +330,9 @@ describe("GET /api/connections/revolut/callback", () => {
       "/api/1.0/accounts",
       `/api/1.0/accounts/${ACC_EUR}/bank-details`,
       `/api/1.0/accounts/${ACC_USD}/bank-details`,
+      // after the confirmation: look for a leftover subscription, then register ours (task R3a)
+      "/api/2.0/webhooks",
+      "/api/2.0/webhooks",
     ]);
     expect(stub.apiCalls.every((c) => c.headers.authorization === "Bearer racc-101")).toBe(true);
 
@@ -332,6 +344,7 @@ describe("GET /api/connections/revolut/callback", () => {
     expect(audit.results.map((a) => a.action)).toEqual([
       "connection.revolut_staged",
       "connection.revolut_confirmed",
+      "connection.revolut_webhook_secret_saved",
     ]);
     expect(audit.results.every((a) => a.actor_email === ADMIN)).toBe(true);
     expect(audit.results[0]?.after_json).toMatch(/"createsBankEntries":true/);

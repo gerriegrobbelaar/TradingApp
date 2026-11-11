@@ -14,7 +14,7 @@ import {
   getRevolutGate,
   revolutGateName,
 } from "../src/revolut/gate-transport";
-import { buildUrl, validateRequest } from "../src/revolut/request";
+import { buildUrl, validateRequest, WEBHOOK_RECOVER_JOB_ID } from "../src/revolut/request";
 import { unwrap } from "../src/revolut/wire";
 import {
   auditActions,
@@ -431,6 +431,52 @@ describe("request building and validation (SSRF, injection)", () => {
   const ok = (over: Partial<RevolutRequest> = {}) => rreq(5, over);
   const refused = (over: Partial<RevolutRequest>) =>
     expect(() => validateRequest(ok(over))).toThrow(RevolutApiError);
+
+  it("lists webhook subscriptions only for the recovery job id, at user priority, nothing else about them", () => {
+    const uuid = "123e4567-e89b-12d3-a456-426614174000";
+    const list = (over: Partial<RevolutRequest> = {}) =>
+      ok({
+        method: "GET",
+        path: "/webhooks",
+        apiVersion: "2.0",
+        jobId: WEBHOOK_RECOVER_JOB_ID,
+        ...over,
+      });
+    expect(() => validateRequest(list())).not.toThrow();
+    // any other job id, including every sync and event job, is refused
+    for (const jobId of [
+      "test",
+      "revolut-sync",
+      "revolut-backfill",
+      "revolut-event-1",
+      "revolut-webhook",
+      "revolut-connect",
+      "revolut-disconnect",
+      "revolut-webhook-recover2",
+      "x-revolut-webhook-recover",
+    ]) {
+      expect(() => validateRequest(list({ jobId })), jobId).toThrow(RevolutApiError);
+    }
+    // job priority is refused even with the right id; so is the wrong API version
+    expect(() => validateRequest(list({ priority: "job" }))).toThrow(RevolutApiError);
+    expect(() => validateRequest(list({ apiVersion: "1.0" }))).toThrow(RevolutApiError);
+    // the recovery id does not widen anything else
+    for (const [method, path] of [
+      ["GET", `/webhooks/${uuid}`],
+      ["POST", `/webhooks/${uuid}`],
+      ["GET", `/webhooks/${uuid}/failed-events`],
+      ["PATCH", "/webhooks"],
+      ["DELETE", "/webhooks"],
+    ] as const) {
+      expect(() => validateRequest(list({ method, path })), `${method} ${path}`).toThrow(
+        RevolutApiError,
+      );
+    }
+    // creating and deleting keep working for every job id
+    expect(() =>
+      validateRequest(ok({ method: "POST", path: "/webhooks", apiVersion: "2.0", body: "{}" })),
+    ).not.toThrow();
+  });
 
   it("accepts the read paths, and on API 2.0 only creating and deleting a webhook", () => {
     const uuid = "123e4567-e89b-12d3-a456-426614174000";

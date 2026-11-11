@@ -3,6 +3,7 @@
  * yet are registered WITHOUT a `run`: the runner records them as `skipped` with code
  * `not_implemented` (never an error, never a silent success), and "Run now" is refused for them.
  */
+import { runRevolutBackfill, runRevolutSync } from "../revolut/sync";
 import { FULL_SYNC_MAX_ATTEMPTS, runExactSync } from "./exact-handlers";
 import type { HandlerDef } from "./types";
 
@@ -19,12 +20,29 @@ const later = (phase: string) => ({ phase, maxAttempts: 1 });
 export const HANDLERS: Record<string, HandlerDef> = {
   "revolut.sync": {
     title: "Revolut balances and transactions",
-    description: "Reads balances and transactions from Revolut Business.",
+    description:
+      "Reads balances and polls new transactions from Revolut Business (the webhook is the fast path; this catches what it missed).",
     usesExact: false,
-    ...later("Phase 5, Revolut connection"),
+    phase: null,
+    // The next slot is the retry: 10 minutes later.
+    maxAttempts: 1,
     // CLAUDE.md 4.1: every 10 minutes, configurable 5 to 15.
     scheduleRules: { allowedIntervalMinutes: [5, 15] },
     maxLatenessMs: 30 * MIN,
+    run: runRevolutSync,
+  },
+  "revolut.backfill": {
+    title: "Revolut backfill",
+    description:
+      "Walks the last 35 days of Revolut transactions, stores what is missing and counts it (a missed webhook). Also used once for the 90-day initial backfill after a connection is confirmed.",
+    usesExact: false,
+    phase: null,
+    // A walk that stops partway continues after a pause; two minutes apart, at most 6 attempts.
+    maxAttempts: 6,
+    // A daily job: never more often than every 12 hours (a daily cron is 23 h on the spring day).
+    scheduleRules: { minIntervalMinutes: 12 * 60 },
+    maxLatenessMs: 6 * HOUR,
+    run: runRevolutBackfill,
   },
   "exact.bank_balances": {
     title: "Bank balances from Exact",

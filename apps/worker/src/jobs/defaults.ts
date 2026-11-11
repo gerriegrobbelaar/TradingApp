@@ -14,7 +14,7 @@ import { nextRun, type Schedule } from "@camelthorn/core";
 import { auditStatement } from "../db/audit";
 import { FULL_SYNC_BUDGET, INCREMENTAL_SYNC_BUDGET } from "./exact-handlers";
 
-export const DEFAULT_JOBS_VERSION = 1;
+export const DEFAULT_JOBS_VERSION = 2;
 const MARKER = "seed.default_jobs";
 
 export interface DefaultJob {
@@ -38,7 +38,18 @@ export const DEFAULT_JOBS: readonly DefaultJob[] = [
     name: "revolut.sync",
     handler: "revolut.sync",
     schedule: { kind: "cron", expr: "*/10 * * * *" },
-    enabled: false, // Phase 5
+    enabled: false,
+    // Switch on after the first live Revolut connection checks (docs/DEPLOY.md).
+    disabledReason: AWAITING_LIVE_VERIFICATION,
+    exactBudget: 0,
+  },
+  {
+    name: "revolut.backfill",
+    handler: "revolut.backfill",
+    // After the nightly Exact full sync (02:00), in the quiet hours.
+    schedule: { kind: "cron", expr: "15 3 * * *" },
+    enabled: false,
+    disabledReason: AWAITING_LIVE_VERIFICATION,
     exactBudget: 0,
   },
   {

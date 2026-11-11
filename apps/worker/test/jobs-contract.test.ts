@@ -13,24 +13,28 @@
  */
 import { env } from "cloudflare:test";
 import type { ExactRequest, ExactTransport } from "@camelthorn/exact";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { HANDLERS } from "../src/jobs/handlers";
 import type { HandlerResult, JobContext } from "../src/jobs/types";
+import { assertCountsAndCodesOnly, MAX_STRING } from "./counts-only";
+import { resetRevolut, seedRevolut, stubRevolut } from "./revolut-helpers";
+import { fakeRevolut, simpleTx } from "./revolut-r3-helpers";
 import { FakeExact, addDivision, fakeGate, resetSync } from "./sync-helpers";
 
 const db = env.DB;
 const NOW = Date.parse("2026-07-15T00:00:00Z"); // 02:00 CEST
-const MAX_STRING = 40;
 
 /** Tables where a repeated run must not add rows. */
 const DATA_TABLES = [
   "open_items",
   "relations",
   "relation_bank_accounts",
-  "bank_accounts",
-  "bank_transactions",
-  "matches",
   "match_suggestions",
+  "matches",
+  "bank_transactions",
+  "bank_accounts",
+  "revolut_sync_state",
+  "webhook_events",
   "payments",
   "payment_batches",
   "approvals",
@@ -61,6 +65,8 @@ interface Effects {
 interface Fixture {
   /** Prepares the database and the fakes; returns the syncDeps-style test seam and the effects log. */
   setup(): Promise<{ syncDeps: JobContext["syncDeps"]; effects: Effects }>;
+  /** Restores whatever setup stubbed. */
+  teardown?(): void;
 }
 
 function recording(inner: ExactTransport, effects: Effects): ExactTransport {
@@ -104,10 +110,41 @@ async function exactFixture(): Promise<{ syncDeps: JobContext["syncDeps"]; effec
   };
 }
 
+/**
+ * The Revolut boundary is the fetch stub behind the real RevolutGate: every call to Revolut is
+ * recorded (method and path). The two Revolut handlers only read from Revolut and write to D1.
+ */
+let revolutStub: ReturnType<typeof stubRevolut> | null = null;
+async function revolutFixture(): Promise<{ syncDeps: JobContext["syncDeps"]; effects: Effects }> {
+  await resetRevolut();
+  const id = await seedRevolut({ status: "active" });
+  expect(id).toBeGreaterThan(0);
+  const stub = stubRevolut();
+  revolutStub = stub;
+  const api = fakeRevolut();
+  api.transactions = [
+    simpleTx("rc-1", { createdAt: new Date(NOW - 3_600_000).toISOString() }),
+    simpleTx("rc-2", { createdAt: new Date(NOW - 7_200_000).toISOString(), state: "pending" }),
+  ];
+  stub.api = api.handle;
+  const effects: Effects = { calls: [], writes: [] };
+  // Mirror what reaches Revolut into the effects log as the gate makes the calls.
+  const original = api.handle;
+  stub.api = (c) => {
+    effects.calls.push({ method: c.method, path: c.url.pathname });
+    if (c.method !== "GET")
+      effects.writes.push({ method: c.method, path: c.url.pathname, body: c.body ?? "" });
+    return original(c);
+  };
+  return { syncDeps: undefined, effects };
+}
+
 /** One entry per implemented handler. */
 const FIXTURES: Record<string, Fixture> = {
   "exact.full_sync": { setup: exactFixture },
   "exact.incremental_sync": { setup: exactFixture },
+  "revolut.sync": { setup: revolutFixture, teardown: () => revolutStub?.restore() },
+  "revolut.backfill": { setup: revolutFixture, teardown: () => revolutStub?.restore() },
 };
 
 function contextFor(
@@ -115,7 +152,7 @@ function contextFor(
   trigger: JobContext["trigger"],
   syncDeps: JobContext["syncDeps"],
 ): JobContext {
-  const budget = key === "exact.full_sync" ? 240 : 40;
+  const budget = key === "exact.full_sync" ? 240 : key.startsWith("revolut.") ? 0 : 40;
   return {
     env,
     job: { id: 1, name: key, handler: key, exactBudget: budget },
@@ -130,30 +167,13 @@ function contextFor(
   };
 }
 
-/** Counts and codes only: numbers, booleans, short plain strings, nothing that looks like personal data. */
-export function assertCountsAndCodesOnly(value: unknown, path = "summary"): void {
-  if (value === null || typeof value === "number" || typeof value === "boolean") return;
-  if (typeof value === "string") {
-    expect(value.length, `${path} is too long`).toBeLessThanOrEqual(MAX_STRING);
-    expect(value, `${path} looks like an IBAN`).not.toMatch(/\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b/);
-    expect(value, `${path} looks like an e-mail address`).not.toMatch(/\S+@\S+/);
-    expect(value, `${path} looks like a URL`).not.toMatch(/https?:\/\//i);
-    return;
-  }
-  if (Array.isArray(value)) {
-    value.forEach((v, i) => assertCountsAndCodesOnly(v, `${path}[${i}]`));
-    return;
-  }
-  if (typeof value === "object") {
-    for (const [k, v] of Object.entries(value)) assertCountsAndCodesOnly(v, `${path}.${k}`);
-    return;
-  }
-  expect.fail(`${path} has an unsupported type ${typeof value}`);
-}
-
 const implemented = Object.entries(HANDLERS).filter(([, d]) => d.run !== undefined);
 
 describe("handler contract: every implemented handler", () => {
+  afterEach(() => {
+    for (const f of Object.values(FIXTURES)) f.teardown?.();
+  });
+
   it("has a contract fixture (add one when a handler gets a run)", () => {
     for (const [key] of implemented) {
       expect(FIXTURES[key], `no contract fixture for ${key}`).toBeDefined();

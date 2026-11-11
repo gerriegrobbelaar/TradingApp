@@ -34,6 +34,7 @@ import { auditStatement, maskDeep } from "../db/audit";
 import type { Env } from "../env";
 import { getEuObject } from "../eu-object";
 import { isTransientFailure, type SyncDeps } from "../exact/sync";
+import { processRevolutEvent, type EventDeps } from "../revolut/events";
 import { handlerFor } from "./handlers";
 import { HEARTBEAT_MS } from "./overhead";
 import { latenessMs } from "./period";
@@ -42,7 +43,6 @@ import {
   type HandlerDef,
   type HandlerResult,
   type JobContext,
-  type JobMessage,
   type JobRow,
   type RunRow,
   type RunTrigger,
@@ -85,6 +85,8 @@ export interface RunnerDeps {
   timeoutMs?: number;
   graceMs?: number;
   syncDeps?: SyncDeps;
+  /** Revolut event processing (clock). */
+  events?: EventDeps;
 }
 
 const iso = (ms: number): string => new Date(ms).toISOString();
@@ -690,24 +692,74 @@ async function finishRun(
   return ack(result.status);
 }
 
-/** The Worker's queue() handler: one run per message. */
+type ParsedMessage =
+  | { kind: "job"; runId: number }
+  | { kind: "revolut_event"; webhookEventId: number }
+  | { kind: "unknown"; name: string };
+
+const MESSAGE_NAME_RE = /^[a-z][a-z0-9_]{0,31}$/;
+
+/**
+ * Strict shapes for everything on the queue. A job message carries a run id (and a job id); a
+ * Revolut event message is EXACTLY `{type: 'revolut_event', webhookEventId}` with a positive
+ * integer id. Anything else is `unknown`, reported by type name only (never its content).
+ */
+export function parseQueueMessage(body: unknown): ParsedMessage {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return { kind: "unknown", name: "invalid" };
+  }
+  const b = body as Record<string, unknown>;
+  const type = b["type"];
+  if (type === "revolut_event") {
+    const id = b["webhookEventId"];
+    if (
+      Object.keys(b).length === 2 &&
+      typeof id === "number" &&
+      Number.isSafeInteger(id) &&
+      id >= 1
+    ) {
+      return { kind: "revolut_event", webhookEventId: id };
+    }
+    return { kind: "unknown", name: "revolut_event" };
+  }
+  const runId = b["runId"];
+  if (type === undefined && typeof runId === "number" && Number.isSafeInteger(runId)) {
+    return { kind: "job", runId };
+  }
+  const name = typeof type === "string" && MESSAGE_NAME_RE.test(type) ? type : "invalid";
+  return { kind: "unknown", name };
+}
+
+/** The Worker's queue() handler: one message per invocation (job runs and Revolut events). */
 export async function handleQueue(
   batch: MessageBatch<unknown>,
   env: Env,
   deps: RunnerDeps = {},
 ): Promise<void> {
   for (const msg of batch.messages) {
-    const body = msg.body as Partial<JobMessage> | null;
-    if (!body || !Number.isSafeInteger(body.runId)) {
+    const parsed = parseQueueMessage(msg.body);
+    if (parsed.kind === "unknown") {
+      console.warn("queue message ignored", parsed.name);
       msg.ack();
       continue;
     }
     try {
-      const d = await executeRun(env, body.runId as number, deps);
+      if (parsed.kind === "revolut_event") {
+        const d = await processRevolutEvent(
+          env,
+          parsed.webhookEventId,
+          msg.attempts ?? 1,
+          deps.events,
+        );
+        if (d.kind === "retry") msg.retry({ delaySeconds: boundedDelay(d.delaySeconds) });
+        else msg.ack();
+        continue;
+      }
+      const d = await executeRun(env, parsed.runId, deps);
       if (d.kind === "retry") msg.retry({ delaySeconds: d.delaySeconds });
       else msg.ack();
     } catch (e) {
-      console.error("job message failed", e instanceof Error ? e.name : "unknown");
+      console.error("queue message failed", e instanceof Error ? e.name : "unknown");
       msg.retry({ delaySeconds: 30 });
     }
   }

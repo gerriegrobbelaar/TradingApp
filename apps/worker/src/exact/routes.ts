@@ -123,7 +123,8 @@ export function registerExactRoutes(router: Router): void {
       .prepare(
         `SELECT id, kind, name, status, expires_at, last_error, connected_by, connected_at,
            revolut_environment, creates_bank_entries, payments_mode, bank_entries_decided_at,
-           pending_until, pending_ref, pending_by, pending_summary
+           pending_until, pending_ref, pending_by, pending_summary,
+           (webhook_id IS NOT NULL AND webhook_secret_enc IS NOT NULL) AS webhook_registered
          FROM connections ORDER BY id`,
       )
       .all<{
@@ -143,6 +144,7 @@ export function registerExactRoutes(router: Router): void {
         pending_ref: string | null;
         pending_by: string | null;
         pending_summary: string | null;
+        webhook_registered: number;
       }>();
     const divs = await db
       .prepare(
@@ -179,6 +181,8 @@ export function registerExactRoutes(router: Router): void {
                 createsBankEntries:
                   c.bank_entries_decided_at === null ? null : c.creates_bank_entries === 1,
                 paymentsMode: c.payments_mode,
+                // Whether the webhook subscription exists and its secret is stored (no secret, no id).
+                webhookRegistered: c.webhook_registered === 1,
                 // A staged connection waiting for an admin's confirmation: masked facts only
                 // (account names, currencies, last 4 of IBANs). The ref goes to admins only.
                 pending:

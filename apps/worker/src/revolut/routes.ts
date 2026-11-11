@@ -33,6 +33,8 @@ import { json, type Ctx, type Router } from "../router";
 import { inspectAccounts } from "./accounts-probe";
 import { isRevolutEnvironment, loadRevolutConfig, type RevolutConfig } from "./config";
 import { createRevolutGateTransport } from "./gate-transport";
+import { queueInitialBackfill } from "./initial-backfill";
+import { registerWebhook } from "./webhooks";
 import { authorizeUrl, exchangeCode, TokenEndpointError } from "./oauth";
 import {
   aad,
@@ -428,7 +430,58 @@ export function registerRevolutRoutes(router: Router): void {
         .bind(row.id, row.pending_ref, nowIso, session.email),
     ]);
     if ((results[1]?.meta.changes ?? 0) !== 1) return json({ error: "nothing_to_confirm" }, 409);
-    return json({ ok: true });
+
+    // After activation, and neither blocks the confirmation: the webhook subscription (a failure
+    // is surfaced as last_error 'webhook_not_registered' and fixed by "Register webhook") and the
+    // one-off 90-day backfill (picked up by the next run if it cannot be enqueued now).
+    const active = await loadRevolutConnection(db);
+    let webhook = "failed";
+    if (active) {
+      try {
+        webhook = (
+          await registerWebhook(ctx.env, active, session.email, {
+            appOrigin: ctx.config.appOrigin,
+          })
+        ).status;
+      } catch (e) {
+        console.error("revolut webhook registration crashed", e instanceof Error ? e.name : "");
+      }
+    }
+    let backfill = "failed";
+    try {
+      backfill = await queueInitialBackfill(ctx.env, row.id, session.email, ctx.nowMs);
+    } catch (e) {
+      console.error("revolut initial backfill not queued", e instanceof Error ? e.name : "");
+    }
+    return json({ ok: true, webhook, backfill });
+  });
+
+  /**
+   * Registers (or recovers, or with `replace: true` rotates) the webhook subscription. Admin with a
+   * fresh sign-in: the subscription decides where every transaction notification goes.
+   */
+  router.add("POST", "/api/connections/revolut/webhook/register", ADMIN_STEP_UP, async (ctx) => {
+    const session = ctx.session;
+    if (!session) return json({ error: "unauthenticated" }, 401);
+    const body = await readJson(ctx.request);
+    const keys = body ? Object.keys(body) : [];
+    if (
+      !body ||
+      keys.some((k) => k !== "replace") ||
+      (body.replace !== undefined && typeof body.replace !== "boolean")
+    ) {
+      return json({ error: "invalid_body" }, 400);
+    }
+    const row = await loadRevolutConnection(ctx.env.DB);
+    if (!row || row.status !== "active") return json({ error: "not_active" }, 409);
+    const r = await registerWebhook(ctx.env, row, session.email, {
+      appOrigin: ctx.config.appOrigin,
+      replace: body.replace === true,
+    });
+    if (r.status === "failed") {
+      return json({ ok: false, error: "webhook_registration_failed", code: r.code }, 502);
+    }
+    return json({ ok: true, status: r.status });
   });
 
   router.add("POST", "/api/connections/revolut/disconnect", ADMIN_STEP_UP, async (ctx) => {

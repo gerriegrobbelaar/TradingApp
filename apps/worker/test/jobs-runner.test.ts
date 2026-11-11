@@ -567,7 +567,6 @@ describe("not built yet, and disabled jobs", () => {
   it("the real registry registers every not-yet-built default as not_implemented", async () => {
     const { HANDLERS } = await import("../src/jobs/handlers");
     for (const k of [
-      "revolut.sync",
       "exact.bank_balances",
       "ecb.fx_import",
       "dq.checks",
@@ -576,7 +575,12 @@ describe("not built yet, and disabled jobs", () => {
     ]) {
       expect(HANDLERS[k]?.run, k).toBeUndefined();
     }
-    for (const k of ["exact.full_sync", "exact.incremental_sync"]) {
+    for (const k of [
+      "exact.full_sync",
+      "exact.incremental_sync",
+      "revolut.sync",
+      "revolut.backfill",
+    ]) {
       expect(typeof HANDLERS[k]?.run, k).toBe("function");
     }
   });
@@ -945,7 +949,7 @@ describe("heartbeat and entry points", () => {
       e,
     );
     const n = await db.prepare("SELECT COUNT(*) AS n FROM jobs").first<{ n: number }>();
-    expect(n?.n).toBe(8);
+    expect(n?.n).toBe(9);
     const tick = await db
       .prepare("SELECT value_json FROM settings WHERE key = 'scheduler.last_tick'")
       .first();

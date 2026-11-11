@@ -29,6 +29,11 @@ export type NoConfigHandler = (ctx: NoConfigCtx) => Promise<Response> | Response
 
 export interface Access {
   public?: true;
+  /**
+   * Skips the CSRF-header rule. Only for PUBLIC routes that authenticate each request another way
+   * (the Revolut webhook: HMAC signature). Registering it on a non-public route throws.
+   */
+  csrfExempt?: true;
   roles?: readonly Role[];
   stepUp?: true;
 }
@@ -67,6 +72,9 @@ export class Router {
   private routes: Route[] = [];
 
   add(method: string, path: string, access: Access, handler: Handler): this {
+    if (access.csrfExempt && !access.public) {
+      throw new Error("csrfExempt is only allowed on public routes");
+    }
     this.routes.push({
       method,
       pattern: `${method} ${path}`,
@@ -89,6 +97,11 @@ export class Router {
       handler,
     });
     return this;
+  }
+
+  /** What is registered, for tests that pin the access rules (no handlers, no request data). */
+  describe(): { pattern: string; access: Access }[] {
+    return this.routes.map((r) => ({ pattern: r.pattern, access: r.access }));
   }
 
   private match(
@@ -154,7 +167,9 @@ export class Router {
       return json({ error: "server_misconfigured" }, 500);
     }
 
-    if (cfg.ok && !csrfOk(request, cfg.config.appOrigin)) return json({ error: "csrf" }, 403);
+    if (cfg.ok && !route.access.csrfExempt && !csrfOk(request, cfg.config.appOrigin)) {
+      return json({ error: "csrf" }, 403);
+    }
 
     let session: Session | null = null;
     if (!route.access.public) {

@@ -185,7 +185,8 @@ export interface AgeingReportResponse {
 }
 
 /** The sync_state entities whose complete reads freshness is based on. */
-export type FreshnessEntity = "receivables" | "payables" | "purchase_entries";
+export type FreshnessEntity =
+  "receivables" | "payables" | "purchase_entries" | "bank_accounts" | "bank_transactions";
 
 export interface Freshness {
   /**
@@ -468,4 +469,72 @@ export interface ApprovalDetail {
     lastSeenSyncId: number | null;
     missedCycles: number;
   };
+}
+
+// ---- bank (Phase 5, task R3a, ADR 0032) ------------------------------------------------------------
+// Amounts are signed integer minor units in the leg's own currency (negative = money out). IBANs
+// are masked (first 4 and last 4 characters); a full IBAN or a provider counterparty id never
+// leaves the server.
+
+export interface BankAccountDto {
+  id: number;
+  name: string;
+  currency: string;
+  balanceMinor: number | null;
+  balanceAt: string | null;
+  state: string | null;
+  ibanMasked: string | null;
+  isActive: boolean;
+}
+
+export type BankTxState = "pending" | "completed" | "declined" | "failed" | "reverted" | "unknown";
+
+export interface BankTransactionDto {
+  id: number;
+  externalId: string;
+  legId: string;
+  accountId: number | null;
+  accountName: string | null;
+  type: string | null;
+  state: BankTxState;
+  isFinal: boolean;
+  createdAt: string;
+  completedAt: string | null;
+  amountMinor: number;
+  currency: string;
+  reference: string | null;
+  description: string | null;
+  counterpartyName: string | null;
+  counterpartyIbanMasked: string | null;
+}
+
+export interface BankAccountsResponse {
+  connection: {
+    id: number;
+    status: string;
+    createsBankEntries: boolean | null;
+    paymentsMode: string;
+  } | null;
+  accounts: BankAccountDto[];
+  totalsByCurrency: { currency: string; balanceMinor: number; accounts: number }[];
+  freshness: Freshness;
+  /** False until the first successful sync. */
+  available: boolean;
+}
+
+export interface BankTransactionsResponse {
+  items: BankTransactionDto[];
+  nextCursor: string | null;
+  total: number;
+  totalsByCurrency: { currency: string; inMinor: number; outMinor: number; count: number }[];
+  freshness: Freshness;
+  available: boolean;
+}
+
+export interface BankTransactionDetail extends BankTransactionDto {
+  /** Every leg of the same Revolut transaction id (including this one), by leg id. */
+  legs: BankTransactionDto[];
+  firstSeenAt: string;
+  lastEventAt: string | null;
+  source: "webhook" | "poll" | "backfill";
 }

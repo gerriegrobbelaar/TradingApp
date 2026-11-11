@@ -13,6 +13,18 @@ export interface JobMessage {
   jobId: number;
 }
 
+/**
+ * A Revolut webhook event to process (task R3a): ids only. The webhook_events row says which
+ * transaction to refresh; amounts and state always come from the API, never from the payload.
+ */
+export interface RevolutEventMessage {
+  type: "revolut_event";
+  webhookEventId: number;
+}
+
+/** Everything that travels on the jobs queue. */
+export type QueueMessage = JobMessage | RevolutEventMessage;
+
 /** Final outcome of a run. */
 export type RunOutcome = "ok" | "partial" | "error" | "skipped";
 export type RunStatus = "queued" | "running" | RunOutcome;
