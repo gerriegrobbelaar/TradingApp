@@ -19,6 +19,7 @@
  */
 import {
   compileSafeRegex,
+  isLoosening,
   likePatterns,
   maskIban,
   normalizeIban,
@@ -46,6 +47,7 @@ import { ANY_ROLE, BadRequest, guarded, positiveIntParam } from "../read/routes"
 import { clearStateConflict } from "../revolut/conflicts";
 import { json, type Ctx, type Router } from "../router";
 import { loadMappings } from "./assemble";
+import { staleSettlements } from "./settlement";
 import {
   AUTO_CONFIRM_PHRASE,
   buildMatchConfig,
@@ -427,6 +429,7 @@ async function statsHandler(ctx: Ctx): Promise<Response> {
     enabled: settings.enabled,
     autoEnabled: settings.autoEnabled,
     unmappedAccounts,
+    staleSettlements: await staleSettlements(db, new Date(ctx.nowMs).toISOString()),
   };
   return json(body);
 }
@@ -833,6 +836,14 @@ async function putConfigHandler(ctx: Ctx): Promise<Response> {
   if (b["config"] !== undefined) {
     const parsed = parseTunables(b["config"], cur.tunables ?? DEFAULT_TUNABLES);
     if (!parsed.ok) return json({ error: "bad_config", problems: parsed.errors.slice(0, 10) }, 422);
+    // Phase 7 review S3: while automatic matching is on (and stays on), a change that lets it do
+    // more needs the typed phrase again. A stored config that is invalid counts as "unknown":
+    // any change then needs it. Tightening never does.
+    const autoStaysOn = cur.autoEnabled && b["autoEnabled"] !== false;
+    if (autoStaysOn && b["confirm"] !== AUTO_CONFIRM_PHRASE) {
+      const loosens = cur.tunables === null ? true : isLoosening(cur.tunables, parsed.value);
+      if (loosens) throw new ApiError("confirmation_required", 422);
+    }
     upsert(SETTING_CONFIG, parsed.value, cur.tunables, "matching.config_changed");
   }
   if (statements.length > 0) await db.batch(statements);

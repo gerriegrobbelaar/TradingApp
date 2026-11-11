@@ -59,6 +59,8 @@ const BLOCKS: Record<string, string> = {
   reference_names_other_item: "The reference also names another open item",
   iban_not_known_for_supplier:
     "The account number is not one of the supplier's known IBANs, so check for fraud",
+  iban_unknown_for_customer:
+    "The account number is not one of the customer's known IBANs (or is missing), so a person checks the payment",
   iban_recently_changed: "The supplier's IBAN was added or changed recently",
   amount_difference: "The amount differs from the open balance",
   not_full_payment: "The payment does not settle the open balance exactly",

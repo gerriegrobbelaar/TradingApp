@@ -28,6 +28,8 @@ export const BLOCK_LABELS: Record<string, string> = {
   reference_names_other_item: "The reference also names another invoice",
   iban_not_known_for_supplier: "This is not a known supplier account, so check for fraud",
   iban_recently_changed: "The supplier's account was added or changed recently",
+  iban_unknown_for_customer:
+    "The payment came from an account we do not know for this customer, so a person checks it",
   amount_difference: "The amount differs from the open balance",
   not_full_payment: "This does not pay the open balance in full",
   suggestion_only: "Matched on the amount alone, so it is only a suggestion",

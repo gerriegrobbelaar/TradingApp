@@ -35,6 +35,7 @@ export interface Tunables {
   amountToleranceMinor: number;
   blockAutoOnRecentIbanChangeDays: number;
   autoLedgerPatterns: boolean;
+  autoIncomingUnknownIban: boolean;
   autoTxTypes: string[];
   noMatchTxTypes: string[];
   internalAccountTypes: string[];
@@ -48,6 +49,7 @@ export const DEFAULT_TUNABLES: Tunables = {
   amountToleranceMinor: Number(DEFAULT_MATCH_CONFIG.amountToleranceMinor),
   blockAutoOnRecentIbanChangeDays: DEFAULT_MATCH_CONFIG.blockAutoOnRecentIbanChangeDays,
   autoLedgerPatterns: DEFAULT_MATCH_CONFIG.autoLedgerPatterns,
+  autoIncomingUnknownIban: DEFAULT_MATCH_CONFIG.autoIncomingUnknownIban,
   autoTxTypes: [...DEFAULT_MATCH_CONFIG.autoTxTypes],
   noMatchTxTypes: [...DEFAULT_MATCH_CONFIG.noMatchTxTypes],
   internalAccountTypes: [...DEFAULT_MATCH_CONFIG.internalAccountTypes],
@@ -61,6 +63,7 @@ const NUMBER_KEYS = [
   "amountToleranceMinor",
   "blockAutoOnRecentIbanChangeDays",
 ] as const;
+const BOOLEAN_KEYS = ["autoLedgerPatterns", "autoIncomingUnknownIban"] as const;
 const LIST_KEYS = ["autoTxTypes", "noMatchTxTypes", "internalAccountTypes"] as const;
 const TYPE_WORD = /^[a-z][a-z0-9_]{0,31}$/;
 const MAX_LIST = 20;
@@ -78,7 +81,7 @@ export function parseTunables(raw: unknown, base: Tunables = DEFAULT_TUNABLES): 
   }
   const rec = raw as Record<string, unknown>;
   const errors: string[] = [];
-  const known = new Set<string>([...NUMBER_KEYS, ...LIST_KEYS, "autoLedgerPatterns"]);
+  const known = new Set<string>([...NUMBER_KEYS, ...LIST_KEYS, ...BOOLEAN_KEYS]);
   for (const k of Object.keys(rec))
     if (!known.has(k)) errors.push(`${k.slice(0, 40)} is not a setting`);
   const out: Tunables = {
@@ -93,10 +96,11 @@ export function parseTunables(raw: unknown, base: Tunables = DEFAULT_TUNABLES): 
     if (typeof v !== "number" || !Number.isSafeInteger(v)) errors.push(`${k} must be an integer`);
     else out[k] = v;
   }
-  if ("autoLedgerPatterns" in rec) {
-    if (typeof rec["autoLedgerPatterns"] !== "boolean")
-      errors.push("autoLedgerPatterns must be true or false");
-    else out.autoLedgerPatterns = rec["autoLedgerPatterns"];
+  for (const k of BOOLEAN_KEYS) {
+    if (!(k in rec)) continue;
+    const v = rec[k];
+    if (typeof v !== "boolean") errors.push(`${k} must be true or false`);
+    else out[k] = v;
   }
   for (const k of LIST_KEYS) {
     if (!(k in rec)) continue;
@@ -127,6 +131,7 @@ export function buildMatchConfig(
     amountToleranceMinor: BigInt(Math.max(0, t.amountToleranceMinor)),
     blockAutoOnRecentIbanChangeDays: t.blockAutoOnRecentIbanChangeDays,
     autoLedgerPatterns: t.autoLedgerPatterns,
+    autoIncomingUnknownIban: t.autoIncomingUnknownIban,
     patterns,
     autoTxTypes: t.autoTxTypes,
     noMatchTxTypes: t.noMatchTxTypes,

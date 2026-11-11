@@ -142,7 +142,14 @@ const SKIP_BY_CODE: Record<MatchErrCode, string> = {
  * depth, ADR 0042): every input the engine's safety rules depend on must be present. A missing
  * one leaves the line in review; null means "complete".
  */
-export function autoInputGap(tx: MatchTx): string | null {
+export function autoInputGap(
+  tx: MatchTx,
+  /** Kinds of the items the automatic match would settle, with the division's freshness. */
+  freshness?: { kinds: readonly ("receivable" | "payable")[]; fresh: OpenItemsFreshness },
+): string | null {
+  if (freshness !== undefined && freshness.kinds.some((k) => !freshness.fresh[k])) {
+    return "open_items_stale";
+  }
   if (!tx.isFinal || tx.state !== "completed") return "incomplete_input";
   if (tx.frozen || tx.stateConflict) return "incomplete_input";
   if (tx.type === null || tx.type === "") return "incomplete_input";
@@ -153,6 +160,42 @@ export function autoInputGap(tx: MatchTx): string | null {
     return "incomplete_input";
   }
   return null;
+}
+
+/** Phase 7 review S4: the last COMPLETE open-items pass must be younger than this. */
+export const OPEN_ITEMS_MAX_AGE_MS = 26 * 3_600_000;
+
+export interface OpenItemsFreshness {
+  receivable: boolean;
+  payable: boolean;
+}
+
+/**
+ * Per item kind: has the division's last complete open-items pass (sync_state `receivables` /
+ * `payables`, `last_completed_at` is only set when a pass ended 'ok') finished less than 26 hours
+ * before `nowMs`? Never synced, an unreadable stamp or an older pass is stale. Pure read.
+ */
+export async function openItemsFreshness(
+  db: D1Database,
+  divisionId: number,
+  nowMs: number,
+): Promise<OpenItemsFreshness> {
+  const rows = (
+    await db
+      .prepare(
+        `SELECT entity, last_completed_at FROM sync_state
+         WHERE division_id = ?1 AND entity IN ('receivables', 'payables')`,
+      )
+      .bind(divisionId)
+      .all<{ entity: string; last_completed_at: string | null }>()
+  ).results;
+  const fresh = (entity: string): boolean => {
+    const at = rows.find((r) => r.entity === entity)?.last_completed_at ?? null;
+    if (at === null) return false;
+    const t = Date.parse(at);
+    return Number.isFinite(t) && nowMs - t < OPEN_ITEMS_MAX_AGE_MS;
+  };
+  return { receivable: fresh("receivables"), payable: fresh("payables") };
 }
 
 export async function runMatching(ctx: JobContext): Promise<HandlerResult> {
@@ -217,6 +260,7 @@ export async function runMatching(ctx: JobContext): Promise<HandlerResult> {
     if (capped) summary.capped = true;
     if (txs.length === 0) continue;
     const items = await assembleItems(db, divisionId);
+    const fresh = await openItemsFreshness(db, divisionId, nowMs);
     const itemsById = new Map(items.map((i) => [i.id, i]));
     const itemsHash = await itemsDigest(items);
     const results = matchBatch(txs, items, config);
@@ -264,7 +308,15 @@ export async function runMatching(ctx: JobContext): Promise<HandlerResult> {
       const currentStatus = status.get(tx.id) ?? "unmatched";
 
       // Automatic match: opt-in, and only what the engine itself calls automatic, with complete inputs.
-      const gap = settings.autoEnabled && r.decision === "auto" ? autoInputGap(tx) : null;
+      const kinds: ("receivable" | "payable")[] = [];
+      for (const a of r.chosen?.allocations ?? []) {
+        const k = itemsById.get(a.itemId)?.kind;
+        // An item the assembly does not know cannot be verified: treat it as both kinds stale.
+        if (k === undefined) kinds.push("receivable", "payable");
+        else kinds.push(k);
+      }
+      const gap =
+        settings.autoEnabled && r.decision === "auto" ? autoInputGap(tx, { kinds, fresh }) : null;
       if (gap !== null) skip(gap);
       if (settings.autoEnabled && r.decision === "auto" && r.chosen !== null && gap === null) {
         const chosen = r.chosen;

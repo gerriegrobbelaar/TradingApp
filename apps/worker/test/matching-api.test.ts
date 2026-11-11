@@ -36,6 +36,9 @@ import {
   txStatus,
   resetWorld,
   enableAuto,
+  setSetting,
+  SETTING_AUTO,
+  SETTING_CONFIG,
   type World,
 } from "./matching-helpers";
 
@@ -1130,6 +1133,60 @@ describe("configuration", () => {
   });
 });
 
+describe("configuration while automatic matching is on (S3)", () => {
+  const PHRASE = "ENABLE AUTOMATIC MATCHING";
+  const put = (body: unknown) =>
+    send<MatchConfigResponse>("admin", "PUT", "/api/matching/config", body);
+  const gapOf = async (): Promise<number> =>
+    (await get<MatchConfigResponse>("admin", "/api/matching/config")).body.config.autoMatchMinGap;
+
+  it("loosening needs the phrase again, tightening and unrelated changes do not", async () => {
+    await put({ config: { autoMatchMinGap: 30 } });
+    await put({ autoEnabled: true, confirm: PHRASE });
+    const loosening: Record<string, unknown>[] = [
+      { autoMatchMinGap: 29 },
+      { blockAutoOnRecentIbanChangeDays: 60 },
+      { autoLedgerPatterns: true },
+      { autoIncomingUnknownIban: true },
+      { amountToleranceMinor: 1 },
+      { autoTxTypes: ["transfer", "topup", "card_payment", "atm"] },
+    ];
+    for (const config of loosening) {
+      const r = await put({ config });
+      expect([r.status, err(r)], JSON.stringify(config)).toEqual([422, "confirmation_required"]);
+    }
+    expect(await gapOf()).toBe(30);
+    const wrong = await put({ config: { autoMatchMinGap: 25 }, confirm: "yes" });
+    expect(err(wrong)).toBe("confirmation_required");
+    const ok = await put({ config: { autoMatchMinGap: 25 }, confirm: PHRASE });
+    expect(ok.status).toBe(200);
+    expect(await gapOf()).toBe(25);
+    // Tightening and an unrelated change: no phrase.
+    expect((await put({ config: { autoMatchMinGap: 40 } })).status).toBe(200);
+    expect((await put({ config: { maxCandidates: 7 } })).status).toBe(200);
+    expect((await put({ config: { autoIncomingUnknownIban: false } })).status).toBe(200);
+    // Turning auto off in the same request lets a loosening through.
+    const both = await put({ autoEnabled: false, config: { autoMatchMinGap: 12 } });
+    expect([both.status, both.body.autoEnabled]).toEqual([200, false]);
+  });
+
+  it("with automatic matching off, loosening needs no phrase", async () => {
+    const r = await put({ config: { autoMatchMinGap: 11, autoIncomingUnknownIban: true } });
+    expect(r.status).toBe(200);
+    expect(r.body.config.autoIncomingUnknownIban).toBe(true);
+  });
+
+  it("a stored config below the floors is invalid, and repairing it while auto is on needs the phrase", async () => {
+    await setSetting(SETTING_CONFIG, { autoMatchMinGap: 5 });
+    await setSetting(SETTING_AUTO, true);
+    const r = await get<MatchConfigResponse>("admin", "/api/matching/config");
+    expect(r.body.configErrors.length).toBeGreaterThan(0);
+    const no = await put({ config: { autoMatchMinGap: 20 } });
+    expect(err(no)).toBe("confirmation_required");
+    expect((await put({ config: { autoMatchMinGap: 20 }, confirm: PHRASE })).status).toBe(200);
+  });
+});
+
 describe("account map", () => {
   it("shows accounts with their mapping and the administrations to choose from", async () => {
     const r = await get<MatchAccountMapResponse>("admin", "/api/matching/account-map");
@@ -1482,6 +1539,7 @@ describe("response shapes", () => {
       "matchesNeedingReview",
       "oldestUnmatchedAt",
       "oldestUnmatchedDays",
+      "staleSettlements",
       "suggested",
       "unmappedAccounts",
       "unmatched",

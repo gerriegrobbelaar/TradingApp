@@ -1,0 +1,24 @@
+{
+  "_readme": "Pinned trigger names and sha-256 of each normalised body after ALL migrations (whitespace collapsed). Rule: any migration that rebuilds a guarded table must recreate its triggers, and this file is updated deliberately with `pnpm --filter @camelthorn/worker run triggers:update`, reviewing the diff. A trigger that is dropped or weakened fails test/migrations-all.test.ts until then.",
+  "triggers": {
+    "audit_log_no_delete": "1623c24532eaa33747f15d6d7074b369b54d023e69d0762a9f17c56d7d0e09ae",
+    "audit_log_no_update": "70dd941a3c641d51f2c88924b91228c4b315a98f3d16d50682b7012ad5509df6",
+    "bank_account_map_guard_delete": "b34cf54fec8835ec1081e5a5ba3583e0e323ee4f0dd04c5b2b3e591804b74942",
+    "bank_account_map_guard_update": "c0f5d3b1e12310394e0202ccd5a5f5bbe30102ebed1eb60516625fe2b187c8ff",
+    "bank_transactions_guard_matched": "3cb94e3f60fbbfc82ae59590c65beadfa0c5889815fe870933f0b20c4a50f15f",
+    "bank_transactions_guard_status": "2ef6e7483ab449653c7c195a99a6d328e7ddbfdbcf7d0b1f817d3a1ab47c098e",
+    "match_allocations_guard": "8162f8a13c96cbdf9c556ba82686f3736032f1ce34f2ce63123779ee83c497a4",
+    "match_allocations_guard_open_before": "d5503ede46c5296403c196fbc5519e273b6d75d23c8cb91611cafb48ef16ed87",
+    "match_allocations_guard_update": "26585bec853477ccfe8aad2ef5f1d41092af2170f2b347ac49213c4603a9fc1b",
+    "matches_guard_booked_at": "241e6ec48212f7460985c5ccf57433e2949b784eb96a25d9cb8e3b0c0a0b158e",
+    "matches_guard_exact_state": "ae4f10bd8f9f3a0b9b1243129475bdcf49c9d54f434d814194e4d9223ac624f9",
+    "matches_guard_immutable": "9397814fab2dabfa68e2b3a9f9bc7d77b3b7a05ccbdb9e0f9b6844e6e359c7a6",
+    "matches_guard_insert": "93aae57d13bbee00661afce00ecc0c050ed67f98e444742edcd796b9fcaa73ac",
+    "matches_guard_undo_claimed": "3a0b9ae78631170ed8ba8db71469b27aa5d04fd7bf8a6d31c9c7ef5813d16a14",
+    "matches_guard_update": "96ddaa6b5cddfa908db697e643611ff2c642210173d37580a58e7d9e8fc9d77c",
+    "open_items_status_insert": "1a85c0107b3a0362fc1cb2f6d38c97b5f1e48b99b74c6c2a8f6da7cfc0b8be30",
+    "open_items_status_update": "f165c19bcb2b7aaddca7b50d046e8af8f77b5253e3b1cb4d466c3321acd757e9",
+    "outbox_guard_insert": "fc391d9006f31e95717db2b2c8dd7a426cd9f0cba374f037f72ad69f58ffb0cb",
+    "outbox_guard_update": "723ad80ecc83f8cf9d46aa4fc6099a0718541cb37c6a595bba49b8bcfe2e4ce9"
+  }
+}

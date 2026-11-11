@@ -103,3 +103,26 @@ references that are not exact, reverted transactions after a match (Phase 8), ma
 Raise `autoMatchMinGap` or `blockAutoOnRecentIbanChangeDays` to be stricter. Keep `amountToleranceMinor` at 0 unless
 there is a known rounding source; it never makes anything automatic. Change weights only in `scores.ts`, then paste
 `renderScoreTable()` here; keep partial (88) and inexact (cap 90) below 95 so they can never qualify.
+
+## Addendum: phase 7 final review (U2, S3, S4 and the incoming-IBAN policy)
+- **Floors (S3).** CLAUDE.md 4.2 says the next candidate must be "far behind". `validateMatchConfig` now requires
+  `autoMatchMinGap` >= 10 and `blockAutoOnRecentIbanChangeDays` >= 30 (`MIN_AUTO_GAP`, `MIN_RECENT_IBAN_DAYS`). A stored
+  configuration below a floor is invalid: the `bank.match` job fails closed with `matching_config_invalid`, the settings
+  screen shows the problems (`configErrors`), and nothing is repaired silently.
+- **Loosening needs the phrase again (S3).** `isLoosening(prev, next)` (core, pure) is true when automatic matching may do
+  more: lower `autoMatchMinScore`, `autoMatchMinGap` or `blockAutoOnRecentIbanChangeDays`, `autoLedgerPatterns` or
+  `autoIncomingUnknownIban` switched on, a higher `amountToleranceMinor`, a new entry in `autoTxTypes`, or an entry removed
+  from `internalAccountTypes`. `PUT /api/matching/config` requires `ENABLE AUTOMATIC MATCHING` for such a change while
+  `matching.auto_enabled` is on and stays on in the same request (a stored invalid config counts as "unknown": any change needs
+  it). Tightening and unrelated changes never need it; with auto off nothing needs it, because switching auto on needs it.
+- **Incoming payment from an unknown IBAN (decided default: review).** `MatchConfig.autoIncomingUnknownIban` (default
+  false). When false, an incoming payment matched to a receivable whose counterparty IBAN is missing or not among the
+  customer's known IBANs gets the block `iban_unknown_for_customer`: it is never automatic, but stays a high-scoring review
+  candidate (scores are unchanged; `scores.ts` is still the single source and the table above is unchanged). When true the
+  earlier behaviour applies (the IBAN is only a bonus for rule 1). The mirror image for payables is the older
+  `iban_not_known_for_supplier`.
+- **Fresh open items (S4).** The worker (not the engine) also requires, per division and per item kind, that the last complete
+  open-items pass (`sync_state` `receivables` / `payables`, `last_completed_at`, which is only set when a pass ended ok) is less
+  than 26 hours old (`OPEN_ITEMS_MAX_AGE_MS`). Otherwise, or when no pass ever completed (Exact sync jobs off), the decision
+  is review only with the skip code `open_items_stale` (counted in the run summary, `skipped_by_reason`); the candidate is
+  still suggested. Exactly 26 hours is stale.

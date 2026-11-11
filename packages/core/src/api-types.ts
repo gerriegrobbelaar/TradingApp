@@ -860,6 +860,8 @@ export interface MatchTunablesDto {
   maxCandidates: number;
   amountToleranceMinor: number;
   blockAutoOnRecentIbanChangeDays: number;
+  /** Always present in responses; optional in the web form until it has a switch for it. */
+  autoIncomingUnknownIban?: boolean;
   autoLedgerPatterns: boolean;
   autoTxTypes: string[];
   noMatchTxTypes: string[];
@@ -993,6 +995,11 @@ export interface MatchStatsResponse {
   autoEnabled: boolean;
   /** Active Revolut accounts without an Exact administration mapping. */
   unmappedAccounts: number;
+  /**
+   * Allocations of matches booked in Exact more than 48 hours ago that still count against their
+   * item because Exact has not shown the payment (Phase 8 data-quality signal; never auto-released).
+   */
+  staleSettlements: number;
 }
 
 // ---- Booking in Exact (Phase 7, M7c). Fixed shapes shared with the web (M7d). -----------------------

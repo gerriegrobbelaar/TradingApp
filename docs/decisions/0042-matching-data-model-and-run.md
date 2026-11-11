@@ -84,3 +84,27 @@ Exact (for example booked and synced after the booking) in the trigger, the asse
 ## What M7c adds
 Done in M7c (ADR 0044): booking outbox, `exact_state` transitions, retry and idempotency keys, and the allocation settlement rule that fixes the double count noted under "Undo window". Reversal stays manual (409 `already_booked_in_exact`, detail `reversal_required_in_exact`).
 Not done here: auto-ignore of internal transfers (they stay unmatched until a person ignores them), FX matches, group UI.
+
+## Addendum: settlement rule v2 (phase 7 final review S5, migration 0025)
+The rule of ADR 0044 ("released once the item was re-read after `booked_at`") trusted that Exact's list read reflects a MatchSet
+as soon as the read starts after booking. If it lags, the item reappears fully open and the same money could be allocated again.
+New rule, ONE predicate (`SETTLEMENT_PREDICATE` in `apps/worker/src/matching/settlement.ts`, copied verbatim into the migration;
+`allocCounts(m, oi, a)` rewrites only its aliases): an allocation of a live match counts, EXCEPT when the match is
+`matched_in_exact`, `booked_at < open_items.synced_at`, the baseline `match_allocations.open_before_minor` is known, AND the item
+is closed or has no balance or `ABS(open_before_minor) - ABS(open_minor) >= allocated_minor`. Anything else keeps counting:
+a lagging read, a partial decrease, an unknown (NULL) baseline. Nothing is released by a timeout. After 48 hours past
+`booked_at` a still-counting booked allocation is a data-quality signal: `staleSettlements(db, nowIso)` and
+`GET /api/matching/stats` `staleSettlements` (Phase 8 raises the issue; a person reviews it).
+- `open_before_minor` is Exact's signed open balance when the match is created (`applyMatch` writes it in the same batch). The
+  booking executor calls `recordOpenBefore(db, matchId)` right BEFORE the claim to refresh it to the balance of the last read
+  before the MatchSet; a trigger refuses the write once the match left `not_booked`. Rows that existed at migration time have
+  NULL = unknown (booking was still off, so no booked match depends on it).
+- The remaining allocation fields stay immutable (`match_allocations_guard_update` now lists its columns).
+- Known limit: the test is per allocation. Two booked matches against one item are each judged on their own decrease; a decrease
+  caused by only one of them can release both, and the over-allocation check then flags the item for review.
+- **Trigger pinning (N5).** `apps/worker/test/fixtures/trigger-hashes.json` lists every trigger after all migrations with the
+  sha-256 of its whitespace-normalised body; `migrations-all.test.ts` compares the exact list and each hash. Rule: any
+  migration that rebuilds a guarded table must recreate its triggers and update the fixture deliberately with
+  `pnpm --filter @camelthorn/worker run triggers:update`, reviewing the diff.
+- Migration 0025 also lets the outbox immutability trigger accept one change to a finished row: replacing `payload_json` by the
+  placeholder `{"v":1,"stage":"redacted"}` (ADR 0011).

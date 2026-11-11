@@ -23,6 +23,7 @@ export const DEFAULT_MATCH_CONFIG: MatchConfig = {
   maxCandidates: 5,
   amountToleranceMinor: 0n,
   blockAutoOnRecentIbanChangeDays: 90,
+  autoIncomingUnknownIban: false,
   autoLedgerPatterns: false,
   patterns: [],
   autoTxTypes: ["transfer", "topup", "card_payment"],
@@ -61,6 +62,46 @@ export type RegexProblemCode = (typeof REGEX_PROBLEM_CODES)[number];
 /** CLAUDE.md 4.2: auto-match only when the top score is at least 95. */
 export const MIN_AUTO_SCORE = 95;
 export const MAX_TOLERANCE_MINOR = 100n;
+/**
+ * Floors (phase 7 review S3). CLAUDE.md 4.2 wants "the next candidate far behind": a gap below 10
+ * points is not far, and a supplier IBAN changed less than 30 days ago is still inside the usual
+ * window of invoice-redirection fraud. A configuration below a floor is invalid.
+ */
+export const MIN_AUTO_GAP = 10;
+export const MIN_RECENT_IBAN_DAYS = 30;
+
+/** The settings that decide how much an automatic match may do. */
+export interface AutoSafetyFields {
+  autoMatchMinScore: number;
+  autoMatchMinGap: number;
+  blockAutoOnRecentIbanChangeDays: number;
+  autoLedgerPatterns: boolean;
+  autoIncomingUnknownIban: boolean;
+  /** Minor units; number (stored JSON) or bigint (engine config). */
+  amountToleranceMinor: number | bigint;
+  autoTxTypes?: readonly string[];
+  internalAccountTypes?: readonly string[];
+}
+
+/**
+ * True when `next` lets automatic matching do MORE than `prev`: a lower score or gap, fewer days of
+ * recent-IBAN protection, ledger patterns or unknown-IBAN incoming payments switched on, a larger
+ * amount tolerance, a new transaction type that may be automatic, or an own-account type removed.
+ * Tightening and unrelated changes are not loosening. Pure.
+ */
+export function isLoosening(prev: AutoSafetyFields, next: AutoSafetyFields): boolean {
+  if (next.autoMatchMinScore < prev.autoMatchMinScore) return true;
+  if (next.autoMatchMinGap < prev.autoMatchMinGap) return true;
+  if (next.blockAutoOnRecentIbanChangeDays < prev.blockAutoOnRecentIbanChangeDays) return true;
+  if (next.autoLedgerPatterns && !prev.autoLedgerPatterns) return true;
+  if (next.autoIncomingUnknownIban && !prev.autoIncomingUnknownIban) return true;
+  if (BigInt(next.amountToleranceMinor) > BigInt(prev.amountToleranceMinor)) return true;
+  const prevAuto = new Set(prev.autoTxTypes ?? []);
+  if ((next.autoTxTypes ?? []).some((t) => !prevAuto.has(t))) return true;
+  const nextInternal = new Set(next.internalAccountTypes ?? []);
+  if ((prev.internalAccountTypes ?? []).some((t) => !nextInternal.has(t))) return true;
+  return false;
+}
 
 /** Reason the regex is outside the safe subset, or null when it is acceptable. */
 export function unsafeRegexReason(src: string): RegexProblemCode | null {
@@ -258,8 +299,8 @@ export function validateMatchConfig(cfg: MatchConfig): string[] {
   if (!isInt(cfg.autoMatchMinScore, MIN_AUTO_SCORE, 100)) {
     out.push(`autoMatchMinScore must be an integer from ${MIN_AUTO_SCORE} to 100`);
   }
-  if (!isInt(cfg.autoMatchMinGap, 1, 100))
-    out.push("autoMatchMinGap must be an integer from 1 to 100");
+  if (!isInt(cfg.autoMatchMinGap, MIN_AUTO_GAP, 100))
+    out.push(`autoMatchMinGap must be an integer from ${MIN_AUTO_GAP} to 100`);
   if (!isInt(cfg.suggestMinScore, 1, 100) || cfg.suggestMinScore > cfg.autoMatchMinScore) {
     out.push("suggestMinScore must be an integer from 1 to autoMatchMinScore");
   }
@@ -271,8 +312,13 @@ export function validateMatchConfig(cfg: MatchConfig): string[] {
   ) {
     out.push(`amountToleranceMinor must be from 0 to ${MAX_TOLERANCE_MINOR}`);
   }
-  if (!isInt(cfg.blockAutoOnRecentIbanChangeDays, 0, 3650)) {
-    out.push("blockAutoOnRecentIbanChangeDays must be an integer from 0 to 3650");
+  if (!isInt(cfg.blockAutoOnRecentIbanChangeDays, MIN_RECENT_IBAN_DAYS, 3650)) {
+    out.push(
+      `blockAutoOnRecentIbanChangeDays must be an integer from ${MIN_RECENT_IBAN_DAYS} to 3650`,
+    );
+  }
+  if (typeof cfg.autoIncomingUnknownIban !== "boolean") {
+    out.push("autoIncomingUnknownIban must be true or false");
   }
   const ids = new Set<string>();
   cfg.patterns.forEach((p, i) => {

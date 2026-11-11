@@ -292,6 +292,10 @@ function itemBlocks(ctx: Ctx, infos: Info[]): string[] {
     if (!info.sameCur) out.add("currency_mismatch");
     if (info.ref !== null && info.ref !== "exact") out.add("reference_not_exact");
     if (info.otherRelIban) out.add("iban_belongs_to_other_relation");
+    if (it.kind === "receivable" && !cfg.autoIncomingUnknownIban) {
+      // Money in from an account we do not know for this customer: a person checks it.
+      if (ctx.txIban === null || !info.ibanHit) out.add("iban_unknown_for_customer");
+    }
     if (it.kind === "payable") {
       // Paying out to a supplier: the account must be one we know for that supplier.
       if (ctx.txIban === null || !info.ibanHit) out.add("iban_not_known_for_supplier");

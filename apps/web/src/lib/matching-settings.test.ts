@@ -48,9 +48,9 @@ describe("thresholds mirror core validateMatchConfig", () => {
     }
   });
 
-  it("the gap is 1 to 100; the suggestion score is at most the automatic score", () => {
-    expect(checkTunables(form({ autoMatchMinGap: "0" })).ok).toBe(false);
-    expect(checkTunables(form({ autoMatchMinGap: "1" })).ok).toBe(true);
+  it("the gap is 10 to 100; the suggestion score is at most the automatic score", () => {
+    expect(checkTunables(form({ autoMatchMinGap: "9" })).ok).toBe(false);
+    expect(checkTunables(form({ autoMatchMinGap: "10" })).ok).toBe(true);
     expect(checkTunables(form({ autoMatchMinGap: "101" })).ok).toBe(false);
     const c = checkTunables(form({ suggestMinScore: "99" }));
     expect(c.ok).toBe(false);
@@ -64,13 +64,14 @@ describe("thresholds mirror core validateMatchConfig", () => {
     expect(checkTunables(form({ suggestMinScore: "95" })).ok).toBe(true);
   });
 
-  it("candidates 1 to 50, tolerance 0 to 100, days 0 to 3650", () => {
+  it("candidates 1 to 50, tolerance 0 to 100, days 30 to 3650", () => {
     expect(checkTunables(form({ maxCandidates: "0" })).ok).toBe(false);
     expect(checkTunables(form({ maxCandidates: "51" })).ok).toBe(false);
     expect(checkTunables(form({ amountToleranceMinor: "101" })).ok).toBe(false);
     expect(checkTunables(form({ amountToleranceMinor: "100" })).ok).toBe(true);
     expect(checkTunables(form({ blockAutoOnRecentIbanChangeDays: "3651" })).ok).toBe(false);
-    expect(checkTunables(form({ blockAutoOnRecentIbanChangeDays: "0" })).ok).toBe(true);
+    expect(checkTunables(form({ blockAutoOnRecentIbanChangeDays: "29" })).ok).toBe(false);
+    expect(checkTunables(form({ blockAutoOnRecentIbanChangeDays: "30" })).ok).toBe(true);
   });
 
   it("the lists must be lower-case words and not overlap", () => {

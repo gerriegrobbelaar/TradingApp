@@ -2,6 +2,12 @@ import { applyD1Migrations, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { checkMatchingInvariants } from "../src/matching/invariants";
 import { flagMatchesForReview } from "../src/matching/store";
+import pinned from "./fixtures/trigger-hashes.json";
+
+async function sha256(text: string): Promise<string> {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 /**
  * Every migration, end to end, on a database populated at the Phase 1 schema (0001..0003): the
@@ -106,31 +112,18 @@ describe("all migrations on a database populated at the first schema", () => {
     });
     expect(await checkMatchingInvariants(mdb)).toEqual([]);
 
-    // Every trigger exists on the migrated database.
-    const triggers = (
+    // Every trigger exists on the migrated database, exactly these and with exactly these bodies
+    // (review N5): a migration that drops or weakens a trigger changes the list or a hash and must
+    // update test/fixtures/trigger-hashes.json deliberately (`pnpm run triggers:update`).
+    const rows = (
       await mdb
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")
-        .all<{ name: string }>()
-    ).results.map((r) => r.name);
-    expect(triggers).toEqual(
-      expect.arrayContaining([
-        "bank_account_map_guard_delete",
-        "bank_account_map_guard_update",
-        "bank_transactions_guard_matched",
-        "bank_transactions_guard_status",
-        "match_allocations_guard",
-        "match_allocations_guard_update",
-        "matches_guard_immutable",
-        "matches_guard_insert",
-        "matches_guard_update",
-        // 0023 (booking)
-        "matches_guard_exact_state",
-        "matches_guard_booked_at",
-        "matches_guard_undo_claimed",
-        "outbox_guard_insert",
-        "outbox_guard_update",
-      ]),
-    );
+        .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name")
+        .all<{ name: string; sql: string }>()
+    ).results;
+    const actual: Record<string, string> = {};
+    for (const r of rows) actual[r.name] = await sha256(r.sql.replace(/\s+/g, " ").trim());
+    expect(Object.keys(actual).sort()).toEqual(Object.keys(pinned.triggers).sort());
+    expect(actual).toEqual(pinned.triggers);
 
     // 0023 on migrated data: the old matches are not booked, nothing is in the outbox, booking is
     // off (no settings row), and the new columns and the call ledger exist.
