@@ -13,7 +13,8 @@ export interface Dec {
 }
 
 const PLAIN_DECIMAL_RE = /^(-?)(\d+)(?:\.(\d+))?$/;
-const MAX_DIGITS = 60;
+/** At most this many digits in a parsed decimal (sign and point not counted). */
+export const MAX_DECIMAL_DIGITS = 60;
 
 export function pow10(n: number): bigint {
   if (!Number.isInteger(n) || n < 0 || n > 1000) throw new RangeError("power out of range");
@@ -26,11 +27,13 @@ export function pow10(n: number): bigint {
  */
 export function parseDecimal(s: string): Dec | null {
   if (typeof s !== "string") return null;
+  // Length first: the regex is linear, but there is no reason to scan megabytes.
+  if (s.length > MAX_DECIMAL_DIGITS + 2) return null;
   const m = PLAIN_DECIMAL_RE.exec(s);
   if (!m) return null;
   const whole = m[2] ?? "";
   const frac = m[3] ?? "";
-  if (whole.length + frac.length > MAX_DIGITS) return null;
+  if (whole.length + frac.length > MAX_DECIMAL_DIGITS) return null;
   const int = BigInt(whole + frac);
   return { int: m[1] === "-" ? -int : int, scale: frac.length };
 }

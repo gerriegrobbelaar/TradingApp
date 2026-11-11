@@ -32,26 +32,40 @@ export interface RateTable {
 const MAX_FRACTION_DIGITS = 12;
 const MAX_INTEGER_DIGITS = 12;
 const CURRENCY_RE = /^[A-Z]{3}$/;
-const RATE_RE = /^(\d+)(?:\.(\d+))?$/;
+const RATE_RE = /^([0-9]+)(?:\.([0-9]+))?$/;
+/**
+ * Longest string `parseRate` looks at. Generous for leading zeros ("0000001.5"), but bounded so a
+ * hostile field is refused in O(1).
+ */
+const MAX_RATE_INPUT_CHARS = 64;
 const ONE: Dec = { int: 1n, scale: 0 };
 
 /**
- * Strict rate parser. Accepts digits with an optional single "." followed by digits: no sign,
- * exponent, whitespace, ".5" or "5.". Leading zeros are allowed and removed ("01.50" -> "1.5").
- * At most 12 integer and 12 fraction digits; must be > 0. Result has no trailing zeros.
+ * Strict rate parser. Accepts ASCII digits with an optional single "." followed by digits: no
+ * sign, exponent, whitespace, ".5", "5.", or non-ASCII digits. Leading zeros are allowed and
+ * removed ("01.50" -> "1.5"). At most 12 integer digits (after leading zeros are removed) and 12
+ * fraction digits (before trailing zeros are removed); must be > 0. The result has no trailing
+ * zeros and parsing it again returns it unchanged. Linear time on any input: the length is
+ * checked before anything else and no regex can backtrack.
  */
 export function parseRate(
   s: string,
 ): { ok: true; rate: RateString } | { ok: false; error: string } {
   if (typeof s !== "string") return { ok: false, error: "not_a_string" };
+  if (s.length > MAX_RATE_INPUT_CHARS) return { ok: false, error: "too_long" };
   const m = RATE_RE.exec(s);
   if (!m) return { ok: false, error: "bad_format" };
+  const rawWhole = m[1] ?? "";
   const rawFrac = m[2] ?? "";
-  const whole = (m[1] ?? "").replace(/^0+(?=\d)/, "");
-  const frac = rawFrac.replace(/0+$/, "");
-  if (whole.length > MAX_INTEGER_DIGITS) return { ok: false, error: "too_large" };
   if (rawFrac.length > MAX_FRACTION_DIGITS) return { ok: false, error: "too_many_decimals" };
-  if (/^0*$/.test(whole + frac)) return { ok: false, error: "not_positive" };
+  let w = 0;
+  while (w < rawWhole.length - 1 && rawWhole.charCodeAt(w) === 48) w += 1;
+  const whole = rawWhole.slice(w);
+  if (whole.length > MAX_INTEGER_DIGITS) return { ok: false, error: "too_large" };
+  let f = rawFrac.length;
+  while (f > 0 && rawFrac.charCodeAt(f - 1) === 48) f -= 1;
+  const frac = rawFrac.slice(0, f);
+  if (whole === "0" && frac === "") return { ok: false, error: "not_positive" };
   return { ok: true, rate: frac === "" ? whole : `${whole}.${frac}` };
 }
 
@@ -63,9 +77,12 @@ function validCode(code: string): boolean {
 function lookup(code: string, table: RateTable): Dec | null {
   if (!validCode(code)) return null;
   if (code === "EUR") return ONE;
-  if (!Object.prototype.hasOwnProperty.call(table.rates, code)) return null;
-  const raw = table.rates[code];
-  if (raw === undefined) return null;
+  const rates: unknown = typeof table === "object" && table !== null ? table.rates : null;
+  if (typeof rates !== "object" || rates === null) return null;
+  // Own data properties only: never the prototype chain, never a getter.
+  const desc = Object.getOwnPropertyDescriptor(rates, code);
+  const raw: unknown = desc === undefined ? undefined : desc.value;
+  if (typeof raw !== "string") return null;
   const p = parseRate(raw);
   return p.ok ? parseDecimal(p.rate) : null;
 }
@@ -75,7 +92,13 @@ function toRateString(d: Dec): RateString | null {
   return decToString(normaliseDec(d));
 }
 
-/** Effective from -> to multiplier to 12 decimals, or null when a rate is missing. */
+/**
+ * Effective from -> to multiplier (`r_to / r_from`, so EUR -> USD is r_usd and USD -> EUR is
+ * 1 / r_usd), rounded half away from zero to 12 decimals, trailing zeros removed. Null when a
+ * rate is missing or a code is invalid, and also when the multiplier is below 0.0000000000005 (it
+ * would round to 0, which is not a rate). For display and audit only: amounts are never
+ * recomputed from it.
+ */
 export function crossRate(from: string, to: string, table: RateTable): RateString | null {
   if (from === to) return validCode(from) ? "1" : null;
   const rf = lookup(from, table);
@@ -84,39 +107,61 @@ export function crossRate(from: string, to: string, table: RateTable): RateStrin
   return toRateString(divDec(rt, rf, MAX_FRACTION_DIGITS));
 }
 
+/**
+ * Largest |amount| in minor units accepted (exclusive): 10^30. Far beyond any real balance
+ * (10^15 EUR is 10^17 cents), small enough that a crafted bigint cannot make the products
+ * below expensive.
+ */
+const MAX_ABS_AMOUNT = 10n ** 30n;
+
 type AmountResult =
   { ok: true; value: bigint } | { ok: false; error: "bad_amount" | "unsafe_number" };
 
 function toBigint(a: bigint | number): AmountResult {
-  if (typeof a === "bigint") return { ok: true, value: a };
+  if (typeof a === "bigint") {
+    if (a >= MAX_ABS_AMOUNT || a <= -MAX_ABS_AMOUNT) return { ok: false, error: "bad_amount" };
+    return { ok: true, value: a };
+  }
   if (typeof a !== "number" || !Number.isFinite(a) || !Number.isInteger(a)) {
     return { ok: false, error: "bad_amount" };
   }
   if (!Number.isSafeInteger(a)) return { ok: false, error: "unsafe_number" };
+  // `-0` becomes 0n.
   return { ok: true, value: BigInt(a) };
 }
 
-function convertBig(
-  amount: bigint,
-  from: string,
-  to: string,
-  table: RateTable,
-): { amountMinor: bigint; rateUsed: RateString } | null {
-  if (from === to) return validCode(from) ? { amountMinor: amount, rateUsed: "1" } : null;
+type ConvertResult =
+  | { ok: true; amountMinor: bigint; rateUsed: RateString }
+  | { ok: false; error: "missing_rate" | "rate_out_of_range" };
+
+function convertBig(amount: bigint, from: string, to: string, table: RateTable): ConvertResult {
+  if (from === to) {
+    return validCode(from)
+      ? { ok: true, amountMinor: amount, rateUsed: "1" }
+      : { ok: false, error: "missing_rate" };
+  }
   const rf = lookup(from, table);
   const rt = lookup(to, table);
-  if (!rf || !rt) return null;
-  // minor_to = a * 10^st * rt / (10^sf * rf), rates being int / 10^scale.
+  if (!rf || !rt) return { ok: false, error: "missing_rate" };
+  const rateUsed = toRateString(divDec(rt, rf, MAX_FRACTION_DIGITS));
+  if (rateUsed === null) return { ok: false, error: "rate_out_of_range" };
+  // minor_to = a * 10^st * rt / (10^sf * rf), rates being int / 10^scale. One exact rational,
+  // one rounding (half away from zero) at the end.
   const sf = currencyScale(from);
   const st = currencyScale(to);
   const num = amount * pow10(st) * rt.int * pow10(rf.scale);
   const den = pow10(sf) * rf.int * pow10(rt.scale);
-  return {
-    amountMinor: divRound(num, den),
-    rateUsed: toRateString(divDec(rt, rf, MAX_FRACTION_DIGITS)) ?? "0",
-  };
+  return { ok: true, amountMinor: divRound(num, den), rateUsed };
 }
 
+/**
+ * Convert integer minor units from one currency to another through the EUR rate table.
+ * `amountMinor` may be a bigint (|a| < 10^30) or a safe-integer number. Errors:
+ * `missing_rate` (a code is invalid or has no usable rate), `rate_out_of_range` (the cross
+ * rate is below 0.0000000000005, so `rateUsed` could not be recorded; no real ECB pair comes
+ * near), `bad_amount` (not an integer, or too large), `unsafe_number` (a number beyond
+ * Number.MAX_SAFE_INTEGER: pass a bigint).
+ */
 export function convertMinor(args: {
   amountMinor: bigint | number;
   from: string;
@@ -124,18 +169,32 @@ export function convertMinor(args: {
   table: RateTable;
 }):
   | { ok: true; amountMinor: bigint; rateUsed: RateString }
-  | { ok: false; error: "missing_rate" | "bad_amount" | "unsafe_number" } {
+  | {
+      ok: false;
+      error: "missing_rate" | "rate_out_of_range" | "bad_amount" | "unsafe_number";
+    } {
   const a = toBigint(args.amountMinor);
   if (!a.ok) return a;
-  const r = convertBig(a.value, args.from, args.to, args.table);
-  if (!r) return { ok: false, error: "missing_rate" };
-  return { ok: true, ...r };
+  return convertBig(a.value, args.from, args.to, args.table);
 }
 
 /**
- * Open foreign-currency balance valued at today's table versus the base-currency amount it was
- * booked at. `differenceMinor` = today - booked. `impliedBookedRate` is booked / open (base
- * per 1 unit of `currency`, 12 dp) or null when it is not positive or the open amount is 0.
+ * Unrealised FX difference of one open item (ADR 0035, "Unrealised difference").
+ *
+ * Sign convention: `openMinor` and `bookedBaseMinor` are signed the way `open_items.open_minor`
+ * and `open_dc_minor` are (ADR 0022): positive for an open invoice and for an open bill alike,
+ * negative for a credit note of either kind. `differenceMinor` = `todayBaseMinor` -
+ * `bookedBaseMinor`: the change in the item's base-currency value since booking. It is NOT a
+ * gain/loss sign; use `unrealisedResultMinor(kind, differenceMinor)` for that (a receivable
+ * that is worth more is a gain, a payable that is worth more is a loss).
+ *
+ * `impliedBookedRate` = booked / open in major units: base-currency units per 1 unit of
+ * `currency`, i.e. the same direction as `rateUsed` of `convertMinor(currency -> base)` and the
+ * INVERSE of the ECB direction when the base is EUR. 12 dp. Null when the open amount is 0,
+ * the booked amount is 0, they have opposite signs, or it rounds to 0.
+ *
+ * Checks in order: amount valid (`bad_amount`), rate available (`missing_rate` /
+ * `rate_out_of_range`), booked known (`booked_unknown`), booked valid (`bad_amount`).
  */
 export function unrealisedDifference(args: {
   openMinor: bigint | number;
@@ -151,11 +210,14 @@ export function unrealisedDifference(args: {
       differenceMinor: bigint;
       impliedBookedRate: RateString | null;
     }
-  | { ok: false; error: "missing_rate" | "booked_unknown" | "bad_amount" } {
+  | {
+      ok: false;
+      error: "missing_rate" | "rate_out_of_range" | "booked_unknown" | "bad_amount";
+    } {
   const open = toBigint(args.openMinor);
   if (!open.ok) return { ok: false, error: "bad_amount" };
   const today = convertBig(open.value, args.currency, args.baseCurrency, args.table);
-  if (!today) return { ok: false, error: "missing_rate" };
+  if (!today.ok) return today;
   if (args.bookedBaseMinor === null) return { ok: false, error: "booked_unknown" };
   const booked = toBigint(args.bookedBaseMinor);
   if (!booked.ok) return { ok: false, error: "bad_amount" };
@@ -173,6 +235,18 @@ export function unrealisedDifference(args: {
     differenceMinor: today.amountMinor - booked.value,
     impliedBookedRate: implied,
   };
+}
+
+/**
+ * Gain (positive) or loss (negative) of an unrealised difference, by open-item kind
+ * (`open_items.kind`: `invoice` = receivable, `bill` = payable). A receivable whose base value
+ * rose is a gain; a payable whose base value rose is a loss. Credit notes need no special case:
+ * their negative open balance already flips `differenceMinor`.
+ */
+export function unrealisedResultMinor(kind: "invoice" | "bill", differenceMinor: bigint): bigint {
+  if (kind === "invoice") return differenceMinor;
+  if (kind === "bill") return -differenceMinor;
+  throw new RangeError("kind must be invoice or bill");
 }
 
 /**

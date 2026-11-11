@@ -5,6 +5,7 @@
  * Rates are "units of currency per 1 EUR", published around 16:00 CET on TARGET working days.
  */
 import { type RateString, type RateTable, parseRate } from "./fx";
+import { previousTargetWorkingDay } from "./target-calendar";
 
 export interface EcbObservation {
   currency: string;
@@ -13,16 +14,23 @@ export interface EcbObservation {
   rate: RateString;
 }
 
-/** Input larger than this many UTF-16 units is refused before any parsing. */
-export const ECB_MAX_CSV_CHARS = 5 * 1024 * 1024;
+/**
+ * Input larger than this many bytes of UTF-8 is refused before any parsing (5 MiB). Measured
+ * on the string as UTF-8 (`utf8ByteLength`), the same unit a fetch body cap uses.
+ */
+export const ECB_MAX_CSV_BYTES = 5 * 1024 * 1024;
+/** @deprecated Same value as `ECB_MAX_CSV_BYTES`; the cap is measured in UTF-8 bytes. */
+export const ECB_MAX_CSV_CHARS = ECB_MAX_CSV_BYTES;
+/** A data row longer than this (UTF-16 units, line ending excluded) is skipped and counted. */
+export const ECB_MAX_ROW_CHARS = 8 * 1024;
 const ECB_BASE = "https://data-api.ecb.europa.eu/service/data/EXR/D..EUR.SP00.A";
 const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const CURRENCY_RE = /^[A-Z]{3}$/;
 const MAX_LAST_N = 1000;
 
-/** True for a real calendar date written YYYY-MM-DD. */
+/** True for a real calendar date written YYYY-MM-DD (years 1900-2999). */
 export function isIsoDate(s: string): boolean {
-  if (typeof s !== "string") return false;
+  if (typeof s !== "string" || s.length !== 10) return false;
   const m = DATE_RE.exec(s);
   if (!m) return false;
   const y = Number(m[1]);
@@ -34,102 +42,190 @@ export function isIsoDate(s: string): boolean {
   return d <= dim;
 }
 
-/** RFC 4180 style split. Returns null when a quoted field is never closed. */
-function parseCsvRows(text: string): string[][] | null {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let field = "";
-  let inQuotes = false;
-  let i = 0;
+/**
+ * UTF-8 byte length of a JS string without allocating (lone surrogates count 3, as
+ * TextEncoder writes U+FFFD). Stops counting once `limit` is exceeded.
+ */
+export function utf8ByteLength(text: string, limit = Number.POSITIVE_INFINITY): number {
+  let bytes = 0;
   const n = text.length;
-  while (i < n) {
-    const c = text.charAt(i);
-    if (inQuotes) {
-      if (c === '"') {
-        if (text.charAt(i + 1) === '"') {
-          field += '"';
-          i += 2;
-          continue;
-        }
-        inQuotes = false;
-      } else {
-        field += c;
-      }
-      i += 1;
-      continue;
-    }
-    if (c === '"' && field === "") {
-      inQuotes = true;
-    } else if (c === ",") {
-      row.push(field);
-      field = "";
-    } else if (c === "\r" || c === "\n") {
-      if (c === "\r" && text.charAt(i + 1) === "\n") i += 1;
-      row.push(field);
-      rows.push(row);
-      row = [];
-      field = "";
-    } else {
-      field += c;
-    }
-    i += 1;
+  for (let i = 0; i < n && bytes <= limit; i += 1) {
+    const c = text.charCodeAt(i);
+    if (c < 0x80) bytes += 1;
+    else if (c < 0x800) bytes += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < n) {
+      const d = text.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) {
+        bytes += 4;
+        i += 1;
+      } else bytes += 3;
+    } else bytes += 3;
   }
-  if (inQuotes) return null;
-  if (field !== "" || row.length > 0) {
-    row.push(field);
-    rows.push(row);
-  }
-  return rows;
+  return bytes;
 }
 
+const QUOTE = 34;
+const COMMA = 44;
+const CR = 13;
+const LF = 10;
+
 /**
- * Parse the ECB SDMX-CSV. Column positions come from the header. Rows are skipped (and
- * counted) when the currency/date/rate is bad, the observation is empty, the denominator is
- * not EUR or the rate type is not SP00. Later duplicates of (currency, date) replace earlier
- * ones. Never throws.
+ * RFC 4180 style split, one pass, O(n): unquoted fields are sliced, never built char by char.
+ * Line endings CRLF, LF or a lone CR. A quoted field may hold commas, line breaks and "" for a
+ * quote; text after its closing quote up to the next comma is appended as is (lenient). A quote
+ * inside an unquoted field is literal. Calls `onRow(fields, chars)` per row (`chars` = row
+ * length without its line ending). Returns false when a quoted field is never closed.
+ */
+function forEachCsvRow(text: string, onRow: (fields: string[], chars: number) => void): boolean {
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    const rowStart = i;
+    const fields: string[] = [];
+    let endOfRow = false;
+    while (!endOfRow) {
+      let value = "";
+      if (i < n && text.charCodeAt(i) === QUOTE) {
+        i += 1;
+        let closed = false;
+        while (i < n) {
+          const q = text.indexOf('"', i);
+          if (q < 0) break;
+          value += text.slice(i, q);
+          if (text.charCodeAt(q + 1) === QUOTE) {
+            value += '"';
+            i = q + 2;
+          } else {
+            i = q + 1;
+            closed = true;
+            break;
+          }
+        }
+        if (!closed) return false;
+      }
+      const start = i;
+      while (i < n) {
+        const c = text.charCodeAt(i);
+        if (c === COMMA || c === CR || c === LF) break;
+        i += 1;
+      }
+      value += text.slice(start, i);
+      fields.push(value);
+      if (i >= n) {
+        endOfRow = true;
+      } else {
+        const c = text.charCodeAt(i);
+        if (c === COMMA) {
+          i += 1;
+          // A comma at the very end of the input still ends a (last, empty) field.
+          if (i >= n) {
+            fields.push("");
+            endOfRow = true;
+          }
+        } else {
+          endOfRow = true;
+          const rowEnd = i;
+          i += c === CR && text.charCodeAt(i + 1) === LF ? 2 : 1;
+          onRow(fields, rowEnd - rowStart);
+          break;
+        }
+      }
+      if (endOfRow && i >= n) {
+        onRow(fields, n - rowStart);
+        return true;
+      }
+    }
+  }
+  return true;
+}
+
+const isBlankRow = (r: string[]): boolean => r.length === 1 && (r[0] ?? "").trim() === "";
+
+/**
+ * Parse the ECB SDMX-CSV (`format=csvdata`). Columns are found by header name (case-insensitive,
+ * trimmed); CURRENCY, TIME_PERIOD and OBS_VALUE are required and must each appear once
+ * (`ambiguous_columns` otherwise). Optional FREQ, CURRENCY_DENOM, EXR_TYPE and EXR_SUFFIX, when
+ * present, must read D, EUR, SP00 and A. Rows are skipped (and counted) when any of those
+ * differ, the currency is not three upper-case letters or is EUR, the date is not a real daily
+ * YYYY-MM-DD (monthly "2026-11" and quarterly "2026-Q1" are skipped), the observation is empty,
+ * "NaN", signed, in exponent form or not > 0, or the row is longer than `ECB_MAX_ROW_CHARS`.
+ * Later duplicates of (currency, date) replace earlier ones. Input over `ECB_MAX_CSV_BYTES`
+ * UTF-8 bytes is refused before parsing. Linear time; never throws.
  */
 export function parseEcbCsv(
   text: string,
 ): { ok: true; observations: EcbObservation[]; skipped: number } | { ok: false; error: string } {
   if (typeof text !== "string") return { ok: false, error: "not_text" };
-  if (text.length > ECB_MAX_CSV_CHARS) return { ok: false, error: "too_large" };
+  // UTF-8 never has fewer bytes than UTF-16 units, so a long string is refused without counting.
+  if (text.length > ECB_MAX_CSV_BYTES) return { ok: false, error: "too_large" };
+  if (
+    text.length * 3 > ECB_MAX_CSV_BYTES &&
+    utf8ByteLength(text, ECB_MAX_CSV_BYTES) > ECB_MAX_CSV_BYTES
+  ) {
+    return { ok: false, error: "too_large" };
+  }
   const body = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
-  const rows = parseCsvRows(body);
-  if (!rows) return { ok: false, error: "malformed_csv" };
 
-  const headerIdx = rows.findIndex((r) => r.some((f) => f.trim() !== ""));
-  if (headerIdx < 0) return { ok: false, error: "empty" };
-  const header = (rows[headerIdx] ?? []).map((h) => h.trim().toUpperCase());
-  const col = (name: string): number => header.indexOf(name);
-  const iCur = col("CURRENCY");
-  const iDate = col("TIME_PERIOD");
-  const iVal = col("OBS_VALUE");
-  if (iCur < 0 || iDate < 0 || iVal < 0) return { ok: false, error: "missing_columns" };
-  const iDenom = col("CURRENCY_DENOM");
-  const iType = col("EXR_TYPE");
-
+  let header: string[] | null = null;
+  let headerError: string | null = null;
+  let iCur = -1;
+  let iDate = -1;
+  let iVal = -1;
+  const optional: { idx: number; want: string }[] = [];
   const byKey = new Map<string, EcbObservation>();
   let skipped = 0;
-  for (const r of rows.slice(headerIdx + 1)) {
-    if (r.length === 1 && (r[0] ?? "").trim() === "") continue; // blank line
+
+  const complete = forEachCsvRow(body, (r, chars) => {
+    if (headerError !== null) return;
+    if (header === null) {
+      if (r.every((f) => f.trim() === "")) return;
+      header = r.map((h) => h.trim().toUpperCase());
+      const h = header;
+      const one = (name: string): number => {
+        const first = h.indexOf(name);
+        if (first >= 0 && h.indexOf(name, first + 1) >= 0) headerError = "ambiguous_columns";
+        return first;
+      };
+      iCur = one("CURRENCY");
+      iDate = one("TIME_PERIOD");
+      iVal = one("OBS_VALUE");
+      if (headerError === null && (iCur < 0 || iDate < 0 || iVal < 0)) {
+        headerError = "missing_columns";
+      }
+      for (const [name, want] of [
+        ["FREQ", "D"],
+        ["CURRENCY_DENOM", "EUR"],
+        ["EXR_TYPE", "SP00"],
+        ["EXR_SUFFIX", "A"],
+      ] as const) {
+        const idx = h.indexOf(name);
+        if (idx >= 0) optional.push({ idx, want });
+      }
+      return;
+    }
+    if (isBlankRow(r)) return;
+    if (chars > ECB_MAX_ROW_CHARS) {
+      skipped += 1;
+      return;
+    }
+    for (const o of optional) {
+      if ((r[o.idx] ?? "").trim() !== o.want) {
+        skipped += 1;
+        return;
+      }
+    }
     const cur = (r[iCur] ?? "").trim();
     const date = (r[iDate] ?? "").trim();
-    const val = (r[iVal] ?? "").trim();
-    if (iDenom >= 0 && (r[iDenom] ?? "").trim() !== "EUR") {
-      skipped += 1;
-      continue;
-    }
-    if (iType >= 0 && (r[iType] ?? "").trim() !== "SP00") {
-      skipped += 1;
-      continue;
-    }
-    const rate = parseRate(val);
+    const rate = parseRate((r[iVal] ?? "").trim());
     if (!CURRENCY_RE.test(cur) || cur === "EUR" || !isIsoDate(date) || !rate.ok) {
       skipped += 1;
-      continue;
+      return;
     }
     byKey.set(`${cur}|${date}`, { currency: cur, rateDate: date, rate: rate.rate });
-  }
+  });
+  if (!complete) return { ok: false, error: "malformed_csv" };
+  if (header === null) return { ok: false, error: "empty" };
+  if (headerError !== null) return { ok: false, error: headerError };
   if (byKey.size === 0) return { ok: false, error: "no_observations" };
   const observations = [...byKey.values()].sort((a, b) =>
     a.rateDate === b.rateDate
@@ -175,30 +271,59 @@ export function ecbRequestUrl(args: {
   return `${ECB_BASE}?${parts.join("&")}`;
 }
 
+/** Default for `buildRateTable`'s `maxAgeTargetDays`. */
+export const ECB_MAX_RATE_AGE_TARGET_DAYS = 10;
+
 /**
  * Latest observation per currency on or before `onOrBefore`. `asOf` is the newest date used;
- * `ratesDate` keeps each currency's own date so stale currencies stay visible. Returns null
- * for a bad date or when nothing qualifies. Invalid rates are ignored.
+ * `ratesDate` keeps each currency's own date so a currency the ECB skipped one day stays visible
+ * with its older date (a Monday before 16:00 CET uses Friday's rates, `asOf` = Friday).
+ *
+ * A currency whose latest observation is more than `maxAgeTargetDays` TARGET working days
+ * (default 10) older than `asOf` is left out: the ECB stopped publishing it (for example HRK
+ * after 2022-12-30, RUB after 2022-03-01), and a stale rate silently used for a conversion is a
+ * money error, so it reads as `missing_rate` instead. How old `asOf` itself is relative to
+ * today is the caller's check (the "rate older than one working day" alert, CLAUDE.md 3).
+ *
+ * Returns null for a bad date or when nothing qualifies. Invalid observations are ignored.
+ * Throws RangeError for a `maxAgeTargetDays` that is not an integer from 0 to 260.
  */
 export function buildRateTable(
   observations: EcbObservation[],
   onOrBefore: string,
+  opts: { maxAgeTargetDays?: number } = {},
 ): RateTable | null {
-  if (!isIsoDate(onOrBefore)) return null;
-  const rates: Record<string, RateString> = Object.create(null) as Record<string, RateString>;
-  const ratesDate: Record<string, string> = Object.create(null) as Record<string, string>;
+  const maxAge = opts.maxAgeTargetDays ?? ECB_MAX_RATE_AGE_TARGET_DAYS;
+  if (!Number.isInteger(maxAge) || maxAge < 0 || maxAge > 260) {
+    throw new RangeError("maxAgeTargetDays must be an integer from 0 to 260");
+  }
+  if (!isIsoDate(onOrBefore) || !Array.isArray(observations)) return null;
+  const latest = new Map<string, { date: string; rate: RateString }>();
   let asOf = "";
   for (const o of observations) {
-    if (!CURRENCY_RE.test(o.currency) || o.currency === "EUR") continue;
-    if (!isIsoDate(o.rateDate) || o.rateDate > onOrBefore) continue;
+    if (typeof o !== "object" || o === null) continue;
+    const { currency, rateDate } = o;
+    if (typeof currency !== "string" || !CURRENCY_RE.test(currency) || currency === "EUR") {
+      continue;
+    }
+    if (!isIsoDate(rateDate) || rateDate > onOrBefore) continue;
     const p = parseRate(o.rate);
     if (!p.ok) continue;
-    const prev = ratesDate[o.currency];
-    if (prev !== undefined && prev > o.rateDate) continue;
-    rates[o.currency] = p.rate;
-    ratesDate[o.currency] = o.rateDate;
-    if (o.rateDate > asOf) asOf = o.rateDate;
+    const prev = latest.get(currency);
+    if (prev !== undefined && prev.date > rateDate) continue;
+    latest.set(currency, { date: rateDate, rate: p.rate });
+    if (rateDate > asOf) asOf = rateDate;
   }
   if (asOf === "") return null;
-  return { asOf, base: "EUR", rates: { ...rates }, ratesDate: { ...ratesDate } };
+  // Oldest date still current: maxAge TARGET working days before asOf (asOf itself counts as 0).
+  let cutoff = asOf;
+  for (let k = 0; k < maxAge; k += 1) cutoff = previousTargetWorkingDay(cutoff);
+  const rates: Record<string, RateString> = {};
+  const ratesDate: Record<string, string> = {};
+  for (const [currency, v] of [...latest.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    if (v.date < cutoff) continue;
+    rates[currency] = v.rate;
+    ratesDate[currency] = v.date;
+  }
+  return { asOf, base: "EUR", rates, ratesDate };
 }

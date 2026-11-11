@@ -179,12 +179,21 @@ describe("convertMinor", () => {
     expect(e(Number.MAX_SAFE_INTEGER).ok).toBe(true);
   });
   it("huge amounts via bigint stay exact", () => {
-    const big = 10n ** 30n + 7n;
+    const big = 10n ** 29n + 7n;
     expect(conv(big, "EUR", "USD")).toBe((big * 10853n + 5000n) / 10000n);
-    // 10^30 * 1.0853 = 1.0853e30 exactly (the +7 contributes 7.5971 -> rounds with the rest)
-    expect(conv(10n ** 30n, "EUR", "USD")).toBe(10853n * 10n ** 26n);
-    expect(conv(-(10n ** 30n), "EUR", "USD")).toBe(-(10853n * 10n ** 26n));
+    // 10^29 * 1.0853 = 1.0853e29 exactly (the +7 contributes 7.5971 -> rounds with the rest)
+    expect(conv(10n ** 29n, "EUR", "USD")).toBe(10853n * 10n ** 25n);
+    expect(conv(-(10n ** 29n), "EUR", "USD")).toBe(-(10853n * 10n ** 25n));
     expect(conv(2n ** 60n, "EUR", "EUR")).toBe(2n ** 60n);
+    expect(conv(10n ** 30n - 1n, "EUR", "EUR")).toBe(10n ** 30n - 1n);
+  });
+  it("refuses bigints of 10^30 or more (no crafted giant products)", () => {
+    for (const a of [10n ** 30n, -(10n ** 30n), 10n ** 100000n]) {
+      expect(convertMinor({ amountMinor: a, from: "EUR", to: "USD", table })).toEqual({
+        ok: false,
+        error: "bad_amount",
+      });
+    }
   });
   it("rateUsed is the 12 dp cross rate", () => {
     const r = convertMinor({ amountMinor: 1, from: "USD", to: "GBP", table });
@@ -294,7 +303,7 @@ describe("unrealisedDifference", () => {
       impliedBookedRate: "0.92",
     });
   });
-  it("negative balances (payables) keep their sign", () => {
+  it("negative balances (credit notes) keep their sign", () => {
     const r = unrealisedDifference({
       openMinor: -100000n,
       currency: "USD",
