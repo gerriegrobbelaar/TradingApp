@@ -1,7 +1,9 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { ExactApiError, ExactBudgetExhaustedError } from "@camelthorn/exact";
+import { isInvoiceApprovedForPayment, type ApprovalStatus } from "@camelthorn/core";
 import {
+  CURSOR_FUTURE_LIMIT_MS,
   CURSOR_MARGIN_MS,
   INCREMENTAL_MAX_CHUNKS,
   PURCHASE_UNAVAILABLE_MS,
@@ -568,5 +570,246 @@ describe("unavailable resource", () => {
     const r = await run("full");
     expect(r.entities.purchase_entries.status).toBe("partial");
     expect((await state())?.unavailable_until ?? null).toBeNull();
+  });
+});
+
+// ---- review K4 -------------------------------------------------------------------------------
+
+describe("a run that lost its lease (review K4)", () => {
+  const takeOver = async (): Promise<void> => {
+    await db
+      .prepare(
+        "UPDATE sync_locks SET holder = 'other', run_seq = run_seq + 100 WHERE division_id = ?1",
+      )
+      .bind(div.id)
+      .run();
+  };
+
+  it("full: writes no entry, no pass, no cursor and strikes nothing", async () => {
+    fx.purchases = [entry(1), entry(2), entry(3)];
+    const takeover: typeof fx.transport = async (req) => {
+      if (req.path === PATH) await takeOver();
+      return fx.transport(req);
+    };
+    await syncDivision(
+      env,
+      div,
+      { jobId: `purchase-${++n}`, mode: "full", actor: "system", budget: 10_000 },
+      { transport: takeover, gate, now: () => clock },
+    );
+    expect(await rows()).toHaveLength(0);
+    const s = await state();
+    expect(s === null || (s.cursor === "0" && s.pass_token === null)).toBe(true);
+  });
+
+  it("incremental: a status read after the takeover is not written and the cursor stays", async () => {
+    fx.purchases = [entry(1, { status: 5 })];
+    await run("full");
+    const before = await state();
+    clock = T0 + HOUR;
+    const p1 = fx.purchases[0] as FakePurchase;
+    p1.status = 50;
+    p1.modified = T0 + 30 * 60_000;
+    const takeover: typeof fx.transport = async (req) => {
+      if (req.path === PATH) await takeOver();
+      return fx.transport(req);
+    };
+    await syncDivision(
+      env,
+      div,
+      { jobId: `purchase-${++n}`, mode: "incremental", actor: "system", budget: 40 },
+      { transport: takeover, gate, now: () => clock },
+    );
+    expect((await byNumber(1))?.status).toBe("pending_approval");
+    expect((await state())?.cursor).toBe(before?.cursor);
+  });
+
+  it("full, closing: a takeover before the close strikes and deletes nothing", async () => {
+    fx.purchases = [entry(1), entry(2), entry(3), entry(4), entry(5), entry(6)];
+    await run("full");
+    fx.purchases.splice(0, 1);
+    clock += DAY;
+    let seen = 0;
+    const takeover: typeof fx.transport = async (req) => {
+      // the last purchase page of the pass: 5 rows at 2 a page = 3 pages
+      if (req.path === PATH && ++seen === 3) {
+        const res = await fx.transport(req);
+        await takeOver();
+        return res;
+      }
+      return fx.transport(req);
+    };
+    await syncDivision(
+      env,
+      div,
+      { jobId: `purchase-${++n}`, mode: "full", actor: "system", budget: 10_000 },
+      { transport: takeover, gate, now: () => clock },
+    );
+    expect(await rows()).toHaveLength(6);
+    expect((await rows()).every((r) => r.missed_cycles === 0)).toBe(true);
+  });
+});
+
+describe("status changes reach the cache (review K4)", () => {
+  it("approved -> waiting again is picked up by the next hourly run", async () => {
+    fx.purchases = [entry(1, { status: 50 })];
+    await run("full");
+    expect((await byNumber(1))?.status).toBe("approved");
+    clock = T0 + HOUR;
+    const p1 = fx.purchases[0] as FakePurchase;
+    p1.status = 5;
+    p1.modified = T0 + 20 * 60_000;
+    await run("incremental");
+    expect(await byNumber(1)).toMatchObject({ status: "pending_approval", status_code: 5 });
+    // and to a code the table does not list: unknown, not approved
+    clock += HOUR;
+    p1.status = 31;
+    p1.modified = clock - 60_000;
+    await run("incremental");
+    expect(await byNumber(1)).toMatchObject({ status: "unknown", status_code: 31 });
+  });
+
+  it("a pending entry older than the window that gets approved stays tracked", async () => {
+    fx.purchases = [entry(1, { status: 5, entryDate: T0 - 300 * DAY, modified: T0 - 300 * DAY })];
+    await run("full");
+    expect((await byNumber(1))?.status).toBe("pending_approval");
+    clock = T0 + HOUR;
+    const p1 = fx.purchases[0] as FakePurchase;
+    p1.status = 50;
+    p1.modified = T0 + 30 * 60_000; // approving it is a change
+    await run("incremental");
+    expect((await byNumber(1))?.status).toBe("approved");
+    for (let d = 1; d <= 3; d++) {
+      clock = T0 + d * DAY;
+      await run("full");
+    }
+    expect((await byNumber(1))?.status).toBe("approved");
+  });
+
+  it("if approving did not touch Modified, the old row is dropped, never kept as pending or guessed", async () => {
+    fx.purchases = [
+      entry(1, { status: 5, entryDate: T0 - 300 * DAY, modified: T0 - 300 * DAY }),
+      ...[2, 3, 4, 5, 6].map((k) => entry(k)),
+    ];
+    await run("full");
+    (fx.purchases[0] as FakePurchase).status = 50; // Modified unchanged: the window misses it
+    clock = T0 + DAY;
+    await run("full");
+    expect(await byNumber(1)).toBeUndefined();
+  });
+
+  it("an approved row that left the scope is no longer refreshed and stops counting for payment", async () => {
+    fx.purchases = [entry(1, { status: 50, entryDate: T0 - 100 * DAY, modified: T0 - 100 * DAY })];
+    await run("full");
+    const asPayment = async (nowMs: number): Promise<boolean> => {
+      const r = await db
+        .prepare(
+          `SELECT status, status_code, synced_at, missed_cycles FROM purchase_entries
+           WHERE division_id = ?1`,
+        )
+        .bind(div.id)
+        .first<{
+          status: ApprovalStatus;
+          status_code: number | null;
+          synced_at: string;
+          missed_cycles: number;
+        }>();
+      if (!r) return false;
+      return isInvoiceApprovedForPayment(
+        {
+          status: r.status,
+          statusCode: r.status_code,
+          lastSeenAt: r.synced_at,
+          missedCycles: r.missed_cycles,
+        },
+        { nowMs },
+      );
+    };
+    expect(await asPayment(clock)).toBe(true);
+    // 30 days later the entry is 130 days old: no longer read, row kept but not refreshed
+    clock = T0 + 30 * DAY;
+    await run("full");
+    expect((await byNumber(1))?.status).toBe("approved");
+    expect(await asPayment(clock)).toBe(false);
+  });
+});
+
+describe("cursor rules (review K4)", () => {
+  it("a later complete full read moves the cursor forward, never back; restart may reset it", async () => {
+    fx.purchases = [entry(1)];
+    await run("full");
+    expect((await state())?.cursor).toBe(String(T0 - CURSOR_MARGIN_MS));
+    // an hourly run moves it to the last Modified read
+    clock = T0 + HOUR;
+    const p1 = fx.purchases[0] as FakePurchase;
+    p1.modified = T0 + 50 * 60_000;
+    await run("incremental");
+    expect((await state())?.cursor).toBe(String(T0 + 50 * 60_000));
+    // the next night's pass starts later: the cursor follows it
+    clock = T0 + DAY;
+    await run("full");
+    expect((await state())?.cursor).toBe(String(T0 + DAY - CURSOR_MARGIN_MS));
+    // a manual full run whose pass started earlier than the cursor does not move it back
+    await db
+      .prepare(
+        "UPDATE sync_state SET cursor = ?2 WHERE division_id = ?1 AND entity = 'purchase_entries'",
+      )
+      .bind(div.id, String(T0 + 3 * DAY))
+      .run();
+    clock = T0 + 2 * DAY;
+    await run("full");
+    expect((await state())?.cursor).toBe(String(T0 + 3 * DAY));
+    // restart sets it to the pass start (re-reads, idempotent)
+    clock = T0 + 2 * DAY + HOUR;
+    await run("full", { restart: true });
+    expect((await state())?.cursor).toBe(String(clock - CURSOR_MARGIN_MS));
+  });
+
+  it("frees a cursor the hourly cap cannot move (more same-second changes than the cap reads)", async () => {
+    fx.purchases = [entry(1)];
+    await run("full");
+    const same = T0 + 10 * 60_000;
+    fx.purchases.push(...Array.from({ length: 25 }, (_, i) => entry(200 + i, { modified: same })));
+    for (let h = 1; h <= 3; h++) {
+      clock = T0 + h * HOUR;
+      const r = await run("incremental", { budget: 40 });
+      expect(r.entities.purchase_entries.error).toBe("incremental_cap");
+    }
+    expect((await state())?.cursor).toBe(String(same));
+    clock = T0 + DAY;
+    await run("full");
+    expect((await state())?.cursor).toBe(String(T0 + DAY - CURSOR_MARGIN_MS));
+    clock += HOUR;
+    const r = await run("incremental", { budget: 40 });
+    expect(r.entities.purchase_entries.status).toBe("ok");
+  });
+
+  it("a far-future Modified does not park the cursor more than 3 hours ahead", async () => {
+    fx.purchases = [entry(1)];
+    await run("full");
+    clock = T0 + HOUR;
+    fx.purchases.push(entry(2, { modified: Date.parse("2099-01-01T00:00:00Z") }));
+    await run("incremental");
+    expect(Number((await state())?.cursor)).toBe(clock + CURSOR_FUTURE_LIMIT_MS);
+    // a real change after that point is read by the hourly run
+    const p1 = fx.purchases[0] as FakePurchase;
+    p1.status = 50;
+    p1.modified = T0 + HOUR + CURSOR_FUTURE_LIMIT_MS + 60_000;
+    clock = p1.modified + 5 * 60_000;
+    await run("incremental");
+    expect((await byNumber(1))?.status).toBe("approved");
+  });
+
+  it("the full read runs before the ledger, so a long ledger cannot starve it", async () => {
+    fx.purchases = [entry(1)];
+    fx.glAccounts = [{ n: 1, code: "1000", name: "Bank" }];
+    let ledgerSeen = false;
+    let purchaseBeforeLedger = false;
+    fx.beforeCall = (_n, req) => {
+      if (req.path.startsWith("/financial/") || req.path.startsWith("/budget/")) ledgerSeen = true;
+      if (req.path === PATH && !ledgerSeen) purchaseBeforeLedger = true;
+    };
+    await run("full");
+    expect(purchaseBeforeLedger).toBe(true);
   });
 });

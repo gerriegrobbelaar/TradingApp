@@ -18,8 +18,9 @@
  *  INCREMENTAL (hourly, before the relations)
  *    Only entries modified since a cursor (`sync_state.cursor`, epoch milliseconds of the last
  *    Modified read; the column only holds digits), `Modified ge cursor` so ties are read again.
- *    The cursor starts when the first complete full read ends (pass start minus a safety margin)
- *    and only moves forward after the rows up to it are written. Before that the hourly run does
+ *    The cursor starts when the first complete full read ends (pass start minus a safety margin),
+ *    moves forward after the rows up to it are written, and is moved forward to that point by every
+ *    later complete full read (never back, except on an explicit `restart`). Before that the hourly run does
  *    nothing for this entity (`available` stays false). Cheap: usually one page. At most
  *    INCREMENTAL_MAX_CHUNKS chunks per run so a backlog (an import) cannot eat the hour's budget;
  *    the rest follows next hour (the result is `skipped`/`incremental_cap`, which leaves
@@ -91,6 +92,10 @@ export interface PurchaseCtx {
 
 const clip = (v: string | null, n: number): string | null => (v === null ? null : v.slice(0, n));
 
+/**
+ * Upserts one entry, only while this run holds the division's lease (a run that outlived its lease
+ * must not write a status it read before a newer run did) and never over a row a later run wrote.
+ */
 function entryStmt(ctx: PurchaseCtx, e: PurchaseEntry, nowIso: string): D1PreparedStatement {
   const status = approvalStatusFromCode(e.statusCode);
   const dc = e.amountDc;
@@ -100,8 +105,9 @@ function entryStmt(ctx: PurchaseCtx, e: PurchaseEntry, nowIso: string): D1Prepar
          relation_name, currency, amount_minor, amount_dc_minor, dc_currency, entry_date, due_date,
          status_code, status, submitted_at, modified_at, has_pdf, search_text, synced_at,
          last_seen_sync_id, missed_cycles)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-         ?19, 0)
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+         ?19, 0
+       WHERE ${leaseHeld("?20", "?21")}
        ON CONFLICT (division_id, exact_id) DO UPDATE SET
          entry_number = excluded.entry_number, relation_id = excluded.relation_id,
          relation_name = excluded.relation_name, currency = excluded.currency,
@@ -134,6 +140,8 @@ function entryStmt(ctx: PurchaseCtx, e: PurchaseEntry, nowIso: string): D1Prepar
       searchText([e.entryNumber, e.supplierName]),
       nowIso,
       ctx.runSeq,
+      ctx.lease.holder,
+      ctx.lease.runSeq,
     );
 }
 
@@ -184,8 +192,20 @@ function cursorStmt(ctx: PurchaseCtx, cursorMs: number): D1PreparedStatement {
     .bind(ctx.division.id, String(cursorMs), ctx.startedAt, ctx.lease.holder, ctx.lease.runSeq);
 }
 
-/** Largest Modified (ms) of a chunk, or null unless the chunk is in ascending order (fail-safe). */
-function chunkCursor(items: readonly PurchaseEntry[]): number | null {
+/**
+ * A Modified beyond our clock moves the cursor at most to now + this. 3 hours: above the 1 to 2
+ * hours a Modified in Amsterdam wall-clock time would be ahead (time zone unverified, ADR 0025),
+ * so genuine values are never capped; a bogus far-future value costs at most 3 hours of hourly
+ * reads (the nightly full read still reads the window).
+ */
+export const CURSOR_FUTURE_LIMIT_MS = 3 * 60 * 60 * 1000;
+
+/**
+ * Largest Modified (ms) of a chunk, or null unless the chunk is in ascending order (fail-safe).
+ * Capped at now + CURSOR_FUTURE_LIMIT_MS: one bogus far-future Modified must not park the cursor
+ * where no later change is ever read (the rows above the cap are simply read again next time).
+ */
+export function chunkCursor(items: readonly PurchaseEntry[], nowMs: number): number | null {
   let prev = -Infinity;
   for (const it of items) {
     if (it.modified === null) return null;
@@ -193,7 +213,7 @@ function chunkCursor(items: readonly PurchaseEntry[]): number | null {
     if (Number.isNaN(t) || t < prev) return null;
     prev = t;
   }
-  return prev === -Infinity ? null : prev;
+  return prev === -Infinity ? null : Math.min(prev, nowMs + CURSOR_FUTURE_LIMIT_MS);
 }
 
 async function markUnavailable(ctx: PurchaseCtx, e: unknown): Promise<string | null> {
@@ -397,12 +417,17 @@ async function finishFull(
       ctx.lease.runSeq,
       need,
     );
-  // The incremental cursor starts here (or restarts after an explicit `restart`); an existing one
-  // is kept: the hourly reads have kept it continuous since the first complete pass.
+  // The incremental cursor starts here. Afterwards a complete pass moves it FORWARD to the pass
+  // start minus the margin (never back): every change after that instant is in the pass's scope
+  // (its Modified is inside the window), so the pass has read it or the hourly read from there
+  // will. This also frees a cursor the hourly cap could not move (more same-second changes than
+  // the cap reads). Only an explicit `restart` may set it back (it re-reads; upserts are
+  // idempotent).
   const cursor = ctx.db
     .prepare(
       `UPDATE sync_state SET
-         cursor = CASE WHEN ?2 = 1 OR cursor = '0' THEN ?3 ELSE cursor END,
+         cursor = CASE WHEN ?2 = 1 OR CAST(cursor AS INTEGER) < CAST(?3 AS INTEGER) THEN ?3
+                       ELSE cursor END,
          unavailable_until = NULL
        WHERE division_id = ?1 AND entity = '${PURCHASE_ENTITY}' AND ${leaseHeld("?4", "?5")}`,
     )
@@ -450,7 +475,7 @@ async function syncIncremental(
       throw e;
     }
     const units: D1PreparedStatement[][] = page.items.map((it) => [entryStmt(ctx, it, nowIso)]);
-    const advance = chunkCursor(page.items);
+    const advance = chunkCursor(page.items, ctx.nowMs());
     // Without a $skiptoken to continue in this run, the next run restarts from the cursor; with
     // one, the cursor is only the safe floor (every row up to it is written).
     if (advance !== null) units.push([cursorStmt(ctx, advance)]);

@@ -3,6 +3,7 @@
  *
  *  GET /api/approvals?division=&status=pending_approval|approved|rejected|all&q=&limit=&cursor=
  *  GET /api/approvals/:id
+ *  GET /api/approvals/status-codes?division=   (admin only)
  *
  * Any signed-in role may read. Same division rules, error codes and `no-store` as the other read
  * routes (routes.ts): `?division=` is our divisions.id (400 bad, 404 unknown or disabled), default
@@ -10,13 +11,17 @@
  * (such entries show under `all` and in `countsByStatus`). Order: pending entries oldest first (the
  * ones waiting longest on top), every other filter newest first, ties by id; a cursor is bound to
  * the direction it was issued for. `available` is false until the purchase entries were read
- * completely once or when Exact refuses the resource; the list is then empty. Nothing here is a
+ * completely once (also when Exact refused the resource from the start); the list is then empty.
+ * A later refusal or failing reads show as stale freshness, not as unavailable. Nothing here is a
  * write: no CSRF or audit concern. No IBAN or email is stored in the table, so none is returned.
  */
 import {
   APPROVAL_STATUSES,
   approvalAgeDays,
+  approvalStatusFromCode,
+  PURCHASE_ENTRY_STATUS_TABLE,
   type ApprovalDetail,
+  type ApprovalStatusCodesResponse,
   type ApprovalItemDto,
   type ApprovalStatus,
   type ApprovalsResponse,
@@ -290,7 +295,54 @@ async function detailHandler(ctx: Ctx): Promise<Response> {
   return json(body);
 }
 
+/**
+ * For verifying the UNVERIFIED Status mapping on a real division (ADR 0025, DEPLOY.md): how many
+ * cached entries carry each raw Exact code, what the stored rows say and what the current table
+ * makes of it. Admin only (it is configuration work); a read, so no audit entry. No amounts,
+ * names, IBANs or emails: counts per code only.
+ */
+async function statusCodesHandler(ctx: Ctx): Promise<Response> {
+  const division = await resolveDivision(ctx);
+  const db = ctx.env.DB;
+  const rows = (
+    await db
+      .prepare(
+        `SELECT status_code, status, COUNT(*) AS n, MAX(synced_at) AS last_seen_at
+         FROM purchase_entries WHERE division_id = ?1
+         GROUP BY status_code, status ORDER BY status_code IS NULL, status_code, status`,
+      )
+      .bind(division.id)
+      .all<{
+        status_code: number | null;
+        status: ApprovalStatus;
+        n: number;
+        last_seen_at: string;
+      }>()
+  ).results;
+  const body: ApprovalStatusCodesResponse = {
+    division: { id: division.id, name: division.name },
+    table: Object.entries(PURCHASE_ENTRY_STATUS_TABLE)
+      .map(([code, status]) => ({ statusCode: Number(code), status }))
+      .sort((a, b) => a.statusCode - b.statusCode),
+    codes: rows.map((r) => ({
+      statusCode: r.status_code,
+      storedStatus: r.status,
+      mappedStatus: approvalStatusFromCode(r.status_code),
+      count: r.n,
+      lastSeenAt: r.last_seen_at,
+    })),
+  };
+  return json(body);
+}
+
 export function registerApprovalsRoutes(router: Router): void {
   router.add("GET", "/api/approvals", ANY_ROLE, guarded(listHandler));
+  // Before /:id (the router takes the first match).
+  router.add(
+    "GET",
+    "/api/approvals/status-codes",
+    { roles: ["admin"] },
+    guarded(statusCodesHandler),
+  );
   router.add("GET", "/api/approvals/:id", ANY_ROLE, guarded(detailHandler));
 }

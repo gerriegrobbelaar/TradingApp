@@ -89,6 +89,20 @@ describe("migration 0011 on a populated database", () => {
     await expect(mdb.prepare(entry("e3", { currency: "'eur'" })).run()).rejects.toThrow();
     await expect(mdb.prepare(entry("e4", { status: "'approvedish'" })).run()).rejects.toThrow();
     await expect(mdb.prepare(entry("e5", { extraCol: "2" })).run()).rejects.toThrow(); // has_pdf 0, 1 or NULL
+    // 'approved' without a raw status code cannot be stored, and the default is 'unknown'
+    await expect(mdb.prepare(entry("e6", { status: "'approved'" })).run()).rejects.toThrow();
+    await mdb
+      .prepare(
+        `INSERT INTO purchase_entries (division_id, exact_id, currency, amount_minor, status_code,
+           synced_at) VALUES (9, 'e7', 'EUR', 1, 50, '2026-01-01T00:00:00Z')`,
+      )
+      .run();
+    expect(
+      await mdb
+        .prepare("SELECT status FROM purchase_entries WHERE exact_id = 'e7'")
+        .first("status"),
+    ).toBe("unknown");
+    await mdb.prepare("DELETE FROM purchase_entries WHERE exact_id = 'e7'").run();
     const saved = await mdb
       .prepare(
         "SELECT amount_minor, has_pdf, missed_cycles, status_code FROM purchase_entries WHERE division_id = 9",

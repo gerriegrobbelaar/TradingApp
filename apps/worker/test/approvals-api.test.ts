@@ -6,6 +6,7 @@ import {
   type ApprovalDetail,
   type ApprovalItemDto,
   type ApprovalStatus,
+  type ApprovalStatusCodesResponse,
   type ApprovalsResponse,
   type Freshness,
 } from "@camelthorn/core";
@@ -570,5 +571,50 @@ describe("list query plan", () => {
     expect(all).not.toMatch(/USE TEMP B-TREE FOR ORDER BY/);
     const counts = await plan(buildCountsQuery(1, []));
     expect(counts).toMatch(/purchase_entries/);
+  });
+});
+
+describe("status codes for verifying the mapping (review K4)", () => {
+  it("is admin only and counts cached entries per raw code, stored and mapped status", async () => {
+    await markSynced(divA);
+    await addEntry(1, { code: 5, status: "pending_approval" });
+    await addEntry(2, { code: 5, status: "pending_approval" });
+    await addEntry(3, { code: 50, status: "approved" });
+    await addEntry(4, { code: 77, status: "unknown" });
+    await addEntry(5, { code: null, status: "unknown" });
+    // a row derived under an older table: stored and mapped status differ
+    await addEntry(6, { code: 20, status: "rejected" });
+    await addEntry(7, { code: 5, division: divB });
+
+    expect((await call("/api/approvals/status-codes")).status).toBe(401);
+    for (const who of ["finance", "viewer", "approver"]) {
+      expect((await get(`/api/approvals/status-codes?division=${divA}`, who)).status, who).toBe(
+        403,
+      );
+    }
+    const r = await get<ApprovalStatusCodesResponse>(
+      `/api/approvals/status-codes?division=${divA}`,
+    );
+    expect(r.status).toBe(200);
+    expect(r.body.division).toEqual({ id: divA, name: "Alpha BV" });
+    expect(r.body.table).toEqual([
+      { statusCode: 5, status: "pending_approval" },
+      { statusCode: 50, status: "approved" },
+    ]);
+    expect(
+      r.body.codes.map((c) => [c.statusCode, c.storedStatus, c.mappedStatus, c.count]),
+    ).toEqual([
+      [5, "pending_approval", "pending_approval", 2],
+      [20, "rejected", "unknown", 1],
+      [50, "approved", "approved", 1],
+      [77, "unknown", "unknown", 1],
+      [null, "unknown", "unknown", 1],
+    ]);
+    expect(r.body.codes[0]?.lastSeenAt).toBe("2026-07-01T00:00:00.000Z");
+    // counts only: nothing about suppliers, amounts or bank details
+    const text = JSON.stringify(r.body);
+    for (const leak of ["Supplier", "NL91", "@", "10001"]) expect(text).not.toContain(leak);
+    expect((await get(`/api/approvals/status-codes?division=${divOff}`)).status).toBe(404);
+    expect((await get(`/api/approvals/status-codes?division=abc`)).status).toBe(400);
   });
 });

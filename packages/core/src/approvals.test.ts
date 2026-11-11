@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  APPROVAL_MAX_AGE_MS,
   approvalAgeDays,
+  type ApprovalForPayment,
   approvalStatusFromCode,
   isInvoiceApprovedForPayment,
   pendingStatusCodes,
@@ -40,9 +42,63 @@ describe("approvalStatusFromCode", () => {
 });
 
 describe("isInvoiceApprovedForPayment", () => {
+  const NOW = Date.parse("2026-11-11T12:00:00.000Z");
+  const HOUR = 3_600_000;
+  const fresh = (over: Partial<ApprovalForPayment> = {}): ApprovalForPayment => ({
+    status: "approved",
+    statusCode: 50,
+    lastSeenAt: new Date(NOW - HOUR).toISOString(),
+    missedCycles: 0,
+    ...over,
+  });
+  const ok = (e: ApprovalForPayment, maxAgeMs?: number): boolean =>
+    isInvoiceApprovedForPayment(
+      e,
+      maxAgeMs === undefined ? { nowMs: NOW } : { nowMs: NOW, maxAgeMs },
+    );
+
   it("is true only for approved", () => {
     const all: ApprovalStatus[] = ["pending_approval", "approved", "rejected", "unknown"];
-    expect(all.filter((status) => isInvoiceApprovedForPayment({ status }))).toEqual(["approved"]);
+    expect(all.filter((status) => ok(fresh({ status })))).toEqual(["approved"]);
+  });
+
+  it("re-derives from the raw code: a stale or inconsistent derivation is not approved", () => {
+    for (const statusCode of [null, 5, 0, 20, 49, 51, 999, 50.5]) {
+      expect(ok(fresh({ statusCode }))).toBe(false);
+    }
+    // the code alone is not enough either: the stored status must agree
+    expect(ok(fresh({ status: "unknown", statusCode: 50 }))).toBe(false);
+  });
+
+  it("is false for a row the reads have not confirmed recently", () => {
+    expect(ok(fresh({ lastSeenAt: new Date(NOW - 35 * HOUR).toISOString() }))).toBe(true);
+    expect(ok(fresh({ lastSeenAt: new Date(NOW - APPROVAL_MAX_AGE_MS).toISOString() }))).toBe(true);
+    expect(ok(fresh({ lastSeenAt: new Date(NOW - APPROVAL_MAX_AGE_MS - 1).toISOString() }))).toBe(
+      false,
+    );
+    expect(ok(fresh({ lastSeenAt: new Date(NOW - 30 * 24 * HOUR).toISOString() }))).toBe(false);
+    expect(ok(fresh({ lastSeenAt: null }))).toBe(false);
+    expect(ok(fresh({ lastSeenAt: "yesterday" }))).toBe(false);
+    // a stamp from the future is a fault, not a fresh row
+    expect(ok(fresh({ lastSeenAt: new Date(NOW + 2 * HOUR).toISOString() }))).toBe(false);
+    expect(ok(fresh({ lastSeenAt: new Date(NOW + 60_000).toISOString() }))).toBe(true);
+  });
+
+  it("is false for a row the last complete read did not see", () => {
+    expect(ok(fresh({ missedCycles: 1 }))).toBe(false);
+    expect(ok(fresh({ missedCycles: -1 }))).toBe(false);
+  });
+
+  it("a caller may ask for a shorter age, never a longer one", () => {
+    const e = fresh({ lastSeenAt: new Date(NOW - 2 * HOUR).toISOString() });
+    expect(ok(e, HOUR)).toBe(false);
+    expect(ok(e, 3 * HOUR)).toBe(true);
+    const old = fresh({ lastSeenAt: new Date(NOW - 40 * HOUR).toISOString() });
+    expect(ok(old, 100 * HOUR)).toBe(false);
+    expect(ok(e, 0)).toBe(false);
+    expect(ok(e, -1)).toBe(false);
+    expect(ok(e, Number.NaN)).toBe(false);
+    expect(isInvoiceApprovedForPayment(e, { nowMs: Number.NaN })).toBe(false);
   });
 });
 

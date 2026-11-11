@@ -104,11 +104,13 @@ export const ENTITIES: readonly EntityName[] = [
   "payables",
   "relations",
   "relation_ibans",
+  // Approval status of purchase entries (purchase-sync.ts, ADR 0025). In FULL runs before the
+  // ledger: a large ledger may need several nights (ADR 0024) and must not keep the approvals
+  // (and the nightly refresh the payment pre-check relies on) waiting. The hourly run reads it
+  // right after the divisions (INCREMENTAL_ORDER).
+  PURCHASE_ENTITY,
   // Ledger data for the reports (ledger-sync.ts, ADR 0024): FULL runs only, after everything else.
   ...LEDGER_ENTITIES,
-  // Approval status of purchase entries (purchase-sync.ts, ADR 0025). In FULL runs it comes last;
-  // the hourly run reads it right after the divisions (INCREMENTAL_ORDER).
-  PURCHASE_ENTITY,
 ];
 /**
  * Order of an INCREMENTAL run: the cheap approval-status read (usually one call) goes before the

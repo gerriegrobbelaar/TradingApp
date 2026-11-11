@@ -358,6 +358,38 @@ sync panel on the test division.
       cycle. A ledger that needs more than one night continues for up to 5 days
       (`LEDGER_PASS_MAX_AGE_MS`); if `gl_balances` is still `partial` after that, raise the
       job's `exact_budget` or the page size question first.
+16. **Purchase-entry approvals (before relying on the Approvals screen, and BEFORE Phase 9 enables
+    any Pay button; ADR 0025).** Run a full sync until the cycle completes, then check:
+    - **Resource and fields.** `purchaseentry/PurchaseEntries` answers to the 13 `$select` names
+      of `PURCHASE_ENTRY_FIELDS` (`EntryID, EntryNumber, Supplier, SupplierName, Currency,
+      AmountFC, AmountDC, EntryDate, DueDate, Status, Created, Modified, Document`). **A 400, 403
+      or 404 on the first page is read as "not available"**: `purchase_entries` then has
+      `last_error = purchase_entries_unavailable_<status>` in `GET /api/sync/status` and the
+      Approvals screen says "not available" for a day. Check that error on the first live run and
+      fix a wrong name (`DueDate` is the likeliest; drop it if the header has none) before
+      accepting "unavailable"; a full sync with "restart" tries again at once.
+    - **Status codes: the mapping allows payments, so it must be verified.** As an admin call
+      `GET /api/approvals/status-codes?division=<id>`: it lists the cached entries per raw Exact
+      `Status` code, the stored status and what the table maps it to. Open, in Exact's own UI, at
+      least two entries of every code listed (and one entry each that is waiting for approval,
+      approved, rejected and processed) and compare. Only then correct or confirm
+      `PURCHASE_ENTRY_STATUS_TABLE` (`packages/core/src/approvals.ts`; today 5 = waiting and
+      50 = approved, both guesses) and record the result in ADR 0025. **Until this is recorded,
+      Phase 9 must not enable paying on the basis of `isInvoiceApprovedForPayment`.** After a
+      table change, run a full sync with "restart" so stored rows are re-derived.
+    - **Filters.** `EntryDate ge datetime'...'`, `Modified ge datetime'...'` and `Status eq 5`
+      joined with `or` are accepted, and `$orderby=Modified` is honoured (rows come back in
+      ascending Modified order; otherwise the hourly cursor never moves and the hourly read
+      re-reads the same rows: `GET /api/sync/status` shows `purchase_entries` rows not falling).
+      Change one entry's status in Exact and check that its `Modified` changes and that the next
+      hourly run picks it up (`GET /api/approvals/:id`, `modifiedAt` and `statusCode`): the
+      status of an entry older than 120 days is only refreshed through `Modified`.
+    - **Time zone.** Whether `Modified` / `Created` (`/Date(ms)/`) are UTC or Amsterdam wall
+      clock, and whether a `datetime'...'` literal in `$filter` is read as UTC. We assume UTC; if
+      Exact uses Amsterdam time the cursor and window are 1 to 2 hours early (reads a little more,
+      safe), and `submittedAt` / `ageDays` can be one day off around midnight. Record it.
+    - `$skiptoken` paging with this filter and order, the page size (60?), and that `Document`
+      holds a GUID when a PDF is attached.
 ---
 
 ## Operations

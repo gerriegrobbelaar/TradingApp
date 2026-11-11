@@ -37,8 +37,11 @@ let div: DivisionRef & { name: string };
 let fx: FakeExact;
 let gate: FakeGate;
 let n = 0;
-/** Exact calls before the ledger in a full run: divisions, receivables, payables, relations, IBANs. */
-const PRE = 5;
+/**
+ * Exact calls before the ledger in a full run: divisions, receivables, payables, relations, IBANs
+ * and the (empty) purchase-entry read, which runs before the ledger (review K4, ADR 0025).
+ */
+const PRE = 6;
 
 beforeEach(async () => {
   await resetSync();
@@ -161,8 +164,7 @@ describe.each([
     expect(calls("/financial/ReportingBalance")).toBe(2 * p.balanceCalls);
     expect(calls("/budget/Budgets")).toBe(p.budgetCalls);
     expect(fx.calls.length).toBeLessThanOrEqual(240);
-    // + 1: the (empty) purchase-entry read that closes a full cycle (K4)
-    expect(fx.calls.length).toBe(PRE + p.accountCalls + 2 * p.balanceCalls + p.budgetCalls + 1);
+    expect(fx.calls.length).toBe(PRE + p.accountCalls + 2 * p.balanceCalls + p.budgetCalls);
     expect(await count("gl_accounts")).toBe(300);
     expect(await count("gl_balances")).toBe(7200);
     expect(await count("gl_balances", "year = 2025")).toBe(3600);

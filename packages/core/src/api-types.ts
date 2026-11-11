@@ -385,8 +385,9 @@ export interface ApprovalItemDto {
 
 /**
  * GET /api/approvals?division=&status=pending_approval|approved|rejected|all&q=&limit=&cursor=
- * `available` is false until the purchase entries have been read completely once (or when Exact
- * refuses the resource); items are then empty. `countsByStatus` ignores the status filter but
+ * `available` is false until the purchase entries have been read completely once (also when Exact
+ * has refused the resource from the start); items are then empty. After that, a refusal or failing
+ * reads show as `freshness.stale`, not as unavailable. `countsByStatus` ignores the status filter but
  * follows `q`.
  */
 export interface ApprovalsResponse {
@@ -397,6 +398,24 @@ export interface ApprovalsResponse {
   countsByStatus: Record<ApprovalStatus, number>;
   freshness: Freshness;
   available: boolean;
+}
+
+/**
+ * GET /api/approvals/status-codes?division= (admin only): cached entries per raw Exact Status
+ * code, to verify the unverified mapping on a real division (ADR 0025). `storedStatus` is what
+ * the rows hold, `mappedStatus` what the current table makes of the code (they differ only after
+ * a table change, until the rows are read again).
+ */
+export interface ApprovalStatusCodesResponse {
+  division: { id: number; name: string };
+  table: { statusCode: number; status: ApprovalStatus }[];
+  codes: {
+    statusCode: number | null;
+    storedStatus: ApprovalStatus;
+    mappedStatus: ApprovalStatus;
+    count: number;
+    lastSeenAt: string;
+  }[];
 }
 
 /** GET /api/approvals/:id */
