@@ -600,39 +600,62 @@ sync panel on the test division.
       stored booked amount until a sync read or the rate computation gives it again (ADR 0038).
       Without option 3 or the incremental read, the criterion is "dormant until verified".
 
-18. **Booking: verify the write path on a TEST division before enabling (Phase 7 M7c; ADR 0043,
-    0040).** Writing to Exact is switched off in four places (the `exact.booking_enabled` switch,
-    the verification mark, the gate, the job `exact.book_matches`, which ships disabled). Nothing
-    below has ever run against a real Exact. Do it on a test division only, in this order:
-    1. Settings, Matching: map the Revolut account (journal, bank GL account) AND the debtor and
-       creditor control accounts (`receivableGlAccountCode`, `payableGlAccountCode`; the MatchSet
-       names them). Decide `creates_bank_entries` on the Revolut connection (does Revolut's own
-       Exact integration import the lines?).
-    2. By hand in Exact (and with `curl` against the API where you can) check the ADR 0040
-       assumptions A1 to A11 and A12 to A15 of ADR 0043: POST one EUR 0.01 bank entry on the test
-       journal and look at it in the Exact UI (one line, the right sign, `YourRef`); upload one
-       MatchSet of a test invoice against that bank line and look at the match in the Exact UI;
-       read both back (`BankEntryLines` by `YourRef`, `cashflow/Receivables` by entry number).
+18. **Booking: verify the write path on a TEST division before enabling (Phase 7 M7c; ADR 0044,
+    0040).** Writing to Exact is switched off in five places: the `exact.booking_enabled` switch, the
+    verification mark (tied to `BOOKING_PROTOCOL_VERSION`), the gate (re-checks every precondition at
+    call time), the job `exact.book_matches` (ships disabled) and the writer guard. NOTHING below
+    has ever run against a real Exact, and the tests use a fake that shares our assumptions
+    (A1-A16 are all UNVERIFIED). Do it on a test division only, in this order:
+    1. **Prepare.** A test division with a test bank journal, a test debtor with one open invoice
+       of EUR 0.01 or more, and a test creditor with one open bill. In Settings, Matching map the
+       Revolut account (journal, bank GL account) AND the debtor and creditor control accounts
+       (`receivableGlAccountCode`, `payableGlAccountCode` via `PUT /api/matching/account-map`
+       until the screen has fields for them). Decide `creates_bank_entries` on the Revolut
+       connection (does Revolut's own Exact integration import the lines?).
+    2. **Check the assumptions by hand** (Exact UI and `curl` against the API), recording each
+       answer in ADR 0040 / 0044:
+       - A1, A3, A7, A9, A10: POST one EUR 0.01 bank entry on the test journal; in the Exact UI
+         confirm one line, the sign, the date and the `YourRef`.
+       - **A6/A13, the duplicate probe (this is what prevents a second bank entry):** GET
+         `BankEntryLines?$filter=YourRef eq '<that id>' and JournalCode eq '<code>'` must return
+         exactly one row; the same with the id in upper case; and a random id that does not
+         exist must return ZERO rows in that journal (if it returns lines, the filter is ignored:
+         STOP, booking must not be enabled). Same for the amount + date filter if the feed creates
+         the lines.
+       - A12: GET `BankEntries?$filter=JournalCode eq '<code>'&$orderby=EntryNumber desc&$top=1`
+         returns the entry just posted with the closing balance the next entry must open with.
+       - A2, A4, A5, A8, A14, A15, A16: upload one MatchSet of the test invoice against that bank
+         line; check the match in the Exact UI and that the invoice shows paid; read
+         `cashflow/Receivables` for the invoice with and without `IsFullyPaid eq true`; check that
+         the bank entry alone (before the MatchSet) did not already settle the invoice.
+       - A11: POST the same bank entry body twice: two entries (Exact has no idempotency, which is
+         why the probe and the balance check are mandatory). Reverse the test entries afterwards.
        Fix `EXACT_WRITE_NAMES` / the builders where Exact differs (this changes
-       `BOOKING_PROTOCOL_VERSION`, so verify again afterwards).
-    3. Create one real test match in the app (a test bank line of EUR 0.01 or more, a test
-       invoice), wait out the 10-minute undo window, and press **Run now** on `exact.book_matches`
-       (admin, fresh sign-in; it does nothing until the next two steps are done).
-    4. In the Booking card (Settings): "Verify" with a note of what you checked in Exact (the
-       dialog asks for the phrase `I VERIFIED THE EXACT WRITE PATH ON A TEST DIVISION`; the note is
-       stored with your email, the time and the protocol version), then "Enable" (fresh sign-in
-       and the phrase `ENABLE EXACT BOOKING`). The blockers list says what is missing.
-    5. Run the job once. Expect: one bank entry, one MatchSet, outbox rows `verified`, the match
-       `matched_in_exact`. Check both in the Exact UI and that the invoice shows paid.
-    6. Failure drills: block the network after the POST (a lost answer) and confirm the row is
-       `outcome_unknown`, the next run does NOT post again, and `retry` finds the entry and does
-       not duplicate it; switch booking off mid-run and confirm nothing more is sent; turn it back
-       on. A part payment must end `manual_required`, never posted.
-    7. Only then repeat on production with `exact.book_matches` still disabled, book one real
-       match, and switch the job on (5-minute schedule, 30 calls per run, 400 per day). Booking
-       stays off after every new verification until you enable it again.
-    - **Done when:** the note in the Verify dialog records what was checked, `GET
-      /api/booking/settings` shows no blockers, and one match completed end to end.
+       `BOOKING_PROTOCOL_VERSION`; start this item again).
+    3. **Verify.** In the Booking card (Settings): "Verify" with a note that lists the checks of
+       step 2 that passed (the dialog asks for the phrase
+       `I VERIFIED THE EXACT WRITE PATH ON A TEST DIVISION`; the note is stored with your email,
+       the time and the protocol version). Verifying always leaves booking off.
+    4. **Enable.** "Enable" (fresh sign-in, phrase `ENABLE EXACT BOOKING`). `GET
+       /api/booking/settings` must show no blockers.
+    5. **One booking.** Create one real test match in the app (a test bank line against the test
+       invoice), wait out the 10-minute undo window, and press **Run now** on
+       `exact.book_matches` (admin, fresh sign-in). Expect one bank entry (or none when the feed
+       creates the lines), one MatchSet, both outbox rows `verified`, the match
+       `matched_in_exact`. Check both in the Exact UI.
+    6. **Failure drills.** (a) Lost answer: block the network to Exact right after the POST (or
+       stop the Worker); the row must be `outcome_unknown`, the next run must NOT post again;
+       `retry` must find the entry (probe) and not duplicate it. (b) Switch booking off between
+       two runs and mid-run: nothing more is sent; switch it on again. (c) A part payment ends
+       `manual_required`, never posted. (d) Book something by hand in the test journal while a
+       row waits: the row must end `manual_required` `bank_balance_changed`.
+    7. **Production.** Only then on production, with `exact.book_matches` still disabled: book
+       one real match with Run now, check it in Exact, then switch the job on (5-minute schedule,
+       30 calls per run, 400 per 25 hours). Booking stays off after every new verification until
+       you enable it again.
+    - **Done when:** the Verify note records the checks of step 2, `GET /api/booking/settings`
+      shows no blockers, and one match completed end to end on the test division and on
+      production.
 
 ### First-live checklist: Revolut connect, webhook, sync and backfill (ADR 0030, 0031, 0033)
 

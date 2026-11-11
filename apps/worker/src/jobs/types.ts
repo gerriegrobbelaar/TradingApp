@@ -100,8 +100,9 @@ export interface HandlerDef {
   /** Spends Exact calls (the budget field applies). */
   usesExact: boolean;
   /**
-   * The handler stops by itself once it used this many Exact calls in an Amsterdam day (and only
-   * spends calls when there is work), so the budget projection uses it instead of fires x budget.
+   * The handler stops by itself once it used this many Exact calls in any rolling 25 hours, so in
+   * any Amsterdam day (a persisted ledger counts every call before it is made; it only spends calls
+   * when there is work), so the budget projection uses it instead of fires x budget.
    */
   dailyExactCallCap?: number;
   /** The phase that builds it, shown while it is `not_implemented`. */

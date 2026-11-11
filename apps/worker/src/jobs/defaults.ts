@@ -115,7 +115,7 @@ export const DEFAULT_JOBS: readonly DefaultJob[] = [
   {
     name: "exact.book_matches",
     handler: "exact.book_matches",
-    // Writes to Exact (ADR 0043). Disabled until the first live checks on a TEST division are done
+    // Writes to Exact (ADR 0044). Disabled until the first live checks on a TEST division are done
     // (docs/DEPLOY.md step 10); the handler ALSO does nothing unless the fail-closed booking switch,
     // the verification mark and the connections say so. 30 Exact calls per run.
     schedule: { kind: "cron", expr: "*/5 * * * *" },

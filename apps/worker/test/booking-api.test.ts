@@ -1,5 +1,5 @@
 /**
- * The booking API (task M7c, ADR 0043): the fail-closed switch with every precondition, the
+ * The booking API (task M7c, ADR 0044): the fail-closed switch with every precondition, the
  * verification mark, the outbox list, the admin resolutions, undo after booking.
  */
 import type {
@@ -8,7 +8,7 @@ import type {
   BookingSettingsResponse,
   BookingStatus,
 } from "@camelthorn/core";
-import { BOOKING_PROTOCOL_VERSION } from "@camelthorn/exact";
+import { BOOKING_PROTOCOL_VERSION } from "../src/booking/protocol";
 import { beforeEach, describe, expect, it } from "vitest";
 import { ENABLE_PHRASE, VERIFY_PHRASE } from "../src/booking/settings";
 import { checkMatchingInvariants } from "../src/matching/invariants";
@@ -126,6 +126,19 @@ describe("POST /api/booking/verify", () => {
     const rows = await auditRows("booking.verified");
     expect(rows.at(-1)?.actor_email).toBe("admin@camelthorncapital.com");
     expect(rows.at(-1)?.after_json).toContain(BOOKING_PROTOCOL_VERSION);
+  });
+
+  it("an IBAN typed into the note is masked in the settings and the audit log", async () => {
+    const r = await verify("admin", {
+      note: "Checked on the test division with account NL91 ABNA 0417 1643 00 in Exact",
+    });
+    expect(r.status).toBe(200);
+    expect((await settings()).body.verified?.note).toContain("NL91****4300");
+    const raw = await db
+      .prepare("SELECT value_json FROM settings WHERE key = 'exact.booking_verified'")
+      .first<{ value_json: string }>();
+    expect(raw?.value_json).not.toMatch(/0417 1643|ABNA/);
+    expect((await auditRows("booking.verified")).at(-1)?.after_json).not.toMatch(/0417 1643|ABNA/);
   });
 
   it("a new verification leaves booking OFF: switching it on is always its own, typed decision", async () => {
@@ -450,6 +463,72 @@ describe("POST /api/booking/outbox/:id/resolve", () => {
       .run();
     const r = await resolve("admin", rowId, "give_up");
     expect([r.status, err(r)]).toEqual([409, "in_flight"]);
+  });
+});
+
+describe("resolve never races a write on the wire", () => {
+  it("a decision on one row is refused while another row of the same match is sending", async () => {
+    await setBooking(true, true);
+    fake.modes.bank_entry = ["lost"];
+    const s = await seedBookable(w, fake);
+    await runBooking(fake);
+    const bank = (await outbox(s.matchId))[0]!;
+    // (the insert guard wants a claimed match: booking, then back to outcome_unknown)
+    await db
+      .prepare("UPDATE matches SET exact_state = 'booking' WHERE id = ?1")
+      .bind(s.matchId)
+      .run();
+    await db
+      .prepare(
+        `INSERT INTO exact_write_outbox (match_id, division_id, kind, idempotency_key, payload_json,
+           payload_hash, status, claimed_at, lease_expires_at, created_at, updated_at)
+         VALUES (?1, ?2, 'matchset', ?3, '{}', ?3, 'sending', 'x', '2099-01-01T00:00:00.000Z', 'x', 'x')`,
+      )
+      .bind(s.matchId, w.divisionId, "b".repeat(64))
+      .run();
+    await db
+      .prepare("UPDATE matches SET exact_state = 'outcome_unknown' WHERE id = ?1")
+      .bind(s.matchId)
+      .run();
+    for (const resolution of ["retry", "give_up", "booked_manually"]) {
+      const r = await send("admin", "POST", `/api/booking/outbox/${bank.id}/resolve`, {
+        resolution,
+        note: "Checked in Exact",
+      });
+      expect([r.status, err(r)]).toEqual([409, "in_flight"]);
+    }
+    expect((await outbox(s.matchId)).map((r) => r.status)).toEqual(["outcome_unknown", "sending"]);
+  });
+});
+
+describe("account map control accounts: who may change them", () => {
+  it("needs an admin with a fresh sign-in", async () => {
+    const body = {
+      bankAccountId: w.accountId,
+      divisionId: w.divisionId,
+      journalCode: "90",
+      bankGlAccountCode: "1210",
+      receivableGlAccountCode: "9999",
+    };
+    for (const role of ["finance", "approver", "viewer"] as const) {
+      expect((await send(role, "PUT", "/api/matching/account-map", body)).status).toBe(403);
+    }
+    const stale = await send("staleAdmin", "PUT", "/api/matching/account-map", body);
+    expect([stale.status, err(stale)]).toEqual([401, "step_up_required"]);
+    const row = await db
+      .prepare(
+        "SELECT receivable_gl_account_code AS c FROM bank_account_exact_map WHERE bank_account_id = ?1",
+      )
+      .bind(w.accountId)
+      .first<{ c: string | null }>();
+    expect(row?.c).toBe("1300");
+    for (const bad of ["", " 1300", "13 00", "1300;", "x".repeat(21), 1300]) {
+      const r = await send("admin", "PUT", "/api/matching/account-map", {
+        ...body,
+        receivableGlAccountCode: bad,
+      });
+      expect(r.status).toBe(400);
+    }
   });
 });
 

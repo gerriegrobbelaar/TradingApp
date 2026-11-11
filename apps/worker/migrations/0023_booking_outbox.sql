@@ -1,4 +1,4 @@
--- 0023 Booking outbox: the GATED write path to Exact (Phase 7, task M7c, ADR 0043).
+-- 0023 Booking outbox: the GATED write path to Exact (Phase 7, task M7c, ADR 0044).
 --
 --  (a) matches.booked_at: when the MatchSet was read back as applied in Exact. matches.exact_note:
 --      a short machine code for the last booking problem (never text from Exact or the bank).
@@ -7,14 +7,14 @@
 --      `control_account_unknown`, never a guess.
 --  (c) exact_write_outbox: one row per write to Exact, stored with its full (sanitised) payload and
 --      idempotency key BEFORE any network call. UNIQUE (match_id, kind).
---  (d) Allocation settlement (ADR 0043, fixes the double count noted in ADR 0042): an allocation of
+--  (d) Allocation settlement (ADR 0044, fixes the double count noted in ADR 0042): an allocation of
 --      a match that reached 'matched_in_exact' stops counting against the item's open balance once
 --      the item was re-read from Exact AFTER the booking (open_items.synced_at > matches.booked_at);
 --      from then on Exact's own open_minor reflects the payment. match_allocations_guard is
 --      recreated with that rule; the assembly, the review flags and the invariants use the same
 --      predicate (matching/store.ts `allocCounts`).
 --  (e) Guards (triggers): legal exact_state transitions only (`match_err:bad_transition`), an
---      undone match never changes state, 'matched_in_exact' needs booked_at, outbox rows only for a
+--      undone match never changes state, a claimed match is never undone, 'matched_in_exact' needs booked_at, outbox rows only for a
 --      claimed live match (`booking_err:not_claimed`), a finished outbox row never changes
 --      (`booking_err:terminal`).
 
@@ -55,6 +55,9 @@ CREATE TABLE exact_write_outbox (
   next_attempt_at  TEXT,
   claimed_at       TEXT,
   lease_expires_at TEXT,
+  -- Random id of the last transition (booking/outbox.ts): lets the same batch prove that IT moved
+  -- the row, so a match that is not where the transition expected rolls the whole batch back.
+  op_nonce         TEXT,
   created_at       TEXT NOT NULL,
   updated_at       TEXT NOT NULL,
   UNIQUE (match_id, kind)
@@ -78,6 +81,16 @@ BEGIN
   SELECT RAISE(ABORT, 'booking_err:terminal');
 END;
 
+-- The persisted call ledger of the booking job (review M7c): one row per Exact call, inserted
+-- BEFORE the call by a conditional INSERT that only succeeds while fewer than the daily cap were
+-- made in the rolling window. Overlapping runs, crashed runs and manual runs all count.
+CREATE TABLE booking_call_ledger (
+  id     INTEGER PRIMARY KEY AUTOINCREMENT,
+  at     TEXT NOT NULL,
+  run_id INTEGER
+);
+CREATE INDEX idx_booking_call_ledger_at ON booking_call_ledger (at);
+
 -- (e) -------------------------------------------------------------------------------------------
 CREATE TRIGGER matches_guard_exact_state BEFORE UPDATE OF exact_state ON matches
 WHEN NEW.exact_state IS NOT OLD.exact_state
@@ -96,6 +109,14 @@ BEGIN
          OR (OLD.exact_state = 'manual_required' AND NEW.exact_state IN ('matched_in_exact')));
   SELECT RAISE(ABORT, 'match_err:bad_match_row')
   WHERE NEW.exact_state = 'matched_in_exact' AND NEW.booked_at IS NULL;
+END;
+
+-- A match that the booking has claimed (anything but 'not_booked') can never be undone in the app:
+-- it may already be in Exact (reversal is a manual step there, ADR 0044).
+CREATE TRIGGER matches_guard_undo_claimed BEFORE UPDATE OF undone_at ON matches
+WHEN OLD.undone_at IS NULL AND NEW.undone_at IS NOT NULL AND OLD.exact_state <> 'not_booked'
+BEGIN
+  SELECT RAISE(ABORT, 'match_err:bad_transition');
 END;
 
 -- booked_at is written once, together with 'matched_in_exact', and never changes afterwards.

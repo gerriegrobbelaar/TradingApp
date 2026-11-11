@@ -55,7 +55,7 @@ the fixtures together. Nothing is wired yet: no worker code holds a writer (enfo
   (`createExactWriter`, `createBankEntry`, `submitMatchSet`, `xmlUpload`, the resource names) may
   appear only in allow-listed files (none yet), and no Exact-area file may contain a non-GET request
   literal except the OAuth token exchange. The future matching booker adds itself, with a reason.
-- Done in M7c (ADR 0043): `ExactGate` refuses every non-GET request except the two booking writes, and
+- Done in M7c (ADR 0044): `ExactGate` refuses every non-GET request except the two booking writes, and
   those only while the fail-closed switch and the verification mark say so; the booker is the one
   allow-listed caller of the writer.
 - The idempotency key is NOT sent as a header: the gate only allows `content-type`, `accept`,

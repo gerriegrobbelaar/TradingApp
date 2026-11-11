@@ -1,5 +1,5 @@
 /**
- * Booking API (task M7c, ADR 0043).
+ * Booking API (task M7c, ADR 0044).
  *
  *  GET  /api/booking/settings               any role   the fail-closed switch, the verification, blockers
  *  PUT  /api/booking/settings               admin      {enabled, confirm, note?}. Enabling: fresh sign-in,
@@ -20,7 +20,8 @@ import {
   type BookingSettingsResponse,
   type BookingStatus,
 } from "@camelthorn/core";
-import { BOOKING_PROTOCOL_VERSION } from "@camelthorn/exact";
+import { maskIbans } from "@camelthorn/core";
+import { BOOKING_PROTOCOL_VERSION } from "./protocol";
 import { isStepUpFresh } from "../auth/session";
 import { auditStatement } from "../db/audit";
 import { safeText } from "../matching/dto";
@@ -95,13 +96,16 @@ async function readBody(ctx: Ctx, allowed: readonly string[]): Promise<Record<st
   return rec;
 }
 
-/** A written note: trimmed, no control characters, `min`..`max` characters. */
+/**
+ * A written note: trimmed, no control characters, `min`..`max` characters. It is stored in settings
+ * and the audit log, so an IBAN typed into it is masked (CLAUDE.md 5).
+ */
 function note(v: unknown, min: number, max: number, code: string): string {
   if (typeof v !== "string") throw new ApiError(code);
   // eslint-disable-next-line no-control-regex
   const t = v.replace(/[\u0000-\u001F\u007F-\u009F]/g, " ").trim();
   if (t.length < min || t.length > max) throw new ApiError(code);
-  return t;
+  return maskIbans(t);
 }
 
 // ---- settings -------------------------------------------------------------------------------------
@@ -380,6 +384,15 @@ async function resolveHandler(ctx: Ctx): Promise<Response> {
   if (row.status === "sending" && (row.lease_expires_at ?? "") >= nowIso) {
     throw new ApiError("in_flight", 409);
   }
+  // A decision covers the whole match: never while another of its writes may be on the wire.
+  const sibling = await db
+    .prepare(
+      `SELECT 1 AS x FROM exact_write_outbox WHERE match_id = ?1 AND id <> ?2 AND status = 'sending'
+         AND (lease_expires_at IS NULL OR lease_expires_at >= ?3) LIMIT 1`,
+    )
+    .bind(row.match_id, id, nowIso)
+    .first();
+  if (sibling !== null) throw new ApiError("in_flight", 409);
 
   let applied: boolean;
   if (resolution === "retry") {
@@ -437,6 +450,7 @@ async function resolveHandler(ctx: Ctx): Promise<Response> {
           .prepare(
             `UPDATE exact_write_outbox SET status = ?3, updated_at = ?4, claimed_at = NULL, lease_expires_at = NULL
              WHERE match_id = ?1 AND id <> ?2 AND status NOT IN ('verified', 'resolved_manually', 'given_up')
+               AND NOT (status = 'sending' AND (lease_expires_at IS NULL OR lease_expires_at >= ?4))
                AND ${GUARD}`,
           )
           .bind(row.match_id, id, toStatus, nowIso),

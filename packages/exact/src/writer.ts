@@ -14,7 +14,7 @@
  * the caller must run the duplicate probe (`findBankEntryLineByRef`) or read back before
  * deciding anything.
  *
- * Callers: the worker's booking executor (apps/worker/src/booking/executor.ts, ADR 0043) is the
+ * Callers: the worker's booking executor (apps/worker/src/booking/executor.ts, ADR 0044) is the
  * only allowed caller (source scan in apps/worker/test/exact-write-guard.test.ts). The ExactGate
  * refuses every other write, and these two only while the fail-closed booking switch is on.
  */
@@ -190,13 +190,7 @@ export function createExactWriter(transport: ExactTransport, options: ExactWrite
         headers: { Accept: "application/json" },
         api: "rest",
       });
-      return resultRows(res.body).rows.map((r) => ({
-        id: str(r, "ID"),
-        entryId: str(r, "EntryID"),
-        entryNumber: num(r, "EntryNumber"),
-        yourRef: str(r, "YourRef"),
-        amountFc: str(r, "AmountFC"),
-      }));
+      return probeHits(res.body);
     },
 
     /**
@@ -218,13 +212,7 @@ export function createExactWriter(transport: ExactTransport, options: ExactWrite
         headers: { Accept: "application/json" },
         api: "rest",
       });
-      return resultRows(res.body).rows.map((r) => ({
-        id: str(r, "ID"),
-        entryId: str(r, "EntryID"),
-        entryNumber: num(r, "EntryNumber"),
-        yourRef: str(r, "YourRef"),
-        amountFc: str(r, "AmountFC"),
-      }));
+      return probeHits(res.body);
     },
 
     /**
@@ -292,6 +280,25 @@ function str(r: Row, k: string): string | null {
 function num(r: Row, k: string): number | null {
   const v = str(r, k);
   return v !== null && /^\d{1,15}$/.test(v) ? Number(v) : null;
+}
+
+/**
+ * Probe answers: one hit per row. A further page (`__next`) means MORE lines than were shown: an
+ * extra unreadable hit is added so the caller can never read a paged answer as "exactly one" or
+ * "none" (review M7c).
+ */
+function probeHits(body: string): BankEntryLineHit[] {
+  const { rows, more } = resultRows(body);
+  const hits: BankEntryLineHit[] = rows.map((r) => ({
+    id: str(r, "ID"),
+    entryId: str(r, "EntryID"),
+    entryNumber: num(r, "EntryNumber"),
+    yourRef: str(r, "YourRef"),
+    amountFc: str(r, "AmountFC"),
+  }));
+  if (more)
+    hits.push({ id: null, entryId: null, entryNumber: null, yourRef: null, amountFc: null });
+  return hits;
 }
 
 function resultRows(body: string): { rows: Row[]; more: boolean } {

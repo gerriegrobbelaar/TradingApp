@@ -1,5 +1,5 @@
 /**
- * ExactGate hardening for the write path (task M7c, ADR 0043): the gate refuses every non-GET
+ * ExactGate hardening for the write path (task M7c, ADR 0044): the gate refuses every non-GET
  * request except the two booking writes, and those only for job `exact-booking` at priority `job`
  * while the gate itself (re-reading D1 at call time) finds the fail-closed switch on and the
  * verification mark current. POSTs are never retried or redirected, and count against the budget.
@@ -30,18 +30,30 @@ beforeEach(async () => {
   await resetExact();
   await db.prepare("DELETE FROM settings WHERE key LIKE 'exact.booking_%'").run();
   await seedConnection();
+  // The gate checks EVERY precondition: the Revolut connection must have decided who books lines.
+  await db
+    .prepare(
+      `INSERT INTO connections (kind, name, status, creates_bank_entries, bank_entries_decided_at)
+       VALUES ('revolut', 'revolut', 'active', 1, '2026-07-01T00:00:00.000Z')`,
+    )
+    .run();
   stub = stubExact();
 });
 afterEach(() => {
   stub.restore();
 });
 
+const ENTRY_BODY =
+  '{"Journal":"90","Currency":"EUR","OpeningBalanceFC":0.00,"ClosingBalanceFC":1.00,"BankEntryLines":[{"Account":"11111111-2222-3333-4444-555555555555","AmountFC":1.00,"Date":"2026-07-15","Description":"x","YourRef":"t1"}]}';
+const MATCHSET_BODY =
+  '<?xml version="1.0" encoding="utf-8"?>\n<eExact xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="eExact-XML.xsd"><MatchSets><MatchSet><GLAccount code="1300"/><Account code="R1"/><Currency code="EUR"/><Description>M</Description><MatchLines><MatchLine><EntryNumber>1</EntryNumber><Amount>1.00</Amount></MatchLine><MatchLine><EntryNumber>2</EntryNumber><Amount>-1.00</Amount></MatchLine></MatchLines></MatchSet></MatchSets></eExact>';
+
 const bankEntry = (over: Partial<ExactRequest> = {}): Partial<ExactRequest> => ({
   method: "POST",
   path: "/financialtransaction/BankEntries",
   priority: "job",
   jobId: BOOKING_JOB_ID,
-  body: '{"Journal":"90"}',
+  body: ENTRY_BODY,
   headers: { "Content-Type": "application/json" },
   ...over,
 });
@@ -52,7 +64,7 @@ const matchSet = (over: Partial<ExactRequest> = {}): Partial<ExactRequest> => ({
   query: { Topic: "MatchSets" },
   priority: "job",
   jobId: BOOKING_JOB_ID,
-  body: "<eExact/>",
+  body: MATCHSET_BODY,
   headers: { "Content-Type": "text/xml" },
   ...over,
 });
@@ -133,6 +145,68 @@ describe("everything else is refused, even with booking on", () => {
     ["a bank entry without a body", bankEntry({ body: "" })],
     ["a bank entry with a query", bankEntry({ query: { x: "1" } })],
     ["XML upload for MatchSets as REST", matchSet({ api: "rest", path: "/docs/XMLUpload.aspx" })],
+    // query tricks
+    ["topic in lower case", matchSet({ query: { Topic: "matchsets" } })],
+    ["topic key in lower case", matchSet({ query: { topic: "MatchSets" } })],
+    ["two topic keys", matchSet({ query: { Topic: "MatchSets", topic: "Accounts" } })],
+    ["a second topic inside the value", matchSet({ query: { Topic: "MatchSets&Topic=Accounts" } })],
+    ["an encoded second topic", matchSet({ query: { Topic: "MatchSets%26Topic%3DAccounts" } })],
+    ["a topic with a trailing space", matchSet({ query: { Topic: "MatchSets " } })],
+    // path tricks
+    [
+      "dot-dot after the resource",
+      bankEntry({ path: "/financialtransaction/BankEntries/../../crm/Accounts" }),
+    ],
+    ["a trailing slash", bankEntry({ path: "/financialtransaction/BankEntries/" })],
+    ["a double slash", bankEntry({ path: "//financialtransaction/BankEntries" })],
+    ["an encoded slash", bankEntry({ path: "/financialtransaction%2FBankEntries" })],
+    ["the resource in lower case", bankEntry({ path: "/financialtransaction/bankentries" })],
+    [
+      "a keyed bank entry (an update target)",
+      bankEntry({
+        path: "/financialtransaction/BankEntries(guid'11111111-2222-3333-4444-555555555555')",
+      }),
+    ],
+    ["a query in the path", bankEntry({ path: "/financialtransaction/BankEntries?x=1" })],
+    ["the XML endpoint with a trailing slash", matchSet({ path: "/docs/XMLUpload.aspx/" })],
+    ["the XML endpoint in lower case", matchSet({ path: "/docs/xmlupload.aspx" })],
+    // method tricks
+    ["PATCH", bankEntry({ method: "PATCH" as ExactRequest["method"] })],
+    ["a method override header", bankEntry({ headers: { "X-HTTP-Method-Override": "DELETE" } })],
+    ["an X-HTTP-Method header", matchSet({ headers: { "X-HTTP-Method": "PUT" } })],
+    // body tricks
+    [
+      "another topic smuggled in the MatchSets document",
+      matchSet({
+        body: '<?xml version="1.0" encoding="utf-8"?>\n<eExact><Accounts><Account code="1"/></Accounts></eExact>',
+      }),
+    ],
+    [
+      "a second topic after the MatchSets",
+      matchSet({ body: MATCHSET_BODY.replace("</MatchSets>", "</MatchSets><GLTransactions/>") }),
+    ],
+    [
+      "a DOCTYPE (entity tricks)",
+      matchSet({
+        body: MATCHSET_BODY.replace("\n<eExact", '\n<!DOCTYPE x [<!ENTITY a "b">]><eExact'),
+      }),
+    ],
+    ["a CDATA section", matchSet({ body: MATCHSET_BODY.replace(">M<", "><![CDATA[M]]><") })],
+    [
+      "something other than MatchSet inside MatchSets",
+      matchSet({ body: MATCHSET_BODY.replace("<MatchSets>", "<MatchSets><Journal/>") }),
+    ],
+    ["a JSON array body", bankEntry({ body: "[]" })],
+    [
+      "a bank entry with an unknown field",
+      bankEntry({ body: ENTRY_BODY.replace('{"Journal"', '{"Type":40,"Journal"') }),
+    ],
+    [
+      "a bank entry line with an unknown field",
+      bankEntry({ body: ENTRY_BODY.replace('"YourRef"', '"VATCode":"1","YourRef"') }),
+    ],
+    ["a bank entry without lines", bankEntry({ body: '{"Journal":"90","BankEntryLines":[]}' })],
+    ["a body that is not JSON", bankEntry({ body: "Journal=90" })],
   ];
   it.each(refused)("%s", async (_name, over) => {
     const div = freshDivision();
@@ -154,6 +228,56 @@ describe("everything else is refused, even with booking on", () => {
     }
     expect(allowedWriteShape(req(1, bankEntry()))).toBe(true);
     expect(allowedWriteShape(req(1, matchSet()))).toBe(true);
+  });
+});
+
+describe("every precondition, checked by the gate itself", () => {
+  it("refuses while the Revolut connection has not decided who creates the bank entries", async () => {
+    const div = freshDivision();
+    await setBooking(true, true);
+    await db
+      .prepare("UPDATE connections SET bank_entries_decided_at = NULL WHERE kind = 'revolut'")
+      .run();
+    expect(await call(div, bankEntry())).toEqual({
+      ok: false,
+      error: { kind: "api", status: 403, code: "writes_disabled" },
+    });
+    expect(posts()).toBe(0);
+  });
+
+  it("re-checks right before the network call: a switch-off during the token refresh stops the POST", async () => {
+    await resetExact();
+    await db
+      .prepare(
+        `INSERT INTO connections (kind, name, status, creates_bank_entries, bank_entries_decided_at)
+         VALUES ('revolut', 'revolut', 'active', 1, '2026-07-01T00:00:00.000Z')`,
+      )
+      .run();
+    // An access token about to expire: the gate refreshes it before the call.
+    await seedConnection({ expiresInMs: 30_000 });
+    const div = freshDivision();
+    await setBooking(true, true);
+    const ok = stub.token;
+    stub.token = async (f, n) => {
+      await setBooking(false, true); // switched off while the request is at the token step
+      return ok(f, n);
+    };
+    const r = await call(div, bankEntry());
+    expect(r).toEqual({ ok: false, error: { kind: "api", status: 403, code: "writes_disabled" } });
+    expect(stub.tokenCalls.length).toBe(1);
+    expect(posts()).toBe(0);
+  });
+
+  it("a GET that carries a body is sent as a plain GET without it", async () => {
+    const div = freshDivision();
+    const r = await call(div, {
+      method: "GET",
+      path: "/financialtransaction/BankEntries",
+      body: ENTRY_BODY,
+    });
+    expect(r.ok).toBe(true);
+    expect(stub.apiCalls).toHaveLength(1);
+    expect(stub.apiCalls[0]).toMatchObject({ method: "GET", body: undefined });
   });
 });
 

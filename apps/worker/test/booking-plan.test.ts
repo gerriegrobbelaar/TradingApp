@@ -1,5 +1,5 @@
 /**
- * planMatch (pure, ADR 0043): what a match becomes in Exact, or why a person must do it by hand.
+ * planMatch (pure, ADR 0044): what a match becomes in Exact, or why a person must do it by hand.
  */
 import { describe, expect, it } from "vitest";
 import {
@@ -44,6 +44,7 @@ const cand = (over: Partial<Candidate> = {}, items: CandidateItem[] = [item()]):
     externalId: "tx-abc-1",
     connectionId: 2,
     amountMinor: 10_000,
+    currency: "EUR",
     bookedAt: "2026-07-15T10:00:00.000Z",
     counterpartyName: "Acme B.V.",
     reference: "INV 2026001",
@@ -211,5 +212,103 @@ describe("stored payload documents", () => {
   it("failure rows get a stable key per match", () => {
     expect(planFailureKey(7)).toBe(planFailureKey(7));
     expect(planFailureKey(7)).not.toBe(planFailureKey(8));
+  });
+});
+
+/**
+ * Hand-built sign examples (A14), independent of the code's own formula: what each MatchSet must
+ * look like in Exact's terms (debtor invoice +, receipt -, creditor bill -, payment +), zero-sum.
+ */
+describe("MatchSet signs, hand-built (review M7c)", () => {
+  const xmlOf = (c: Candidate): string => {
+    const p = planMatch(c);
+    if (!p.ok || p.mode !== "matched") throw new Error(`not planned: ${code(p)}`);
+    const b = buildMatchsetFromPlan({ ...p.matchset, bankEntryNumber: 900 });
+    if (!b.ok) throw new Error(b.code);
+    return b.built.xml;
+  };
+  const line = (entry: number, amount: string): string =>
+    `<MatchLine><EntryNumber>${entry}</EntryNumber><Amount>${amount}</Amount></MatchLine>`;
+  const tx = (amountMinor: number, currency = "EUR") => ({ ...cand().tx, amountMinor, currency });
+
+  it.each([
+    [
+      "customer invoice 1,000 received",
+      cand({ tx: tx(100_000) }, [item({ openMinor: 100_000, allocatedMinor: 100_000 })]),
+      "1300",
+      [line(21, "1000.00"), line(900, "-1000.00")],
+    ],
+    [
+      "supplier bill 500 paid",
+      cand({ tx: tx(-50_000) }, [
+        item({ kind: "bill", openMinor: 50_000, allocatedMinor: 50_000 }),
+      ]),
+      "1600",
+      [line(21, "-500.00"), line(900, "500.00")],
+    ],
+    [
+      "customer credit note 200 refunded",
+      cand({ tx: tx(-20_000) }, [item({ openMinor: -20_000, allocatedMinor: 20_000 })]),
+      "1300",
+      [line(21, "-200.00"), line(900, "200.00")],
+    ],
+    [
+      "supplier credit note 70 refunded to us",
+      cand({ tx: tx(7_000) }, [item({ kind: "bill", openMinor: -7_000, allocatedMinor: 7_000 })]),
+      "1600",
+      [line(21, "70.00"), line(900, "-70.00")],
+    ],
+    [
+      "JPY (scale 0)",
+      cand({ currency: "JPY", baseCurrency: "JPY", tx: tx(1_234, "JPY") }, [
+        item({ currency: "JPY", openMinor: 1_234, allocatedMinor: 1_234 }),
+      ]),
+      "1300",
+      [line(21, "1234"), line(900, "-1234")],
+    ],
+    [
+      "KWD (scale 3)",
+      cand({ currency: "KWD", baseCurrency: "KWD", tx: tx(1_234, "KWD") }, [
+        item({ currency: "KWD", openMinor: 1_234, allocatedMinor: 1_234 }),
+      ]),
+      "1300",
+      [line(21, "1.234"), line(900, "-1.234")],
+    ],
+  ])("%s", (_name, c, gl, lines) => {
+    const xml = xmlOf(c);
+    expect(xml).toContain(`<GLAccount code="${gl}"/>`);
+    expect(xml.match(/<MatchLine>/g)).toHaveLength(2);
+    for (const l of lines) expect(xml).toContain(l);
+  });
+
+  it.each([
+    [
+      "a receipt against a bill",
+      cand({ tx: tx(500) }, [item({ kind: "bill", openMinor: 500, allocatedMinor: 500 })]),
+    ],
+    [
+      "a payment against an invoice",
+      cand({ tx: tx(-500) }, [item({ openMinor: 500, allocatedMinor: 500 })]),
+    ],
+    [
+      "an amount above 2^53",
+      cand({ tx: tx(2 ** 53 + 2) }, [
+        item({ openMinor: 2 ** 53 + 2, allocatedMinor: 2 ** 53 + 2 }),
+      ]),
+    ],
+    [
+      "an item amount above 2^53",
+      cand({ tx: tx(100) }, [item({ openMinor: 2 ** 60, allocatedMinor: 100 })]),
+    ],
+    ["a bank line in another currency than the match", cand({ tx: tx(10_000, "USD") })],
+    [
+      "invoice and credit note netted",
+      cand({ tx: tx(800) }, [
+        item({ id: 1, exactId: "i1", entryNumber: 21, openMinor: 1_000, allocatedMinor: 1_000 }),
+        item({ id: 2, exactId: "i2", entryNumber: 22, openMinor: -200, allocatedMinor: 200 }),
+      ]),
+    ],
+  ])("never booked: %s", (_name, c) => {
+    expect(planMatch(c).ok).toBe(false);
   });
 });

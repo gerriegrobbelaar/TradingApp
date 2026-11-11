@@ -1,5 +1,5 @@
 /**
- * What to write to Exact for one match (task M7c, ADR 0043). Pure: no I/O. `planMatch` turns the
+ * What to write to Exact for one match (task M7c, ADR 0044). Pure: no I/O. `planMatch` turns the
  * match, its bank line, its items and the account mapping into builder inputs, or into a machine
  * code that says why a person has to do it (v1 books full matches in the administration's currency
  * only: part payments, surplus, mixed kinds and currencies, foreign currency and reversals are
@@ -54,6 +54,8 @@ export interface Candidate {
     connectionId: number;
     /** Signed: money in positive. */
     amountMinor: number;
+    /** The bank line's own currency (must equal the match's). */
+    currency: string;
     bookedAt: string;
     counterpartyName: string | null;
     reference: string | null;
@@ -116,6 +118,13 @@ export function planMatch(c: Candidate): Plan {
   const mode = c.ledgerAccountCode !== null ? "ledger" : "matched";
   const fail = (code: string): Plan => ({ ok: false, code, mode });
   if (!Number.isSafeInteger(c.tx.amountMinor) || c.tx.amountMinor === 0) return fail("bad_amount");
+  // Every amount must be an exact integer (D1 hands back a float above 2^53).
+  if (
+    c.items.some(
+      (i) => !Number.isSafeInteger(i.openMinor) || !Number.isSafeInteger(i.allocatedMinor),
+    )
+  )
+    return fail("bad_amount");
   if (
     Math.abs(c.tx.amountMinor) !== Math.abs(c.items.reduce((s, i) => s + i.allocatedMinor, 0)) &&
     mode === "matched"
@@ -124,6 +133,7 @@ export function planMatch(c: Candidate): Plan {
     return fail("partial_match_not_supported_v1");
   }
   if (c.currency !== c.baseCurrency) return fail("fx_not_supported_v1");
+  if (c.tx.currency !== c.currency) return fail("mixed_currency");
   const text = bankLineText(c);
   const date = amsterdamParts(Date.parse(c.tx.bookedAt)).date;
   const draftBase = {

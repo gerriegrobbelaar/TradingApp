@@ -1,5 +1,5 @@
 /**
- * The booking outbox (task M7c, ADR 0043): one row per write to Exact, stored WITH its full
+ * The booking outbox (task M7c, ADR 0044): one row per write to Exact, stored WITH its full
  * sanitised payload and idempotency key before any network call. Every state change of a row, its
  * audit row and the matching change of `matches.exact_state` are ONE db.batch (ADR 0013).
  *
@@ -231,6 +231,8 @@ export async function transition(db: D1Database, t: Transition): Promise<boolean
     add("journal_code", t.payload.journalCode);
   }
   if (t.keepLease !== true) set.push("claimed_at = NULL", "lease_expires_at = NULL");
+  const nonce = crypto.randomUUID();
+  add("op_nonce", nonce);
   let where = `id = ?1 AND status IN (${inList(t.from)})`;
   if (t.token !== null) {
     binds.push(t.token);
@@ -265,14 +267,31 @@ export async function transition(db: D1Database, t: Transition): Promise<boolean
           t.match.bookedAt ?? null,
           t.match.from,
         ),
+      // The row moved (its nonce is ours) but the match did not: abort the WHOLE batch (json()
+      // of invalid text raises), so a row can never change state without its match.
+      db
+        .prepare(
+          `SELECT CASE WHEN changes() = 0 AND EXISTS (SELECT 1 FROM exact_write_outbox
+                    WHERE id = ?1 AND op_nonce = ?2) THEN json('booking_err:match_out_of_step') END`,
+        )
+        .bind(t.rowId, nonce),
     );
   }
   if (t.after !== undefined) stmts.push(...t.after(db));
-  const out = await db.batch(stmts);
+  let out: D1Result[];
+  try {
+    out = await db.batch(stmts);
+  } catch (e) {
+    // The out-of-step guard rolled the batch back: nothing changed, the caller lost a race.
+    if (e instanceof Error && /malformed JSON/i.test(e.message)) {
+      console.error("booking: match state out of step", t.matchId);
+      return false;
+    }
+    throw e;
+  }
   if ((out[0]?.meta.changes ?? 0) !== 1) return false;
   if (moveIndex >= 0 && (out[moveIndex]?.meta.changes ?? 0) !== 1) {
-    // The row moved but the match was not where we expected. Unreachable while only this module
-    // changes exact_state after the claim; the invariants check reports the mismatch.
+    // Unreachable: the guard statement above aborts the batch in this case.
     console.error("booking: match state out of step", t.matchId);
     return false;
   }

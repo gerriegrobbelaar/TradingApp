@@ -17,6 +17,14 @@ export type PostMode =
   | "html"
   /** MatchSet: answers success but does not apply it. */
   | "ok_unapplied"
+  /** MatchSet: answers with an explicit error message and does not apply it. */
+  | "refused"
+  /** Bank entry: performed, then Exact answers 500 (the commit happened before the error). */
+  | "http500_after_commit"
+  /** Bank entry: performed, then the gate reports a 401 (the token expired on the way back). */
+  | "auth401_after_commit"
+  /** A raw 401 answer reaches the writer (not converted by the gate): performed. */
+  | "raw401_after_commit"
   /** The gate refuses to re-send after a 401. */
   | "auth401"
   | "rate_limited";
@@ -226,6 +234,9 @@ export class FakeExact {
     }
     this.closing.set(body.Journal, Math.round(body.ClosingBalanceFC * 100));
     if (mode === "lost") this.fail(mode);
+    if (mode === "http500_after_commit") return { status: 500, headers: {}, body: "boom" };
+    if (mode === "auth401_after_commit") throw new ExactWriteAuthRetryRefused();
+    if (mode === "raw401_after_commit") return { status: 401, headers: {}, body: "" };
     if (mode === "html") return { status: 200, headers: {}, body: "<html>login</html>" };
     return this.json({
       d: {
@@ -247,6 +258,13 @@ export class FakeExact {
     const lines = [
       ...xml.matchAll(/<EntryNumber>(\d+)<\/EntryNumber><Amount>(-?[\d.]+)<\/Amount>/g),
     ].map((m) => ({ entryNumber: Number(m[1]), amountMinor: Math.round(Number(m[2]) * 100) }));
+    if (mode === "refused") {
+      return {
+        status: 200,
+        headers: {},
+        body: '<?xml version="1.0"?><eExact><Messages><Message type="0"><Description>Fout</Description></Message></Messages></eExact>',
+      };
+    }
     if (mode !== "ok_unapplied") {
       this.matchSets.push({ lines });
       for (const l of lines) {

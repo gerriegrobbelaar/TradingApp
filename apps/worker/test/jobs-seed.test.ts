@@ -136,6 +136,30 @@ describe("default jobs (CLAUDE.md 4.1)", () => {
   });
 });
 
+describe("the version 4 upgrade (M7c booking job)", () => {
+  beforeEach(reset);
+
+  it("an install at version 3 gets exact.book_matches DISABLED, with no next run; nothing else changes", async () => {
+    await seedDefaultJobs(db);
+    await db.prepare("UPDATE jobs SET enabled = 1 WHERE name LIKE 'exact.%sync'").run();
+    await db.prepare("DELETE FROM jobs WHERE name = 'exact.book_matches'").run();
+    await db
+      .prepare(
+        "UPDATE settings SET value_json = json_object('version', 3) WHERE key = 'seed.default_jobs'",
+      )
+      .run();
+    resetDefaultJobsMemoForTests();
+    expect(await seedDefaultJobs(db)).toBe("applied");
+    const rows = await jobs();
+    expect(rows.find((r) => r.name === "exact.book_matches")).toMatchObject({
+      enabled: 0,
+      next_run_at: null,
+      exact_budget: 30,
+    });
+    expect(rows.filter((r) => r.name.endsWith("_sync")).every((r) => r.enabled === 1)).toBe(true);
+  });
+});
+
 describe("migration 0008 on a populated database", () => {
   it("keeps old jobs and runs, maps them to the new columns, and the foreign keys hold", async () => {
     const mdb = env.MIGRATE_DB;

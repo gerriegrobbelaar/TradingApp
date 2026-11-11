@@ -1,12 +1,12 @@
 /**
- * The fail-closed switch for writing matches to Exact (task M7c, ADR 0043).
+ * The fail-closed switch for writing matches to Exact (task M7c, ADR 0044).
  *
  *  settings.exact.booking_enabled   JSON boolean, default FALSE (a missing row is off). Only the
  *                                   strict JSON `true` counts.
  *  settings.exact.booking_verified  JSON { at, by, note, protocolVersion }: an admin recorded that
  *                                   the write path worked on a TEST division. It counts only while its
  *                                   protocolVersion equals BOOKING_PROTOCOL_VERSION (a hash computed
- *                                   from the payload builders in packages/exact), so ANY change to
+ *                                   from the builders, probes, parsers and plan: booking/protocol.ts), so ANY change to
  *                                   what we send invalidates it.
  *
  * Booking runs only when ALL of these hold (`bookingBlockers` lists what is missing): the switch is
@@ -14,7 +14,7 @@
  * decided whether this app creates the bank entries. The ExactGate re-checks the switch and the
  * verification at call time (exact/write-policy.ts), the executor checks them again.
  */
-import { BOOKING_PROTOCOL_VERSION } from "@camelthorn/exact";
+import { BOOKING_PROTOCOL_VERSION } from "./protocol";
 
 export const SETTING_ENABLED = "exact.booking_enabled";
 export const SETTING_VERIFIED = "exact.booking_verified";

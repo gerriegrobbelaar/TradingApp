@@ -967,7 +967,10 @@ export interface MatchStatsResponse {
   unmappedAccounts: number;
 }
 
-// ---- Booking to Exact (Phase 7, M7c, ADR 0043) ----------------------------------------------------
+// ---- Booking in Exact (Phase 7, M7c). Fixed shapes shared with the web (M7d). -----------------------
+// GET /api/booking/settings ; PUT /api/booking/settings {enabled, confirm, note?} ;
+// POST /api/booking/verify {note, confirm} ; GET /api/booking/outbox?status=&limit=&cursor= ;
+// POST /api/booking/outbox/:id/resolve {resolution: 'booked_manually'|'retry'|'give_up', note}
 
 export type BookingStatus =
   | "pending"
@@ -998,7 +1001,6 @@ export interface BookingOutboxItemDto {
   itemLabels: string[];
 }
 
-/** GET /api/booking/outbox?status=&limit=&cursor= (any signed-in role) */
 export interface BookingOutboxResponse {
   items: BookingOutboxItemDto[];
   nextCursor: string | null;
@@ -1006,16 +1008,18 @@ export interface BookingOutboxResponse {
   countsByStatus: Record<BookingStatus, number>;
 }
 
-/** GET /api/booking/settings (any signed-in role). PUT /api/booking/settings returns the same. */
 export interface BookingSettingsResponse {
   enabled: boolean;
   verified: { at: string; by: string; note: string; protocolVersion: string } | null;
   protocolVersion: string;
   protocolChanged: boolean;
   createsBankEntries: boolean | null;
-  /** Codes why booking cannot run now: not_verified, protocol_changed, bank_entries_undecided, no_exact_connection, writes_disabled. */
   blockers: string[];
 }
+
+// ---- Booking request shapes (M7c, ADR 0044). The block above is byte-identical to M7d's copy. ------
+// GET /api/booking/settings: any role. Blockers: not_verified, protocol_changed,
+// bank_entries_undecided, no_exact_connection, writes_disabled.
 
 /** PUT /api/booking/settings (admin; enabling needs a fresh sign-in and the typed phrase ENABLE EXACT BOOKING). */
 export interface BookingSettingsRequest {

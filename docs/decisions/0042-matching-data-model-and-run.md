@@ -82,5 +82,5 @@ is booked and the sync has lowered `open_minor`, its allocation would count twic
 Exact (for example booked and synced after the booking) in the trigger, the assembly, the review flags and the invariants together.
 
 ## What M7c adds
-Done in M7c (ADR 0043): booking outbox, `exact_state` transitions, retry and idempotency keys, and the allocation settlement rule that fixes the double count noted under "Undo window". Reversal stays manual (409 `already_booked_in_exact`, detail `reversal_required_in_exact`).
+Done in M7c (ADR 0044): booking outbox, `exact_state` transitions, retry and idempotency keys, and the allocation settlement rule that fixes the double count noted under "Undo window". Reversal stays manual (409 `already_booked_in_exact`, detail `reversal_required_in_exact`).
 Not done here: auto-ignore of internal transfers (they stay unmatched until a person ignores them), FX matches, group UI.

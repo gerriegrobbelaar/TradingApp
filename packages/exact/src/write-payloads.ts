@@ -33,6 +33,7 @@ import {
   buildXmlEnvelope,
   parseXmlResponse,
   xmlElement,
+  xmlEscape,
   xmlTextElement,
 } from "./xml";
 
@@ -951,7 +952,7 @@ export function mapOpenItemLineRow(r: Row): OpenItemLineRow {
  * Descriptions of the builder rules that the sample outputs below cannot show on their own. Change
  * a string (or anything in EXACT_WRITE_NAMES, BANK_ENTRY_SIGN or a builder) and
  * BOOKING_PROTOCOL_VERSION changes, which invalidates the stored "write path verified" mark: an
- * admin must verify again on a test division (ADR 0043).
+ * admin must verify again on a test division (ADR 0044).
  */
 export const WRITE_BUILDER_RULES = {
   bankEntry: "bank-entry/v1",
@@ -964,7 +965,8 @@ export const WRITE_BUILDER_RULES = {
   probe: "probe/v1:yourref+journal,amount+date-window",
 } as const;
 
-function protocolCanonical(): string {
+/** The canonical text hashed into BOOKING_PROTOCOL_VERSION (exported for tests and for diffing). */
+export function bookingProtocolCanonical(): string {
   // A fixed sample through BOTH builders: any change of field names, number formatting, escaping,
   // sorting, sanitising or checks shows up in the output and therefore in the version.
   const g1 = "11111111-2222-3333-4444-555555555555";
@@ -1010,7 +1012,205 @@ function protocolCanonical(): string {
     entry.ok ? [entry.body, entry.headers, entry.yourRefs] : entry.error,
     set.ok ? [set.xml, set.topic] : set.error,
     bankLineShortRef("tx-sample"),
+    dependencySamples(g1, g2),
   ]);
+}
+
+/** Runs `f`; a throw is recorded by its class name and message (a changed refusal changes the hash). */
+function attempt(f: () => unknown): unknown {
+  try {
+    return f();
+  } catch (e) {
+    return ["threw", e instanceof Error ? `${e.name}:${e.message}` : String(e)];
+  }
+}
+
+/**
+ * Outputs of every helper that decides WHAT is sent or WHETHER something is sent, on adversarial
+ * samples (review M7c): the text sanitiser and IBAN masking, XML escaping, money formatting at the
+ * scales 0/2/3 and near 2^53, the builders' refusals, the probe and balance queries (a wrong
+ * filter turns "already there" into "not found", so they are part of the protocol), the parsers of
+ * Exact's answers and the read-back verdicts. A behaviour change in any of them (even in a shared
+ * dependency such as @camelthorn/core) changes BOOKING_PROTOCOL_VERSION.
+ */
+function dependencySamples(g1: string, g2: string): unknown {
+  const texts = [
+    "NL91ABNA0417164300",
+    "nl91 abna 0417 1643 00",
+    "toNL91ABNA0417164300x",
+    "NL91-ABNA-0417-1643-00",
+    "\uFF2E\uFF2C\uFF19\uFF11ABNA0417164300",
+    "DE89 3704 0044 0532 0130 00 / GB82WEST12345698765432",
+    "Café <script>&amp; ' \" \u202E evil \u0000\u0007 x",
+    "a".repeat(80),
+    "",
+  ];
+  // Rows as the writer sees them: through the same raw-number JSON parser.
+  const lineRow = (amount: string, paid: boolean, n = 7): Row =>
+    asRow(
+      parseJsonRawNumbers(
+        `{"ID":"${g1}","Account":"${g2}","AccountCode":"R1","AmountFC":${amount},"Currency":"EUR","IsFullyPaid":${paid},"EntryNumber":${n}}`,
+      ),
+    );
+  const verdict = (rows: Row[], before: number, paidRows?: Row[]): unknown =>
+    attempt(() =>
+      verifyMatchSetApplied(
+        rows.map(mapOpenItemLineRow),
+        [{ entryNumber: 7, currency: "EUR", openBeforeMinor: before }],
+        paidRows?.map(mapOpenItemLineRow),
+      ),
+    );
+  const entryInput = (o: Partial<BankEntryInput>): unknown =>
+    attempt(() => {
+      const r = buildBankEntryPayload({
+        division: 1,
+        journalCode: "90",
+        entryDate: "2026-01-31",
+        currency: "EUR",
+        openingBalanceMinor: 0,
+        closingBalanceMinor: 100,
+        idempotencyKey: bankEntryIdempotencyKey("c", "t1", "main"),
+        divisionCurrency: "EUR",
+        lines: [
+          { amountMinor: 100, description: "x", accountId: g2, bankTransactionExternalId: "t1" },
+        ],
+        ...o,
+      });
+      return r.ok ? r.body : r.error;
+    });
+  const setInput = (o: Partial<MatchSetInput>): unknown =>
+    attempt(() => {
+      const r = buildMatchSetXml({
+        division: 1,
+        glAccountCode: "1300",
+        relationCode: "R1",
+        currency: "EUR",
+        reference: "M",
+        lines: [
+          { entryNumber: 2, currency: "EUR", amountMinor: -100 },
+          { entryNumber: 1, currency: "EUR", amountMinor: 100 },
+        ],
+        ...o,
+      });
+      return r.ok ? r.xml : r.error;
+    });
+  return {
+    sanitize: texts.map((t) => [sanitizeBankText(t), sanitizeBankText(t, 12)]),
+    escape: ["<a href='x'>&\"]]>", "\uD800", "\u0001", "\uFFFE", "ok"].map((t) =>
+      attempt(() => xmlEscape(t)),
+    ),
+    money: [
+      [0, 0],
+      [-1, 0],
+      [1, 2],
+      [-1, 2],
+      [123_456, 2],
+      [-5, 3],
+      [1234, 3],
+      [9_007_199_254_740_991, 2],
+      [-9_007_199_254_740_991, 0],
+    ].map(([m, sc]) => attempt(() => formatMinor(m as number, sc as number))),
+    scales: ["EUR", "JPY", "KWD", "USD"].map((c) => currencyScale(c)),
+    entries: [
+      entryInput({ currency: "JPY", divisionCurrency: "JPY" }),
+      entryInput({ currency: "KWD", divisionCurrency: "KWD", closingBalanceMinor: 100 }),
+      entryInput({ closingBalanceMinor: 101 }),
+      entryInput({ openingBalanceMinor: 2 ** 53, closingBalanceMinor: 2 ** 53 + 100 }),
+      entryInput({
+        lines: [
+          { amountMinor: -100, description: "y", glAccountId: g1, bankTransactionExternalId: "t1" },
+        ],
+        closingBalanceMinor: -100,
+      }),
+      entryInput({ lines: [] }),
+      entryInput({ journalCode: "9'0" }),
+    ],
+    sets: [
+      setInput({}),
+      setInput({
+        lines: [
+          { entryNumber: 1, currency: "EUR", amountMinor: 100 },
+          { entryNumber: 2, currency: "EUR", amountMinor: -99 },
+        ],
+      }),
+      setInput({
+        lines: [
+          { entryNumber: 1, currency: "EUR", amountMinor: 100 },
+          { entryNumber: 2, currency: "USD", amountMinor: -100 },
+        ],
+      }),
+      setInput({ lines: [{ entryNumber: 1, currency: "EUR", amountMinor: 0 }] }),
+      setInput({ relationCode: "R<1>" }),
+      setInput({
+        currency: "KWD",
+        lines: [
+          { entryNumber: 1, currency: "KWD", amountMinor: 1001 },
+          { entryNumber: 2, currency: "KWD", amountMinor: -1001 },
+        ],
+      }),
+    ],
+    keys: [
+      attempt(() => matchSetIdempotencyKey("t1", ["b", "a"], [{ itemId: "a", amountMinor: 1 }])),
+      attempt(() => bankEntryIdempotencyKey(1, "t1", "main")),
+      bankLineShortRef("00000000-0000-0000-0000-000000000000"),
+    ],
+    queries: [
+      attempt(() => findExistingBankEntryQuery({ journalCode: "90", yourRef: "tx-1" })),
+      attempt(() => findExistingBankEntryQuery({ journalCode: "90", yourRef: "a'b" })),
+      attempt(() =>
+        findBankLineByAmountQuery({
+          journalCode: "90",
+          amountMinor: -12_345,
+          currency: "EUR",
+          dateFrom: "2026-01-30",
+          dateTo: "2026-02-03",
+        }),
+      ),
+      attempt(() => latestBankEntryQuery("90")),
+    ],
+    balances: [
+      parseLatestClosingBalance([{ ClosingBalanceFC: "12.34", Currency: "EUR" }], "EUR"),
+      parseLatestClosingBalance([{ ClosingBalanceFC: "12.34", Currency: "USD" }], "EUR"),
+      parseLatestClosingBalance([], "EUR"),
+      parseLatestClosingBalance(
+        [
+          { ClosingBalanceFC: "1", Currency: "EUR" },
+          { ClosingBalanceFC: "2", Currency: "EUR" },
+        ],
+        "EUR",
+      ),
+    ],
+    answers: [
+      parseBankEntryResponse(
+        JSON.stringify({ d: { EntryID: g1, EntryNumber: 5, BankEntryLines: [{ YourRef: "t1" }] } }),
+        ["t1"],
+      ),
+      parseBankEntryResponse(
+        JSON.stringify({ d: { EntryID: g1, BankEntryLines: [{ YourRef: "t2" }] } }),
+        ["t1"],
+      ),
+      parseBankEntryResponse("<html>login</html>", ["t1"]),
+      parseBankEntryResponse(JSON.stringify({ error: { message: "x" } }), ["t1"]),
+      parseMatchSetResponse(
+        '<?xml version="1.0"?><eExact><Messages><Message type="2"><Description>ok</Description></Message></Messages></eExact>',
+      ),
+      parseMatchSetResponse(
+        '<?xml version="1.0"?><eExact><Messages><Message type="0"><Description>no</Description></Message></Messages></eExact>',
+      ),
+      parseMatchSetResponse("<html>x</html>"),
+      parseMatchSetResponse(""),
+    ],
+    readBack: [
+      verdict([lineRow("0", true)], 100),
+      verdict([lineRow("1.00", false)], 100),
+      verdict([lineRow("0.50", false)], 100),
+      verdict([], 100),
+      verdict([], 100, [lineRow("0", true)]),
+      verdict([], 100, []),
+      verdict([lineRow("0", true), lineRow("0", true)], 100),
+      verdict([lineRow("0", false)], 100),
+    ],
+  };
 }
 
 /**
@@ -1019,7 +1219,7 @@ function protocolCanonical(): string {
  * hash in packages/core).
  */
 export function computeBookingProtocolVersion(): string {
-  return sha256Hex(protocolCanonical());
+  return sha256Hex(bookingProtocolCanonical());
 }
 
 export const BOOKING_PROTOCOL_VERSION: string = computeBookingProtocolVersion();

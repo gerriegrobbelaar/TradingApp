@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 /**
  * Review M7e (ADR 0040): nothing in the worker may write to Exact (the system of record) except
  * through `createExactWriter` from `@camelthorn/exact`, which carries the strict `writeEnabled`
- * guard, and only from an allow-listed module: the booking executor (M7c, ADR 0043; the gate's
+ * guard, and only from an allow-listed module: the booking executor (M7c, ADR 0044; the gate's
  * write policy may name the endpoints to refuse everything else). Any other module that wants the
  * writer must add itself here, WITH the reason, in a reviewed diff.
  *

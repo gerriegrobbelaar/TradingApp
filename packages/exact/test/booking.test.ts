@@ -4,6 +4,7 @@ import {
   BOOKING_PROTOCOL_VERSION,
   EXACT_WRITE_NAMES,
   WRITE_BUILDER_RULES,
+  bookingProtocolCanonical,
   computeBookingProtocolVersion,
   createExactWriter,
   findBankLineByAmountQuery,
@@ -85,12 +86,32 @@ describe("BOOKING_PROTOCOL_VERSION", () => {
     expect(sign).toBe("money_in_positive");
   });
 
+  it("covers the helpers that decide what and whether we send (sanitiser, escaping, money, probes, parsers, read-back)", () => {
+    const c = bookingProtocolCanonical();
+    // IBAN masking on adversarial input (glued, lower case, punctuated, full-width digits)
+    expect(c).toContain('"NL91****4300"');
+    expect(c).not.toMatch(/NL91ABNA0417164300|0417 1643/);
+    // the probe filters: a wrong filter turns "already in Exact" into "not found"
+    expect(c).toContain("YourRef eq 'tx-1' and JournalCode eq '90'");
+    expect(c).toContain("AmountFC eq -123.45");
+    expect(c).toContain("EntryNumber desc");
+    // money at scales 0, 2 and 3, and the refusal above 2^53
+    for (const v of ['"-0.005"', '"1.234"', '"90071992547409.91"', '"invalid_balance"']) {
+      expect(c).toContain(v);
+    }
+    // XML escaping and its refusals, the MatchSet structure, read-back verdicts
+    expect(c).toContain("&lt;a href=&apos;x&apos;&gt;&amp;&quot;]]&gt;");
+    expect(c).toContain("<MatchSets><MatchSet><GLAccount code=");
+    expect(c).toContain('"not_applied"');
+    expect(c).toContain('"missing_needs_second_query"');
+  });
+
   it("is pinned: a deliberate change of what we send must update this value AND re-verify on a test division", () => {
     expect(BOOKING_PROTOCOL_VERSION).toBe(PINNED);
   });
 });
 
-const PINNED = "5bee5f5c37846efed438407f6aaeb838d2bb9379d21f81a894477c83a2e8dad6";
+const PINNED = "d1721e6fcac05ccb0b97adff63315b7d74364f0b60b33ce4cab9cb26fcb02a50";
 
 describe("probe and balance queries", () => {
   it("builds the amount probe with a date window, quoted journal and exact decimal", () => {
@@ -217,6 +238,32 @@ describe("writer reads for the booker", () => {
     ]);
     expect(calls.map((c) => c.method)).toEqual(["GET", "GET"]);
     expect(calls.every((c) => c.jobId === "exact-booking" && c.priority === "job")).toBe(true);
+  });
+
+  it("a paged probe answer is never 'exactly one' or 'none': an extra unreadable hit is added", async () => {
+    const { w } = writer([
+      ok(
+        '{"d":{"results":[{"EntryNumber":9,"YourRef":"tx-1","AmountFC":1}],"__next":"https://x/next"}}',
+      ),
+      ok('{"d":{"results":[],"__next":"https://x/next"}}'),
+    ]);
+    const a = await w.findBankEntryLineByRef({ journalCode: "90", yourRef: "tx-1" });
+    expect(a).toHaveLength(2);
+    expect(a[1]).toEqual({
+      id: null,
+      entryId: null,
+      entryNumber: null,
+      yourRef: null,
+      amountFc: null,
+    });
+    const b = await w.findBankLineByAmount({
+      journalCode: "90",
+      amountMinor: 100,
+      currency: "EUR",
+      dateFrom: "2026-07-14",
+      dateTo: "2026-07-15",
+    });
+    expect(b).toHaveLength(1);
   });
 
   it("passes the gate's typed 401 refusal through untouched (the booker re-probes)", async () => {

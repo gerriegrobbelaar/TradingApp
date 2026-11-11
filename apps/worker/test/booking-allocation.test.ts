@@ -1,5 +1,5 @@
 /**
- * Allocation settlement (task M7c, ADR 0043; fixes the double count noted in ADR 0042): the
+ * Allocation settlement (task M7c, ADR 0044; fixes the double count noted in ADR 0042): the
  * allocation of a match booked in Exact keeps counting against the item's open balance only until
  * the item was re-read from Exact AFTER the booking. The database trigger, the assembly, the review
  * flags and the invariants all use the same rule.
@@ -216,6 +216,15 @@ describe("legal transitions only", () => {
     await set("booking");
     await set("manual_required");
     await expect(set("booking")).rejects.toThrow(/bad_transition/);
+    // a claimed match is never undone, even by direct SQL
+    await expect(
+      db
+        .prepare(
+          "UPDATE matches SET undone_at = '2026-07-16T00:00:00.000Z', undone_by = 'x' WHERE id = ?1",
+        )
+        .bind(a.id)
+        .run(),
+    ).rejects.toThrow(/bad_transition/);
   });
 
   it("booked_at is written once", async () => {

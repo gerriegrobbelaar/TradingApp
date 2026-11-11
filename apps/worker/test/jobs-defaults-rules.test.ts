@@ -72,7 +72,7 @@ describe("default jobs against the schedule rules and the Exact budget cap", () 
     const all = projectedExactCalls(
       DEFAULT_JOBS.filter((j) => HANDLERS[j.handler]?.usesExact).map((j) => loadOf(j.name)),
     );
-    // 1,960 (sync) + 600 (earlier jobs) + 400 (booking daily cap, ADR 0043)
+    // 1,960 (sync) + 600 (earlier jobs) + 400 (booking daily cap, ADR 0044)
     expect(all).toBe(2960);
     expect(all).toBeLessThanOrEqual(MAX_PROJECTED_EXACT_CALLS_PER_DAY);
   });

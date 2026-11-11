@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { checkMatchingInvariants } from "../src/matching/invariants";
 
 /**
- * Migration 0023 (booking outbox, ADR 0043) on a populated database: the matches and allocations
+ * Migration 0023 (booking outbox, ADR 0044) on a populated database: the matches and allocations
  * written under 0022 are untouched, the new columns start empty, the outbox and the guards work.
  */
 describe("migration 0023 on a populated database", () => {

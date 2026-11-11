@@ -123,7 +123,46 @@ describe("all migrations on a database populated at the first schema", () => {
         "matches_guard_immutable",
         "matches_guard_insert",
         "matches_guard_update",
+        // 0023 (booking)
+        "matches_guard_exact_state",
+        "matches_guard_booked_at",
+        "matches_guard_undo_claimed",
+        "outbox_guard_insert",
+        "outbox_guard_update",
       ]),
     );
+
+    // 0023 on migrated data: the old matches are not booked, nothing is in the outbox, booking is
+    // off (no settings row), and the new columns and the call ledger exist.
+    expect(
+      (
+        await mdb
+          .prepare("SELECT id, exact_state, booked_at, exact_note FROM matches ORDER BY id")
+          .all()
+      ).results,
+    ).toEqual([
+      { id: 1, exact_state: "not_booked", booked_at: null, exact_note: null },
+      { id: 2, exact_state: "not_booked", booked_at: null, exact_note: null },
+    ]);
+    expect(
+      (await mdb.prepare("SELECT COUNT(*) AS n FROM exact_write_outbox").first<{ n: number }>())?.n,
+    ).toBe(0);
+    expect(
+      await mdb.prepare("SELECT 1 FROM settings WHERE key LIKE 'exact.booking_%'").first(),
+    ).toBeNull();
+    expect(
+      (await mdb.prepare("SELECT COUNT(*) AS n FROM booking_call_ledger").first<{ n: number }>())
+        ?.n,
+    ).toBe(0);
+    const outboxCols = (
+      await mdb.prepare("PRAGMA table_info(exact_write_outbox)").all<{ name: string }>()
+    ).results.map((c) => c.name);
+    expect(outboxCols).toEqual(
+      expect.arrayContaining(["op_nonce", "needs_probe", "lease_expires_at"]),
+    );
+    // the illegal move is refused on the migrated database too
+    await expect(
+      mdb.prepare("UPDATE matches SET exact_state = 'matched_in_exact' WHERE id = 1").run(),
+    ).rejects.toThrow(/match_err:bad_transition/);
   });
 });

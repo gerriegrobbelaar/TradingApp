@@ -269,7 +269,7 @@ export class ExactGate extends DurableObject<Env> {
 
   async request(req: ExactRequest): Promise<ExactResponse> {
     validateRequest(req);
-    // Defence in depth (ADR 0043): the gate refuses every write except the two booking writes, and
+    // Defence in depth (ADR 0044): the gate refuses every write except the two booking writes, and
     // those only while the fail-closed switch and the verification mark say so, read from D1 NOW.
     await this.assertMethodAllowed(req);
     if (!(await this.claimRole(`division:${req.division}`))) {

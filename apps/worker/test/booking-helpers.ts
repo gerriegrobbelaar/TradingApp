@@ -1,5 +1,5 @@
 import { env } from "cloudflare:test";
-import { BOOKING_PROTOCOL_VERSION } from "@camelthorn/exact";
+import { BOOKING_PROTOCOL_VERSION } from "../src/booking/protocol";
 import { runBookMatches } from "../src/booking/executor";
 import { SETTING_ENABLED, SETTING_VERIFIED } from "../src/booking/settings";
 import { applyMatch } from "../src/matching/store";
@@ -54,6 +54,7 @@ export async function bookingWorld(
   const creates = o.creates ?? true;
   await db.batch([
     db.prepare("DELETE FROM exact_write_outbox"),
+    db.prepare("DELETE FROM booking_call_ledger"),
     db.prepare("DELETE FROM gl_accounts"),
     db.prepare("DELETE FROM settings WHERE key LIKE 'exact.booking_%'"),
     db

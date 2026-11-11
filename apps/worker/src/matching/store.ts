@@ -405,7 +405,7 @@ export function suggestionStatements(
 }
 
 /**
- * SQL predicate (ADR 0043): the allocations of match `m` still count against the open balance of
+ * SQL predicate (ADR 0044): the allocations of match `m` still count against the open balance of
  * item `oi`. A live match counts, EXCEPT a match booked in Exact (`matched_in_exact`) once the item
  * was re-read from Exact AFTER the booking (`synced_at > booked_at`): from then on Exact's own
  * open_minor already reflects the payment, so counting it again would be a double count. The sync

@@ -1,5 +1,5 @@
 /**
- * The booking executor, job `exact.book_matches` (task M7c, ADR 0043; handler contract ADR 0021).
+ * The booking executor, job `exact.book_matches` (task M7c, ADR 0044; handler contract ADR 0021).
  *
  * Writes the matches of the review queue to Exact: a bank entry (REST, unless Revolut's own Exact
  * feed already created the line) and then a MatchSet (XML), verified by reading Exact back. Every
@@ -21,20 +21,30 @@ import {
   ExactAuthError,
   ExactBudgetExhaustedError,
   ExactRateLimitedError,
-  ExactWriteAuthRetryRefused,
-  ExactWriteDisabledError,
-  ExactWritePayloadError,
   buildBankEntryPayload,
   createExactWriter,
   verifyMatchSetApplied,
   type BankEntryLineHit,
   type ExactTransport,
   type ExactWriter,
+  type MatchSetResponse,
   type ReadBackVerdict,
 } from "@camelthorn/exact";
 import { getExactGate, createGateTransport, gateName } from "../exact/gate-transport";
 import { BOOKING_JOB_ID } from "../exact/write-policy";
 import type { HandlerResult, JobContext } from "../jobs/types";
+import { classifyWriteError, RunStop, type WriteFailure } from "./classify";
+import {
+  BOOKING_DELAY_MS,
+  DAILY_BOOKING_CALL_CAP,
+  DAILY_CAP_WINDOW_MS,
+  MAX_AUTO_RETRIES,
+  MAX_CALLS_PER_RUN,
+  MAX_MATCHES_PER_RUN,
+  RETRY_BACKOFF_MS,
+  UNVERIFIED_MAX_MS,
+  WAIT_FOR_LINE_MS,
+} from "./constants";
 import { bookingMayRun, blockersOf, loadBookingState, writesPermitted } from "./settings";
 import {
   claimAndEnqueue,
@@ -65,84 +75,51 @@ import {
   type BankEntryDoc,
 } from "./plan";
 
-export const MAX_MATCHES_PER_RUN = 10;
-export const MAX_CALLS_PER_RUN = 30;
-/** Calls this job may spend in any 24 hours (all administrations together): see dailyExactCallCap. */
-export const DAILY_BOOKING_CALL_CAP = 400;
-/** A match must be at least this old before it is booked: the window in which Undo is easy. */
-export const BOOKING_DELAY_MS = 10 * 60_000;
-export const MAX_AUTO_RETRIES = 3;
-const RETRY_BACKOFF_MS = [5 * 60_000, 30 * 60_000, 2 * 3600_000];
-export const WAIT_FOR_LINE_MS = 48 * 3600_000;
-/** An answer we accepted but could not verify for this long becomes `outcome_unknown`. */
-export const UNVERIFIED_MAX_MS = 6 * 3600_000;
+export {
+  BOOKING_DELAY_MS,
+  DAILY_BOOKING_CALL_CAP,
+  MAX_AUTO_RETRIES,
+  MAX_CALLS_PER_RUN,
+  MAX_MATCHES_PER_RUN,
+  UNVERIFIED_MAX_MS,
+  WAIT_FOR_LINE_MS,
+} from "./constants";
+export { classifyWriteError, RunStop, type WriteFailure } from "./classify";
+
 const ROW_LIMIT = 20;
 const DAY_MS = 24 * 3600_000;
+/** Call ledger rows older than this are deleted (the cap only looks back DAILY_CAP_WINDOW_MS). */
+const LEDGER_KEEP_MS = 3 * DAY_MS;
 
-/** Ends the whole run (budget, deadline, switch off, gate or connection trouble). */
-export class RunStop extends Error {
-  constructor(readonly code: string) {
-    super(code);
-    this.name = "RunStop";
-  }
+/**
+ * Reserves one Exact call in the persisted call ledger (migration 0023), atomically: the INSERT
+ * only happens while fewer than DAILY_BOOKING_CALL_CAP calls were made in the rolling window. Two
+ * executors at once, a crashed run or a manual run in between can therefore never exceed the cap,
+ * whatever job_runs says.
+ */
+async function reserveCall(db: D1Database, nowMs: number, runId: number): Promise<boolean> {
+  const out = await db
+    .prepare(
+      `INSERT INTO booking_call_ledger (at, run_id)
+       SELECT ?1, ?2 WHERE (SELECT COUNT(*) FROM booking_call_ledger WHERE at > ?3) < ?4`,
+    )
+    .bind(
+      new Date(nowMs).toISOString(),
+      runId,
+      new Date(nowMs - DAILY_CAP_WINDOW_MS).toISOString(),
+      DAILY_BOOKING_CALL_CAP,
+    )
+    .run();
+  return (out.meta.changes ?? 0) === 1;
 }
 
-// ---------------------------------------------------------------------------------------------
-// Error classification
-// ---------------------------------------------------------------------------------------------
-
-export type WriteFailure =
-  /** Provably nothing was sent (the gate or the writer refused before the call). */
-  | { kind: "not_sent"; code: string }
-  /** Exact (or the gate's queue) answered 429. Not applied; probe before sending again. */
-  | { kind: "rate_limited" }
-  /** Exact answered with a definite 4xx: our payload was refused. Repeating it is pointless. */
-  | { kind: "rejected"; code: string }
-  /** Anything else after the call was made: timeout, 5xx, lost or unreadable answer, 401. */
-  | { kind: "unknown"; code: string };
-
-const NOT_SENT_GATE_CODES: ReadonlySet<string> = new Set([
-  "writes_disabled",
-  "write_not_allowed",
-  "method",
-  "division",
-  "api",
-  "priority",
-  "job_id",
-  "path",
-  "query",
-  "header",
-  "body",
-  "division_mismatch",
-  "host",
-  "token_refresh_retry",
-  "wrong_token_authority",
-  "not_connected",
-  "needs_reauth",
-]);
-
-export function classifyWriteError(e: unknown): WriteFailure {
-  if (e instanceof RunStop) return { kind: "not_sent", code: e.code };
-  if (e instanceof ExactBudgetExhaustedError) return { kind: "not_sent", code: "gate_budget" };
-  if (e instanceof ExactWriteDisabledError) return { kind: "not_sent", code: "writes_disabled" };
-  if (e instanceof ExactWritePayloadError) return { kind: "rejected", code: "payload_refused" };
-  if (e instanceof ExactAuthError) return { kind: "not_sent", code: "exact_auth" };
-  if (e instanceof ExactWriteAuthRetryRefused)
-    return { kind: "unknown", code: "auth_retry_refused" };
-  if (e instanceof ExactRateLimitedError) return { kind: "rate_limited" };
-  if (e instanceof ExactApiError) {
-    if (e.code !== undefined) {
-      return NOT_SENT_GATE_CODES.has(e.code)
-        ? { kind: "not_sent", code: e.code }
-        : { kind: "unknown", code: e.code === "network" ? "network" : "gate_error" };
-    }
-    // A real HTTP answer from Exact (the writer throws these for non-2xx).
-    if (e.status >= 400 && e.status < 500 && e.status !== 408) {
-      return { kind: "rejected", code: `exact_rejected_${e.status}` };
-    }
-    return { kind: "unknown", code: `exact_http_${e.status}` };
-  }
-  return { kind: "unknown", code: "write_error" };
+/** Calls in the rolling window (the cap's own count). */
+export async function bookingCallsInWindow(db: D1Database, nowMs: number): Promise<number> {
+  const r = await db
+    .prepare("SELECT COUNT(*) AS n FROM booking_call_ledger WHERE at > ?1")
+    .bind(new Date(nowMs - DAILY_CAP_WINDOW_MS).toISOString())
+    .first<{ n: number }>();
+  return r?.n ?? 0;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -160,6 +137,7 @@ interface CandidateSql {
   external_id: string;
   connection_id: number;
   tx_amount: number;
+  tx_currency: string;
   booked_at: string;
   counterparty_name: string | null;
   reference: string | null;
@@ -195,7 +173,7 @@ async function loadCandidates(
     await db
       .prepare(
         `SELECT m.id AS match_id, m.division_id, m.source, m.ledger_account_code, m.amount_minor, m.currency,
-                t.id AS tx_id, t.external_id, t.connection_id, t.amount_minor AS tx_amount, t.booked_at,
+                t.id AS tx_id, t.external_id, t.connection_id, t.amount_minor AS tx_amount, t.currency AS tx_currency, t.booked_at,
                 t.counterparty_name, t.reference, t.description,
                 mp.journal_code, mp.receivable_gl_account_code, mp.payable_gl_account_code,
                 d.exact_division, d.base_currency,
@@ -243,6 +221,7 @@ async function loadCandidates(
         externalId: r.external_id,
         connectionId: r.connection_id,
         amountMinor: r.tx_amount,
+        currency: r.tx_currency,
         bookedAt: r.booked_at,
         counterpartyName: r.counterparty_name,
         reference: r.reference,
@@ -280,6 +259,9 @@ interface WorkRow extends OutboxRow {
   tx_currency: string;
   tx_booked_at: string;
   tx_account_id: number;
+  tx_is_final: number;
+  tx_state: string;
+  tx_state_conflict: number;
   exact_division: number;
   map_journal: string | null;
 }
@@ -289,7 +271,8 @@ const WORK_SELECT = `SELECT ${OUTBOX_COLUMNS.split(",")
   .join(", ")},
        m.exact_state, m.undone_at, t.id AS tx_id, t.external_id AS tx_external_id,
        t.amount_minor AS tx_amount, t.currency AS tx_currency, t.booked_at AS tx_booked_at,
-       t.bank_account_id AS tx_account_id, d.exact_division, mp.journal_code AS map_journal
+       t.bank_account_id AS tx_account_id, t.is_final AS tx_is_final, t.state AS tx_state,
+       t.state_conflict AS tx_state_conflict, d.exact_division, mp.journal_code AS map_journal
      FROM exact_write_outbox o
        JOIN matches m ON m.id = o.match_id
        JOIN bank_transactions t ON t.id = m.bank_transaction_id
@@ -339,17 +322,13 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
     };
   }
   const createsBankEntries = state0.createsBankEntries === true;
-  // A daily cap of its own (the budget projection of the schedules relies on it): calls of the last
-  // 24 hours of this job, finished runs only.
-  const usedToday =
-    (
-      await db
-        .prepare(
-          "SELECT COALESCE(SUM(calls_used), 0) AS n FROM job_runs WHERE job_id = ?1 AND started_at >= ?2",
-        )
-        .bind(ctx.job.id, iso(clock() - DAY_MS))
-        .first<{ n: number }>()
-    )?.n ?? 0;
+  // A daily cap of its own (the budget projection of the schedules relies on it): the persisted
+  // call ledger of the last DAILY_CAP_WINDOW_MS, every call counted BEFORE it is made.
+  await db
+    .prepare("DELETE FROM booking_call_ledger WHERE at < ?1")
+    .bind(iso(clock() - LEDGER_KEEP_MS))
+    .run();
+  const usedToday = await bookingCallsInWindow(db, clock());
   const remainingToday = DAILY_BOOKING_CALL_CAP - usedToday;
   if (remainingToday <= 0) {
     return {
@@ -378,6 +357,8 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
   let calls = 0;
   let stop: string | null = null;
   const divisions = new Map<number, DivisionRuntime>();
+  /** Matches claimed in THIS run (their opening balance was read moments ago). */
+  const fresh = new Set<number>();
 
   const nowMs = (): number => clock();
   const nowIso = (): string => iso(nowMs());
@@ -403,6 +384,8 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
     const transport: ExactTransport = async (req) => {
       if (ctx.signal.aborted || nowMs() >= ctx.deadlineMs) throw new RunStop("time_limit");
       if (calls >= budget) throw new RunStop("call_budget");
+      // Counted in D1 before the call: the daily cap holds across runs, crashes and overlaps.
+      if (!(await reserveCall(db, nowMs(), ctx.run.id))) throw new RunStop("daily_cap_reached");
       calls++;
       return base(req);
     };
@@ -472,6 +455,20 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
     counters[key]++;
   }
 
+  /**
+   * The bank line is still what was planned: final, completed, without a state conflict and with
+   * the same signed amount (Revolut may have reverted or changed it after the claim).
+   */
+  function txUnchanged(w: WorkRow, plannedAmountMinor: number | undefined): boolean {
+    return (
+      w.tx_is_final === 1 &&
+      w.tx_state === "completed" &&
+      w.tx_state_conflict === 0 &&
+      plannedAmountMinor !== undefined &&
+      w.tx_amount === plannedAmountMinor
+    );
+  }
+
   async function giveUpToManual(
     w: WorkRow,
     token: string,
@@ -503,6 +500,7 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
       count("reverted");
       throw f.code === "writes_disabled" ||
         f.code === "call_budget" ||
+        f.code === "daily_cap_reached" ||
         f.code === "time_limit" ||
         f.code === "gate_unavailable" ||
         f.code === "exact_auth"
@@ -575,7 +573,12 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
   }
 
   /** The matchset row is verified: both rows are done and the match is booked. */
-  async function finishMatchset(w: WorkRow, token: string, via: string): Promise<void> {
+  async function finishMatchset(
+    w: WorkRow,
+    token: string,
+    via: string,
+    matchNote: string | null,
+  ): Promise<void> {
     const at = nowIso();
     const ok = await note(w, token, {
       from: [
@@ -590,7 +593,7 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
       errorCode: null,
       needsProbe: false,
       nextAttemptAt: null,
-      match: { from: w.exact_state, to: "matched_in_exact", note: null, bookedAt: at },
+      match: { from: w.exact_state, to: "matched_in_exact", note: matchNote, bookedAt: at },
       action: "booking.matched",
       audit: { via, kind: w.kind },
       after: (d) => [completeKeyStatement(d, "matchset", w.idempotency_key, via, at)],
@@ -777,7 +780,30 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
       return;
     }
 
-    // 2. POST (switch re-read first; `sending` stored first).
+    // 2. Before the POST: the bank line is unchanged, and the journal's balance is still the one
+    // the entry was built on (A12). A different closing balance means somebody else booked in this
+    // journal OR an earlier POST of ours did arrive although the probe cannot see it: never guess.
+    if (!txUnchanged(w, doc.input.lines[0]?.amountMinor)) {
+      return giveUpToManual(w, token, "bank_line_changed");
+    }
+    if (!(fresh.has(w.match_id) && w.attempts === 0 && w.needs_probe === 0)) {
+      const bal = await readOr(() =>
+        rt.writer.readLatestClosingBalance({
+          journalCode: built.journalCode,
+          currency: doc.input.currency,
+        }),
+      );
+      if (!bal.ok) {
+        await releaseLease(w.id, token);
+        count("deferred");
+        return;
+      }
+      if (bal.value !== doc.input.openingBalanceMinor) {
+        return giveUpToManual(w, token, "bank_balance_changed");
+      }
+    }
+
+    // 3. POST (switch re-read first; `sending` stored first).
     await assertStillEnabled();
     const sent = await note(w, token, {
       from: ["pending", "failed"],
@@ -819,7 +845,7 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
     });
     if (!afterPost) return;
 
-    // 3. Verify by probing again (a second look, never a second POST).
+    // 4. Verify by probing again (a second look, never a second POST).
     const verify = await readOr(() =>
       rt.writer.findBankEntryLineByRef({ journalCode: built.journalCode, yourRef }),
     );
@@ -1014,10 +1040,22 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
       return;
     }
     const verdict = before.value;
-    if (verdict.outcome === "verified") return finishMatchset(w, token, "already_matched");
+    if (verdict.outcome === "verified") {
+      // Closed in Exact before OUR MatchSet was ever sent: matched by someone (or something) else,
+      // possibly to another bank line. Booked, but marked so a person can check the bank line.
+      return finishMatchset(
+        w,
+        token,
+        "already_matched",
+        w.attempts === 0 && w.needs_probe === 0 ? "already_matched_in_exact" : null,
+      );
+    }
     if (verdict.outcome === "inconclusive")
       return giveUpToManual(w, token, "readback_inconclusive");
     // not_applied from here on.
+    if (!txUnchanged(w, -doc.input.bankAmountMinor)) {
+      return giveUpToManual(w, token, "bank_line_changed");
+    }
 
     await assertStillEnabled();
     const sent = await note(w, token, {
@@ -1041,45 +1079,86 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
       attempts: w.attempts + 1,
       exact_state: w.exact_state === "booking_failed" ? "booking" : w.exact_state,
     };
+    let answer: MatchSetResponse;
     try {
-      await rt.writer.submitMatchSet(rebuilt.built);
+      answer = await rt.writer.submitMatchSet(rebuilt.built);
     } catch (e) {
       return applyFailure(sendingRow, token, classifyWriteError(e));
     }
-    // The answer is never proof: read back, whatever it said.
+    // The answer is never proof: read back, whatever it said. Its kind decides what a "nothing
+    // changed" read-back means: only Exact's explicit refusal may lead to an automatic new attempt.
+    const answerCode =
+      answer.accepted === true
+        ? "matchset_accepted"
+        : answer.error === "exact_reported_problem"
+          ? "matchset_refused"
+          : answer.error === "bad_xml"
+            ? "matchset_answer_unreadable"
+            : "matchset_no_success_message";
     const stored = await note(sendingRow, token, {
       from: ["sending"],
       to: "sent_unverified",
       keepLease: true,
+      errorCode: answerCode,
       action: "booking.sent_unverified",
-      audit: { kind: w.kind },
+      audit: { kind: w.kind, answer: answerCode },
     });
     if (!stored) return;
-    const sentRow: WorkRow = { ...sendingRow, status: "sent_unverified" };
+    const sentRow: WorkRow = {
+      ...sendingRow,
+      status: "sent_unverified",
+      last_error_code: answerCode,
+    };
     const check = await readOr(() => readBack(rt, doc.input));
     if (!check.ok) {
+      if (answerCode === "matchset_answer_unreadable") {
+        return unknownAfterPost(sentRow, token, answerCode);
+      }
       await releaseLease(w.id, token);
       return;
     }
-    return decideAfterPost(sentRow, token, check.value);
+    return decideAfterPost(sentRow, token, check.value, false);
   }
 
-  async function decideAfterPost(w: WorkRow, token: string, v: ReadBackVerdict): Promise<void> {
-    if (v.outcome === "verified") return finishMatchset(w, token, "posted");
-    if (v.outcome === "inconclusive") {
-      const ok = await note(w, token, {
-        from: ["sent_unverified"],
-        to: "outcome_unknown",
-        errorCode: "readback_inconclusive",
-        needsProbe: true,
-        match: { from: w.exact_state, to: "outcome_unknown", note: "readback_inconclusive" },
-        action: "booking.outcome_unknown",
-        audit: { code: "readback_inconclusive", kind: w.kind },
-      });
-      if (ok) count("outcomeUnknown");
+  async function unknownAfterPost(w: WorkRow, token: string, code: string): Promise<void> {
+    const ok = await note(w, token, {
+      from: ["sent_unverified"],
+      to: "outcome_unknown",
+      errorCode: code,
+      needsProbe: true,
+      match: { from: w.exact_state, to: "outcome_unknown", note: code },
+      action: "booking.outcome_unknown",
+      audit: { code, kind: w.kind },
+    });
+    if (ok) count("outcomeUnknown");
+  }
+
+  /**
+   * After a MatchSet POST (now, or in an earlier run when `later`): verified = done; inconclusive
+   * = outcome_unknown; not applied = an automatic new attempt ONLY when Exact explicitly refused
+   * it (`matchset_refused`). Accepted, unreadable or empty answers with nothing applied are never
+   * re-posted: the row waits (`sent_unverified`) and becomes outcome_unknown after
+   * UNVERIFIED_MAX_MS (an unreadable answer at once).
+   */
+  async function decideAfterPost(
+    w: WorkRow,
+    token: string,
+    v: ReadBackVerdict,
+    later: boolean,
+  ): Promise<void> {
+    if (v.outcome === "verified") return finishMatchset(w, token, "posted", null);
+    if (v.outcome === "inconclusive") return unknownAfterPost(w, token, "readback_inconclusive");
+    if (w.last_error_code !== "matchset_refused") {
+      if (w.last_error_code === "matchset_answer_unreadable") {
+        return unknownAfterPost(w, token, "matchset_answer_unreadable");
+      }
+      if (later && nowMs() - Date.parse(w.updated_at) > UNVERIFIED_MAX_MS) {
+        return unknownAfterPost(w, token, "not_visible_after_post");
+      }
+      await releaseLease(w.id, token);
       return;
     }
-    // Exact accepted nothing: not applied. Retry later, at most MAX_AUTO_RETRIES times in all.
+    // Exact refused it and nothing was applied. Retry later, at most MAX_AUTO_RETRIES times in all.
     const retry = w.attempts < MAX_AUTO_RETRIES;
     const ok = await note(w, token, {
       from: ["sent_unverified"],
@@ -1108,22 +1187,12 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
     const r = await readOr(() => readBack(rt, doc.input));
     if (!r.ok) {
       if (nowMs() - Date.parse(w.updated_at) > UNVERIFIED_MAX_MS) {
-        await note(w, token, {
-          from: ["sent_unverified"],
-          to: "outcome_unknown",
-          errorCode: "not_visible_after_post",
-          needsProbe: true,
-          match: { from: w.exact_state, to: "outcome_unknown", note: "not_visible_after_post" },
-          action: "booking.outcome_unknown",
-          audit: { code: "not_visible_after_post", kind: w.kind },
-        });
-        count("outcomeUnknown");
-      } else {
-        await releaseLease(w.id, token);
+        return unknownAfterPost(w, token, "not_visible_after_post");
       }
+      await releaseLease(w.id, token);
       return;
     }
-    return decideAfterPost(w, token, r.value);
+    return decideAfterPost(w, token, r.value, true);
   }
 
   // -- the loop --------------------------------------------------------------------------------------
@@ -1349,6 +1418,7 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
     });
     if (r === "lost") return;
     counters.claimed++;
+    fresh.add(cand.matchId);
     return runClaimed(cand.matchId, ["bank_entry"]);
   }
 
