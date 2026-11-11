@@ -82,8 +82,8 @@ export interface HandlerResult {
  *  3. Derive periods from `run.scheduledFor` (see jobs/period.ts), never from the clock. A late or
  *     retried run of the 31 October slot still works on October.
  *  4. Lateness: a scheduled run that starts later than the handler's `maxLatenessMs` after its slot
- *     is recorded `skipped` / `too_late` by the runner; the next slot proceeds as normal. Manual
- *     runs are never too late.
+ *     is recorded `skipped` / `too_late` by the runner (or `error` / `too_late` when the handler
+ *     sets `tooLateIsFailure`); the next slot proceeds as normal. Manual runs are never too late.
  *  5. Check `ctx.signal` between items and stop starting new work once it is aborted (deadline or
  *     lost lease). JavaScript cannot kill a promise; cooperation is the only way to stop a zombie.
  *  6. Retry ONLY by returning `partial` or `skipped` with `retry`. Never throw to get a retry
@@ -112,6 +112,16 @@ export interface HandlerDef {
    * `skipped` / `too_late`. Undefined = no limit. Never applies to manual runs.
    */
   maxLatenessMs?: number;
+  /**
+   * Record a too-late run as `error` / `too_late` instead of `skipped`: for a job whose slot
+   * matters (the day's ECB rates), missing it is a failure that alerts must see. Default false.
+   */
+  tooLateIsFailure?: boolean;
+  /**
+   * Called (best effort, errors swallowed) when the runner records a run too_late without calling
+   * `run`, so a handler that keeps its own health row can record the outcome truthfully.
+   */
+  onTooLate?: (env: Env, nowMs: number) => Promise<void>;
   /** What an admin may set as the schedule (checked in PATCH /api/jobs, shown in the editor). */
   scheduleRules?: ScheduleRules;
   /** Undefined = not implemented yet: runs are recorded as skipped with code not_implemented. */

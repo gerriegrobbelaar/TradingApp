@@ -600,10 +600,19 @@ export interface FxRateDto {
 }
 
 /**
- * GET /api/fx/rates?date=YYYY-MM-DD (default: latest). Units of currency per 1 EUR. For each
- * currency the newest rate on or before `date`; `rateDate` is that rate's own date (a weekend or
- * holiday reuses the last rate and shows its date). `stale` / `workingDaysOld` describe the newest
- * rate returned (`asOf`) against now (ADR 0035), not the last import run.
+ * GET /api/fx/rates?date=YYYY-MM-DD (default: today, Amsterdam). Units of currency per 1 EUR, as
+ * canonical decimal strings (core parseRate form: "1.165", never "1.1650"). For each currency the
+ * newest rate on or before `date`; `rateDate` is that rate's own date (a weekend or holiday reuses
+ * the last rate and shows its date). Same selection as core `buildRateTable`: a currency whose
+ * newest rate is more than ECB_MAX_RATE_AGE_TARGET_DAYS (10) TARGET working days older than
+ * `asOf` (the ECB stopped publishing it, e.g. HRK) is left out.
+ *
+ * `stale` / `staleReason` / `workingDaysOld` describe the FEED: the newest rate stored at all (up
+ * to today) against now, whatever `date` asks for, and independent of the job's state (a disabled
+ * or failing job shows as stale once the rates age). Stale = older than the date expected at this
+ * moment (today's after 17:30 Amsterdam on a TARGET working day, else the previous working day;
+ * ADR 0036). `workingDaysOld` = TARGET working days in (newest, today]: Friday's rate on Monday
+ * morning is 1 and not stale; on Monday after 17:30 it is 1 and stale.
  */
 export interface FxRatesResponse {
   base: "EUR";

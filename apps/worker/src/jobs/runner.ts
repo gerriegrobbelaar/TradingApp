@@ -509,8 +509,15 @@ export async function executeRun(
     const late = latenessMs({ run: { scheduledFor: row.scheduled_for } }, startMs);
     if (late > def.maxLatenessMs) {
       await lock.release(token).catch(() => undefined);
+      if (def.onTooLate) {
+        await def
+          .onTooLate(env, clock())
+          .catch((e: unknown) =>
+            console.error("too_late hook failed", e instanceof Error ? e.name : "unknown"),
+          );
+      }
       return finish({
-        status: "skipped",
+        status: def.tooLateIsFailure === true ? "error" : "skipped",
         code: "too_late",
         summary: { lateMinutes: Math.floor(late / 60_000) },
       });

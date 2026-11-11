@@ -1,4 +1,4 @@
--- ECB FX import (Phase 6, task F2, ADR 0035).
+-- ECB FX import (Phase 6, task F2, ADR 0036).
 -- fx_rates (0003) already has what is needed: currency CHAR(3) uppercase, rate_date, rate as a
 -- decimal TEXT with a CHECK, source, fetched_at and PRIMARY KEY (currency, rate_date). This adds
 -- the single-row import state (health of the import, read by the rates API and, later, by the

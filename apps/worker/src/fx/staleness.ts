@@ -1,6 +1,6 @@
 /**
  * When is the newest ECB rate stale (CLAUDE.md 3: "alert if the latest rate is older than one
- * working day"; ADR 0035)? The ECB publishes around 16:00 CET on TARGET working days and the
+ * working day"; ADR 0036)? The ECB publishes around 16:00 CET on TARGET working days and the
  * import retries until 17:30 Amsterdam, so the rate we EXPECT to hold depends on the clock:
  *
  *  - a TARGET working day, after 17:30: today's rate;

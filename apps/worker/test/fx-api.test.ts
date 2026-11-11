@@ -100,7 +100,9 @@ describe("GET /api/fx/rates", () => {
     await put("USD", "2026-11-09", "1.1000");
     await put("USD", "2026-11-10", "1.1650");
     await put("GBP", "2026-11-10", "0.8700");
-    await put("HRK", "2022-12-30", "7.5300"); // discontinued: keeps its own date
+    await put("HRK", "2022-12-30", "7.5300"); // discontinued: dropped, as core buildRateTable does
+    await put("CHF", "2026-10-27", "0.9400"); // 10 TARGET days before asOf: still current
+    await put("SEK", "2026-10-26", "11.2000"); // 11 TARGET days before asOf: dropped
     await db
       .prepare(
         `UPDATE fx_import_state SET last_attempt_at = '2026-11-10T15:20:00.000Z', last_status = 'ok' WHERE id = 1`,
@@ -108,7 +110,7 @@ describe("GET /api/fx/rates", () => {
       .run();
     const { body } = await get<FxRatesResponse>("/api/fx/rates");
     expect(Object.keys(body).sort()).toEqual(RATES_KEYS);
-    expect(body.rates.map((r) => r.currency)).toEqual(["GBP", "HRK", "USD"]);
+    expect(body.rates.map((r) => r.currency)).toEqual(["CHF", "GBP", "USD"]);
     for (const r of body.rates) {
       expect(Object.keys(r).sort()).toEqual(RATE_KEYS);
       expect(r.source).toBe("ECB");
@@ -116,11 +118,14 @@ describe("GET /api/fx/rates", () => {
     }
     expect(body.rates.find((r) => r.currency === "USD")).toEqual({
       currency: "USD",
-      rate: "1.1650",
+      rate: "1.165", // canonical form (core parseRate), whatever was stored
       rateDate: "2026-11-10",
       source: "ECB",
     });
-    expect(body.rates.find((r) => r.currency === "HRK")?.rateDate).toBe("2022-12-30");
+    expect(body.rates.find((r) => r.currency === "CHF")).toMatchObject({
+      rate: "0.94",
+      rateDate: "2026-10-27",
+    });
     expect(body).toMatchObject({
       asOf: "2026-11-10",
       stale: false, // Wednesday noon expects Tuesday's rate
@@ -136,12 +141,23 @@ describe("GET /api/fx/rates", () => {
     await put("USD", "2026-11-09", "1.0900");
     const sat = (await get<FxRatesResponse>("/api/fx/rates?date=2026-11-08")).body;
     expect(sat.rates).toEqual([
-      { currency: "USD", rate: "1.0600", rateDate: "2026-11-06", source: "ECB" },
+      { currency: "USD", rate: "1.06", rateDate: "2026-11-06", source: "ECB" },
     ]);
     expect(sat.asOf).toBe("2026-11-06");
-    // The first stored date is the lower edge: before it there are no rates, and that is not stale.
+    // Freshness describes the feed (newest stored: Monday 9th) against now (Wednesday noon
+    // expects Tuesday's), not the past date asked for: stale, 2 working days old.
+    expect(sat).toMatchObject({
+      stale: true,
+      staleReason: "older_than_one_working_day",
+      workingDaysOld: 2,
+    });
+    // Before the first stored date: no rates; the freshness is still the feed's.
     const early = (await get<FxRatesResponse>("/api/fx/rates?date=2026-01-01")).body;
-    expect(early).toMatchObject({ asOf: null, rates: [], stale: false, staleReason: null });
+    expect(early).toMatchObject({ asOf: null, rates: [], stale: true, workingDaysOld: 2 });
+    // With Tuesday's rate stored the same past date reads fresh.
+    await put("USD", "2026-11-10", "1.1");
+    const fresh = (await get<FxRatesResponse>("/api/fx/rates?date=2026-11-08")).body;
+    expect(fresh).toMatchObject({ asOf: "2026-11-06", stale: false, workingDaysOld: 1 });
     // Today is allowed.
     expect((await get("/api/fx/rates?date=2026-11-11")).status).toBe(200);
   });
@@ -199,8 +215,8 @@ describe("GET /api/fx/history", () => {
     expect(body.currency).toBe("USD");
     expect(body.base).toBe("EUR");
     expect(body.points).toEqual([
-      { rateDate: "2026-10-12", rate: "1.1200" },
-      { rateDate: "2026-11-10", rate: "1.1650" },
+      { rateDate: "2026-10-12", rate: "1.12" },
+      { rateDate: "2026-11-10", rate: "1.165" },
     ]);
   });
 

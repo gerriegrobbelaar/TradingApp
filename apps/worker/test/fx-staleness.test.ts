@@ -1,5 +1,5 @@
 /**
- * Staleness of the newest ECB rate (task F2, ADR 0035): the matrix of weekday x time x newest date.
+ * Staleness of the newest ECB rate (task F2, ADR 0036): the matrix of weekday x time x newest date.
  */
 import { amsterdamParts, isTargetWorkingDay, previousTargetWorkingDay } from "@camelthorn/core";
 import { describe, expect, it } from "vitest";

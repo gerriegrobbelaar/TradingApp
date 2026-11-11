@@ -3,7 +3,12 @@
  * yet are registered WITHOUT a `run`: the runner records them as `skipped` with code
  * `not_implemented` (never an error, never a silent success), and "Run now" is refused for them.
  */
-import { ECB_MAX_ATTEMPTS, ECB_MAX_LATENESS_MS, runEcbImport } from "../fx/ecb-import";
+import {
+  ECB_MAX_ATTEMPTS,
+  ECB_MAX_LATENESS_MS,
+  recordEcbTooLate,
+  runEcbImport,
+} from "../fx/ecb-import";
 import { loadRevolutConfig } from "../revolut/config";
 import { runRevolutBackfill, runRevolutSync } from "../revolut/sync";
 import { FULL_SYNC_MAX_ATTEMPTS, runExactSync } from "./exact-handlers";
@@ -93,9 +98,14 @@ export const HANDLERS: Record<string, HandlerDef> = {
     maxAttempts: ECB_MAX_ATTEMPTS,
     // Rates exist on TARGET working days only and are published once a day. Retries carry the
     // 16:15 slot, so 75 minutes of lateness ends them at 17:30 (16:15 + 75 min), whatever the
-    // attempt number; the handler ends the last attempt that fits as rate_not_published.
+    // attempt number. The handler decides from the slot and the clock (with a queue-delay
+    // margin) and ends the last attempt that fits as error / rate_not_published. If the queue is
+    // later than the margin anyway, the runner records error / too_late (a failure Phase 8 alerts
+    // on, never a quiet skip) and the hook writes it into fx_import_state.
     scheduleRules: { workingDaysOnly: true, minIntervalMinutes: 60 },
     maxLatenessMs: ECB_MAX_LATENESS_MS,
+    tooLateIsFailure: true,
+    onTooLate: recordEcbTooLate,
     run: runEcbImport,
   },
   "dq.checks": {

@@ -65,7 +65,7 @@ export const DEFAULT_JOBS: readonly DefaultJob[] = [
     name: "ecb.fx_import",
     handler: "ecb.fx_import",
     schedule: { kind: "cron", expr: "15 16 * * *", workingDaysOnly: true },
-    // Public, read-only, credential-free source: on by default on NEW installs (ADR 0035).
+    // Public, read-only, credential-free source: on by default on NEW installs (ADR 0036).
     // Existing rows are never flipped by the seeding.
     enabled: true,
     exactBudget: 0,

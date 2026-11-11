@@ -1,5 +1,5 @@
 /**
- * The ECB import job (task F2, ADR 0035): fetch hardening, idempotent storage, conflicts, the
+ * The ECB import job (task F2, ADR 0036): fetch hardening, idempotent storage, conflicts, the
  * working-day and 17:30 rules, and the retry chain through the real runner.
  */
 import { nextRun, type Schedule } from "@camelthorn/core";
@@ -131,8 +131,12 @@ describe("import window and storage", () => {
       );
     const r = await run({ trigger: "manual" });
     expect(r.status).toBe("ok");
-    expect(await fxRows()).toEqual([{ currency: "USD", rate_date: "2026-11-10", rate: "1.1000" }]);
-    expect(r.summary["skipped"]).toBeGreaterThanOrEqual(4);
+    // core parseEcbCsv keeps the later of two rows for one (currency, date); the rate is stored in
+    // canonical form (parseRate: no trailing zeros).
+    expect(await fxRows()).toEqual([{ currency: "USD", rate_date: "2026-11-10", rate: "1.2" }]);
+    // EUR, 0 and abc are refused by the parser, the future JPY row by the store.
+    expect(r.summary["skipped"]).toBe(4);
+    expect(r.summary).toMatchObject({ received: 2, inserted: 1 });
   });
 
   it("stores 100+ rows in chunks", async () => {
@@ -220,13 +224,13 @@ describe("working days, publication and the 17:30 rule", () => {
       status: "error",
       code: "rate_not_published",
     });
-    // Exactly on the edge: a retry at 17:30 is still allowed (the runner allows lateness == 75).
-    expect((await runEcbImport(ctxAt(SLOT, { now: slot + 65 * MIN, attempt: 7 }))).status).toBe(
+    // Exactly on the edge: a retry due at 17:27 still has the 3-minute queue margin to 17:30.
+    expect((await runEcbImport(ctxAt(SLOT, { now: slot + 62 * MIN, attempt: 7 }))).status).toBe(
       "partial",
     );
-    // One second over the edge is the end.
+    // One second over the edge is the end (17:27:01 + 3 min margin is past 17:30).
     expect(
-      (await runEcbImport(ctxAt(SLOT, { now: slot + 65 * MIN + 1000, attempt: 7 }))).code,
+      (await runEcbImport(ctxAt(SLOT, { now: slot + 62 * MIN + 1000, attempt: 7 }))).code,
     ).toBe("rate_not_published");
     // The attempt count also bounds the chain.
     expect((await runEcbImport(ctxAt(SLOT, { now: slot, attempt: ECB_MAX_ATTEMPTS }))).code).toBe(
@@ -300,11 +304,11 @@ describe("working days, publication and the 17:30 rule", () => {
     ecb.fill(CURRENCIES, "2026-03-20", "2026-03-27");
     const slot = Date.parse("2026-03-30T14:15:00.000Z");
     expect(
-      (await runEcbImport(ctxAt("2026-03-30T14:15:00.000Z", { now: slot + 65 * MIN, attempt: 7 })))
+      (await runEcbImport(ctxAt("2026-03-30T14:15:00.000Z", { now: slot + 62 * MIN, attempt: 7 })))
         .status,
-    ).toBe("partial"); // 17:20 local, a retry at 17:30 fits
+    ).toBe("partial"); // 17:17 local: a retry at 17:27 fits with the queue margin
     expect(
-      (await runEcbImport(ctxAt("2026-03-30T14:15:00.000Z", { now: slot + 66 * MIN, attempt: 7 })))
+      (await runEcbImport(ctxAt("2026-03-30T14:15:00.000Z", { now: slot + 63 * MIN, attempt: 7 })))
         .code,
     ).toBe("rate_not_published");
   });
@@ -344,8 +348,22 @@ describe("fetch hardening and failure classification", () => {
       expect(isAllowedEcbUrl(bad), bad).toBe(false);
       expect(await fetchEcb(bad)).toEqual({ kind: "permanent", code: "url_not_allowed" });
     }
+    // Query allow-list: only the keys core ecbRequestUrl writes, once each, format=csvdata.
+    for (const q of [
+      "?x=1",
+      "",
+      "?format=csvdata&x=1",
+      "?format=jsondata",
+      "?format=csvdata&format=csvdata",
+      "?format=csvdata&startPeriod=2026-01-01&startPeriod=2026-02-01",
+    ]) {
+      const u = `https://data-api.ecb.europa.eu/service/data/EXR/D..EUR.SP00.A${q}`;
+      expect(isAllowedEcbUrl(u), q).toBe(false);
+    }
     expect(
-      isAllowedEcbUrl("https://data-api.ecb.europa.eu/service/data/EXR/D..EUR.SP00.A?x=1"),
+      isAllowedEcbUrl(
+        "https://data-api.ecb.europa.eu/service/data/EXR/D..EUR.SP00.A?format=csvdata&startPeriod=2026-01-01",
+      ),
     ).toBe(true);
     expect(ecb.calls).toHaveLength(0);
   });
@@ -416,7 +434,7 @@ describe("fetch hardening and failure classification", () => {
       const r = await run();
       expect(r.status).toBe("partial");
       expect(r.retry).toEqual({ delaySeconds: 600 });
-      expect(["ecb_unavailable", "ecb_network"]).toContain(r.code);
+      expect(["ecb_unavailable", "ecb_rate_limited", "ecb_network"]).toContain(r.code);
       const last = await runEcbImport(
         ctxAt(SLOT, { now: Date.parse(SLOT) + 70 * MIN, attempt: 8 }),
       );
@@ -443,7 +461,9 @@ describe("fetch hardening and failure classification", () => {
           reject(new DOMException("aborted", "AbortError")),
         );
       });
-    const p = fetchEcb("https://data-api.ecb.europa.eu/service/data/EXR/D..EUR.SP00.A");
+    const p = fetchEcb(
+      "https://data-api.ecb.europa.eu/service/data/EXR/D..EUR.SP00.A?format=csvdata",
+    );
     await vi.advanceTimersByTimeAsync(ECB_TIMEOUT_MS - 1);
     let settled = false;
     void p.then(() => (settled = true));
@@ -463,7 +483,10 @@ describe("fetch hardening and failure classification", () => {
         ac.abort();
       });
     await expect(
-      fetchEcb("https://data-api.ecb.europa.eu/service/data/EXR/D..EUR.SP00.A", ac.signal),
+      fetchEcb(
+        "https://data-api.ecb.europa.eu/service/data/EXR/D..EUR.SP00.A?format=csvdata",
+        ac.signal,
+      ),
     ).rejects.toThrow();
   });
 

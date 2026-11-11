@@ -168,8 +168,17 @@ async function ecbFixture(): Promise<{ syncDeps: JobContext["syncDeps"]; effects
   const stub = stubEcb();
   ecbStub = stub;
   stub.fill({ USD: 1.1, GBP: 0.86, JPY: 160 }, "2026-06-01", "2026-07-14");
-  // The stub's own call log doubles as the effects log (only its length is asserted).
-  const effects: Effects = { calls: stub.calls as unknown as Effects["calls"], writes: [] };
+  // Live views of the stub's call log: every request is a call, anything but a GET a write.
+  const view = () =>
+    stub.calls.map((c) => ({ method: c.init?.method ?? "GET", path: c.url.pathname }));
+  const effects = {} as Effects;
+  Object.defineProperty(effects, "calls", { get: view });
+  Object.defineProperty(effects, "writes", {
+    get: () =>
+      view()
+        .filter((c) => c.method !== "GET")
+        .map((c) => ({ ...c, body: "" })),
+  });
   return { syncDeps: undefined, effects };
 }
 
