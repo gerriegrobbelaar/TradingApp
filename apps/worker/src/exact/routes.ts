@@ -7,12 +7,16 @@
  * Every change is one db.batch of the change plus its audit row (ADR 0013). Tokens are encrypted
  * before they are stored and never appear in a response, a log line or an audit row.
  *
- * Reconnecting to a DIFFERENT Exact account (review S7, ADR 0016 item 21): the callback compares
- * the identity of the account /current/Me reports with the one stored on the connection. If it
- * differs, nothing is replaced unless the flow was started with `confirm_replace=1`: the saved
- * sign-in is removed again (the connection is disabled, its old identity and divisions are kept)
- * and the callback answers `?exact=different_exact_account`. With the confirmation the old
- * divisions are switched off for syncing and the new account's current division is enabled.
+ * Reconnecting to a DIFFERENT Exact account (review S7, ADR 0016 item 21, ADR 0019): the new
+ * tokens are staged with status 'pending' (nothing but GET /current/Me can use them), then the
+ * callback compares the account /current/Me reports with the connection's history
+ * (`isDifferentAccount`). If it differs, nothing is replaced unless the flow was started with
+ * `confirm_replace=1` (admin + step-up at the start, carried in the signed single-use flow
+ * cookie): the staged sign-in is removed again (connection disabled, old identity and divisions
+ * kept) and the callback answers `?exact=different_exact_account`. With the confirmation the old
+ * divisions are switched off for syncing and the new account's current division is enabled. If
+ * /current/Me cannot be read for a connection with history, the sign-in is removed as well
+ * (`?exact=unverified`): an unverified account is never activated.
  */
 import { auditStatement } from "../db/audit";
 import { claimOnceAndPurge } from "../db/idempotency";
@@ -55,30 +59,51 @@ function exactConfig(ctx: Ctx): { config: ExactConfig } | { response: Response }
   return { config: cfg.config };
 }
 
+export const DIFFERENT_EXACT_ACCOUNT = "different_exact_account";
+
 /**
- * Stable identity of the Exact account (subscription owner) behind a /current/Me answer: a hash of
- * the customer id, else of the customer name. Null when Exact sent neither. Only the hash is
- * stored; audit rows carry its first 12 characters.
+ * Identity of the Exact account (the customer that owns the current division) behind a
+ * /current/Me answer: `id:<sha256>` of the `DivisionCustomer` GUID when Exact sends one (stable),
+ * else `name:<sha256>` of the lower-cased customer name (NOT stable: a rename in Exact changes
+ * it), else null. Only the hash is stored; audit rows carry `shortIdentity`.
  */
 export async function exactIdentity(me: CurrentMe): Promise<string | null> {
-  const key =
-    me.divisionCustomerId ?? (me.divisionCustomerName ?? "").trim().toLowerCase().slice(0, 200);
-  return key === "" ? null : sha256Hex(`exact-account:${key}`);
+  if (me.divisionCustomerId !== null) {
+    return `id:${await sha256Hex(`exact-account:${me.divisionCustomerId.toLowerCase()}`)}`;
+  }
+  const name = (me.divisionCustomerName ?? "").trim().toLowerCase().slice(0, 200);
+  return name === "" ? null : `name:${await sha256Hex(`exact-account:${name}`)}`;
+}
+
+/** Kind plus the first 12 hex characters, for audit rows. */
+export const shortIdentity = (v: string | null): string | null => {
+  if (v === null) return null;
+  const i = v.indexOf(":");
+  return i < 0 ? v.slice(0, 12) : `${v.slice(0, i)}:${v.slice(i + 1, i + 13)}`;
+};
+
+/** The identity to store after a successful connect: never downgrade a stable id to a name. */
+export function keepIdentity(prior: string | null, next: string | null): string | null {
+  if (next === null) return prior;
+  if (prior !== null && prior.startsWith("id:") && !next.startsWith("id:")) return prior;
+  return next;
 }
 
 /**
- * True when the account behind `me` is not the one this connection was used with. Identities are
- * compared when both sides have one; otherwise (a connection made before identities were stored,
- * or Exact without the customer fields) the division list decides: a current division we have
- * never seen means a different account. A connection with no history is never "different".
+ * True when the account behind `me` is not the one this connection was used with:
+ *  1. a connection with no history (no identity, no division) is never "different";
+ *  2. a current division we already know is the same data whatever the identity says, so a
+ *     company RENAME (which changes a name-based identity) never locks the admin out;
+ *  3. otherwise (a division we have never seen) only two equal identities of the same kind make
+ *     it the same account; two different stable ids, a name, or an unknown side mean different.
  */
 export function isDifferentAccount(
   prior: { identity: string | null; divisions: readonly number[] },
   next: { identity: string | null; division: number },
 ): boolean {
   if (prior.identity === null && prior.divisions.length === 0) return false;
-  if (prior.identity !== null && next.identity !== null) return prior.identity !== next.identity;
-  return prior.divisions.length > 0 && !prior.divisions.includes(next.division);
+  if (prior.divisions.includes(next.division)) return false;
+  return prior.identity === null || next.identity === null || prior.identity !== next.identity;
 }
 
 const divisionName = (me: CurrentMe): string =>
@@ -256,117 +281,217 @@ export function registerExactRoutes(router: Router): void {
     const refreshEnc = await encryptToken(key, tokens.refreshToken, aad(row.id, "refresh"));
     const expiresAt = new Date(ctx.nowMs + tokens.expiresInS * 1000).toISOString();
     const nowIso = new Date(ctx.nowMs).toISOString();
+    // Stage the new tokens as 'pending': the scheduler, the sync and every division gate refuse a
+    // pending connection, and the gate serves it for GET /current/Me only. So until /Me proved
+    // which account signed in, no call for our divisions can run with the new tokens.
     await db.batch([
       auditStatement(db, {
         actorEmail: session.email,
-        action: "connection.exact_connected",
+        action: "connection.exact_authorized",
         entity: "connection",
         entityId: row.id,
         before: { status: row.status },
-        after: { status: "active", host: DEFAULT_EXACT_HOST },
+        after: { status: "pending", host: DEFAULT_EXACT_HOST },
       }),
       db
         .prepare(
           `UPDATE connections
-           SET status = 'active', access_token_enc = ?2, refresh_token_enc = ?3, expires_at = ?4,
-               region_host = ?5, last_error = NULL, token_ref = NULL, connected_by = ?6,
-               connected_at = ?7, updated_at = ?7
+           SET status = 'pending', access_token_enc = ?2, refresh_token_enc = ?3, expires_at = ?4,
+               region_host = ?5, last_error = NULL, token_ref = NULL, updated_at = ?6
            WHERE id = ?1`,
         )
-        .bind(row.id, accessEnc, refreshEnc, expiresAt, DEFAULT_EXACT_HOST, session.email, nowIso),
+        .bind(row.id, accessEnc, refreshEnc, expiresAt, DEFAULT_EXACT_HOST, nowIso),
     ]);
 
-    // Learn the division through the gate (the same path every later call takes).
+    // Every later statement only acts while the staged tokens are still OURS: a second callback
+    // running at the same time (another flow) must not have its tokens activated by this one.
+    // The refresh ciphertext is unique (random IV), so it identifies this callback's tokens.
+    const mine = (enc: string, id = "?1"): string =>
+      `EXISTS (SELECT 1 FROM connections WHERE id = ${id} AND status = 'pending'
+               AND refresh_token_enc = ${enc})`;
+    const wipe = (lastError: string): D1PreparedStatement =>
+      db
+        .prepare(
+          `UPDATE connections
+           SET status = 'disabled', last_error = ?2,
+               access_token_enc = NULL, refresh_token_enc = NULL, token_ref = NULL,
+               expires_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+           WHERE id = ?1 AND ${mine("?3")}`,
+        )
+        .bind(row.id, lastError, refreshEnc);
+    const hasHistory = row.exact_identity !== null || knownDivisions.length > 0;
+
+    // Learn the account and division through the gate (the same path every later call takes).
     let me: CurrentMe | null = null;
     try {
       me = await fetchCurrentMe(createCurrentGateTransport(ctx.env), { jobId: "exact-connect" });
     } catch (e) {
       console.warn("exact current/Me failed", e instanceof Error ? e.name : "error");
     }
-    if (!me) return back("connected_no_division");
+    if (!me) {
+      if (hasHistory) {
+        // We cannot tell whether this is the account the connection was used with: fail closed.
+        // The admin simply connects again; nothing else (identity, divisions) changes.
+        await db.batch([
+          auditStatement(
+            db,
+            {
+              actorEmail: session.email,
+              action: "connection.exact_account_unverified",
+              entity: "connection",
+              entityId: row.id,
+              after: { status: "disabled", refused: true },
+            },
+            { sql: mine("?7", "?8"), binds: [refreshEnc, row.id] },
+          ),
+          wipe("account_unverified"),
+        ]);
+        console.warn("exact connect refused", "account_unverified");
+        return back("unverified");
+      }
+      // A first connection has nothing to compare with: it is used as it is.
+      const results = await db.batch([
+        auditStatement(
+          db,
+          {
+            actorEmail: session.email,
+            action: "connection.exact_connected",
+            entity: "connection",
+            entityId: row.id,
+            before: { status: "pending" },
+            after: { status: "active", division: null },
+          },
+          { sql: mine("?7", "?8"), binds: [refreshEnc, row.id] },
+        ),
+        db
+          .prepare(
+            `UPDATE connections SET status = 'active', connected_by = ?2, connected_at = ?3,
+               updated_at = ?3
+             WHERE id = ?1 AND ${mine("?4")}`,
+          )
+          .bind(row.id, session.email, nowIso, refreshEnc),
+      ]);
+      return (results[1]?.meta.changes ?? 0) === 1 ? back("connected_no_division") : back("error");
+    }
 
     const identity = await exactIdentity(me);
     const different = isDifferentAccount(
       { identity: row.exact_identity, divisions: knownDivisions },
       { identity, division: me.currentDivision },
     );
-    const short = (v: string | null): string | null => (v === null ? null : v.slice(0, 12));
-    // New divisions start disabled, except the first one of a connection with none enabled.
-    const upsertDivision = db
-      .prepare(
-        `INSERT INTO divisions (connection_id, exact_division, name, sync_enabled)
-         VALUES (?1, ?2, ?3, CASE WHEN EXISTS
-           (SELECT 1 FROM divisions WHERE connection_id = ?1 AND sync_enabled = 1) THEN 0 ELSE 1 END)
-         ON CONFLICT (connection_id, exact_division) DO UPDATE SET name = excluded.name`,
-      )
-      .bind(row.id, me.currentDivision, divisionName(me));
+    const short = shortIdentity;
+    const guard = { sql: mine("?7", "?8"), binds: [refreshEnc, row.id] };
 
     if (different && flow.confirmReplace !== true) {
       // Refuse: take the new sign-in out again; the old identity and divisions stay as they were.
       await db.batch([
-        auditStatement(db, {
-          actorEmail: session.email,
-          action: "connection.exact_account_mismatch",
-          entity: "connection",
-          entityId: row.id,
-          before: { identity: short(row.exact_identity) },
-          after: { identity: short(identity), division: me.currentDivision, refused: true },
-        }),
-        db
-          .prepare(
-            `UPDATE connections
-             SET status = 'disabled', last_error = 'different_exact_account',
-                 access_token_enc = NULL, refresh_token_enc = NULL, token_ref = NULL,
-                 expires_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-             WHERE id = ?1`,
-          )
-          .bind(row.id),
+        auditStatement(
+          db,
+          {
+            actorEmail: session.email,
+            action: "connection.exact_account_mismatch",
+            entity: "connection",
+            entityId: row.id,
+            before: { identity: short(row.exact_identity) },
+            after: { identity: short(identity), division: me.currentDivision, refused: true },
+          },
+          guard,
+        ),
+        wipe(DIFFERENT_EXACT_ACCOUNT),
       ]);
-      console.warn("exact connect refused", "different_exact_account");
-      return back("different_exact_account");
+      console.warn("exact connect refused", DIFFERENT_EXACT_ACCOUNT);
+      return back(DIFFERENT_EXACT_ACCOUNT);
     }
 
+    // New divisions start disabled, except the first one of a connection with none enabled.
+    const upsertDivision = db
+      .prepare(
+        `INSERT INTO divisions (connection_id, exact_division, name, sync_enabled)
+         SELECT ?1, ?2, ?3, CASE WHEN EXISTS
+           (SELECT 1 FROM divisions WHERE connection_id = ?1 AND sync_enabled = 1) THEN 0 ELSE 1 END
+         WHERE ${mine("?4")}
+         ON CONFLICT (connection_id, exact_division) DO UPDATE SET name = excluded.name`,
+      )
+      .bind(row.id, me.currentDivision, divisionName(me), refreshEnc);
+    // Activation comes LAST in the batch: every guarded statement before it still sees 'pending'.
+    const activate = db
+      .prepare(
+        `UPDATE connections
+         SET status = 'active', connected_by = ?2, connected_at = ?3, updated_at = ?3,
+             exact_identity = ?4
+         WHERE id = ?1 AND ${mine("?5")}`,
+      )
+      .bind(row.id, session.email, nowIso, keepIdentity(row.exact_identity, identity), refreshEnc);
+    const connectedAudit = auditStatement(
+      db,
+      {
+        actorEmail: session.email,
+        action: "connection.exact_connected",
+        entity: "connection",
+        entityId: row.id,
+        before: { status: "pending" },
+        after: { status: "active", division: me.currentDivision },
+      },
+      guard,
+    );
+
     if (different) {
-      await db.batch([
-        auditStatement(db, {
-          actorEmail: session.email,
-          action: "connection.exact_account_replaced",
-          entity: "connection",
-          entityId: row.id,
-          before: { identity: short(row.exact_identity), divisions: knownDivisions },
-          after: { identity: short(identity), division: me.currentDivision, confirmed: true },
-        }),
-        db.prepare("UPDATE divisions SET sync_enabled = 0 WHERE connection_id = ?1").bind(row.id),
+      const results = await db.batch([
+        auditStatement(
+          db,
+          {
+            actorEmail: session.email,
+            action: "connection.exact_account_replaced",
+            entity: "connection",
+            entityId: row.id,
+            before: { identity: short(row.exact_identity), divisions: knownDivisions },
+            after: { identity: short(identity), division: me.currentDivision, confirmed: true },
+          },
+          guard,
+        ),
+        connectedAudit,
+        db
+          .prepare(
+            `UPDATE divisions SET sync_enabled = 0 WHERE connection_id = ?1 AND ${mine("?2")}`,
+          )
+          .bind(row.id, refreshEnc),
         upsertDivision,
         db
           .prepare(
-            "UPDATE divisions SET sync_enabled = 1 WHERE connection_id = ?1 AND exact_division = ?2",
+            `UPDATE divisions SET sync_enabled = 1
+             WHERE connection_id = ?1 AND exact_division = ?2 AND ${mine("?3")}`,
           )
-          .bind(row.id, me.currentDivision),
+          .bind(row.id, me.currentDivision, refreshEnc),
         db
-          .prepare("UPDATE connections SET exact_identity = ?2 WHERE id = ?1")
-          .bind(row.id, identity),
+          .prepare(
+            `UPDATE connections
+             SET status = 'active', connected_by = ?2, connected_at = ?3, updated_at = ?3,
+                 exact_identity = ?4
+             WHERE id = ?1 AND ${mine("?5")}`,
+          )
+          .bind(row.id, session.email, nowIso, identity, refreshEnc),
       ]);
-      return back("connected");
+      return (results[5]?.meta.changes ?? 0) === 1 ? back("connected") : back("error");
     }
 
-    await db.batch([
+    const results = await db.batch([
+      connectedAudit,
       upsertDivision,
+      auditStatement(
+        db,
+        {
+          actorEmail: session.email,
+          action: "connection.exact_divisions_synced",
+          entity: "connection",
+          entityId: row.id,
+          after: { divisions: [me.currentDivision] },
+        },
+        guard,
+      ),
       // Remember who this is (fills in connections made before identities were stored).
-      db
-        .prepare(
-          "UPDATE connections SET exact_identity = COALESCE(?2, exact_identity) WHERE id = ?1",
-        )
-        .bind(row.id, identity),
-      auditStatement(db, {
-        actorEmail: session.email,
-        action: "connection.exact_divisions_synced",
-        entity: "connection",
-        entityId: row.id,
-        after: { divisions: [me.currentDivision] },
-      }),
+      activate,
     ]);
-    return back("connected");
+    return (results[3]?.meta.changes ?? 0) === 1 ? back("connected") : back("error");
   });
 
   router.add("POST", "/api/connections/exact/disconnect", ADMIN_STEP_UP, async (ctx) => {
@@ -388,7 +513,8 @@ export function registerExactRoutes(router: Router): void {
           after: { status: "disabled" },
         },
         {
-          sql: "EXISTS (SELECT 1 FROM connections WHERE id = ?7 AND status IN ('active','needs_reauth','expired'))",
+          sql: `EXISTS (SELECT 1 FROM connections WHERE id = ?7 AND (status IN ('active','needs_reauth','expired')
+                  OR (status = 'pending' AND refresh_token_enc IS NOT NULL)))`,
           binds: [before?.id ?? 0],
         },
       ),
@@ -397,7 +523,8 @@ export function registerExactRoutes(router: Router): void {
           `UPDATE connections
          SET status = 'disabled', access_token_enc = NULL, refresh_token_enc = NULL, token_ref = NULL,
              expires_at = NULL, last_error = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-         WHERE id = ?1 AND status IN ('active','needs_reauth','expired')`,
+         WHERE id = ?1 AND (status IN ('active','needs_reauth','expired')
+                            OR (status = 'pending' AND refresh_token_enc IS NOT NULL))`,
         )
         .bind(before?.id ?? 0),
     ]);

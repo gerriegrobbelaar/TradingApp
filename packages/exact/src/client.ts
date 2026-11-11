@@ -1,4 +1,4 @@
-import { type Money, money } from "@camelthorn/core";
+import { type Money, money, normalizeIban } from "@camelthorn/core";
 import {
   type Row,
   asRow,
@@ -769,7 +769,7 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
         return {
           id: reqGuid(r, "ID"),
           accountId: reqGuid(r, "Account"),
-          iban: iban === null ? null : iban.replace(/\s+/g, "").toUpperCase(),
+          iban: iban === null ? null : normalizeIban(iban),
           bic: trimField(r, "BICCode"),
           bankName: trimField(r, "BankName"),
           main: boolField(r, "Main"),

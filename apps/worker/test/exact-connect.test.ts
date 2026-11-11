@@ -2,7 +2,14 @@ import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cookieFrom, addSession, addUser, authed, call, db, resetDb, setCookies } from "./helpers";
 import worker from "../src/index";
-import { exactIdentity, isDifferentAccount } from "../src/exact/routes";
+import {
+  exactIdentity,
+  isDifferentAccount,
+  keepIdentity,
+  shortIdentity,
+} from "../src/exact/routes";
+import { createGateTransport } from "../src/exact/gate-transport";
+import { ExactAuthError } from "@camelthorn/exact";
 import {
   auditActions,
   resetExact,
@@ -170,6 +177,7 @@ describe("GET /api/connections/exact/callback", () => {
       )
       .all<{ actor_email: string; action: string; after_json: string }>();
     expect(audit.results.map((a) => a.action)).toEqual([
+      "connection.exact_authorized",
       "connection.exact_connected",
       "connection.exact_divisions_synced",
     ]);
@@ -473,7 +481,7 @@ describe("reconnecting to another Exact account", () => {
   it("stores the identity and enables only the /Me division on the first connection", async () => {
     await callback(await start());
     expect((await rows()).results).toEqual([{ exact_division: 123456, sync_enabled: 1 }]);
-    expect((await conn())?.exact_identity).toMatch(/^[0-9a-f]{64}$/);
+    expect((await conn())?.exact_identity).toMatch(/^(id|name):[0-9a-f]{64}$/);
   });
 
   it("lets the same account reconnect and never re-enables a division an admin switched off", async () => {
@@ -566,7 +574,7 @@ describe("reconnecting to another Exact account", () => {
     await db.prepare("UPDATE connections SET exact_identity = NULL").run();
     // Same division as before: the same account, and the identity is filled in.
     await callback(await start());
-    expect((await conn())?.exact_identity).toMatch(/^[0-9a-f]{64}$/);
+    expect((await conn())?.exact_identity).toMatch(/^(id|name):[0-9a-f]{64}$/);
     await db.prepare("UPDATE connections SET exact_identity = NULL").run();
     stub.api = () => Response.json(meBody({ CurrentDivision: 555 }));
     const res = await callback(await start());
@@ -590,7 +598,7 @@ describe("account identity", () => {
     const byId = await exactIdentity(
       me({ divisionCustomerId: CUSTOMER, divisionCustomerName: "A" }),
     );
-    expect(byId).toMatch(/^[0-9a-f]{64}$/);
+    expect(byId).toMatch(/^(id|name):[0-9a-f]{64}$/);
     expect(
       await exactIdentity(me({ divisionCustomerId: CUSTOMER, divisionCustomerName: "B" })),
     ).toBe(byId);
@@ -601,27 +609,224 @@ describe("account identity", () => {
     expect(await exactIdentity(me({ divisionCustomerName: "   " }))).toBeNull();
   });
 
-  it("decides 'different' from identities, else from the known divisions", () => {
+  it("decides 'different' from the known divisions first, else from identities", () => {
     const none = { identity: null, divisions: [] as number[] };
-    expect(isDifferentAccount(none, { identity: "a", division: 1 })).toBe(false);
+    // No history: never different.
+    expect(isDifferentAccount(none, { identity: "id:a", division: 1 })).toBe(false);
+    // A division we know is the same data, whatever the identity says (a rename, a missing id).
     expect(
-      isDifferentAccount({ identity: "a", divisions: [1] }, { identity: "a", division: 9 }),
+      isDifferentAccount({ identity: "id:a", divisions: [1] }, { identity: "id:b", division: 1 }),
     ).toBe(false);
     expect(
-      isDifferentAccount({ identity: "a", divisions: [1] }, { identity: "b", division: 1 }),
-    ).toBe(true);
-    expect(
-      isDifferentAccount({ identity: null, divisions: [1] }, { identity: "b", division: 1 }),
+      isDifferentAccount(
+        { identity: "name:a", divisions: [1] },
+        { identity: "name:b", division: 1 },
+      ),
     ).toBe(false);
     expect(
-      isDifferentAccount({ identity: null, divisions: [1] }, { identity: "b", division: 2 }),
-    ).toBe(true);
-    expect(
-      isDifferentAccount({ identity: "a", divisions: [1] }, { identity: null, division: 2 }),
-    ).toBe(true);
-    expect(
-      isDifferentAccount({ identity: "a", divisions: [] }, { identity: null, division: 2 }),
+      isDifferentAccount({ identity: null, divisions: [1] }, { identity: "id:b", division: 1 }),
     ).toBe(false);
+    // An unknown division: only equal identities make it the same account.
+    expect(
+      isDifferentAccount({ identity: "id:a", divisions: [1] }, { identity: "id:a", division: 9 }),
+    ).toBe(false);
+    expect(
+      isDifferentAccount({ identity: "id:a", divisions: [1] }, { identity: "id:b", division: 9 }),
+    ).toBe(true);
+    expect(
+      isDifferentAccount({ identity: null, divisions: [1] }, { identity: "id:b", division: 2 }),
+    ).toBe(true);
+    expect(
+      isDifferentAccount({ identity: "id:a", divisions: [1] }, { identity: null, division: 2 }),
+    ).toBe(true);
+    expect(
+      isDifferentAccount({ identity: "id:a", divisions: [] }, { identity: null, division: 2 }),
+    ).toBe(true);
+    expect(
+      isDifferentAccount({ identity: "id:a", divisions: [1] }, { identity: "name:a", division: 2 }),
+    ).toBe(true);
+  });
+
+  it("never downgrades a stable id to a name, and keeps the old one when Exact sends none", () => {
+    expect(keepIdentity("id:a", "name:b")).toBe("id:a");
+    expect(keepIdentity("id:a", null)).toBe("id:a");
+    expect(keepIdentity("name:a", "id:b")).toBe("id:b");
+    expect(keepIdentity("name:a", "name:b")).toBe("name:b");
+    expect(keepIdentity(null, "name:b")).toBe("name:b");
+  });
+
+  it("shortens identities for audit rows to the kind and 12 characters", () => {
+    expect(shortIdentity(`id:${"a".repeat(64)}`)).toBe(`id:${"a".repeat(12)}`);
+    expect(shortIdentity(`name:${"b".repeat(64)}`)).toBe(`name:${"b".repeat(12)}`);
+    expect(shortIdentity("f".repeat(64))).toBe("f".repeat(12));
+    expect(shortIdentity(null)).toBeNull();
+  });
+});
+
+describe("reconnect safety (review G3)", () => {
+  const conn = () =>
+    db
+      .prepare(
+        "SELECT status, last_error, exact_identity, access_token_enc, refresh_token_enc FROM connections",
+      )
+      .first<{
+        status: string;
+        last_error: string | null;
+        exact_identity: string | null;
+        access_token_enc: string | null;
+        refresh_token_enc: string | null;
+      }>();
+  const enabled = async () =>
+    (
+      await db
+        .prepare("SELECT exact_division, sync_enabled FROM divisions ORDER BY exact_division")
+        .all<{ exact_division: number; sync_enabled: number }>()
+    ).results;
+  const other = () =>
+    Response.json(
+      meBody({
+        CurrentDivision: 999001,
+        DivisionCustomer: "bbbbbbbb-1111-2222-3333-444444444444",
+        DivisionCustomerName: "Other Company B.V.",
+      }),
+    );
+
+  it("a company rename in Exact (no customer id) does not lock the admin out", async () => {
+    stub.api = () => Response.json(meBody({ DivisionCustomer: null }));
+    await callback(await start());
+    const first = (await conn())?.exact_identity;
+    expect(first).toMatch(/^name:/);
+    stub.api = () =>
+      Response.json(
+        meBody({ DivisionCustomer: null, DivisionCustomerName: "Camelthorn Holding B.V." }),
+      );
+    const res = await callback(await start());
+    expect(res.headers.get("location")).toBe("/settings/connections?exact=connected");
+    const after = await conn();
+    expect(after?.status).toBe("active");
+    expect(after?.exact_identity).toMatch(/^name:/);
+    expect(after?.exact_identity).not.toBe(first);
+  });
+
+  it("a renamed company with a stable id keeps its id identity", async () => {
+    await callback(await start());
+    const first = (await conn())?.exact_identity;
+    expect(first).toMatch(/^id:/);
+    stub.api = () => Response.json(meBody({ DivisionCustomerName: "Renamed B.V." }));
+    expect((await callback(await start())).headers.get("location")).toContain("exact=connected");
+    stub.api = () => Response.json(meBody({ DivisionCustomer: null }));
+    expect((await callback(await start())).headers.get("location")).toContain("exact=connected");
+    expect((await conn())?.exact_identity).toBe(first);
+  });
+
+  it("after a refusal the original account reconnects and its divisions are as before", async () => {
+    await callback(await start());
+    await db
+      .prepare(
+        "INSERT INTO divisions (connection_id, exact_division, name, sync_enabled) SELECT id, 777, 'Second', 1 FROM connections",
+      )
+      .run();
+    const identity = (await conn())?.exact_identity;
+    stub.api = other;
+    await callback(await start());
+    expect(await conn()).toMatchObject({
+      status: "disabled",
+      access_token_enc: null,
+      refresh_token_enc: null,
+    });
+    stub.api = () => Response.json(ME);
+    const res = await callback(await start());
+    expect(res.headers.get("location")).toBe("/settings/connections?exact=connected");
+    expect(await conn()).toMatchObject({
+      status: "active",
+      last_error: null,
+      exact_identity: identity,
+    });
+    expect(await enabled()).toEqual([
+      { exact_division: 777, sync_enabled: 1 },
+      { exact_division: 123456, sync_enabled: 1 },
+    ]);
+  });
+
+  it("while the new sign-in is unverified, its tokens serve GET /Me only", async () => {
+    await callback(await start());
+    let seen: { status?: string; division?: string } = {};
+    stub.api = async (c) => {
+      // While /Me runs, the connection is 'pending': a division call must be refused.
+      const row = await db.prepare("SELECT status FROM connections").first<{ status: string }>();
+      seen = { status: row?.status ?? "", division: c.url.pathname };
+      const t = createGateTransport(env, 123456);
+      const err = await t({
+        division: 123456,
+        api: "rest",
+        method: "GET",
+        path: "/crm/Accounts",
+        priority: "user",
+        jobId: "probe",
+      }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ExactAuthError);
+      return other();
+    };
+    await callback(await start());
+    expect(seen).toEqual({ status: "pending", division: "/api/v1/current/Me" });
+    // Exactly one API call went out with the new tokens: /current/Me.
+    expect(stub.apiCalls.map((c) => c.url.pathname)).toEqual([
+      "/api/v1/current/Me",
+      "/api/v1/current/Me",
+    ]);
+    expect((await conn())?.status).toBe("disabled");
+  });
+
+  it("fails closed when /current/Me cannot be read for a connection with history", async () => {
+    await callback(await start());
+    const before = await conn();
+    stub.api = () => new Response("nope", { status: 500 });
+    const res = await callback(await start());
+    expect(res.headers.get("location")).toBe("/settings/connections?exact=unverified");
+    expect(await conn()).toMatchObject({
+      status: "disabled",
+      last_error: "account_unverified",
+      access_token_enc: null,
+      refresh_token_enc: null,
+      exact_identity: before?.exact_identity,
+    });
+    expect(await enabled()).toEqual([{ exact_division: 123456, sync_enabled: 1 }]);
+    expect(await auditActions("connection.exact_account_unverified")).toBe(1);
+    // Retrying with /Me working connects again.
+    stub.api = () => Response.json(ME);
+    expect((await callback(await start())).headers.get("location")).toContain("exact=connected");
+    expect((await conn())?.status).toBe("active");
+  });
+
+  it("never activates tokens another callback staged meanwhile", async () => {
+    await callback(await start());
+    stub.api = async () => {
+      // A second flow staged its own tokens while this callback was verifying.
+      await db.prepare("UPDATE connections SET refresh_token_enc = 'someone-else'").run();
+      return Response.json(ME);
+    };
+    const connected = await auditActions("connection.exact_connected");
+    const res = await callback(await start());
+    expect(res.headers.get("location")).toBe("/settings/connections?exact=error");
+    expect(await conn()).toMatchObject({ status: "pending", refresh_token_enc: "someone-else" });
+    expect(await auditActions("connection.exact_connected")).toBe(connected);
+  });
+
+  it("confirm_replace needs an admin with a recent sign-in", async () => {
+    const stale = await addSession(adminId, { lastAuthAgoMs: 20 * 60 * 1000 });
+    expect((await authed("/api/connections/exact/start?confirm_replace=1", stale)).status).toBe(
+      401,
+    );
+    const fin = await addSession(await addUser("f@camelthorncapital.com", ["finance"]));
+    expect((await authed("/api/connections/exact/start?confirm_replace=1", fin)).status).toBe(403);
+  });
+
+  it("a confirm_replace flow is single use", async () => {
+    await callback(await start());
+    stub.api = other;
+    const s = await start(adminTok, "?confirm_replace=1");
+    expect((await callback(s)).headers.get("location")).toContain("exact=connected");
+    expect((await callback(s)).headers.get("location")).toContain("exact=denied");
   });
 });
 

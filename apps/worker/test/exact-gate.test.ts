@@ -680,9 +680,13 @@ describe("request building", () => {
     await expect(t(req(5, { path: "/Me" }))).rejects.toMatchObject({ code: "division_mismatch" });
   });
 
-  it("the gate itself still refuses division 0 for anything but /Me", () => {
+  it("the gate itself still refuses division 0 for anything but GET /Me", () => {
     expect(() => validateRequest(req(0, { path: "/crm/Accounts" }))).toThrow(ExactApiError);
     expect(() => validateRequest(req(0, { path: "/Me", api: "xml" }))).toThrow(ExactApiError);
+    for (const method of ["POST", "PUT", "DELETE"] as const) {
+      expect(() => validateRequest(req(0, { path: "/Me", method }))).toThrow(ExactApiError);
+    }
+    expect(() => validateRequest(req(0, { path: "/Me" }))).not.toThrow();
   });
 });
 
@@ -948,6 +952,44 @@ describe("rate limiting", () => {
     await go(div, { priority: "user" });
     // The minute bucket was reported empty, so the user call had to wait for the reset.
     expect(clock.sleeps.reduce((a, b) => a + b, 0)).toBeGreaterThanOrEqual(9000);
+  });
+
+  it("adversarial headers can only tighten: huge counts are ignored, a far reset is capped", async () => {
+    await seedConnection();
+    const div = freshDivision();
+    const clock = await fakeClock(gateName(div));
+    stub.api = () =>
+      Response.json(
+        { d: { results: [] } },
+        {
+          headers: {
+            "x-ratelimit-limit": "9007199254740991",
+            "x-ratelimit-remaining": "9007199254740991",
+            "x-ratelimit-minutely-limit": "100000",
+            "x-ratelimit-minutely-remaining": "100000",
+          },
+        },
+      );
+    await go(div);
+    const loose = await gateStub(gateName(div)).usage();
+    // Never above the local count (5,000 a day by default, one call used).
+    expect(loose.remaining).toBeLessThanOrEqual(4999);
+
+    // "0 left, reset in the year 3000": blocks today, but not for longer than a day.
+    stub.api = () =>
+      Response.json(
+        { d: { results: [] } },
+        {
+          headers: {
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": String(Date.UTC(3000, 0, 1)),
+          },
+        },
+      );
+    await go(div);
+    expect((await gateStub(gateName(div)).usage()).remaining).toBe(0);
+    clock.t += 25 * 3600 * 1000 + 1000;
+    expect((await gateStub(gateName(div)).usage()).remaining).toBeGreaterThan(0);
   });
 
   it("writes a daily summary row to D1", async () => {

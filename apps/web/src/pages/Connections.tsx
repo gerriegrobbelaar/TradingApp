@@ -30,7 +30,12 @@ const RESULT_MESSAGE: Record<string, string> = {
   error: "Could not finish connecting to Exact Online. Try again.",
   different_exact_account:
     "That sign-in belongs to a different Exact Online account. Nothing was replaced and the connection is off.",
+  unverified:
+    "Exact Online did not say which account signed in, so the sign-in was not used and the connection is off. Connect again.",
 };
+
+/** Set on the connection when /current/Me could not be read, so the account was not checked. */
+export const ACCOUNT_UNVERIFIED = "account_unverified";
 
 /** Set on the connection by the server when a sign-in for another Exact account was refused. */
 export const DIFFERENT_ACCOUNT = "different_exact_account";
@@ -248,6 +253,12 @@ export function Connections() {
                 {isAdmin
                   ? "These are Worker settings: fix them where the app is deployed. The saved sign-in is kept, so re-authorising does not help."
                   : "Ask an admin to fix the app settings."}
+              </p>
+            )}
+            {exact?.lastError === ACCOUNT_UNVERIFIED && state === "not_connected" && (
+              <p role="alert" className="notice warn">
+                The last sign-in could not be checked against the connected Exact Online account, so
+                it was not used. Connect again; the administrations and their data are unchanged.
               </p>
             )}
             {exact?.lastError === DIFFERENT_ACCOUNT && state === "not_connected" && (

@@ -94,6 +94,8 @@ const REFRESH_RETRY_DELAYS_MS = [5_000, 15_000];
 /** After a failed refresh with a still-valid token, do not try again for this long. */
 const REFRESH_COOLDOWN_MS = 10_000;
 /** Wait before retrying a call whose 401 came from a token too young to refresh. */
+/** Longest daily window an X-RateLimit-Reset header may announce (24 h plus clock slack). */
+const MAX_DAY_WINDOW_MS = 25 * 3600 * 1000;
 const YOUNG_401_WAIT_MS = 2_000;
 /** Retry persisting a stashed token pair this often (alarm). */
 const PENDING_RETRY_MS = 30_000;
@@ -1012,10 +1014,18 @@ export class ExactGate extends DurableObject<Env> {
   private async execute(item: Queued): Promise<ExactResponse | null> {
     const { req } = item;
     const row = await loadExactConnection(this.env.DB);
-    if (!row || row.status === "pending" || row.status === "disabled") {
+    // A 'pending' connection holds tokens the connect callback has not verified yet (ADR 0019):
+    // they serve GET /current/Me (division 0) and nothing else.
+    const verifying =
+      row?.status === "pending" &&
+      req.division === 0 &&
+      req.api === "rest" &&
+      req.method === "GET" &&
+      req.path === "/Me";
+    if (!row || (row.status === "pending" && !verifying) || row.status === "disabled") {
       throw new ExactAuthError("not_connected");
     }
-    if (row.status !== "active") throw new ExactAuthError("needs_reauth");
+    if (row.status !== "active" && !verifying) throw new ExactAuthError("needs_reauth");
     const url = buildUrl(row.region_host, req);
     const token = await this.accessTokenFor(row);
 
@@ -1130,7 +1140,10 @@ export class ExactGate extends DurableObject<Env> {
           this.limits.perDay,
         ),
         dayRemaining: Math.max(0, dayRemaining),
-        dayResetMs: resetMs !== null && resetMs > now ? resetMs : null,
+        // Exact's daily window is at most a day long: a reset further out (a garbled or hostile
+        // header) is capped, so "0 left" can never lock the gate for longer than that.
+        dayResetMs:
+          resetMs !== null && resetMs > now ? Math.min(resetMs, now + MAX_DAY_WINDOW_MS) : null,
       };
     }
     const minuteLimit = info.minutely.limit;

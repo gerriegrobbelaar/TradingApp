@@ -199,7 +199,10 @@ fix the constant or parser it names.
 7. **`crm/BankAccounts`.** The IBAN field (`BankAccount` or `IBAN`), page size, that the `Main`
    flag is what we think. Check `relation_bank_accounts` after the nightly run: every account of a
    relation present, `iban_added_at` / `iban_changed_at` empty after the very first IBAN pass
-   (ADR 0014 item 7, ADR 0019).
+   (ADR 0014 item 7, ADR 0019). On a database that already synced IBANs before migration 0007,
+   the first pass after it flags (once) every relation whose Exact record has an IBAN besides the
+   one stored before: expected, review them with the accountant. An IBAN with a wrong check digit
+   (`hasValidIbanChecksum`) is stored and flagged like any other.
 8. **`ReceivablesList` / `PayablesList`.** `ID` versus `HID`, what `Amount` means and in which
    currency, page size (60?), dates and their time zone (ADR 0014 items 3, 9).
 9. **`/sync/Cashflow/*`.** Do the endpoints exist (the payables one may be `Payments` or
@@ -221,6 +224,9 @@ fix the constant or parser it names.
     different Exact account: expect `?exact=different_exact_account`, the connection disabled and
     the original divisions untouched; then repeat with "Replace with the other account" and check
     the old divisions are switched off and the audit rows `connection.exact_account_mismatch` /
-    `connection.exact_account_replaced` (ADR 0019).
+    `connection.exact_account_replaced` (ADR 0019). Check `connections.exact_identity` starts with
+    `id:` (Exact sent `DivisionCustomer`); `name:` means only the name came back, so a rename in
+    Exact is then recognised through the known divisions only. During the callback the connection
+    is `pending` and only `GET /current/Me` may run (`wrangler tail` shows no other call).
 14. **Before Phase 7 (matching):** XML upload with bearer auth, the `_Division_` parameter, the
     message type codes, and that a MatchSet can be read back (ADR 0014 item 13).

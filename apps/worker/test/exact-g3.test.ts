@@ -316,11 +316,8 @@ describe("relation bank accounts (S8)", () => {
     expect(changed[0]?.before_json).toBe('{"iban":null}');
   });
 
-  it("treats a relation from before migration 0007 (IBAN, no rows) as a baseline", async () => {
-    fx.banks = [
-      { n: 1, account: 2, iban: NL, main: true },
-      { n: 2, account: 2, iban: DE, main: false },
-    ];
+  it("treats the one IBAN of a relation from before migration 0007 (IBAN, no rows) as its baseline", async () => {
+    fx.banks = [{ n: 1, account: 2, iban: NL, main: true }];
     await run("full");
     // Simulate the pre-0007 state: relations.iban set, no relation_bank_accounts rows.
     await db.prepare("DELETE FROM relation_bank_accounts").run();
@@ -330,12 +327,92 @@ describe("relation bank accounts (S8)", () => {
       iban_changed_at: null,
       iban_added_at: null,
     });
-    expect(await accounts()).toHaveLength(2);
-    // ... but a different display IBAN is still a change.
+    expect(await accounts()).toHaveLength(1);
+    expect(await audits("relation.iban_added")).toHaveLength(0);
+  });
+
+  it("a legacy relation with ANOTHER IBAN next to its old one flags that one as added", async () => {
+    fx.banks = [{ n: 1, account: 2, iban: NL, main: true }];
+    await run("full");
+    await db.prepare("DELETE FROM relation_bank_accounts").run();
+    // Between the last pre-0007 pass and the first one after it, a second account appeared.
+    fx.banks = [
+      { n: 1, account: 2, iban: NL, main: true },
+      { n: 2, account: 2, iban: GB, main: false },
+    ];
+    await run("full");
+    expect(await relation()).toMatchObject({ iban: NL, iban_changed_at: null });
+    expect((await relation())?.iban_added_at).not.toBeNull();
+    const added = await audits("relation.iban_added");
+    expect(added.map((a) => a.after_json)).toEqual(['{"iban":"GB82****5432"}']);
+  });
+
+  it("a legacy relation whose display IBAN differs is a change", async () => {
+    fx.banks = [{ n: 1, account: 2, iban: NL, main: true }];
+    await run("full");
     await db.prepare("DELETE FROM relation_bank_accounts").run();
     fx.banks = [{ n: 2, account: 2, iban: DE, main: true }];
     await run("full");
     expect((await relation())?.iban_changed_at).not.toBeNull();
+    expect((await relation())?.iban_added_at).not.toBeNull();
+  });
+
+  it("a swap in one read (old IBAN gone, new one there) flags added AND changed, with or without main", async () => {
+    // Relation 2 uses main accounts, relation 1 none.
+    fx.banks = [
+      { n: 1, account: 2, iban: NL, main: true },
+      { n: 2, account: 1, iban: DE, main: false },
+    ];
+    await run("full");
+    fx.banks = [
+      { n: 3, account: 2, iban: GB, main: true },
+      { n: 4, account: 1, iban: BE, main: false },
+    ];
+    await run("full");
+    for (const [acct, before, after] of [
+      [2, "NL91****4300", "GB82****5432"],
+      [1, "DE89****3000", "BE68****7034"],
+    ] as const) {
+      const rel = await db
+        .prepare(
+          "SELECT iban_added_at, iban_changed_at FROM relations WHERE division_id = ?1 AND exact_id = ?2",
+        )
+        .bind(div.id, guid(acct))
+        .first<{ iban_added_at: string | null; iban_changed_at: string | null }>();
+      expect(rel?.iban_added_at).not.toBeNull();
+      expect(rel?.iban_changed_at).not.toBeNull();
+      const changed = await auditRows("relation.iban_changed", `${div.id}:${guid(acct)}`);
+      expect(changed.map((c) => `${c.before_json} ${c.after_json}`)).toEqual([
+        `{"iban":"${before}"} {"iban":"${after}"}`,
+      ]);
+      expect(await auditRows("relation.iban_added", `${div.id}:${guid(acct)}`)).toHaveLength(1);
+    }
+  });
+
+  it("invisible and full-width characters do not make a known IBAN new", async () => {
+    fx.banks = [{ n: 1, account: 2, iban: NL, main: true }];
+    await run("full");
+    fx.banks = [{ n: 1, account: 2, iban: "NL91\u00a0ABNA\u200b0417 1643 ００", main: true }];
+    await run("full");
+    expect(await relation()).toMatchObject({
+      iban: NL,
+      iban_added_at: null,
+      iban_changed_at: null,
+    });
+    expect((await accounts()).map((a) => a.iban)).toEqual([NL]);
+  });
+
+  it("a new IBAN with a wrong check digit is still stored and flagged (never ignored)", async () => {
+    fx.banks = [{ n: 1, account: 2, iban: NL, main: true }];
+    await run("full");
+    const bad = "NL00ABNA0417164300"; // fails mod-97
+    fx.banks = [
+      { n: 1, account: 2, iban: NL, main: true },
+      { n: 2, account: 2, iban: bad, main: false },
+    ];
+    await run("full");
+    expect((await accounts()).map((a) => a.iban)).toEqual([bad, NL]);
+    expect((await relation())?.iban_added_at).not.toBeNull();
   });
 
   it("writes nothing when the sync lease was lost during the IBAN pass", async () => {

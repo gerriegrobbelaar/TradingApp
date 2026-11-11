@@ -1379,10 +1379,14 @@ async function syncOpenItemsFull(
  * completed (the first pass is the baseline) and never because Exact returned rows in another order:
  *  - relations.iban_added_at   the set of active IBANs gained an IBAN it did not have (new, or one
  *                              that was removed and came back). Audit `relation.iban_added`.
- *  - relations.iban_changed_at the IBAN we would pay to changed because the MAIN account changed
- *                              (or the first IBAN appeared). Audit `relation.iban_changed`. A
- *                              display IBAN that moves only because a new lowest IBAN joined the
- *                              set is an addition, not a change.
+ *  - relations.iban_changed_at the IBAN we would pay to changed because the MAIN account changed,
+ *                              the old one is no longer returned (a swap), or the first IBAN
+ *                              appeared. Audit `relation.iban_changed`. A display IBAN that moves
+ *                              only because a new lowest IBAN joined the set is an addition, not a
+ *                              change.
+ * IBANs are normalised with `normalizeIban` (NFKC, no whitespace or invisible characters, upper
+ * case); strings that still do not look like an IBAN are skipped, IBANs with a wrong check digit
+ * are stored and flagged like any other (Phase 9 must refuse to pay to them).
  * Audit rows are masked and sit in the same batch as the change, guarded by the sync lease. A
  * relation that loses all its accounts keeps its last IBAN in relations.iban.
  */
@@ -1463,6 +1467,9 @@ async function syncIbans(ctx: Ctx): Promise<EntityResult> {
     stored.set(r.relation_id, m);
   }
 
+  // The first completed pass is the baseline, even when it found nothing: a division that really
+  // had no IBANs must flag its first one. (A faulty empty first answer then makes the next real
+  // one flag every relation once: the cautious direction.)
   const hadPass = (ctx.state.get("relation_ibans")?.last_completed_at ?? null) !== null;
   const nowIso = ctx.nowIso();
   // ?{n}: division, holder, run_seq of the lease, appended to every statement below.
@@ -1487,12 +1494,20 @@ async function syncIbans(ctx: Ctx): Promise<EntityResult> {
     const newDisplay = newMain ?? lowest(now.keys()) ?? rel.iban;
     const displayChanged = newDisplay !== rel.iban;
 
-    // Relations from before migration 0007 have an IBAN but no rows: their rows are a baseline,
-    // not additions; only a different display IBAN counts (the old rule).
+    // Relations from before migration 0007 have an IBAN but no rows. The one IBAN the old sync
+    // stored is their baseline; any OTHER IBAN on the first pass after the migration counts as
+    // added (it may have appeared since the last pre-0007 pass, and nothing older can tell).
+    // This flags a relation with several accounts once; silently missing a new account would be
+    // worse. A different display IBAN counts as changed (the old rule).
     const legacy = before.size === 0 && rel.iban !== null;
-    const flagAdded = hadPass && !legacy && added.length > 0;
+    const flagged = legacy ? added.filter((i) => i !== rel.iban) : added;
+    const flagAdded = hadPass && flagged.length > 0;
+    // Changed: the IBAN we would pay to moved because the main account changed, the old one is
+    // gone (removed, or swapped for another in the same read), or the relation had none.
     const flagChanged =
-      hadPass && displayChanged && (rel.iban === null || legacy || prevMain !== newMain);
+      hadPass &&
+      displayChanged &&
+      (rel.iban === null || legacy || prevMain !== newMain || !now.has(rel.iban));
 
     // Rows that need writing: new, changed in a stored column, or no longer returned.
     const upserts = [...now.values()].filter((c) => {
@@ -1518,7 +1533,7 @@ async function syncIbans(ctx: Ctx): Promise<EntityResult> {
     const unit: D1PreparedStatement[] = [];
     const entityId = `${division.id}:${rel.exact_id}`;
     if (flagAdded) {
-      for (const iban of added) {
+      for (const iban of flagged) {
         unit.push(
           auditStatement(
             db,

@@ -292,6 +292,43 @@ describe("Settings, Connections", () => {
     );
   });
 
+  it("explains a sign-in that could not be checked against the connected account", async () => {
+    const body: api.ConnectionsResponse = {
+      exactConfigured: true,
+      connections: [
+        {
+          ...(EXACT_ACTIVE.connections[0] as api.ConnectionRow),
+          status: "disabled",
+          lastError: "account_unverified",
+        },
+      ],
+    };
+    mockFetch({ ...ME_OK(ADMIN), ...list(body) });
+    const { container } = renderApp("/settings/connections?exact=unverified");
+    expect(await screen.findByText(/did not say which account signed in/)).toBeTruthy();
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("could not be checked");
+    expect(screen.queryByRole("button", { name: "Replace with the other account" })).toBeNull();
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
+  it("the account-mismatch notice has no accessibility violations", async () => {
+    const body: api.ConnectionsResponse = {
+      exactConfigured: true,
+      connections: [
+        {
+          ...(EXACT_ACTIVE.connections[0] as api.ConnectionRow),
+          status: "disabled",
+          lastError: "different_exact_account",
+        },
+      ],
+    };
+    mockFetch({ ...ME_OK(ADMIN), ...list(body) });
+    const { container } = renderApp("/settings/connections?exact=different_exact_account");
+    await screen.findByRole("button", { name: "Replace with the other account" });
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
   it("has no accessibility violations", async () => {
     mockFetch({ ...ME_OK(ADMIN), ...list(REAUTH) });
     const { container } = renderApp("/settings/connections");

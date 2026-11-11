@@ -25,6 +25,16 @@ describe("migration 0007 on a populated database", () => {
       mdb.prepare(
         "INSERT INTO divisions (id, connection_id, exact_division, name) VALUES (10, 5, 124, 'Second')",
       ),
+      // A second connection whose divisions were inserted with higher ids, in another order.
+      mdb.prepare(
+        "INSERT INTO connections (id, kind, name, status) VALUES (6, 'exact', 'exact-2', 'active')",
+      ),
+      mdb.prepare(
+        "INSERT INTO divisions (id, connection_id, exact_division, name) VALUES (12, 6, 100, 'B first')",
+      ),
+      mdb.prepare(
+        "INSERT INTO divisions (id, connection_id, exact_division, name) VALUES (13, 6, 50, 'B second')",
+      ),
       mdb.prepare(
         "INSERT INTO relations (id, division_id, exact_id, name, iban, updated_at) VALUES (1, 9, 'r1', 'Supplier', 'NL91ABNA0417164300', '2026-01-01T00:00:00Z')",
       ),
@@ -51,7 +61,29 @@ describe("migration 0007 on a populated database", () => {
       ),
     ]);
 
+    const objects = async (type: string) =>
+      (
+        await mdb
+          .prepare("SELECT name, sql FROM sqlite_master WHERE type = ?1 ORDER BY name")
+          .bind(type)
+          .all<{ name: string; sql: string }>()
+      ).results;
+    const triggersBefore = await objects("trigger");
+
     await applyD1Migrations(mdb, all);
+
+    // Every trigger survives unchanged (audit log append-only, open item status rules).
+    expect(await objects("trigger")).toEqual(triggersBefore);
+    expect(triggersBefore.map((t) => t.name)).toEqual(
+      expect.arrayContaining(["audit_log_no_update", "audit_log_no_delete"]),
+    );
+    // The audit log is still append-only after the migration.
+    await mdb
+      .prepare(
+        "INSERT INTO audit_log (actor_email, action, entity) VALUES ('system', 'test.after_0007', 'test')",
+      )
+      .run();
+    await expect(mdb.prepare("DELETE FROM audit_log").run()).rejects.toThrow();
 
     const rows = await mdb
       .prepare(
@@ -151,6 +183,9 @@ describe("migration 0007 on a populated database", () => {
     ).toEqual([
       { id: 9, sync_enabled: 1, base_currency: "EUR", base_currency_read_at: null },
       { id: 10, sync_enabled: 0, base_currency: "EUR", base_currency_read_at: null },
+      // Per connection: the lowest id (the division the connect callback inserted first).
+      { id: 12, sync_enabled: 1, base_currency: "EUR", base_currency_read_at: null },
+      { id: 13, sync_enabled: 0, base_currency: "EUR", base_currency_read_at: null },
     ]);
     expect(
       await mdb.prepare("SELECT exact_identity FROM connections WHERE id = 5").first(),

@@ -28,7 +28,14 @@ database and checks `PRAGMA foreign_key_check`.
 - The nightly full run reads `crm/BankAccounts` completely or fails (the client throws on an
   incomplete read). Only such a complete read upserts rows (`last_seen_at` moves for all active
   rows with one statement at the end) and sets `removed_at` on rows it no longer returns; a row that
-  returns is active again (`removed_at` cleared, `first_seen_at` kept). Simple on purpose: one
+  returns is active again (`removed_at` cleared, `first_seen_at` kept).
+- Normalisation (`normalizeIban` in `packages/core`): NFKC (full-width letters and digits, a
+  non-breaking space become ASCII), all whitespace and invisible format characters (U+200B, BOM)
+  dropped, upper case. Lookalikes from another script (Cyrillic "А") are not folded and fail the
+  shape check, so they are skipped like any non-IBAN. The mod-97 check digits are NOT a filter:
+  an IBAN with a wrong check digit is still what Exact holds and still a new place a payment could
+  be pointed at, so it is stored and flagged like any other; Phase 9 must refuse to pay to an
+  IBAN that fails `hasValidIbanChecksum`. Simple on purpose: one
   complete read is enough to remove (a removed account only makes the app more cautious), but an
   answer with no usable account at all changes nothing (a wrong division or licence is far more
   likely than every supplier losing every account). Every write is guarded by the sync lease
@@ -39,16 +46,27 @@ database and checks `PRAGMA foreign_key_check`.
     IBAN it did not have (new, or one that had been removed and came back). Any new IBAN is a
     payment-safety event whether or not it is main: it is a new place money can go.
   - `relations.iban_changed_at` + audit `relation.iban_changed` (before and after, masked): the
-    IBAN we would pay to changed because the **main account changed** (including the main account
-    being removed so another takes over), or a relation got its first IBAN. A display IBAN that
-    moves only because a new lowest IBAN joined a relation without a main account is an addition,
-    not a change; reordering, case and spacing differences are neither.
+    IBAN we would pay to changed because the **main account changed**, or the old one is **no
+    longer returned** (removed, or swapped for another in the same read, with or without a main
+    flag), or a relation got its first IBAN. A display IBAN that moves only because a new lowest
+    IBAN joined a relation without a main account (the old one still there) is an addition, not a
+    change; reordering, case, spacing and invisible characters are neither. A swap therefore sets
+    both flags.
   - Phase 9 must treat either flag as "new or changed bank details" for the second-approver rule
     (CLAUDE.md 4.4) and must re-read the supplier's accounts (`listBankAccounts({ accountId })`)
     when it prepares a payment, because the nightly read can be a day old.
-- Relations that already had an IBAN before migration 0007 have no rows yet. Their first pass
-  after the migration is a baseline for the set (no `iban_added_at` for the accounts it finds); a
-  different display IBAN still counts as changed (the old rule).
+- The baseline is the first COMPLETED pass of a division, even one that found nothing: a division
+  that really had no IBANs must flag its first one. The price: a faulty empty first answer makes
+  the next real one flag every relation once (the cautious direction).
+- Relations that already had an IBAN before migration 0007 have no rows yet. The one IBAN the old
+  sync stored (`relations.iban`) is their baseline; any OTHER IBAN the first pass after the
+  migration finds is flagged as added, because it may have appeared after the last pre-0007 pass
+  and nothing older can tell. This flags relations with several accounts once (review them after
+  the upgrade) instead of silently accepting an account nobody has seen; a different display IBAN
+  still counts as changed (the old rule).
+- Known limit: one complete read that lacks many accounts (an Exact fault) marks them removed, and
+  the next normal read flags all of them as added again. That is the cautious direction; a removal
+  guard like the open-items close guard can be added if it happens in practice.
 - `open_items.relation_iban` (migration 0003) is unused and stays unused: matching joins
   `open_items.relation_id` to `relations` and `relation_bank_accounts` instead of copying an IBAN
   onto every invoice (which would go stale). Treat the column as dead; a later migration can drop it.
@@ -72,13 +90,24 @@ database and checks `PRAGMA foreign_key_check`.
   stays (EUR until read). The same run switches the client to the division's currency right after
   the divisions step, so division-currency amounts (`AmountDC`) get the right scale. Field name
   provisional.
-- **Reconnecting to a different Exact account.** `/current/Me` is read through the gate
-  (`fetchCurrentMe` over `createCurrentGateTransport`, division 0, `GET /Me` only). The stored
-  identity (`connections.exact_identity`) is a SHA-256 of the Exact customer (subscription) id
-  from `DivisionCustomer`, else of the lower-cased customer name; only the hash is stored and audit
-  rows carry its first 12 characters. "Different" means: both identities known and unequal; or
-  one side unknown and the `/Me` division is not among the connection's known divisions (a
-  connection with no history is never different). If different and the flow was **not** started
+- **Reconnecting to a different Exact account.** The callback stores the new tokens with status
+  **`pending`**: the scheduler, the manual sync and every division gate refuse a pending
+  connection, and the gate serves it for `GET /current/Me` (division 0) only, so no call for our
+  divisions can run with tokens of an unchecked account. `/current/Me` is read through the gate
+  (`fetchCurrentMe` over `createCurrentGateTransport`; the gate's own validation also allows
+  division 0 for `GET /Me` only). The stored identity (`connections.exact_identity`) is
+  `id:<sha256>` of the `DivisionCustomer` GUID (stable), else `name:<sha256>` of the lower-cased
+  customer name (changes on a rename); audit rows carry the kind and 12 hex characters. A later
+  connect never downgrades an `id:` identity to `name:`. "Different" (`isDifferentAccount`):
+  never for a connection with no history; never when the `/Me` division is one we already know
+  (the same data whatever the identity says, so a **company rename never locks the admin out**);
+  otherwise (an unknown division) different unless both identities are known and equal. If
+  `/current/Me` cannot be read for a connection with history, the staged sign-in is removed
+  (`last_error = 'account_unverified'`, audit `connection.exact_account_unverified`,
+  `?exact=unverified`); a first connection is activated as before (`connected_no_division`).
+  Every statement after staging is guarded by the staged refresh-token ciphertext, so a second
+  callback running at the same time can never have its tokens activated by this one (it answers
+  `?exact=error`). If different and the flow was **not** started
   with `confirm_replace=1`: the callback removes the new sign-in again (connection `disabled`,
   `last_error = 'different_exact_account'`, tokens wiped, old identity and divisions kept) and
   redirects with `?exact=different_exact_account`; audit `connection.exact_account_mismatch`.

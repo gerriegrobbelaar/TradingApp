@@ -42,8 +42,8 @@ export function validateRequest(req: ExactRequest): void {
   if (req.api === "xml") {
     if (!XML_PATHS.has(req.path)) throw bad("path");
     if (req.division < 1) throw bad("division");
-  } else if (req.division === 0 && req.path !== "/Me") {
-    // Division 0 ("current") exists only for /current/Me.
+  } else if (req.division === 0 && (req.path !== "/Me" || req.method !== "GET")) {
+    // Division 0 ("current") exists only for GET /current/Me.
     throw bad("division");
   }
   for (const [k, v] of Object.entries(req.query ?? {})) {
