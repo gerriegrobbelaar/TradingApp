@@ -139,7 +139,10 @@ dead_letter_queue = "camelthorn-jobs-dlq"
 
 # ---------------------------------------------------------------------------------------------
 # Staging (ADR 0029): `wrangler deploy --env staging` (via `pnpm run deploy:staging`, which runs the
-# guard first). Environments do not inherit bindings, so everything is written out again. Nothing
+# guard first). Environments do not inherit bindings or vars (d1_databases, queues, durable_objects,
+# vars), so those are written out again. They DO inherit routes, triggers, observability, limits,
+# assets, migrations, workers_dev and preview_urls from the top level when not set here; every one of
+# those is written out below as well, so nothing silently comes from production. Nothing
 # is shared with production: own Worker, D1 database, queues and Durable Object namespaces (a
 # Durable Object namespace belongs to its Worker, so a separate Worker name means separate state).
 # Fill the placeholders with a TEST Exact division and, preferably, a Google client with its own
@@ -149,8 +152,12 @@ dead_letter_queue = "camelthorn-jobs-dlq"
 name = "camelthorn-finance-staging"
 workers_dev = false
 preview_urls = false
-# PLACEHOLDER. Uncomment and set the staging hostname (not the production one):
-# routes = [{ pattern = "staging.example.com", custom_domain = true }]
+# PLACEHOLDER. Replace with the staging hostname (never the production one), for example
+#   routes = [{ pattern = "staging.example.com", custom_domain = true }]
+# Keep the key even while empty: an environment without `routes` inherits the top-level routes, and
+# a staging deploy would then take over the production hostname (wrangler 4.160 only warns). The
+# deploy guard refuses an empty list and any route shared with production.
+routes = []
 
 [env.staging.triggers]
 crons = ["* * * * *"]

@@ -123,18 +123,28 @@ left:
 | `OAUTH_REDIRECT_URI`                     | exactly the redirect URI registered on Google, `https://<app host>/api/auth/callback`; its origin is the CSRF origin | `app.example.com` placeholder or not https                      |
 | `EXACT_CLIENT_ID`                        | Exact app client ID (item 7)                                                                                       | empty                                                           |
 | `EXACT_REDIRECT_URI`                     | `https://<app host>/api/connections/exact/callback`, same origin as `OAUTH_REDIRECT_URI`                            | placeholder, not https, or wrong origin or path                 |
-| `routes`                                 | uncomment one of the two examples and set your hostname (same host as the redirect URIs)                           | no routes set                                                   |
+| `routes`                                 | uncomment one of the two examples and set your hostname (same host as the redirect URIs)                           | no routes set, or the redirect URI host is not a route          |
 | `[triggers] crons = ["* * * * *"]`       | leave as is                                                                                                        | no cron trigger                                                 |
 | `EXACT_GATE` / `JOB_LOCK` bindings + migrations `v1`, `v2` | leave as is                                                                                      | ExactGate or JobLock binding or migration missing               |
 | `JOBS_QUEUE` producer, consumer, `dead_letter_queue` | leave as is (names from step 3)                                                                        | producer, consumer or dead-letter queue missing                 |
 
-`INITIAL_ADMIN_EMAIL` and `ALLOWED_HD` are not guarded: check them by eye. `workers_dev` and
-`preview_urls` stay `false`. `[observability]` keeps application logs but turns off invocation logs
-and redacts query strings; the guard refuses invocation logs at sampling above 0.05 (see "Log
-hygiene"). `[limits] cpu_ms = 30000` is the CPU time allowed per invocation (Cloudflare's default,
-written out; step 10 item 11 says when to raise it).
+The guard only checks that `INITIAL_ADMIN_EMAIL` looks like an email address and `ALLOWED_HD` is
+set: check by eye that they are the right ones. It also refuses `workers_dev` or `preview_urls`
+other than `false`, a secret name or a `TEST_*` name in `[vars]`, test values left from the
+vitest config (`test-…` client IDs, `*.test` hosts), a Durable Object binding with `script_name`,
+and a `wrangler.toml` that does not parse. `[observability]` must be written out (wrangler leaves the
+dashboard setting alone when the key is missing): it keeps application logs but turns off
+invocation logs and redacts query strings, and the guard refuses invocation logs at sampling above
+0.05 or logging without `redact_query_string = true` (see "Log hygiene"). `[limits] cpu_ms = 30000`
+is the CPU time allowed per invocation (Cloudflare's default, written out; step 10 item 11 says when
+to raise it).
 
 Staging has its own copy of every row of this table inside `[env.staging]` (see "Staging first").
+The guard reads the file with the TOML parser wrangler uses and applies wrangler's inheritance
+rules: an environment inherits `routes`, `triggers`, `observability`, `limits`, `assets`,
+`migrations`, `workers_dev` and `preview_urls` from the top level when it leaves them out, and never
+inherits `vars` or bindings. It checks the resolved configs, so a staging that would inherit the
+production route, or whose Durable Object migrations differ from production's, is refused.
 
 The cron `* * * * *` is the scheduler tick: every minute the Worker works out from each job's own
 schedule (Settings, Schedules; Europe/Amsterdam, daylight saving aware) which jobs are due and puts
@@ -163,8 +173,8 @@ the repo and outside any synced folder (for example `~/secrets/camelthorn.json`,
 `{"GOOGLE_CLIENT_SECRET":"...","SESSION_SECRET":"...","EXACT_CLIENT_SECRET":"...","TOKEN_ENC_KEY":"..."}`)
 and run `pnpm exec wrangler secret bulk ~/secrets/camelthorn.json` (`wrangler secret bulk --help`:
 JSON or `.env` file, up to 100 secrets, a `null` value deletes; with no file it reads stdin). Delete
-the file afterwards. Whether bulk also offers to create a missing Worker is **unverified**; if it
-errors, do the first secret with `secret put` as below.
+the file afterwards. Like `secret put`, `secret bulk` offers to create the missing Worker (same
+prompt; read from wrangler 4.160's source, not yet run here). For staging add `--env staging`.
 
 ```sh
 pnpm exec wrangler secret put GOOGLE_CLIENT_SECRET
@@ -280,7 +290,7 @@ scheduler itself is checked with a harmless manual run.
       (producer and consumer, bound by name only) works with them. Check the dashboard, Queues, for
       the jurisdiction if `wrangler queues info` does not print it.
 - [ ] Logs (ADR 0029, unverified): after a few requests with a query string (for example
-      `/api/open-items?q=test`) open Workers Logs and confirm no stored URL contains `?q=` or an OAuth
+      `/api/invoices?q=test`) open Workers Logs and confirm no stored URL contains `?q=` or an OAuth
       `code`, and that no per-request invocation line is kept.
 
 ## Step 10. Connect Exact and run the first-live-connection checklist
@@ -335,14 +345,16 @@ sync panel on the test division.
     (Run now on `exact.full_sync`): compare the counts and totals of `open_items` with Exact's own
     creditors and debtors ageing, and `exact_usage` with the remaining-calls header. When this
     passes, enable `exact.full_sync` and then `exact.incremental_sync` in Settings, Schedules, and
-    re-run the Run now check of step 9 (expect `OK`). Mind the budget: the defaults cost up to 1,960
+    re-run the Run now check of step 9 (expect `OK`). The "First sync procedure" below spells this
+    item out step by step. Mind the budget: the defaults cost up to 1,960
     of Exact's 5,000 daily calls per administration (ADR 0021); the gate stops jobs at 4,500.
 11. **Subrequest limit and D1 batches.** Which per-invocation subrequest limit the account has
     (we assume 1,000, `SUBREQUEST_LIMIT`), and whether one `db.batch` of up to 100 statements
     counts as one subrequest (we count it as one). Run a full pass on the largest division and
     read the Worker's subrequest count from the invocation logs (ADR 0017 verify 8; invocation
-    logs are off in `wrangler.toml`, so for this check switch them on temporarily on **staging**
-    only, or use `wrangler tail`, which does not need them). The queue runner's own heartbeats and
+    logs are off in `wrangler.toml`, so use `wrangler tail --env staging`, which does not need
+    them; switching them on, even on staging, means bypassing the deploy guard and is not
+    recommended). The queue runner's own heartbeats and
     finish writes are not in that meter (review S7). Also check the **CPU limit**: Workers allow
     30 s of CPU per invocation by default and `[limits] cpu_ms = 30000` in `wrangler.toml` states
     it. A full pass is bounded by calls, not CPU, but JSON parsing of a large division is the
@@ -463,10 +475,13 @@ sync panel on the test division.
 its own D1 database `camelthorn-finance-staging`, queues `camelthorn-jobs-staging` and
 `camelthorn-jobs-staging-dlq`, its own `ExactGate` and `JobLock` objects (a Durable Object namespace
 belongs to its Worker), its own variables and cron. Nothing is shared with production, and the
-deploy guard refuses a staging that reuses the production Worker name, D1 id or name, a queue or a
-redirect URI.
+deploy guard refuses a staging that reuses the production Worker name, D1 id or name, a queue, a
+route or a redirect URI. `routes = []` is committed in `[env.staging]` on purpose: without the key
+staging would inherit the production route, and a plain `wrangler deploy --env staging` would move
+the production hostname to the staging Worker (wrangler only warns).
 
-Procedure: do steps 0 to 7 for staging, then 8 to 10 on staging **before** touching production.
+Procedure: do steps 0 to 7 for staging, then 8 to 10 and the "First sync procedure" on staging
+**before** touching production.
 
 1. Step 0: pick a staging hostname (for example `staging.<your domain>`). Either create a second
    Google OAuth client for it, or reuse the production client and add the staging redirect URI
@@ -493,8 +508,9 @@ Procedure: do steps 0 to 7 for staging, then 8 to 10 on staging **before** touch
 7. Steps 8, 9 and 10 against the staging hostname, with `--env staging` and the staging database
    name in every `wrangler` command. Record the answers to the step 10 checklist in the ADRs it
    names.
-8. Only when step 10 and the "First sync procedure" below pass on staging, repeat steps 2 to 9 for
-   production with production names.
+8. Only when step 10 and the "First sync procedure" below pass on staging, repeat steps 2 to 10
+   for production with production names (step 10 there on the real administration, with the Exact
+   jobs off until the "First sync procedure" passes on production too).
 
 What differs on staging: Worker name, hostname, D1 database, queues, objects, secrets and
 `TOKEN_ENC_KEY`, the Exact division (test data) and, if you made one, the Google client. What must
@@ -518,14 +534,14 @@ Proposed by the Phase 4 final review. Follow it on staging, then on production.
    debtors and creditors ageing; the balance sheet for the last closed month against Exact's trial
    balance (step 10 item 15); the HTTP status codes in `sync_state.last_error` for every entity
    (none left over); `GET /api/approvals/status-codes` against Exact's UI (item 16).
-4. Read `exact_usage` (`wrangler d1 execute <db> --remote --command "SELECT * FROM exact_usage ORDER
+4. Read `exact_usage` (`wrangler d1 execute <db> --remote --env staging --command "SELECT * FROM exact_usage ORDER
    BY 1 DESC LIMIT 20"`) and the remaining-calls header. A first full cycle costs a few hundred
    calls; the defaults allow up to 1,960 per administration and day (ADR 0021).
 5. Enable `exact.full_sync` (nightly, 02:00) in Settings, Schedules. Look at the next morning's run.
 6. Then enable the hourly `exact.incremental_sync`. Check one day of hourly runs (2 to 4 calls
    each) and the daily total in `exact_usage`.
 7. Repeat the whole procedure on production with the real administration, starting again with the
-   jobs off and a daytime Run now.
+   jobs off and a daytime Run now (commands without `--env staging`, production database name).
 
 ---
 
@@ -543,9 +559,11 @@ Pick the first that works:
    `pnpm exec wrangler queues pause-delivery camelthorn-jobs` (resume with `resume-delivery`) or
    `pnpm exec wrangler queues purge camelthorn-jobs`. Commands exist in wrangler 4.160 help;
    behaviour **unverified**. A paused queue builds up messages that run when delivery resumes.
-3. Remove the cron: delete the `[triggers]` block, deploy with `pnpm exec wrangler deploy` (the
-   guard would refuse, so this bypasses `run deploy` on purpose), and put it back afterwards. Manual
-   "Run now" still works.
+3. Remove the cron: set `crons = []` in `[triggers]` and deploy with
+   `pnpm exec wrangler deploy --env=""` (the guard would refuse, so this bypasses `run deploy` on
+   purpose); put it back afterwards. Do **not** delete the `[triggers]` block instead: wrangler 4.160
+   only sends the schedules when `crons` is set, so a missing block leaves the deployed cron running.
+   Manual "Run now" still works.
 
 Re-enabling: switch jobs back on in the app. A job switched on starts counting from that moment;
 missed slots are not replayed (ADR 0021).
@@ -627,11 +645,11 @@ encrypted Exact tokens, IBANs and the audit log: store them as sensitive.
 2. Apply migrations before the code that needs them, and keep each migration compatible with the
    previous release, so `pnpm exec wrangler rollback` (code only; does not touch D1 or Durable
    Object migrations; **unverified** here) stays possible.
-3. If `migrations apply` fails part way, run `migrations list` and read the error. Cloudflare
-   documents that a migration file that fails is rolled back as a whole and is not recorded as
-   applied, and `wrangler d1 migrations apply --help` says it prompts first and captures a backup
-   after applying; the help text does not state the rollback itself, so confirm it on the first
-   failure (check the tables the file touches before re-running).
+3. If `migrations apply` fails part way, run `migrations list` and read the error. `wrangler d1
+   migrations apply --help` (4.160) says it prompts first (skipped when not interactive), captures a
+   backup, and that a migration that errors "will be rolled back, and the previous successful
+   migration will remain applied". Still check the tables the file touches before re-running
+   (**unverified** on this account).
 4. If data is damaged, stop the jobs (above), take an export, then use Time Travel (above) to
    restore to just before the apply.
 

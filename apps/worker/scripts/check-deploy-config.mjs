@@ -6,9 +6,14 @@ import { readFileSync } from "node:fs";
 import { deployConfigProblems } from "./deploy-config.mjs";
 
 const args = process.argv.slice(2);
-const flag = args.indexOf("--env");
-const env = flag >= 0 ? args[flag + 1] : "production";
-if (!env || env.startsWith("--")) {
+const flag = args.findIndex((a) => a === "--env" || a.startsWith("--env="));
+const env =
+  flag < 0 ? "production" : args[flag].startsWith("--env=") ? args[flag].slice(6) : args[flag + 1];
+if (
+  !env ||
+  env.startsWith("-") ||
+  args.length > (flag < 0 ? 0 : args[flag].includes("=") ? 1 : 2)
+) {
   console.error("Usage: check-deploy-config.mjs [--env <name>]");
   process.exit(2);
 }
@@ -22,4 +27,4 @@ if (problems.length > 0) {
   for (const p of problems) console.error(`  - ${p}`);
   process.exit(1);
 }
-console.log(`wrangler.toml (${env}): no placeholders left.`);
+console.log(`wrangler.toml (${env}): no placeholders left, isolated from the other environments.`);

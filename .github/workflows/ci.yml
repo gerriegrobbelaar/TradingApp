@@ -14,7 +14,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # The event name keeps a manual run (screens) and a push to the same branch from cancelling each
+  # other.
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -67,7 +69,8 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: sudo apt-get update && sudo apt-get install -y poppler-utils
-      - run: npm install --prefix "$RUNNER_TEMP/pw" playwright
+      # Pinned (not in the lockfile on purpose: only this optional job needs it); no install scripts.
+      - run: npm install --prefix "$RUNNER_TEMP/pw" --ignore-scripts --no-audit --no-fund playwright@1.63.0
       - run: pnpm --filter @camelthorn/web build
       - run: pnpm --filter @camelthorn/web exec vitest run --config scripts/vitest.screens.config.ts
         env:
