@@ -33,10 +33,11 @@ let fx: FakeExact;
 let gate: FakeGate;
 let n = 0;
 /**
- * Exact calls before the ledger in a full run: divisions, receivables, payables, relations, IBANs
- * and the (empty) purchase-entry read, which runs before the ledger (review K4, ADR 0025).
+ * Exact calls before the ledger in a full run: divisions, receivables, payables, relations
+ * and the (empty) purchase-entry read, which runs before the ledger (review K4, ADR 0025). The IBAN
+ * read comes after the ledger (review S10).
  */
-const PRE = 6;
+const PRE = 5;
 
 beforeEach(async () => {
   await resetSync();
