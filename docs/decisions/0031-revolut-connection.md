@@ -1,4 +1,4 @@
-# 0030 Revolut Business connection: gate, tokens, connect flow
+# 0031 Revolut Business connection: gate, tokens, connect flow
 
 Status: accepted for Phase 5 (task R2). Everything marked **verify with credentials** is an
 assumption about the Revolut Business API that has not been checked against a live sandbox.

@@ -1,7 +1,7 @@
 /**
  * D1 access for the Revolut connection row. Tokens and webhook signing secrets are encrypted
  * before they reach this layer (crypto/token-crypto.ts); the row types here never carry plaintext.
- * v1 has exactly one Revolut connection (kind 'revolut', name 'revolut'); see ADR 0030.
+ * v1 has exactly one Revolut connection (kind 'revolut', name 'revolut'); see ADR 0031.
  */
 import { auditStatement } from "../db/audit";
 import { decryptToken, encryptToken, keyring } from "../crypto/token-crypto";

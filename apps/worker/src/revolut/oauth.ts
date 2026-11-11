@@ -2,13 +2,19 @@
  * Revolut Business OAuth 2.0 calls: consent URL, authorization-code exchange and refresh, both
  * authenticated with a signed client assertion (JWT, private_key_jwt style) instead of a client
  * secret. Shared by the connect callback and the RevolutGate. Nothing here logs; errors carry
- * codes only. Wire-format assumptions: docs/decisions/0030-revolut-connection.md (UNVERIFIED
+ * codes only. Wire-format assumptions: docs/decisions/0031-revolut-connection.md (UNVERIFIED
  * until a live sandbox connection exists).
  *
  * The pure helpers (client assertion, consent URL, token parsing) come from @camelthorn/revolut
  * (task R1); this file is the one adapter around them.
  */
-import { buildAuthorizeUrl, buildClientAssertion, parseTokenResponse } from "@camelthorn/revolut";
+import {
+  buildAuthorizeUrl,
+  buildClientAssertion,
+  buildTokenRequestBody,
+  parseTokenResponse,
+  type RevolutTokens,
+} from "@camelthorn/revolut";
 import {
   revolutApiHost,
   revolutConsentHost,
@@ -86,21 +92,26 @@ async function post(
   } catch {
     throw new TokenEndpointError("bad_config");
   }
-  const form: Record<string, string> =
+  const body =
     grant.kind === "authorization_code"
-      ? { grant_type: "authorization_code", code: grant.code }
-      : { grant_type: "refresh_token", refresh_token: grant.refreshToken };
+      ? buildTokenRequestBody({
+          grant: "authorization_code",
+          code: grant.code,
+          clientId: cfg.clientId,
+          clientAssertion: assertion,
+        })
+      : buildTokenRequestBody({
+          grant: "refresh_token",
+          refreshToken: grant.refreshToken,
+          clientId: cfg.clientId,
+          clientAssertion: assertion,
+        });
   let res: Response;
   try {
     res = await fetch(`https://${revolutApiHost(environment)}/api/1.0/auth/token`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
-      body: new URLSearchParams({
-        ...form,
-        client_id: cfg.clientId,
-        client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-        client_assertion: assertion,
-      }).toString(),
+      body,
       // A 307/308 would re-send the assertion and refresh token to wherever it points: never follow.
       redirect: "manual",
       signal: AbortSignal.timeout(20_000),
@@ -131,29 +142,20 @@ async function post(
   if (code !== "" && obj.access_token === undefined) {
     throw new TokenEndpointError(code === "invalid_grant" ? "invalid_grant" : "rejected");
   }
-  let parsed;
+  let parsed: RevolutTokens;
   try {
+    // R1's parser: access_token printable, token_type bearer, expires_in an integer 1..604800.
     parsed = parseTokenResponse(text);
   } catch {
     throw new TokenEndpointError("malformed");
   }
-  if (
-    typeof parsed.accessToken !== "string" ||
-    parsed.accessToken === "" ||
-    !Number.isFinite(parsed.expiresInS) ||
-    parsed.expiresInS <= 0
-  ) {
-    throw new TokenEndpointError("malformed");
-  }
   const refreshToken =
-    typeof parsed.refreshToken === "string" && parsed.refreshToken !== ""
-      ? parsed.refreshToken
-      : null;
+    parsed.refreshToken !== undefined && parsed.refreshToken !== "" ? parsed.refreshToken : null;
   // The first exchange must deliver a refresh token; without one the connection could not last.
   if (grant.kind === "authorization_code" && refreshToken === null) {
     throw new TokenEndpointError("malformed");
   }
-  return { accessToken: parsed.accessToken, refreshToken, expiresInS: parsed.expiresInS };
+  return { accessToken: parsed.accessToken, refreshToken, expiresInS: parsed.expiresInSeconds };
 }
 
 export const exchangeCode = (

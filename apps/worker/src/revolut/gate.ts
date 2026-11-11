@@ -1,6 +1,6 @@
 /**
  * RevolutGate: one Durable Object per Revolut connection ("revolut:<connectionId>") that every
- * Revolut call goes through (docs/decisions/0030-revolut-connection.md, mirroring ExactGate,
+ * Revolut call goes through (docs/decisions/0031-revolut-connection.md, mirroring ExactGate,
  * docs/decisions/0015-exactgate-design.md).
  *
  * Unlike Exact, Revolut has one API host and one rate-limit scope per connection, so the gate

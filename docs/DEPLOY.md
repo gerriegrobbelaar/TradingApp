@@ -85,7 +85,7 @@ the deploy check refuses a leftover `DO_JURISDICTION_DISABLED`. Step 9 confirms 
 **Durable Object migration tags.** `wrangler.toml` declares `ExactGate` (binding `EXACT_GATE`) in
 `[[migrations]]` with `tag = "v1"` and `JobLock` (binding `JOB_LOCK`, the scheduler's per-job
 no-overlap lease) with `tag = "v2"`, and `RevolutGate` (binding `REVOLUT_GATE`, one per Revolut
-connection, ADR 0030) with `tag = "v3"`, all in `new_sqlite_classes`. Never edit or reuse a deployed
+connection, ADR 0031) with `tag = "v3"`, all in `new_sqlite_classes`. Never edit or reuse a deployed
 tag: a new class or a rename needs a new `[[migrations]]` entry with the next tag (`v4`).
 
 ## Step 3. Create the queues

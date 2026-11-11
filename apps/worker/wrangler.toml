@@ -11,7 +11,7 @@
 #   - [triggers] crons = ["* * * * *"]: the scheduler tick, once a minute (do not change it);
 #   - the ExactGate Durable Object binding with migration tag v1 (sqlite), the JobLock binding
 #     (per-job no-overlap lease, ADR 0021) with migration tag v2, and the RevolutGate binding
-#     (ADR 0030) with migration tag v3; never reuse or edit a deployed tag;
+#     (ADR 0031) with migration tag v3; never reuse or edit a deployed tag;
 #   - the JOBS_QUEUE producer, the consumer and its dead_letter_queue. Create both queues first, in
 #     the EU: `wrangler queues create camelthorn-jobs --jurisdiction eu` and the same for
 #     camelthorn-jobs-dlq (ADR 0028). The producer/consumer tables have no jurisdiction field in
@@ -134,7 +134,7 @@ tag = "v2"
 new_sqlite_classes = ["JobLock"]
 
 # One RevolutGate per Revolut connection ("revolut:<connection id>"): rate limit, per-job budgets
-# and the token refresh (ADR 0030).
+# and the token refresh (ADR 0031).
 [[durable_objects.bindings]]
 name = "REVOLUT_GATE"
 class_name = "RevolutGate"
