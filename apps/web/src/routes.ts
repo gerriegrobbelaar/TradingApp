@@ -50,6 +50,7 @@ export const BUILT_PAGES: readonly string[] = [
   "/invoices",
   "/purchases/payables",
   "/purchases/approvals",
+  "/treasury/bank",
   "/reporting/balance-sheet",
   "/reporting/profit-loss",
   "/reporting/creditors-ageing",

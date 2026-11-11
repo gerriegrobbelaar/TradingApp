@@ -26,6 +26,9 @@ const WEB_ALLOWED = new Set([
   "./components/OpenItemDetailBody.tsx", // the sheet row "Amount as stored"
   "./components/AccountSheet.tsx", // ledger periods, unrelated to open items
   "./pages/Approvals.tsx", // purchase entries, unrelated
+  "./components/BankParts.tsx", // bank transaction amounts, unrelated to open items
+  "./pages/Bank.tsx", // bank transaction rows, unrelated to open items
+  "./components/BankTransactionSheet.tsx", // bank transaction detail, unrelated
 ]);
 const CORE_ALLOWED = new Set([
   "../../../packages/core/src/api-types.ts",

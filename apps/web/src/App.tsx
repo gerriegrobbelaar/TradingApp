@@ -17,6 +17,7 @@ import { ToastProvider, useToast } from "./toasts";
 import { ComingSoon, NotFound } from "./pages/Placeholder";
 import { Approvals } from "./pages/Approvals";
 import { CreditorsAgeing, ReceivablesAgeing } from "./pages/AgeingReport";
+import { Bank } from "./pages/Bank";
 import { BalanceSheet } from "./pages/BalanceSheet";
 import { Invoices } from "./pages/Invoices";
 import { Overview } from "./pages/Overview";
@@ -95,6 +96,7 @@ function SignedInShell() {
             <Route path="/invoices" element={<Invoices />} />
             <Route path="/purchases/payables" element={<Payables />} />
             <Route path="/purchases/approvals" element={<Approvals />} />
+            <Route path="/treasury/bank" element={<Bank />} />
             <Route path="/reporting/balance-sheet" element={<BalanceSheet />} />
             <Route path="/reporting/profit-loss" element={<ProfitLoss />} />
             <Route path="/reporting/creditors-ageing" element={<CreditorsAgeing />} />

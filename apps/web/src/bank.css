@@ -1,0 +1,101 @@
+/* Bank screen (R3b). Colours come from tokens; contrast is checked in contrast.test.ts. */
+.app .acct-grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 12px;
+}
+.app .acct-grid > li {
+  min-width: 0;
+}
+.app .acct {
+  width: 100%;
+  min-height: 44px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  text-align: left;
+  font: inherit;
+  color: var(--ink);
+  background: var(--fill);
+  border: 1px solid var(--control-line);
+  border-radius: 18px;
+  padding: 14px 16px;
+  cursor: pointer;
+}
+.app .acct:hover {
+  background: var(--hover);
+}
+.app .acct.sel {
+  background: var(--hover);
+  border-color: var(--accent-text);
+  box-shadow: inset 0 0 0 1px var(--accent-text);
+}
+.app .acct-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+}
+.app .acct-name {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.app .acct.off .acct-name,
+.app .acct.off .acct-bal {
+  color: var(--muted);
+}
+.app .acct-bal {
+  font-size: 22px;
+  line-height: 30px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.app .acct-totals {
+  margin-bottom: 14px;
+}
+.app .acct-totals .cap {
+  display: inline;
+}
+.app .tx-in {
+  color: var(--accent-text);
+}
+.app .tx-out {
+  color: var(--ink);
+}
+.app .tx-amt {
+  white-space: nowrap;
+}
+.app .tx-state {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+.app .tx-total {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px 16px;
+}
+.app .date-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.app .copyable {
+  user-select: all;
+  overflow-wrap: anywhere;
+}
+/* Neutral chips on an account card (fill on fill) use --ink, like chips in rows. */
+.app .acct .chip:not(.ok):not(.warn):not(.gold) {
+  color: var(--ink);
+}
+.app .dt-table .tx-state .chip,
+.app .drill .chip {
+  align-self: flex-start;
+}
