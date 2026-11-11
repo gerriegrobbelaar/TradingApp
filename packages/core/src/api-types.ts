@@ -1104,6 +1104,12 @@ export interface BookingSettingsResponse {
   backlogCount?: number;
   divisions?: number[];
   maxPerRun?: number;
+  /**
+   * Only with `GET ?bookingFrom=<ISO>` (U1 review): what moving the watermark there would do,
+   * before it is done. backlogCount: matches older than the proposed watermark; reopenedCount:
+   * live not-booked matches that would become bookable (not eligible under the current one).
+   */
+  proposed?: { bookingFrom: string; backlogCount: number; reopenedCount: number };
 }
 
 // ---- Booking request shapes (M7c, ADR 0044). One definition, shared with the web (M7d). ------
@@ -1113,9 +1119,12 @@ export interface BookingSettingsResponse {
 // at run time they defer the single match (`bookingDeferredCode`), they never stop the job.
 
 /**
- * PUT /api/booking/settings (admin). Two shapes, never mixed:
- *  - switch: {enabled, confirm, note?}. Enabling needs a fresh sign-in, confirm =
- *    BOOKING_ENABLE_PHRASE, every precondition, and sets bookingFrom to now.
+ * PUT /api/booking/settings (admin). Shapes:
+ *  - off: {enabled: false, note?} only (no step-up, no phrase).
+ *  - on: {enabled: true, confirm, note?, divisions?, maxPerRun?, bookingFrom?}. A fresh sign-in,
+ *    confirm = BOOKING_ENABLE_PHRASE, every precondition (seen with the divisions sent along).
+ *    divisions and maxPerRun are applied in the same batch (own audit row). The watermark becomes
+ *    NOW; a bookingFrom sent along can only move it later (at most a day ahead), never earlier.
  *  - limits (U1): {bookingFrom?, divisions?, maxPerRun?, note?} without `enabled`. Widening
  *    anything (an earlier bookingFrom, another division, a higher maxPerRun) needs a fresh sign-in.
  */

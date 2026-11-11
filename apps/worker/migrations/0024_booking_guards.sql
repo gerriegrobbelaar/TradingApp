@@ -22,6 +22,15 @@
 --        outbox_guard_status         the legal status transitions of an outbox row (S9). A row leaves
 --                                    outcome_unknown or failed for pending ONLY by an admin retry:
 --                                    needs_probe = 1 and admin_resolved_by/at set in the same UPDATE.
+--        outbox_guard_sent_facts     what proves that something MAY have been sent is never erased
+--                                    (review of U1): attempts only go down by one together with
+--                                    sending -> pending (a provably unsent POST), exact_ref is never
+--                                    cleared, a stage 'none' payload is never written or changed by an
+--                                    UPDATE, sending -> pending needs that given-back attempt or a probe.
+--        outbox_guard_delete         only an unsent stage 'none' row may be deleted (undo or retry of a
+--                                    claim that never reached Exact): with the rows gone a match may go
+--                                    back to not_booked, so deleting a row that was sent would re-open
+--                                    a booked match for a second booking.
 --      Rebuilding matches or exact_write_outbox later MUST recreate these triggers.
 
 -- (a) -------------------------------------------------------------------------------------------
@@ -122,8 +131,9 @@ BEGIN
           ('verified', 'outcome_unknown', 'failed', 'manual_required', 'resolved_manually', 'given_up'))
     OR (OLD.status = 'failed' AND NEW.status IN
           ('sending', 'pending', 'verified', 'manual_required', 'resolved_manually', 'given_up'))
-    OR (OLD.status = 'outcome_unknown' AND NEW.status IN
-          ('pending', 'verified', 'manual_required', 'resolved_manually', 'given_up'))
+    -- An unknown outcome is decided by a person only: retry (pending, probe first), booked by hand
+    -- (resolved_manually) or given up. Nothing in the app may call it verified.
+    OR (OLD.status = 'outcome_unknown' AND NEW.status IN ('pending', 'resolved_manually', 'given_up'))
     OR (OLD.status = 'manual_required' AND NEW.status IN ('resolved_manually', 'given_up')));
   -- Out of 'outcome_unknown' or 'failed' back to 'pending' only by a person's retry: the same
   -- UPDATE asks for a probe before any send and records who resolved it and when.
@@ -132,4 +142,32 @@ BEGIN
     AND NOT (NEW.needs_probe = 1 AND NEW.admin_resolved_by IS NOT NULL AND NEW.admin_resolved_at IS NOT NULL
              AND (NEW.admin_resolved_at IS NOT OLD.admin_resolved_at
                   OR NEW.admin_resolved_by IS NOT OLD.admin_resolved_by));
+END;
+
+-- The facts that say something MAY be in Exact are never erased (U1 review). The undo/retry of an
+-- unsent claim (matches_guard_undo_claimed, matches_guard_exact_state, outbox_guard_delete) trusts
+-- `attempts = 0`, `exact_ref IS NULL` and the stage 'none' payload: none of them can be forged later.
+CREATE TRIGGER outbox_guard_sent_facts BEFORE UPDATE ON exact_write_outbox
+BEGIN
+  SELECT RAISE(ABORT, 'booking_err:sent_facts')
+  WHERE NEW.attempts < OLD.attempts
+    AND NOT (OLD.status = 'sending' AND NEW.status = 'pending' AND NEW.attempts = OLD.attempts - 1);
+  SELECT RAISE(ABORT, 'booking_err:sent_facts')
+  WHERE OLD.exact_ref IS NOT NULL AND NEW.exact_ref IS NOT OLD.exact_ref AND NEW.exact_ref IS NULL;
+  SELECT RAISE(ABORT, 'booking_err:sent_facts')
+  WHERE NEW.payload_json IS NOT OLD.payload_json
+    AND ((json_valid(NEW.payload_json) AND json_extract(NEW.payload_json, '$.stage') = 'none')
+      OR (json_valid(OLD.payload_json) AND json_extract(OLD.payload_json, '$.stage') = 'none'));
+  -- Back from sending to pending only when the POST provably did not leave (the attempt is given
+  -- back) or with a probe before any new send (429).
+  SELECT RAISE(ABORT, 'booking_err:sent_facts')
+  WHERE OLD.status = 'sending' AND NEW.status = 'pending'
+    AND NOT (NEW.attempts = OLD.attempts - 1 OR NEW.needs_probe = 1);
+END;
+
+CREATE TRIGGER outbox_guard_delete BEFORE DELETE ON exact_write_outbox
+WHEN NOT (json_valid(OLD.payload_json) AND json_extract(OLD.payload_json, '$.stage') = 'none'
+          AND OLD.status = 'manual_required' AND OLD.attempts = 0 AND OLD.exact_ref IS NULL)
+BEGIN
+  SELECT RAISE(ABORT, 'booking_err:not_deletable');
 END;

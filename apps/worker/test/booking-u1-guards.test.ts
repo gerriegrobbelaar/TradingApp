@@ -163,7 +163,8 @@ describe("S9b: the status transitions of an outbox row", () => {
       "given_up",
     ],
     failed: ["sending", "pending", "verified", "manual_required", "resolved_manually", "given_up"],
-    outcome_unknown: ["pending", "verified", "manual_required", "resolved_manually", "given_up"],
+    // A person decides an unknown outcome (U1 review): nothing in the app may call it verified.
+    outcome_unknown: ["pending", "resolved_manually", "given_up"],
     manual_required: ["resolved_manually", "given_up"],
     verified: [],
     resolved_manually: [],
@@ -236,10 +237,30 @@ describe("S9b: the status transitions of an outbox row", () => {
   });
 
   it("the executor's own moves out of 'sending' and 'waiting' to pending need no admin", async () => {
+    // not sent: the attempt is given back
     const id = await rowIn("sending");
-    await run("UPDATE exact_write_outbox SET status = 'pending' WHERE match_id = ?1", id);
+    await run("UPDATE exact_write_outbox SET attempts = 1 WHERE match_id = ?1", id);
+    await run(
+      "UPDATE exact_write_outbox SET status = 'pending', attempts = 0 WHERE match_id = ?1",
+      id,
+    );
+    // 429: the attempt counts, a probe comes first
+    const id3 = await rowIn("sending");
+    await run(
+      "UPDATE exact_write_outbox SET status = 'pending', needs_probe = 1 WHERE match_id = ?1",
+      id3,
+    );
     const id2 = await rowIn("waiting_for_bank_line");
     await run("UPDATE exact_write_outbox SET status = 'pending' WHERE match_id = ?1", id2);
+  });
+
+  it("sending -> pending with neither the attempt given back nor a probe is refused", async () => {
+    const id = await rowIn("sending");
+    await run("UPDATE exact_write_outbox SET attempts = 1 WHERE match_id = ?1", id);
+    await expect(
+      run("UPDATE exact_write_outbox SET status = 'pending' WHERE match_id = ?1", id),
+    ).rejects.toThrow(/booking_err:sent_facts/);
+    expect((await outbox(id))[0]?.status).toBe("sending");
   });
 
   it("a finished row never changes, whatever the column", async () => {

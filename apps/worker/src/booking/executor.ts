@@ -47,7 +47,7 @@ import {
   WAIT_FOR_LINE_MS,
 } from "./constants";
 import { bookingMayRun, loadBookingState, runBlockersOf, writesPermitted } from "./settings";
-import { readItemsBack } from "./readback";
+import { readBankLineBack, readItemsBack } from "./readback";
 import {
   ourPostMayHaveLanded,
   PREFLIGHT_CODE,
@@ -335,6 +335,8 @@ interface WorkRow extends OutboxRow {
   tx_state_conflict: number;
   exact_division: number;
   map_journal: string | null;
+  /** The admin's opening balance on the account map NOW (it may have changed since the claim). */
+  map_opening: number | null;
   tx_conn_mode: number | null;
   tx_conn_decided: string | null;
 }
@@ -346,7 +348,7 @@ const WORK_SELECT = `SELECT ${OUTBOX_COLUMNS.split(",")
        t.amount_minor AS tx_amount, t.currency AS tx_currency, t.booked_at AS tx_booked_at,
        t.bank_account_id AS tx_account_id, t.is_final AS tx_is_final, t.state AS tx_state,
        t.state_conflict AS tx_state_conflict, d.exact_division, mp.journal_code AS map_journal,
-       rc.creates_bank_entries AS tx_conn_mode, rc.bank_entries_decided_at AS tx_conn_decided
+       mp.opening_balance_minor AS map_opening, rc.creates_bank_entries AS tx_conn_mode, rc.bank_entries_decided_at AS tx_conn_decided
      FROM exact_write_outbox o
        JOIN matches m ON m.id = o.match_id
        JOIN bank_transactions t ON t.id = m.bank_transaction_id
@@ -717,6 +719,35 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
     if (ok) count("verified");
   }
 
+  /**
+   * The items are closed and our earlier POST may have landed: booked ONLY when the bank line we
+   * name in the MatchSet is closed as well (readBankLineBack, assumption A15c). A bank line that is
+   * still open means somebody else settled the items: a person looks (`already_settled_in_exact`).
+   * Anything unclear is never taken as booked. A failed read leaves the row for a later run.
+   */
+  async function finishIfOurs(
+    w: WorkRow,
+    token: string,
+    input: MatchsetPlanInput,
+    from: OutboxStatus,
+  ): Promise<void> {
+    const rt = await division(w.division_id, w.exact_division);
+    const line = await readOr(() => readBankLineBack(rt.writer, input));
+    if (!line.ok) {
+      await releaseLease(w.id, token);
+      count("deferred");
+      return;
+    }
+    if (line.value.outcome === "verified") {
+      return finishMatchset(w, token, "verified_by_readback", null);
+    }
+    const code =
+      line.value.outcome === "not_applied"
+        ? PREFLIGHT_CODE.already_settled
+        : "bank_line_readback_inconclusive";
+    return giveUpToManual(w, token, code, [from]);
+  }
+
   // -- bank entry row ------------------------------------------------------------------------------
 
   async function verifiedBankEntry(
@@ -922,9 +953,11 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
         count("deferred");
         return;
       }
+      // Still no entry: the admin's opening balance holds only while it is still the one the row was
+      // built on (an admin who corrected it meant the corrected figure: a person rebuilds the match).
       const unchanged =
         bal.value === null
-          ? doc.openingFromAdmin === true // still no entry: the admin's opening balance still holds
+          ? doc.openingFromAdmin === true && w.map_opening === doc.input.openingBalanceMinor
           : doc.openingFromAdmin !== true && bal.value === doc.input.openingBalanceMinor;
       if (!unchanged) {
         return giveUpToManual(w, token, "bank_balance_changed");
@@ -1194,9 +1227,11 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
       if (pf !== "open_as_expected") return giveUpToManual(w, token, PREFLIGHT_CODE[pf]);
     } else if (verdict.outcome === "verified") {
       // We did send before and the answer was lost or unclear: the closed items may be ours. After
-      // an explicit refusal they are not (a person checks).
+      // an explicit refusal they are not (a person checks). Even then, closed items are only OUR
+      // doing when our bank line is closed too (somebody may have settled the invoice with another
+      // payment meanwhile): `ourMatchClosed` reads it.
       if (ourPostMayHaveLanded(w.attempts, w.last_error_code)) {
-        return finishMatchset(w, token, "verified_by_readback", null);
+        return finishIfOurs(w, token, doc.input, w.status);
       }
       return giveUpToManual(w, token, PREFLIGHT_CODE.already_settled);
     } else if (verdict.outcome === "inconclusive") {
@@ -1268,7 +1303,7 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
       await releaseLease(w.id, token);
       return;
     }
-    return decideAfterPost(sentRow, token, check.value, false);
+    return decideAfterPost(sentRow, token, check.value, null);
   }
 
   async function unknownAfterPost(w: WorkRow, token: string, code: string): Promise<void> {
@@ -1295,15 +1330,23 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
     w: WorkRow,
     token: string,
     v: ReadBackVerdict,
-    later: boolean,
+    /** The plan input when this is a LATER run's look at an earlier POST; null right after it. */
+    later: MatchsetPlanInput | null,
   ): Promise<void> {
-    if (v.outcome === "verified") return finishMatchset(w, token, "posted", null);
+    const isLater = later !== null;
+    if (v.outcome === "verified") {
+      // Right after our own POST (same run, seconds after a preflight that saw the items open) the
+      // closed items are ours. In a LATER run (hours may have passed) somebody else may have
+      // settled them: our bank line must be closed too.
+      if (later !== null) return finishIfOurs(w, token, later, "sent_unverified");
+      return finishMatchset(w, token, "posted", null);
+    }
     if (v.outcome === "inconclusive") return unknownAfterPost(w, token, "readback_inconclusive");
     if (w.last_error_code !== "matchset_refused") {
       if (w.last_error_code === "matchset_answer_unreadable") {
         return unknownAfterPost(w, token, "matchset_answer_unreadable");
       }
-      if (later && nowMs() - Date.parse(w.updated_at) > UNVERIFIED_MAX_MS) {
+      if (isLater && nowMs() - Date.parse(w.updated_at) > UNVERIFIED_MAX_MS) {
         return unknownAfterPost(w, token, "not_visible_after_post");
       }
       await releaseLease(w.id, token);
@@ -1343,7 +1386,7 @@ export async function runBookMatches(ctx: JobContext): Promise<HandlerResult> {
       await releaseLease(w.id, token);
       return;
     }
-    return decideAfterPost(w, token, r.value, true);
+    return decideAfterPost(w, token, r.value, doc.input);
   }
 
   // -- the loop --------------------------------------------------------------------------------------

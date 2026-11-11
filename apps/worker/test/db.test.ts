@@ -8,6 +8,7 @@ import {
   completeIdempotencyKey,
 } from "../src/db/idempotency";
 import { ensureSeeded, resetSeedMemoForTests, seedInitialAdmin } from "../src/db/seed";
+import { outboxWipeStatements } from "./outbox-wipe";
 
 const db = env.DB;
 
@@ -48,7 +49,7 @@ async function seedDomain(): Promise<void> {
 async function clearDomain(): Promise<void> {
   await db.batch([
     db.prepare("DELETE FROM payments"),
-    db.prepare("DELETE FROM exact_write_outbox"),
+    ...(await outboxWipeStatements(db)),
     db.prepare("DELETE FROM match_allocations"),
     db.prepare("DELETE FROM matches"),
     db.prepare("DELETE FROM bank_account_exact_map"),

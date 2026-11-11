@@ -132,9 +132,23 @@ async function backlogCountOf(db: D1Database, bookingFrom: string | null): Promi
   return r?.n ?? 0;
 }
 
-async function settingsResponse(db: D1Database): Promise<BookingSettingsResponse> {
+async function settingsResponse(
+  db: D1Database,
+  proposedFrom: string | null = null,
+): Promise<BookingSettingsResponse> {
   const s = await loadBookingState(db);
+  const proposed =
+    proposedFrom === null
+      ? {}
+      : {
+          proposed: {
+            bookingFrom: proposedFrom,
+            backlogCount: await backlogCountOf(db, proposedFrom),
+            reopenedCount: await reopenedCountOf(db, s.bookingFrom, proposedFrom),
+          },
+        };
   return {
+    ...proposed,
     enabled: s.enabled,
     verified: s.verified,
     protocolVersion: s.protocolVersion,
@@ -148,8 +162,14 @@ async function settingsResponse(db: D1Database): Promise<BookingSettingsResponse
   };
 }
 
+/**
+ * `?bookingFrom=<ISO>` adds `proposed`: the backlog and the number of matches an admin would make
+ * bookable by moving the watermark there (shown BEFORE the change is made).
+ */
 async function getSettingsHandler(ctx: Ctx): Promise<Response> {
-  return json(await settingsResponse(ctx.env.DB));
+  const raw = ctx.url.searchParams.get("bookingFrom");
+  const proposed = raw === null ? null : parseBookingFrom(raw, ctx.nowMs);
+  return json(await settingsResponse(ctx.env.DB, proposed));
 }
 
 const UPSERT_SETTING = `INSERT INTO settings (key, value_json, updated_by) VALUES (?1, ?2, ?3)
@@ -158,34 +178,72 @@ const UPSERT_SETTING = `INSERT INTO settings (key, value_json, updated_by) VALUE
 
 const MAX_DIVISIONS = 20;
 
+interface ParsedLimits {
+  stmts: D1PreparedStatement[];
+  before: Record<string, unknown>;
+  after: Record<string, unknown>;
+  /** Anything that lets MORE be written to Exact (needs a fresh sign-in). */
+  widening: boolean;
+  /** The allow-list after the change (null = unchanged). */
+  divisions: number[] | null;
+  /** Matches that become bookable by an earlier watermark (audited). */
+  reopenedCount: number;
+}
+
+/** Live, not-booked matches eligible under `proposed` but not under `current` (null = never on). */
+async function reopenedCountOf(
+  db: D1Database,
+  current: string | null,
+  proposed: string,
+): Promise<number> {
+  const r = await db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM matches
+       WHERE undone_at IS NULL AND exact_state = 'not_booked'
+         AND created_at >= ?1 AND (?2 IS NULL OR created_at < ?2)`,
+    )
+    .bind(proposed, current)
+    .first<{ n: number }>();
+  return r?.n ?? 0;
+}
+
+/** A watermark from the body: ISO, after 2000, at most a day ahead of now. */
+function parseBookingFrom(raw: unknown, nowMs: number): string {
+  if (typeof raw !== "string" || raw.length > 40) throw new ApiError("bad_booking_from");
+  const ms = Date.parse(raw);
+  if (!Number.isFinite(ms) || ms < Date.parse("2000-01-01T00:00:00Z")) {
+    throw new ApiError("bad_booking_from");
+  }
+  if (ms > nowMs + BOOKING_FROM_MAX_FUTURE_MS) throw new ApiError("booking_from_in_future");
+  return new Date(ms).toISOString();
+}
+
 /** The limits of booking (U1, review B2b/c): the watermark, the allow-list and the per-run cap. */
-async function putLimits(
+async function parseLimits(
   ctx: Ctx,
   b: Record<string, unknown>,
   who: string,
-  why: string | null,
-): Promise<Response> {
+  before: Awaited<ReturnType<typeof loadBookingState>>,
+  withWatermark: boolean,
+): Promise<ParsedLimits> {
   const db = ctx.env.DB;
-  const before = await loadBookingState(db);
-  const stmts: D1PreparedStatement[] = [];
-  const beforeJson: Record<string, unknown> = {};
-  const afterJson: Record<string, unknown> = {};
-  let widening = false;
-
-  if (b["bookingFrom"] !== undefined) {
-    const raw = b["bookingFrom"];
-    if (typeof raw !== "string" || raw.length > 40) throw new ApiError("bad_booking_from");
-    const ms = Date.parse(raw);
-    if (!Number.isFinite(ms) || ms < Date.parse("2000-01-01T00:00:00Z")) {
-      throw new ApiError("bad_booking_from");
-    }
-    if (ms > ctx.nowMs + BOOKING_FROM_MAX_FUTURE_MS) throw new ApiError("booking_from_in_future");
-    const next = new Date(ms).toISOString();
+  const out: ParsedLimits = {
+    stmts: [],
+    before: {},
+    after: {},
+    widening: false,
+    divisions: null,
+    reopenedCount: 0,
+  };
+  if (withWatermark && b["bookingFrom"] !== undefined) {
+    const next = parseBookingFrom(b["bookingFrom"], ctx.nowMs);
     // Moving the watermark LATER only narrows what is booked; anything else widens it.
-    if (before.bookingFrom === null || next < before.bookingFrom) widening = true;
-    beforeJson["bookingFrom"] = before.bookingFrom;
-    afterJson["bookingFrom"] = next;
-    stmts.push(db.prepare(UPSERT_SETTING).bind(SETTING_FROM, JSON.stringify(next), who));
+    if (before.bookingFrom === null || next < before.bookingFrom) out.widening = true;
+    out.reopenedCount = await reopenedCountOf(db, before.bookingFrom, next);
+    out.before["bookingFrom"] = before.bookingFrom;
+    out.after["bookingFrom"] = next;
+    out.after["reopenedCount"] = out.reopenedCount;
+    out.stmts.push(db.prepare(UPSERT_SETTING).bind(SETTING_FROM, JSON.stringify(next), who));
   }
   if (b["divisions"] !== undefined) {
     const raw = b["divisions"];
@@ -210,37 +268,55 @@ async function putLimits(
       ).results;
       if (known.length !== ids.length) throw new ApiError("unknown_division", 422);
     }
-    if (ids.some((id) => !before.divisions.includes(id))) widening = true;
-    beforeJson["divisions"] = before.divisions;
-    afterJson["divisions"] = ids;
-    stmts.push(db.prepare(UPSERT_SETTING).bind(SETTING_DIVISIONS, JSON.stringify(ids), who));
+    if (ids.some((id) => !before.divisions.includes(id))) out.widening = true;
+    out.divisions = ids;
+    out.before["divisions"] = before.divisions;
+    out.after["divisions"] = ids;
+    out.stmts.push(db.prepare(UPSERT_SETTING).bind(SETTING_DIVISIONS, JSON.stringify(ids), who));
   }
   if (b["maxPerRun"] !== undefined) {
     const raw = b["maxPerRun"];
     if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1 || raw > MAX_MAX_PER_RUN) {
       throw new ApiError("bad_max_per_run");
     }
-    if (raw > before.maxPerRun) widening = true;
-    beforeJson["maxPerRun"] = before.maxPerRun;
-    afterJson["maxPerRun"] = raw;
-    stmts.push(db.prepare(UPSERT_SETTING).bind(SETTING_MAX_PER_RUN, JSON.stringify(raw), who));
+    if (raw > before.maxPerRun) out.widening = true;
+    out.before["maxPerRun"] = before.maxPerRun;
+    out.after["maxPerRun"] = raw;
+    out.stmts.push(db.prepare(UPSERT_SETTING).bind(SETTING_MAX_PER_RUN, JSON.stringify(raw), who));
   }
-  if (stmts.length === 0) throw new ApiError("bad_request");
+  return out;
+}
+
+const limitsAudit = (
+  db: D1Database,
+  who: string,
+  l: ParsedLimits,
+  why: string | null,
+): D1PreparedStatement =>
+  auditStatement(db, {
+    actorEmail: who,
+    action: "booking.limits_changed",
+    entity: "settings",
+    entityId: "exact.booking_limits",
+    before: l.before,
+    after: { ...l.after, ...(why !== null ? { note: why } : {}) },
+  });
+
+async function putLimits(
+  ctx: Ctx,
+  b: Record<string, unknown>,
+  who: string,
+  why: string | null,
+): Promise<Response> {
+  const db = ctx.env.DB;
+  const before = await loadBookingState(db);
+  const l = await parseLimits(ctx, b, who, before, true);
+  if (l.stmts.length === 0) throw new ApiError("bad_request");
   // Widening what may be written to Exact needs a fresh sign-in; narrowing is the safe direction.
-  if (widening && (!ctx.session || !isStepUpFresh(ctx.session, ctx.nowMs))) {
+  if (l.widening && (!ctx.session || !isStepUpFresh(ctx.session, ctx.nowMs))) {
     return json({ error: "step_up_required" }, 401);
   }
-  await db.batch([
-    ...stmts,
-    auditStatement(db, {
-      actorEmail: who,
-      action: "booking.limits_changed",
-      entity: "settings",
-      entityId: "exact.booking_limits",
-      before: beforeJson,
-      after: { ...afterJson, ...(why !== null ? { note: why } : {}) },
-    }),
-  ]);
+  await db.batch([...l.stmts, limitsAudit(db, who, l, why)]);
   return json(await settingsResponse(db));
 }
 
@@ -263,7 +339,9 @@ async function putSettingsHandler(ctx: Ctx): Promise<Response> {
     if (!hasLimits || b["confirm"] !== undefined) throw new ApiError("bad_request");
     return putLimits(ctx, b, who, why);
   }
-  if (typeof b["enabled"] !== "boolean" || hasLimits) throw new ApiError("bad_request");
+  if (typeof b["enabled"] !== "boolean") throw new ApiError("bad_request");
+  // Switching OFF takes nothing else: the safe direction stays one simple shape.
+  if (b["enabled"] === false && hasLimits) throw new ApiError("bad_request");
 
   if (b["enabled"] === false) {
     // The safe direction: admin only (route), no step-up, no phrase. Audited when it changes.
@@ -289,15 +367,25 @@ async function putSettingsHandler(ctx: Ctx): Promise<Response> {
   if (typeof b["confirm"] !== "string" || !phraseMatches(b["confirm"], ENABLE_PHRASE))
     throw new ApiError("confirmation_required");
   const before = await loadBookingState(db);
-  const blockers = blockersOf(before).filter((x) => x !== "writes_disabled");
+  // The enable dialog (U3) sends the allow-list and the per-run cap with the switch: applied in the
+  // same batch, before the switch (whose own conditions then see them), with their own audit row.
+  // The watermark is NOW on every enable (review B2b): a `bookingFrom` sent along may only move it
+  // LATER (at most a day ahead), never earlier; an earlier one is the limits call with its own rules.
+  const limits = await parseLimits(ctx, b, who, before, false);
+  const nowFrom = new Date(ctx.nowMs).toISOString();
+  const asked =
+    b["bookingFrom"] === undefined ? null : parseBookingFrom(b["bookingFrom"], ctx.nowMs);
+  const from = asked !== null && asked > nowFrom ? asked : nowFrom;
+  const proposed = limits.divisions === null ? before : { ...before, divisions: limits.divisions };
+  const blockers = blockersOf(proposed).filter((x) => x !== "writes_disabled");
   if (blockers.length > 0) throw new ApiError("blocked", 409, { blockers });
-  // The watermark is NOW on every enable: only matches made from here on are booked (review B2b).
-  const from = new Date(ctx.nowMs).toISOString();
   const backlog = await backlogCountOf(db, from);
   // The conditions are repeated in the write itself, so a change between the read and the write
   // (a connection disabled, a verification replaced, a mode flipped, the allow-list emptied) cannot
   // slip through.
+  const pre = limits.stmts.length > 0 ? [...limits.stmts, limitsAudit(db, who, limits, why)] : [];
   const out = await db.batch([
+    ...pre,
     db
       .prepare(
         `INSERT INTO settings (key, value_json, updated_by)
@@ -326,8 +414,8 @@ async function putSettingsHandler(ctx: Ctx): Promise<Response> {
           protocolVersion: BOOKING_PROTOCOL_VERSION,
           createsBankEntries: before.createsBankEntries,
           bookingFrom: from,
-          divisions: before.divisions,
-          maxPerRun: before.maxPerRun,
+          divisions: limits.divisions ?? before.divisions,
+          maxPerRun: (limits.after["maxPerRun"] as number | undefined) ?? before.maxPerRun,
           backlogCount: backlog,
           ...(why !== null ? { note: why } : {}),
         },
@@ -343,7 +431,7 @@ async function putSettingsHandler(ctx: Ctx): Promise<Response> {
       )
       .bind(SETTING_FROM, JSON.stringify(from), who),
   ]);
-  if ((out[0]?.meta.changes ?? 0) !== 1) {
+  if ((out[pre.length]?.meta.changes ?? 0) < 1) {
     const now = await loadBookingState(db);
     throw new ApiError("blocked", 409, {
       blockers: blockersOf(now).filter((x) => x !== "writes_disabled"),

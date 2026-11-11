@@ -23,6 +23,7 @@ import {
   type World,
 } from "./matching-helpers";
 import { fakeGate } from "./sync-helpers";
+import { outboxWipeStatements } from "./outbox-wipe";
 
 export const db = env.DB;
 export { NOW };
@@ -80,7 +81,7 @@ export async function bookingWorld(
   const w = await resetWorld();
   const creates = o.creates ?? true;
   await db.batch([
-    db.prepare("DELETE FROM exact_write_outbox"),
+    ...(await outboxWipeStatements(db)),
     db.prepare("DELETE FROM booking_call_ledger"),
     db.prepare("DELETE FROM gl_accounts"),
     db.prepare("DELETE FROM settings WHERE key LIKE 'exact.booking_%'"),

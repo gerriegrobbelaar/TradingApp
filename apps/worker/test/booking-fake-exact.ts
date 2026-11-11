@@ -85,8 +85,16 @@ export class FakeExact {
     this.items.push({ kind: "receivable", currency: "EUR", paid: false, ...i });
   }
 
-  /** A line another system (Revolut's own feed) created. */
-  addFeedLine(l: { journal: string; amountMinor: number; yourRef?: string | null }): number {
+  /**
+   * A line another system (Revolut's own feed) created. With `account` (a relation guid) the line
+   * is booked on that relation and shows in its cashflow list as an open payment (A15c).
+   */
+  addFeedLine(l: {
+    journal: string;
+    amountMinor: number;
+    yourRef?: string | null;
+    account?: string;
+  }): number {
     const entryNumber = this.nextEntry++;
     this.lines.push({
       entryNumber,
@@ -95,7 +103,30 @@ export class FakeExact {
       yourRef: l.yourRef ?? null,
       amountMinor: l.amountMinor,
     });
+    if (l.account !== undefined) this.addPaymentItem(entryNumber, l.account, l.amountMinor, "EUR");
     return entryNumber;
+  }
+
+  /**
+   * Assumption A15c as the fake implements it: a bank line booked on a relation is an item of that
+   * relation in the same cashflow list (the kind of the relation's other items), open with the
+   * NEGATED bank amount (the MatchSet line's own amount) until a MatchSet closes it.
+   */
+  private addPaymentItem(
+    entryNumber: number,
+    account: string,
+    lineMinor: number,
+    ccy: string,
+  ): void {
+    const kind = this.items.find((i) => i.account === account)?.kind ?? "receivable";
+    this.items.push({
+      entryNumber,
+      account,
+      kind,
+      openMinor: -lineMinor,
+      currency: ccy,
+      paid: false,
+    });
   }
 
   private json(body: unknown): ExactResponse {
@@ -211,9 +242,10 @@ export class FakeExact {
     if (mode === "rate_limited") return { status: 429, headers: { "retry-after": "60" }, body: "" };
     const body = JSON.parse(req.body ?? "{}") as {
       Journal: string;
+      Currency?: string;
       OpeningBalanceFC: number;
       ClosingBalanceFC: number;
-      BankEntryLines: { YourRef: string; AmountFC: number }[];
+      BankEntryLines: { YourRef: string; AmountFC: number; Account?: string }[];
     };
     const entryNumber = this.nextEntry++;
     const entryId = guid(entryNumber);
@@ -231,6 +263,14 @@ export class FakeExact {
         yourRef: l.YourRef,
         amountMinor: Math.round(l.AmountFC * 100),
       });
+      if (typeof l.Account === "string") {
+        this.addPaymentItem(
+          entryNumber,
+          l.Account,
+          Math.round(l.AmountFC * 100),
+          body.Currency ?? "EUR",
+        );
+      }
     }
     this.closing.set(body.Journal, Math.round(body.ClosingBalanceFC * 100));
     if (mode === "lost") this.fail(mode);
