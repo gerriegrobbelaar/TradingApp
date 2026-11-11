@@ -544,7 +544,7 @@ describe("M1 review: wrangler's inheritance rules, read with a real TOML parser"
 });
 
 describe("M1 review: the committed file once filled in", () => {
-  it("passes for production and staging when only the placeholders are replaced", () => {
+  it("passes for production and staging when only the required placeholders are replaced (Revolut optional)", () => {
     let n = 0;
     const filled = committed
       .replace(
@@ -557,10 +557,6 @@ describe("M1 review: the committed file once filled in", () => {
       )
       .replace(/GOOGLE_CLIENT_ID = ""/g, 'GOOGLE_CLIENT_ID = "1-a.apps.googleusercontent.com"')
       .replace(/EXACT_CLIENT_ID = ""/g, 'EXACT_CLIENT_ID = "11111111-2222-3333-4444-555555555555"')
-      .replace(
-        /REVOLUT_CLIENT_ID = ""/g,
-        'REVOLUT_CLIENT_ID = "aaaaaaaa-1111-2222-3333-444444444444"',
-      )
       .replace(/app\.example\.com/g, "finance.camelthorncapital.com")
       .replace(/staging\.example\.com/g, "staging.camelthorncapital.com")
       .replace(

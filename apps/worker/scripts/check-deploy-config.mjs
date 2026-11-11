@@ -3,7 +3,7 @@
 // (`--env staging`) before `wrangler deploy` (docs/DEPLOY.md).
 // `wrangler deploy --dry-run` in CI does not run this, so placeholders stay committable.
 import { readFileSync } from "node:fs";
-import { deployConfigProblems } from "./deploy-config.mjs";
+import { deployConfigNotices, deployConfigProblems } from "./deploy-config.mjs";
 
 const args = process.argv.slice(2);
 const flag = args.findIndex((a) => a === "--env" || a.startsWith("--env="));
@@ -18,13 +18,12 @@ if (
   process.exit(2);
 }
 
-const problems = deployConfigProblems(
-  readFileSync(new URL("../wrangler.toml", import.meta.url), "utf8"),
-  env,
-);
+const toml = readFileSync(new URL("../wrangler.toml", import.meta.url), "utf8");
+const problems = deployConfigProblems(toml, env);
 if (problems.length > 0) {
   console.error(`Refusing to deploy (${env}), wrangler.toml has problems (docs/DEPLOY.md):`);
   for (const p of problems) console.error(`  - ${p}`);
   process.exit(1);
 }
+for (const n of deployConfigNotices(toml, env)) console.log(`NOTICE (${env}): ${n}`);
 console.log(`wrangler.toml (${env}): no placeholders left, isolated from the other environments.`);

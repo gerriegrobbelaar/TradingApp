@@ -103,8 +103,12 @@ export interface OpenItemDetail {
   division: DivisionRef;
   asOf: string;
   item: OpenItemRow;
-  /** Stored amounts as we hold them. amountMinor may equal the open balance (ADR 0022). */
-  amountMinor: number;
+  /**
+   * The amount as stored: the invoice total when Exact told us, else the open balance (ADR 0022).
+   * Shown only on the item sheet as "Amount as stored"; lists and totals use openMinor and
+   * originalMinor.
+   */
+  storedMinor: number;
   rate: string | null;
   closedAt: string | null;
   openDcMinor: number | null;

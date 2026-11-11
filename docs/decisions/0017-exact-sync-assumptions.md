@@ -196,7 +196,7 @@ is local to `apps/worker/src/exact/sync.ts` or to the client field lists.
    model: **verify with credentials**. If `$select` rejects one, the incremental open-item read
    fails with `http_400` and only the nightly FULL keeps open items right.
    Stored as (migration 0005): `open_minor` open balance (part payments keep the remainder),
-   `original_minor` invoice total or NULL, `amount_minor` = original when known else open,
+   `original_minor` invoice total or NULL, `amount_minor` (renamed `stored_minor` by migration 0017, review S10) = original when known else open,
    `open_dc_minor` + `dc_currency` (snapshot, cleared when a read does not carry it so it is never
    stale), `rate`. Original total and rate are kept when a later bulk read lacks them (same
    currency only).

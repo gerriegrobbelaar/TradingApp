@@ -45,3 +45,16 @@ Status: accepted for Phase 5 (task R3b). The worker endpoints are R3a; shapes ar
 over pending and completed rows only (the UI shows absolute values either way); `count` counts
 those rows; `legs` includes the opened leg; `q` searches reference, description and counterparty
 name, never the IBAN; `state` takes one value; `legCount` is optional.
+
+## Own-account transfers and exchanges in the In/Out totals (review N9, design only)
+
+Today the In and Out totals count every pending and completed row, so a transfer between two of
+our own Revolut accounts shows once as Out and once as In, and an exchange adds both currencies.
+The totals are therefore gross movement, not income and spending. The design: a transaction is
+**internal** when its type is `exchange`, or when its counterparty is one of our own accounts
+(counterparty `account_type` of `self`, or a counterparty account id that matches a row in
+`bank_accounts`); the totals then report internal rows in a third column, "Between own accounts",
+and leave them out of In and Out. This needs the counterparty id, account id and account type to
+be stored per transaction, which the Phase 5 ingest does not do yet (review S6, ADR 0030 open
+items), and the type field to be verified on the Revolut sandbox. The totals are therefore
+unchanged for now; the change lands with the counterparty columns and its sandbox check.

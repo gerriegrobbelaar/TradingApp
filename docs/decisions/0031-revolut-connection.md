@@ -165,5 +165,18 @@ route and the Bank screen are R3.
 - R1's `packages/revolut` (`buildClientAssertion`, `buildAuthorizeUrl`, `buildTokenRequestBody`,
   `parseTokenResponse` returning `expiresInSeconds` and an optional `refreshToken`) is used through one
   adapter, `apps/worker/src/revolut/oauth.ts`; the account check uses R1's client through the gate.
-- `REVOLUT_REDIRECT_URI` must be https (R1's consent URL builder and Revolut require it), so local
-  development of the connect flow needs an https tunnel.
+- `REVOLUT_REDIRECT_URI` must be https (R1's consent URL builder and Revolut require it). The
+  connect flow also needs `RevolutGate`, whose EU jurisdiction workerd does not implement, so it
+  cannot be tried locally even through a tunnel: use staging (docs/DEPLOY.md).
+
+## Revolut is optional as a whole (review S5)
+
+A deployment may leave `REVOLUT_CLIENT_ID`, `REVOLUT_REDIRECT_URI` and `REVOLUT_ISSUER` all empty.
+The deploy guard then passes with the notice "Revolut is not configured: the Revolut routes will
+answer server_misconfigured and the Revolut jobs stay off"; with only some of the three set it
+fails and names the empty ones. The `RevolutGate` binding, migration `v3` and the refusal of a
+private key in `wrangler.toml` stay mandatory. At runtime the Revolut routes answer `500
+server_misconfigured`, `GET /api/connections` reports `revolutConfigured: false` (the card says
+"Revolut is not configured on this deployment" and offers no Connect button), and the Revolut jobs
+skip with `revolut_not_configured` before they touch the database or the network. The environment
+(production or sandbox) on the connect card is no longer preselected (review N6).

@@ -15,7 +15,17 @@ repo root use `pnpm --filter @camelthorn/worker exec wrangler <command>`. Sign i
 real Cloudflare, Google or Exact account, do them once on the staging environment first (own Worker,
 database, queues and objects; see "Staging first" below) and only then repeat them on production.
 Durable Object jurisdictions do not work in local `wrangler dev`, so staging is the first place the
-Exact connection and the scheduler can run at all.
+Exact connection, the Revolut connection and the scheduler can run at all.
+
+**Revolut is optional as a whole.** A deployment that leaves `REVOLUT_CLIENT_ID`,
+`REVOLUT_REDIRECT_URI` and `REVOLUT_ISSUER` all empty in `wrangler.toml` (as committed) passes the
+deploy guard with a printed notice ("Revolut is not configured: the Revolut routes will answer
+server_misconfigured and the Revolut jobs stay off"). Settings, Connections then shows "Revolut is
+not configured on this deployment" instead of a Connect button, and the `revolut.sync` and
+`revolut.backfill` jobs skip with `revolut_not_configured`. If only some of the three are set the
+guard fails and names the empty ones. The `REVOLUT_GATE` binding and its migration stay mandatory
+either way (they cost nothing and keep adding Revolut later a settings-only change). Skip every
+"Revolut" row and section below if you do not use Revolut; add it later by doing them then.
 
 ## Step 0. What a human must do
 
@@ -31,17 +41,70 @@ database id, hostname).
 | 5   | Google Cloud admin      | Pick the Google Cloud project that owns the OAuth client (open decision 8 in CLAUDE.md; ADR 0002: only `camelthorncapital.com`). Set the OAuth consent screen to **Internal** (Workspace users only). Create an OAuth client of type Web application. | Google Cloud console, APIs and services, Credentials  | Step 4 and 5  |
 | 6   | Google Cloud admin      | On that client add the authorised redirect URI `https://<app host>/api/auth/callback`. For local work also `http://localhost:5173/api/auth/callback`. Keep the client ID and secret.                                                                  | Same                                                  | Step 4 and 5  |
 | 7   | Exact administrator     | Register the app in the Exact App Center ("Register API keys") with the redirect URI `https://<app host>/api/connections/exact/callback`. Keep the client ID and secret.                                                                             | apps.exactonline.com (Dutch instance: start.exactonline.nl) | Step 4 and 5  |
-| 8   | Admin                   | Generate the secrets (step 5): `SESSION_SECRET`, `TOKEN_ENC_KEY`; collect `GOOGLE_CLIENT_SECRET` and `EXACT_CLIENT_SECRET` from items 6 and 7.                                                                                                      | Terminal, password manager                            | Step 5        |
+| 8   | Admin                   | Generate the secrets (step 5): `SESSION_SECRET`, `TOKEN_ENC_KEY`; collect `GOOGLE_CLIENT_SECRET` and `EXACT_CLIENT_SECRET` from items 6 and 7, and `REVOLUT_PRIVATE_KEY` from item 12 (Revolut only).                                                                                                      | Terminal, password manager                            | Step 5        |
 | 9   | Admin                   | Back up `TOKEN_ENC_KEY` in the password manager (see "Rotating secrets"). Losing it means reconnecting Exact.                                                                                                                                       | Password manager                                      | Step 5        |
 | 10  | Admin                   | Confirm `INITIAL_ADMIN_EMAIL` (and `ALLOWED_HD`) in `wrangler.toml` are right: that Google account becomes the first admin.                                                                                                                         | `apps/worker/wrangler.toml`                           | Step 4        |
+| 11  | Revolut account owner (Revolut only) | Have a **Revolut Business** account with API access, and a **sandbox** Revolut Business account for staging. Creating the sandbox account: Revolut's developer docs / Business sandbox sign-up (**UNVERIFIED**: where the sign-up lives and whether it needs a separate email). Production API access may need a plan that includes the Business API and an owner or admin role (**UNVERIFIED**). | Revolut Business web app; developer.revolut.com        | Step 10 (Revolut) |
+| 12  | Admin (Revolut only)    | Generate the **API key pair** and public certificate with the commands in "Revolut: key, certificate and registration" below. Keep the private key in the password manager; it becomes the secret `REVOLUT_PRIVATE_KEY`. One pair per Revolut environment (sandbox for staging, production for production) is recommended. | Terminal, password manager                            | Step 5        |
+| 13  | Revolut account owner (Revolut only) | In Revolut Business, Settings, APIs: add an API certificate, upload the public certificate (`revolut-public-cert.pem`), enter the OAuth redirect URI `https://<app host>/api/connections/revolut/callback`, and keep the **client ID** it shows. **UNVERIFIED**: the exact menu names, whether the certificate must be `.cer` or PEM, and whether a webhook URL is entered here too (the app registers webhooks itself on confirm). | Revolut Business, Settings, APIs (**UNVERIFIED**)      | Step 4 (Revolut) |
+| 14  | Admin (Revolut only)    | Decide, before connecting: **who creates bank entries in Exact** (this app, or Revolut's own Exact integration; open decision 2) and the **payments mode** (drafts, or pay directly on a Company plan; open decision 1). The Connections card asks for both and does not default them. The environment (production or sandbox) is also chosen explicitly. | Settings, Connections                                  | Step 10 (Revolut) |
+| 15  | Admin (Revolut only)    | Leave **IP allow-listing off** on the Revolut API certificate. Workers have no fixed outgoing IP address, so an allow-list would block the app. It is optional on Revolut's side (CLAUDE.md section 3); **UNVERIFIED** whether your Revolut plan offers or requires it. | Revolut Business, Settings, APIs (**UNVERIFIED**)      | Step 10 (Revolut) |
 
-Order dependency: the app hostname (item 2) is needed to register both redirect URIs (items 6 and
-7), and the client IDs from those registrations are needed to fill `wrangler.toml` (step 4). So
-decide the hostname first, register Google and Exact, then fill the variables. The client secrets
+Order dependency: the app hostname (item 2) is needed to register the redirect URIs (items 6, 7 and
+13), and the client IDs from those registrations are needed to fill `wrangler.toml` (step 4). So
+decide the hostname first, register Google and Exact (and Revolut, if used), then fill the
+variables. The client secrets
 only go into Workers secrets (step 5), never into the repo.
 
 Exact app registration and the Exact first-live-connection checks are unverified against the real
-service: see step 10.
+service: see step 10. The same holds for everything on the Revolut side (items 11, 13 and 15 are
+written from memory of Revolut's documentation, not from a live account): see "Revolut: key,
+certificate and registration" and the Revolut first-live checklist.
+
+### Revolut: key, certificate and registration
+
+Revolut Business authenticates the app with a client assertion: a JWT signed with a private RSA
+key (RS256); Revolut holds the matching public certificate. The Worker accepts only an
+**unencrypted PKCS#8 RSA key of at least 2048 bits** (`BEGIN PRIVATE KEY`). Generate the pair on a
+trusted machine, outside the repository and outside any synced folder. These `openssl` commands
+were run on OpenSSL 3.0.13 for this document (the output was checked), but Revolut's acceptance of
+the certificate is **UNVERIFIED**:
+
+```sh
+umask 077
+# 1. RSA 2048-bit private key, unencrypted, PKCS#8 (genpkey writes PKCS#8 by default)
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out revolut-private-pkcs8.pem
+# 2. Self-signed public certificate for that key, valid five years (adjust -days and the name)
+openssl req -new -x509 -key revolut-private-pkcs8.pem -out revolut-public-cert.pem -days 1825 \
+  -subj "/CN=camelthorn-finance"
+# 3. Checks: first line must be "-----BEGIN PRIVATE KEY-----", size must say 2048 bit or more,
+#    and both MD5 lines below must be identical (the certificate belongs to this key)
+head -1 revolut-private-pkcs8.pem
+openssl pkey -in revolut-private-pkcs8.pem -noout -text | head -1
+openssl x509 -in revolut-public-cert.pem -noout -pubkey | openssl md5
+openssl pkey -in revolut-private-pkcs8.pem -pubout | openssl md5
+```
+
+- Upload **only** `revolut-public-cert.pem` to Revolut (item 13). Whether Revolut wants the PEM
+  text or a `.cer` (DER) file is **UNVERIFIED**; if it insists on DER, convert with
+  `openssl x509 -in revolut-public-cert.pem -outform der -out revolut-public-cert.cer`.
+- `revolut-private-pkcs8.pem` goes into the Worker secret `REVOLUT_PRIVATE_KEY` (step 5) and the
+  password manager, then delete the file. An old-style `BEGIN RSA PRIVATE KEY` (PKCS#1) key is
+  refused by the Worker with a convert message; convert with
+  `openssl pkcs8 -topk8 -nocrypt -in old.pem -out revolut-private-pkcs8.pem`.
+- **Redirect URI.** Register `https://<app host>/api/connections/revolut/callback` on the
+  certificate. It must be https, on the same origin as the app, at exactly that path. The same
+  string goes into `REVOLUT_REDIRECT_URI`. `REVOLUT_ISSUER` is that URI's host without `https://`
+  (Revolut's rule for the assertion's `iss`). Staging uses its own staging host and, preferably, its
+  own sandbox certificate. Local `http://localhost` cannot be used (https only).
+- **Sandbox account.** Staging connects to a Revolut **sandbox** business account (the card's
+  "Sandbox (test)" environment, hosts `sandbox-b2b.revolut.com` and `sandbox-business.revolut.com`
+  in the code). The sandbox has its own certificate and client ID; production credentials do not
+  work there and the other way round. Where to create the sandbox account and its certificate is
+  **UNVERIFIED** (Revolut developer documentation).
+- **IP allow-listing.** Optional on Revolut's side. Workers have no fixed outgoing IP address, so
+  leave it off (item 15). If your Revolut plan forces an allow-list, the app cannot be used with it
+  without a fixed-IP egress (not built, not planned).
 
 ## Step 1. Check out and install
 
@@ -124,13 +187,20 @@ left:
 | `OAUTH_REDIRECT_URI`                     | exactly the redirect URI registered on Google, `https://<app host>/api/auth/callback`; its origin is the CSRF origin | `app.example.com` placeholder or not https                      |
 | `EXACT_CLIENT_ID`                        | Exact app client ID (item 7)                                                                                       | empty                                                           |
 | `EXACT_REDIRECT_URI`                     | `https://<app host>/api/connections/exact/callback`, same origin as `OAUTH_REDIRECT_URI`                            | placeholder, not https, or wrong origin or path                 |
-| `REVOLUT_CLIENT_ID`                      | client ID of the Revolut Business API certificate (Revolut Business, Settings, APIs)                               | empty or a test value                                           |
-| `REVOLUT_REDIRECT_URI`                   | `https://<app host>/api/connections/revolut/callback`, same origin as `OAUTH_REDIRECT_URI`; register it on the certificate | placeholder, not https, or wrong origin or path          |
-| `REVOLUT_ISSUER`                         | the host of `REVOLUT_REDIRECT_URI`, without `https://` (the `iss` of the client assertion)                         | empty, or not that host                                         |
+| `REVOLUT_CLIENT_ID`                      | **optional as a set:** client ID of the Revolut Business API certificate (item 13). Leave all three Revolut rows empty to run without Revolut | only when some of the three are set: empty or a test value |
+| `REVOLUT_REDIRECT_URI`                   | `https://<app host>/api/connections/revolut/callback`, same origin as `OAUTH_REDIRECT_URI`; register it on the certificate | only when some are set: empty, placeholder, not https, or wrong origin or path |
+| `REVOLUT_ISSUER`                         | the host of `REVOLUT_REDIRECT_URI`, without `https://` (the `iss` of the client assertion)                         | only when some are set: empty, or not that host                 |
 | `routes`                                 | uncomment one of the two examples and set your hostname (same host as the redirect URIs)                           | no routes set, or the redirect URI host is not a route          |
 | `[triggers] crons = ["* * * * *"]`       | leave as is                                                                                                        | no cron trigger                                                 |
 | `EXACT_GATE` / `JOB_LOCK` / `REVOLUT_GATE` bindings + migrations `v1`, `v2`, `v3` | leave as is                                                               | a gate or lock binding or migration missing                     |
 | `JOBS_QUEUE` producer, consumer, `dead_letter_queue` | leave as is (names from step 3)                                                                        | producer, consumer or dead-letter queue missing                 |
+
+All three Revolut rows empty (as committed) is a valid configuration: the guard prints the notice
+"Revolut is not configured: ..." and moves on; the Revolut routes then answer `500
+server_misconfigured` and the Revolut jobs stay off. The `REVOLUT_PRIVATE_KEY` secret is not
+checked by the guard (secrets are not visible to it); a missing or malformed key shows up at
+runtime as `server_misconfigured` on the Revolut routes (names of the missing settings in the log,
+never values).
 
 The guard only checks that `INITIAL_ADMIN_EMAIL` looks like an email address and `ALLOWED_HD` is
 set: check by eye that they are the right ones. It also refuses `workers_dev` or `preview_urls`
@@ -172,9 +242,15 @@ Secrets live only in Workers secrets. The Worker does not exist yet before the f
 run the first `secret put` below by hand (interactive prompt) and accept; the later ones then find
 the Worker. The placeholder Worker it creates has no code until step 7.
 
-Alternative that avoids the prompt per secret: put all four values in a JSON file kept **outside**
+The Worker uses **five secrets**: `SESSION_SECRET`, `TOKEN_ENC_KEY`, `GOOGLE_CLIENT_SECRET`,
+`EXACT_CLIENT_SECRET` and `REVOLUT_PRIVATE_KEY` (plus `TOKEN_ENC_KEY_PREVIOUS` only while rotating).
+`REVOLUT_PRIVATE_KEY` is needed only if Revolut is used. The list matches `apps/worker/src/env.ts`
+and the deploy guard's refusal list.
+
+Alternative that avoids the prompt per secret: put all the values in a JSON file kept **outside**
 the repo and outside any synced folder (for example `~/secrets/camelthorn.json`, mode 600, content
-`{"GOOGLE_CLIENT_SECRET":"...","SESSION_SECRET":"...","EXACT_CLIENT_SECRET":"...","TOKEN_ENC_KEY":"..."}`)
+`{"GOOGLE_CLIENT_SECRET":"...","SESSION_SECRET":"...","EXACT_CLIENT_SECRET":"...","TOKEN_ENC_KEY":"..."}`;
+add `"REVOLUT_PRIVATE_KEY":"<the PEM with \n for line breaks>"` if you use Revolut)
 and run `pnpm exec wrangler secret bulk ~/secrets/camelthorn.json` (`wrangler secret bulk --help`:
 JSON or `.env` file, up to 100 secrets, a `null` value deletes; with no file it reads stdin). Delete
 the file afterwards. Like `secret put`, `secret bulk` offers to create the missing Worker (same
@@ -184,8 +260,8 @@ prompt; read from wrangler 4.160's source, not yet run here). For staging add `-
 pnpm exec wrangler secret put GOOGLE_CLIENT_SECRET
 openssl rand -base64 48 | pnpm exec wrangler secret put SESSION_SECRET
 pnpm exec wrangler secret put EXACT_CLIENT_SECRET
-# Revolut Business API private key, PKCS#8 PEM (`openssl pkcs8 -topk8 -nocrypt`); its certificate
-# is the one registered with Revolut. Paste the whole PEM, or pipe the file.
+# Revolut only: the unencrypted PKCS#8 private key from "Revolut: key, certificate and
+# registration" (step 0); its certificate is the one registered with Revolut. Pipe the file.
 pnpm exec wrangler secret put REVOLUT_PRIVATE_KEY < revolut-private-pkcs8.pem
 # AES-256-GCM key for stored Exact tokens: exactly 32 random bytes as standard, padded base64
 # (44 characters ending in "="). Anything else is rejected at startup.
@@ -231,7 +307,7 @@ names the top level explicitly; without it wrangler warns that several environme
 Do not call `wrangler deploy` directly: it skips the check. `wrangler deploy --dry-run --env=""`
 (and `--env staging`, both run in CI) checks bundle and config without publishing and does not check
 placeholders. A dry run on this repo needs `apps/web/dist` to exist (build first) and lists the
-bindings `EXACT_GATE`, `JOB_LOCK`, `JOBS_QUEUE`, `DB`, `ASSETS` and the variables.
+bindings `EXACT_GATE`, `JOB_LOCK`, `REVOLUT_GATE`, `JOBS_QUEUE`, `DB`, `ASSETS` and the variables.
 
 After the first deploy, `https://camelthorn-finance.<account>.workers.dev` must not answer
 (`workers_dev` is off).
@@ -480,50 +556,95 @@ sync panel on the test division.
     - `$skiptoken` paging with this filter and order, the page size (60?), and that `Document`
       holds a GUID when a PDF is attached.
 
-### First-live checklist: Revolut webhook, sync and backfill (task R3a, ADR 0033)
+### First-live checklist: Revolut connect, webhook, sync and backfill (ADR 0030, 0031, 0033)
+
+Skip this section if Revolut is not configured on the deployment. **Nothing in it has been run
+against a real Revolut account;** every answer below is an assumption in ADR 0030, 0031 or 0033 and
+must be recorded there (and the code, fixtures and ADR fixed together) when it turns out different.
 
 **Sandbox first, via staging** (see "Staging first" below): connect the staging Worker to a Revolut
-**sandbox** business account and run steps 1 to 5 there before production. The production
-connection is only made after staging delivered, verified and processed real sandbox webhooks.
+**sandbox** business account and run every item there before production. The production connection
+is made only after staging connected, delivered, verified and processed real sandbox webhooks.
+Local `wrangler dev` or a tunnel cannot do this: connecting and confirming call `RevolutGate`, a
+Durable Object with an EU jurisdiction, which workerd does not implement (see "Local
+development"). The webhook URL must be public https and `workers.dev` is off, so staging is the
+place.
 
-The webhook URL is `<app origin>/api/webhooks/revolut`. It must be **public https** (Revolut calls
-it from the internet; a `wrangler dev` or tunnel URL works for tests, `workers.dev` is off). No
-variable to set: it is derived from `REVOLUT_REDIRECT_URI`. The route must not sit behind
-Cloudflare Access or any other sign-in (Revolut has no cookie); it authenticates every request by
-its HMAC signature and answers one fixed 401 to everything unsigned. Confirming the connection (Settings,
-Connections) registers the subscription and queues the 90-day backfill; if Connections says the
+Before you start: step 0 items 11 to 15 done, the staging Worker has `REVOLUT_CLIENT_ID`,
+`REVOLUT_REDIRECT_URI`, `REVOLUT_ISSUER` (vars, sandbox certificate) and the secret
+`REVOLUT_PRIVATE_KEY`, and `GET /api/connections` shows `revolutConfigured: true`. The Revolut jobs
+are still **off**.
+
+**A. Connect (ADR 0030/0031).** Settings, Connections, Revolut Business card, as an admin with a
+fresh sign-in:
+
+1. The card has no preselected environment and Connect stays disabled until you choose
+   Environment (Sandbox for staging), who creates bank entries, and the payments mode. Choose and
+   press Connect. Check the browser goes to the **consent URL**
+   `https://sandbox-business.revolut.com/app-confirm?client_id=...&redirect_uri=...&response_type=code&state=...`
+   (production: `business.revolut.com`). Record the real path and parameters if different.
+2. Approve in Revolut. Check the redirect back to `/api/connections/revolut/callback` carries
+   `state` (**state echo**). If `state` is **not** echoed the flow is bound only by the signed
+   cookie and the confirm step is the only defence: note it in ADR 0031 and keep the confirm step.
+3. The token exchange succeeds (**assertion claims**: `iss` = `REVOLUT_ISSUER`, `sub` = client id,
+   `aud` = `https://revolut.com`, RS256, our extra `iat` and `jti` tolerated). On `invalid_client`
+   or `invalid_request` check issuer, client id and that the uploaded certificate matches the key
+   (the MD5 check in step 0); the card then says the app credentials were rejected.
+4. Check the **`expires_in`** Revolut returns (assumed about 2399 s) and whether a **refresh token**
+   comes back on the code exchange. After the first refresh (within the hour, or force it by
+   waiting) check whether the refresh token **rotates** (a new value each time) or stays: the gate
+   handles both, record which. Look for `needs_reauth` after a day: the refresh token's lifetime
+   (**90 days?**, open decision 1) decides how often someone must re-authorise.
+5. The **accounts list** and bank details read for the staged connection: the card shows the
+   masked summary (account names, currencies, holder, last 4 of each IBAN). Compare with the
+   sandbox account. A failure ends in `verification_failed` and wipes the staged tokens.
+6. **Confirm step.** The card asks you to confirm the accounts are yours (and, for a changed
+   account set, to replace the old ones). Confirm within 15 minutes; an unconfirmed staging expires
+   (`pending_expired`, tokens wiped). Check the audit log has `revolut_staged` and
+   `revolut_confirmed`, and that a second start while connected is refused (409).
+
+**B. Webhook, sync and backfill (ADR 0033).**
+
+The webhook URL is `<app origin>/api/webhooks/revolut`. It must be **public https**: Revolut calls
+it from the internet. No variable to set: it is derived from `REVOLUT_REDIRECT_URI`. The route must
+not sit behind Cloudflare Access or any other sign-in (Revolut has no cookie); it authenticates
+every request by its HMAC signature and answers one fixed 401 to everything unsigned. Confirming
+the connection registers the subscription and queues the 90-day backfill; if Connections says the
 webhook is not registered, use "Register webhook" (admin, fresh sign-in).
 
-1. After confirming, `GET /api/connections` shows `revolut.webhookRegistered: true`; `last_error` is
-   empty. In Revolut Business (Settings, APIs, Webhooks) one subscription points at the URL above.
-2. Send a test payment (EUR 0.01 between two own accounts) and watch `webhook_events`:
+7. After confirming, `GET /api/connections` shows `revolut.webhookRegistered: true`; `last_error` is
+   empty. In Revolut Business (Settings, APIs, Webhooks) one subscription points at the URL above
+   (**UNVERIFIED** menu path).
+8. Send a test payment (EUR 0.01 between two own accounts, sandbox) and watch `webhook_events`:
    `SELECT id, event_type, status, error_code, received_at, processed_at FROM webhook_events ORDER BY id DESC LIMIT 5`
-   (`wrangler d1 execute ... --remote`). Expect `processed` within seconds and rows in
+   (`wrangler d1 execute ... --remote --env staging`). Expect `processed` within seconds and rows in
    `bank_transactions` (`source = 'webhook'`, two rows for a transfer). A 401 in the Revolut
    delivery log means the signature check failed: record the exact header names, the timestamp unit
    (we expect epoch milliseconds in `Revolut-Request-Timestamp`) and the signed-payload format, and
    fix ADR 0030/0033 and `packages/revolut` together.
-3. Verify the assumptions of ADR 0033 (payload shape, whether `TransactionStateChanged` fires for
+9. Verify the assumptions of ADR 0033 (payload shape, whether `TransactionStateChanged` fires for
    every state, retry timing, the rate limit) and note the answers there.
-4. Run "Run now" on `revolut.backfill`, then switch on `revolut.sync` (Settings, Schedules). Check
-   the Bank screen shows balances and that `revolut_sync_state` has `last_status = 'ok'` for
-   `accounts` and `transactions`. The daily backfill result reports `missing`: a number above zero
-   on ordinary days means webhooks or the poll missed transactions.
-5. Dead letters: events that exhaust their retries end as `webhook_events.status = 'error'`; the
-   poll and backfill still pick the transaction up.
-6. The initial 90-day backfill is a manual run (never retried automatically). If its result is
-   `partial` / `initial_backfill_incomplete`, press "Run now" on `revolut.backfill` again (or let
-   the daily slot run once it is switched on) until it ends `ok`: each run resumes the stored cursor.
-7. While the connection is `needs_reauth` / `expired`, signed deliveries are still accepted and
-   recorded (`webhook_events.error_code = 'needs_reauth'`). After re-authorising, "Run now" on
-   `revolut.backfill` recovers those transactions.
+10. Run "Run now" on `revolut.backfill`, then switch on `revolut.sync` (Settings, Schedules). Check
+    the Bank screen shows balances and that `revolut_sync_state` has `last_status = 'ok'` for
+    `accounts` and `transactions`. The daily backfill result reports `missing`: a number above zero
+    on ordinary days means webhooks or the poll missed transactions.
+11. Dead letters: events that exhaust their retries end as `webhook_events.status = 'error'`; the
+    poll and backfill still pick the transaction up.
+12. The initial 90-day backfill is a manual run (never retried automatically). If its result is
+    `partial` / `initial_backfill_incomplete`, press "Run now" on `revolut.backfill` again (or let
+    the daily slot run once it is switched on) until it ends `ok`: each run resumes the stored cursor.
+13. While the connection is `needs_reauth` / `expired`, signed deliveries are still accepted and
+    recorded (`webhook_events.error_code = 'needs_reauth'`). After re-authorising, "Run now" on
+    `revolut.backfill` recovers those transactions.
+14. After a day of running on staging, repeat A and B on production with the **production**
+    certificate, client ID and environment, starting again with the Revolut jobs off.
 
 ## Staging first
 
 `wrangler.toml` has a complete `[env.staging]` block (ADR 0029): Worker `camelthorn-finance-staging`,
 its own D1 database `camelthorn-finance-staging`, queues `camelthorn-jobs-staging` and
-`camelthorn-jobs-staging-dlq`, its own `ExactGate` and `JobLock` objects (a Durable Object namespace
-belongs to its Worker), its own variables and cron. Nothing is shared with production, and the
+`camelthorn-jobs-staging-dlq`, its own `ExactGate`, `JobLock` and `RevolutGate` objects (a Durable
+Object namespace belongs to its Worker), its own variables and cron. Nothing is shared with production, and the
 deploy guard refuses a staging that reuses the production Worker name, D1 id or name, a queue, a
 route or a redirect URI. `routes = []` is committed in `[env.staging]` on purpose: without the key
 staging would inherit the production route, and a plain `wrangler deploy --env staging` would move
@@ -546,10 +667,16 @@ Procedure: do steps 0 to 7 for staging, then 8 to 10 and the "First sync procedu
    ```
 
 3. Step 4: fill the staging `database_id`, `GOOGLE_CLIENT_ID`, `OAUTH_REDIRECT_URI`,
-   `EXACT_CLIENT_ID`, `EXACT_REDIRECT_URI` and `routes` inside `[env.staging]`, then
-   `pnpm run check:deploy:staging` (from `apps/worker`).
+   `EXACT_CLIENT_ID`, `EXACT_REDIRECT_URI` and `routes` inside `[env.staging]`, and, if Revolut is
+   used, all three of `REVOLUT_CLIENT_ID` (the **sandbox** certificate's client ID),
+   `REVOLUT_REDIRECT_URI` (`https://<staging host>/api/connections/revolut/callback`, registered
+   on the sandbox certificate) and `REVOLUT_ISSUER` (the staging host). Then
+   `pnpm run check:deploy:staging` (from `apps/worker`). The staging `RevolutGate` binding and
+   migration `v3` are already in `[env.staging]`; the guard checks them.
 4. Step 5: every secret again for the staging Worker, with a **different** `TOKEN_ENC_KEY`:
-   `pnpm exec wrangler secret put GOOGLE_CLIENT_SECRET --env staging` and so on.
+   `pnpm exec wrangler secret put GOOGLE_CLIENT_SECRET --env staging` and so on, including
+   `REVOLUT_PRIVATE_KEY` (the sandbox key pair from step 0) when Revolut is used:
+   `pnpm exec wrangler secret put REVOLUT_PRIVATE_KEY --env staging < revolut-private-pkcs8.pem`.
 5. Step 6: `pnpm exec wrangler d1 migrations apply camelthorn-finance-staging --remote --env
    staging`.
 6. Step 7: `pnpm --filter @camelthorn/web build`, then `pnpm --filter @camelthorn/worker run
@@ -566,9 +693,10 @@ What differs on staging: Worker name, hostname, D1 database, queues, objects, se
 not differ: the code and `wrangler.toml` structure, which is why staging is deployed from the same
 commit as production. Staging has its own copy of every job: jobs are off after install there too.
 
-Where things can run: Durable Object jurisdictions (`ExactGate`, `JobLock`) are not implemented in
-workerd, so they can be exercised **only on staging or production**, never in local `wrangler dev`
-or with `--remote` aimed at production. Unit tests stub the call.
+Where things can run: Durable Object jurisdictions (`ExactGate`, `JobLock`, `RevolutGate`) are
+not implemented in workerd, so they can be exercised **only on staging or production**, never in
+local `wrangler dev` (nor through a tunnel to it) or with `--remote` aimed at production. This
+includes connecting Revolut, confirming it and registering its webhook. Unit tests stub the call.
 
 ## First sync procedure
 
@@ -659,15 +787,32 @@ each deploy and when Settings, Schedules shows repeated failures.
 
 ### Rotating secrets
 
-- `TOKEN_ENC_KEY`: put the old value in `TOKEN_ENC_KEY_PREVIOUS`, set the new `TOKEN_ENC_KEY`,
-  deploy. Tokens are rewritten with the new key at their next refresh (within minutes while the
-  connection is used); then `pnpm exec wrangler secret delete TOKEN_ENC_KEY_PREVIOUS`. If the key is
-  lost without a previous copy, reconnect Exact (Settings, Connections).
+- `TOKEN_ENC_KEY` covers **everything the app encrypts**: the Exact tokens, the Revolut access and
+  refresh tokens **and the Revolut webhook signing secrets**. Procedure (**verify on staging
+  first**; the automatic re-encryption of Revolut tokens and webhook secrets is being added by
+  task Q2 and has not been run on a real deployment):
+  1. Put the old value in `TOKEN_ENC_KEY_PREVIOUS` and the new one in `TOKEN_ENC_KEY`
+     (`secret put` for both), then deploy.
+  2. Wait for a refresh cycle (Exact and Revolut tokens are rewritten with the current key when
+     they refresh, within about an hour while the connections are used; a Revolut access token
+     lives about 40 minutes) **and** for one webhook delivery to be processed (a webhook signing
+     secret is re-encrypted when it is next used). Test deliveries count: send a EUR 0.01 sandbox
+     payment.
+  3. Check there is nothing left on the old key before deleting it: the Connections screen shows
+     both connections as Connected with no error, and `webhook_events` has a recent `processed`
+     row. Where the build provides a count of values still under the previous key, use it
+     (**UNVERIFIED** whether one exists).
+  4. Only then `pnpm exec wrangler secret delete TOKEN_ENC_KEY_PREVIOUS`.
+  Deleting the previous key too early makes a token or webhook secret unreadable: Exact and Revolut
+  then need reconnecting, and a webhook secret that cannot be decrypted makes every delivery fail
+  signature verification (the poll and the daily backfill still catch up). If the key is lost
+  without a previous copy, reconnect Exact and Revolut (Settings, Connections).
 - `GOOGLE_CLIENT_SECRET`: create a new secret on the Google OAuth client, `secret put`, then remove
   the old one in Google.
-- `REVOLUT_PRIVATE_KEY`: create a new certificate in Revolut Business, `secret put` the new key, update
-  `REVOLUT_CLIENT_ID` if it changed, deploy. Existing refresh tokens belong to the old client;
-  whether they survive is **unverified**, be ready to re-authorise (Settings, Connections).
+- `REVOLUT_PRIVATE_KEY`: create a new key pair and certificate (step 0), upload the certificate in
+  Revolut Business, `secret put` the new key, update `REVOLUT_CLIENT_ID` if it changed, deploy.
+  Existing refresh tokens belong to the old client; whether they survive is **unverified**, be
+  ready to re-authorise (Settings, Connections). Remove the old certificate in Revolut afterwards.
 - `EXACT_CLIENT_SECRET`: regenerate it in the Exact App Center, `secret put`. Whether existing
   refresh tokens survive a secret change is **unverified**; be ready to reconnect.
 - `SESSION_SECRET`: `secret put` a new value. It signs only the short sign-in round-trip cookie;
@@ -715,7 +860,8 @@ pnpm --filter @camelthorn/worker dev                       # Worker on :8787
 pnpm --filter @camelthorn/web dev                          # UI on :5173, proxies /api to :8787
 ```
 
-- `.dev.vars` holds the four secrets (placeholders in the example) and overrides public variables.
+- `.dev.vars` holds the secrets (placeholders in the example; `REVOLUT_PRIVATE_KEY` only matters if
+  you work on Revolut) and overrides public variables.
   Local sign-in needs `OAUTH_REDIRECT_URI=http://localhost:5173/api/auth/callback` and
   `EXACT_REDIRECT_URI=http://localhost:5173/api/connections/exact/callback` (already in the example),
   and `GOOGLE_CLIENT_ID` (and `EXACT_CLIENT_ID`) set there until the committed values are filled.
@@ -725,7 +871,9 @@ pnpm --filter @camelthorn/web dev                          # UI on :5173, proxie
   `apps/worker`).
 - Durable Object jurisdiction: plain `wrangler dev` (workerd) does not implement jurisdictions, so
   Exact calls and `JobLock` use fail locally with "Jurisdiction restrictions are not implemented in
-  workerd". There is no local way around it (no switch exists, by design, ADR 0018).
+  workerd". The same holds for `RevolutGate`, so the Revolut connect, confirm and webhook
+  registration cannot be tried locally or through a tunnel either (Revolut also needs an https
+  redirect URI). There is no local way around it (no switch exists, by design, ADR 0018).
   **Do not use `wrangler dev --remote` for the scheduler or the Exact connection**: it runs against
   the real D1 and Durable Objects of the account the config points at, which is production unless
   you deliberately aim it at staging, and the Durable Object classes would run there with the

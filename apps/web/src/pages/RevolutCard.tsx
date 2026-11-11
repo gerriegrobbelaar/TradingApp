@@ -124,10 +124,12 @@ interface Props {
 export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Props) {
   const toast = useToast();
   const requiredId = useId();
+  const envRequiredId = useId();
   const state = revolutState(row);
   const label = STATE_LABEL[state];
   const live = row?.revolut;
-  const [env, setEnv] = useState<RevolutEnvironment>("production");
+  // No default: production vs sandbox is an explicit choice (review N6).
+  const [env, setEnv] = useState<RevolutEnvironment | null>(null);
   const [bank, setBank] = useState<boolean | null>(null);
   const [mode, setMode] = useState<RevolutPaymentsMode>("drafts");
   const [dialog, setDialog] = useState<Dialog>(null);
@@ -153,11 +155,14 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
   // What the form shows: the saved values for a connection, else the admin's pending choice.
   const shownBank = connected ? (live?.createsBankEntries ?? null) : bank;
   const shownMode = connected ? (live?.paymentsMode ?? "drafts") : mode;
-  const shownEnv = connected ? (live?.environment ?? "production") : env;
+  const shownEnv: RevolutEnvironment | null = connected ? (live?.environment ?? null) : env;
   const needsBankChoice = shownBank === null;
+  const needsEnvChoice = !connected && shownEnv === null;
+  // Nothing to set up and nothing connected: Revolut is not used on this deployment.
+  const unavailable = !configured && state === "not_connected" && !pending;
 
   async function connect() {
-    if (shownBank === null) return;
+    if (shownBank === null || shownEnv === null) return;
     setBusy(true);
     try {
       const current = await fetchMe();
@@ -243,8 +248,12 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
             </p>
             {!configured && (
               <p className="notice warn">
-                Revolut Business is not set up on the server yet. Ask whoever deploys the app to add
-                the Revolut client ID, private key and redirect settings.
+                {unavailable
+                  ? "Revolut is not configured on this deployment. "
+                  : "Revolut Business is not set up on the server. "}
+                {isAdmin || !unavailable
+                  ? "Whoever deploys the app must add the Revolut client ID, private key and redirect settings before it can be connected."
+                  : "Ask an admin."}
               </p>
             )}
             {state === "credentials_rejected" && (
@@ -288,7 +297,7 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
               />
             )}
 
-            {!pending && !connected && isAdmin && (
+            {!pending && !connected && isAdmin && !unavailable && (
               <fieldset className="choices">
                 <legend>Environment</legend>
                 {(["production", "sandbox"] as const).map((v) => (
@@ -304,10 +313,15 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
                     <span>{ENV_LABEL[v]}</span>
                   </label>
                 ))}
+                {needsEnvChoice && (
+                  <p className="stamp" id={envRequiredId}>
+                    Choose the environment before you can connect.
+                  </p>
+                )}
               </fieldset>
             )}
 
-            {!pending && (
+            {!pending && !unavailable && (
               <fieldset className="choices">
                 <legend>Who creates bank entries in Exact?</legend>
                 {BANK_OPTIONS.map((o) => (
@@ -337,7 +351,7 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
               </fieldset>
             )}
 
-            {!pending && (
+            {!pending && !unavailable && (
               <fieldset className="choices">
                 <legend>Payments mode</legend>
                 {MODE_OPTIONS.map((o) => (
@@ -373,13 +387,22 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
               </section>
             )}
 
-            {pending ? null : isAdmin ? (
+            {pending || unavailable ? null : isAdmin ? (
               <div className="chips" ref={actions}>
                 {(state === "not_connected" || state === "needs_reauth") && (
                   <Button
                     variant="primary"
-                    disabled={busy || !configured || needsBankChoice}
-                    aria-describedby={needsBankChoice && !connected ? requiredId : undefined}
+                    disabled={busy || !configured || needsBankChoice || needsEnvChoice}
+                    aria-describedby={
+                      !connected && (needsBankChoice || needsEnvChoice)
+                        ? [
+                            needsEnvChoice ? envRequiredId : null,
+                            needsBankChoice ? requiredId : null,
+                          ]
+                            .filter(Boolean)
+                            .join(" ")
+                        : undefined
+                    }
                     onClick={(e) => {
                       remember(e);
                       void connect();

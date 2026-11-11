@@ -118,7 +118,7 @@ export function OpenItemDetailView({
           )}
         </Row>
         <Row label="Amount as stored">
-          <Money minor={detail.amountMinor} currency={item.currency} />
+          <Money minor={detail.storedMinor} currency={item.currency} />
         </Row>
         <Row label="Exchange rate">{detail.rate ?? NO_VALUE}</Row>
         {detail.closedAt && <Row label="Closed">{formatDate(detail.closedAt)}</Row>}

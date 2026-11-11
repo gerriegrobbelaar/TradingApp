@@ -2,8 +2,11 @@
 # PLACEHOLDERS below must be filled in before the first deploy:
 #   database_id (EU D1), routes, GOOGLE_CLIENT_ID, OAUTH_REDIRECT_URI,
 #   EXACT_CLIENT_ID, EXACT_REDIRECT_URI (same origin as OAUTH_REDIRECT_URI, fixed path),
-#   REVOLUT_CLIENT_ID, REVOLUT_REDIRECT_URI (same origin, fixed path), REVOLUT_ISSUER (the host of
-#   REVOLUT_REDIRECT_URI).
+#   Revolut is OPTIONAL as a whole: leave REVOLUT_CLIENT_ID, REVOLUT_REDIRECT_URI and REVOLUT_ISSUER
+#   all empty and the deploy guard passes with a notice (the Revolut routes answer
+#   server_misconfigured and the Revolut jobs stay off). To use Revolut set ALL THREE:
+#   REVOLUT_CLIENT_ID, REVOLUT_REDIRECT_URI (same origin as OAUTH_REDIRECT_URI, fixed path) and
+#   REVOLUT_ISSUER (the host of REVOLUT_REDIRECT_URI), plus the secret REVOLUT_PRIVATE_KEY.
 # Secrets are never in this file: GOOGLE_CLIENT_SECRET, SESSION_SECRET, EXACT_CLIENT_SECRET,
 # REVOLUT_PRIVATE_KEY (PKCS#8 PEM) and TOKEN_ENC_KEY (and TOKEN_ENC_KEY_PREVIOUS while rotating)
 # go in with `wrangler secret put`.
@@ -95,16 +98,17 @@ EXACT_CLIENT_ID = ""
 # PLACEHOLDER (app.example.com). Must equal the redirect URI registered on the Exact app and live on
 # the same origin as OAUTH_REDIRECT_URI: https://<app host>/api/connections/exact/callback
 EXACT_REDIRECT_URI = "https://app.example.com/api/connections/exact/callback"
-# PLACEHOLDER. Client ID of the Revolut Business API certificate (Revolut Business, Settings, APIs).
-# Empty until the certificate exists; while empty, /api/connections/revolut/start answers 500
-# server_misconfigured. The private key is the secret REVOLUT_PRIVATE_KEY.
+# OPTIONAL (all three REVOLUT_* settings empty = Revolut not used; set all three or none).
+# Client ID of the Revolut Business API certificate (Revolut Business, Settings, APIs). While
+# empty, /api/connections/revolut/* answers 500 server_misconfigured. The private key is the secret
+# REVOLUT_PRIVATE_KEY.
 REVOLUT_CLIENT_ID = ""
-# PLACEHOLDER (app.example.com). Registered as the OAuth redirect URI on the Revolut API
-# certificate; same origin as OAUTH_REDIRECT_URI: https://<app host>/api/connections/revolut/callback
-REVOLUT_REDIRECT_URI = "https://app.example.com/api/connections/revolut/callback"
-# PLACEHOLDER (app.example.com). The `iss` of the client assertion: the HOST of REVOLUT_REDIRECT_URI,
-# without https:// (Revolut's rule).
-REVOLUT_ISSUER = "app.example.com"
+# Registered as the OAuth redirect URI on the Revolut API certificate; same origin as
+# OAUTH_REDIRECT_URI: https://<app host>/api/connections/revolut/callback
+REVOLUT_REDIRECT_URI = ""
+# The `iss` of the client assertion: the HOST of REVOLUT_REDIRECT_URI, without https://
+# (Revolut's rule).
+REVOLUT_ISSUER = ""
 
 [[d1_databases]]
 binding = "DB"
@@ -214,12 +218,13 @@ OAUTH_REDIRECT_URI = "https://staging.example.com/api/auth/callback"
 EXACT_CLIENT_ID = ""
 # PLACEHOLDER (staging.example.com). Same origin as the staging OAUTH_REDIRECT_URI.
 EXACT_REDIRECT_URI = "https://staging.example.com/api/connections/exact/callback"
-# PLACEHOLDER. Revolut API certificate client ID (use a SANDBOX certificate for staging).
+# OPTIONAL (all three empty = Revolut not used). Revolut API certificate client ID (use a SANDBOX
+# certificate for staging).
 REVOLUT_CLIENT_ID = ""
-# PLACEHOLDER (staging.example.com). Same origin as the staging OAUTH_REDIRECT_URI.
-REVOLUT_REDIRECT_URI = "https://staging.example.com/api/connections/revolut/callback"
-# PLACEHOLDER (staging.example.com). The host of the staging REVOLUT_REDIRECT_URI.
-REVOLUT_ISSUER = "staging.example.com"
+# Same origin as the staging OAUTH_REDIRECT_URI: https://<staging host>/api/connections/revolut/callback
+REVOLUT_REDIRECT_URI = ""
+# The host of the staging REVOLUT_REDIRECT_URI.
+REVOLUT_ISSUER = ""
 
 [[env.staging.d1_databases]]
 binding = "DB"

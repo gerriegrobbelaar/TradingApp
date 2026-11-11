@@ -112,7 +112,7 @@ const items = async (): Promise<
     kind: string;
     status: string;
     currency: string;
-    amount_minor: number;
+    stored_minor: number;
     open_minor: number;
     closed_at: string | null;
     invoice_number: string | null;
@@ -123,7 +123,7 @@ const items = async (): Promise<
   (
     await db
       .prepare(
-        `SELECT exact_id, kind, status, currency, amount_minor, open_minor, closed_at,
+        `SELECT exact_id, kind, status, currency, stored_minor, open_minor, closed_at,
                 invoice_number, due_date, last_seen_sync_id
          FROM open_items WHERE division_id = ?1 ORDER BY exact_id`,
       )
@@ -196,7 +196,7 @@ describe("full sync", () => {
     expect(byId[guid(101)]).toMatchObject({
       kind: "invoice",
       currency: "EUR",
-      amount_minor: 123450,
+      stored_minor: 123450,
       open_minor: 123450,
       status: "open",
       invoice_number: "20240001",
@@ -873,13 +873,13 @@ describe("amount model (review E3)", () => {
     const read = () =>
       db
         .prepare(
-          `SELECT amount_minor, open_minor, original_minor, open_dc_minor, dc_currency, rate, status
+          `SELECT stored_minor, open_minor, original_minor, open_dc_minor, dc_currency, rate, status
            FROM open_items WHERE division_id = ?1`,
         )
         .bind(usd.id)
         .first();
     expect(await read()).toEqual({
-      amount_minor: 100000,
+      stored_minor: 100000,
       open_minor: 40010,
       original_minor: 100000,
       open_dc_minor: 36855,
@@ -893,7 +893,7 @@ describe("amount model (review E3)", () => {
     fx2.receivables = [{ ...(fx2.receivables[0] as FakeItem), amount: 100 }];
     expect((await sync("full")).status).toBe("ok");
     expect(await read()).toEqual({
-      amount_minor: 100000,
+      stored_minor: 100000,
       open_minor: 10000,
       original_minor: 100000,
       open_dc_minor: null,

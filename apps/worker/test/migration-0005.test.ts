@@ -56,7 +56,7 @@ describe("migration 0005 on a database with existing rows", () => {
 
     const rows = await mdb
       .prepare(
-        `SELECT id, exact_id, kind, currency, amount_minor, open_minor, status, entry_number, closed_at,
+        `SELECT id, exact_id, kind, currency, stored_minor, open_minor, status, entry_number, closed_at,
                 last_seen_sync_id FROM open_items ORDER BY id`,
       )
       .all();
@@ -66,7 +66,7 @@ describe("migration 0005 on a database with existing rows", () => {
         exact_id: "item-1",
         kind: "invoice",
         currency: "EUR",
-        amount_minor: 12345,
+        stored_minor: 12345,
         open_minor: 12345,
         status: "open",
         entry_number: null,
@@ -78,7 +78,7 @@ describe("migration 0005 on a database with existing rows", () => {
         exact_id: "item-2",
         kind: "bill",
         currency: "JPY",
-        amount_minor: 1500,
+        stored_minor: 1500,
         open_minor: 0,
         status: "closed",
         entry_number: null,
@@ -98,7 +98,7 @@ describe("migration 0005 on a database with existing rows", () => {
     await expect(
       mdb
         .prepare(
-          `INSERT INTO open_items (division_id, exact_id, kind, currency, amount_minor, open_minor, status, synced_at)
+          `INSERT INTO open_items (division_id, exact_id, kind, currency, stored_minor, open_minor, status, synced_at)
            VALUES (9, 'x', 'invoice', 'EUR', 1, 1, 'weird', '2026-01-01T00:00:00Z')`,
         )
         .run(),

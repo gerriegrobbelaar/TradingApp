@@ -7,3 +7,5 @@ export function parseConfig(toml: string): { raw?: Raw; error?: string };
 export function environmentNames(raw: Raw): string[];
 /** The config wrangler would deploy for `env` ("production" = top level) and what it inherited. */
 export function resolveEnvironment(raw: Raw, env?: string): { config: Raw; inherited: string[] };
+/** Notices for a deploy that passes (for example Revolut left unconfigured). */
+export function deployConfigNotices(toml: string, env?: string): string[];

@@ -143,6 +143,52 @@ function migrationTags(config) {
 
 const isPlaceholderId = (id) => !id || /^[0-]+$/.test(id);
 
+/** The three public Revolut settings. All empty means Revolut is not used on this deployment. */
+const REVOLUT_VARS = ["REVOLUT_CLIENT_ID", "REVOLUT_REDIRECT_URI", "REVOLUT_ISSUER"];
+
+/** True when none of the Revolut settings is set (Revolut is optional as a whole, review S5). */
+export function revolutUnconfigured(config) {
+  const vars = isObject(config.vars) ? config.vars : {};
+  return REVOLUT_VARS.every((k) => (str(vars[k]) ?? "").trim() === "");
+}
+
+/**
+ * Revolut is optional as a whole: with all three settings empty there is nothing to check (the
+ * Revolut routes answer server_misconfigured and the Revolut jobs stay off). With any one set,
+ * every missing one is named. The Durable Object binding and migration checks stay mandatory.
+ */
+function revolutProblems(vars, appRedirect) {
+  const v = (k) => str(vars[k]) ?? "";
+  if (REVOLUT_VARS.every((k) => v(k).trim() === "")) return [];
+  const problems = [];
+  if (!v("REVOLUT_CLIENT_ID")) problems.push("REVOLUT_CLIENT_ID is empty");
+  else if (/^test-/i.test(v("REVOLUT_CLIENT_ID"))) {
+    problems.push("REVOLUT_CLIENT_ID is a test value");
+  }
+  const revolutRedirect = v("REVOLUT_REDIRECT_URI");
+  const revolutBad = badUrl(revolutRedirect);
+  if (revolutBad === "empty") problems.push("REVOLUT_REDIRECT_URI is empty");
+  else if (revolutBad) {
+    problems.push("REVOLUT_REDIRECT_URI is still the app.example.com placeholder or not https");
+  }
+  // The Revolut callback lives on the app's own origin at the fixed path, and the client
+  // assertion's issuer is that redirect URI's host (Revolut's rule).
+  if (appRedirect && !revolutBad) {
+    const g = new URL(appRedirect);
+    const r = new URL(revolutRedirect);
+    if (r.origin !== g.origin || r.pathname !== "/api/connections/revolut/callback") {
+      problems.push(
+        "REVOLUT_REDIRECT_URI must be <OAUTH_REDIRECT_URI origin>/api/connections/revolut/callback",
+      );
+    }
+  }
+  if (!v("REVOLUT_ISSUER")) problems.push("REVOLUT_ISSUER is empty");
+  else if (!revolutBad && v("REVOLUT_ISSUER") !== new URL(revolutRedirect).host) {
+    problems.push("REVOLUT_ISSUER must be the host of REVOLUT_REDIRECT_URI (no https://)");
+  }
+  return problems;
+}
+
 /** Checks of one resolved environment on its own. */
 function environmentProblems(config) {
   const problems = [];
@@ -181,30 +227,7 @@ function environmentProblems(config) {
       );
     }
   }
-  if (!v("REVOLUT_CLIENT_ID")) problems.push("REVOLUT_CLIENT_ID is empty");
-  else if (/^test-/i.test(v("REVOLUT_CLIENT_ID"))) {
-    problems.push("REVOLUT_CLIENT_ID is a test value");
-  }
-  const revolutRedirect = v("REVOLUT_REDIRECT_URI");
-  const revolutBad = badUrl(revolutRedirect);
-  if (revolutBad) {
-    problems.push("REVOLUT_REDIRECT_URI is still the app.example.com placeholder or not https");
-  }
-  // The Revolut callback lives on the app's own origin at the fixed path, and the client
-  // assertion's issuer is that redirect URI's host (Revolut's rule).
-  if (!redirectBad && !revolutBad) {
-    const g = new URL(redirect);
-    const r = new URL(revolutRedirect);
-    if (r.origin !== g.origin || r.pathname !== "/api/connections/revolut/callback") {
-      problems.push(
-        "REVOLUT_REDIRECT_URI must be <OAUTH_REDIRECT_URI origin>/api/connections/revolut/callback",
-      );
-    }
-  }
-  if (!v("REVOLUT_ISSUER")) problems.push("REVOLUT_ISSUER is empty");
-  else if (!revolutBad && v("REVOLUT_ISSUER") !== new URL(revolutRedirect).host) {
-    problems.push("REVOLUT_ISSUER must be the host of REVOLUT_REDIRECT_URI (no https://)");
-  }
+  problems.push(...revolutProblems(vars, redirectBad === null ? redirect : null));
   if (!/^[^@\s]+@[^@\s]+$/.test(v("INITIAL_ADMIN_EMAIL"))) {
     problems.push("INITIAL_ADMIN_EMAIL is missing or not an email address");
   }
@@ -422,4 +445,21 @@ export function deployConfigProblems(toml, env = "production") {
     }
   }
   return [...new Set(problems)];
+}
+
+/**
+ * Notices for a deploy that passes: things that are allowed but that the person deploying should
+ * know. Currently: Revolut left unconfigured.
+ */
+export function deployConfigNotices(toml, env = "production") {
+  const parsed = parseConfig(toml);
+  if (parsed.raw === undefined) return [];
+  const names = environmentNames(parsed.raw);
+  if (env !== "production" && !names.includes(env)) return [];
+  const { config } = resolveEnvironment(parsed.raw, env);
+  return revolutUnconfigured(config)
+    ? [
+        "Revolut is not configured: the Revolut routes will answer server_misconfigured and the Revolut jobs stay off",
+      ]
+    : [];
 }
