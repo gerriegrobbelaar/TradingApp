@@ -19,6 +19,7 @@ import {
 } from "../api";
 import { useSignedIn } from "../auth";
 import { useDivision } from "../division";
+import { REVOLUT_RESULT_MESSAGE, RevolutCard } from "./RevolutCard";
 import { SyncPanel } from "./SyncPanel";
 import { useToast } from "../toasts";
 
@@ -145,7 +146,25 @@ export function Connections() {
     );
   }, [result, setParams, toast]);
 
+  // Result of the Revolut connect round trip arrives as ?revolut=...; same treatment.
+  const revolutReported = useRef(false);
+  const revolutResult = params.get("revolut");
+  useEffect(() => {
+    if (revolutResult === null || revolutReported.current) return;
+    revolutReported.current = true;
+    const msg = REVOLUT_RESULT_MESSAGE[revolutResult];
+    if (msg) toast.show(msg);
+    setParams(
+      (p) => {
+        p.delete("revolut");
+        return p;
+      },
+      { replace: true },
+    );
+  }, [revolutResult, setParams, toast]);
+
   const exact = data?.connections.find((c) => c.kind === "exact");
+  const revolut = data?.connections.find((c) => c.kind === "revolut");
   const state = exactState(exact);
   const label = STATE_LABEL[state];
 
@@ -393,6 +412,14 @@ export function Connections() {
           </>
         )}
       </Card>
+
+      <RevolutCard
+        row={revolut}
+        loaded={data !== null}
+        configured={data?.revolutConfigured === true}
+        isAdmin={isAdmin}
+        onChanged={load}
+      />
 
       <SyncPanel canSync={canSync} />
 

@@ -84,8 +84,9 @@ the deploy check refuses a leftover `DO_JURISDICTION_DISABLED`. Step 9 confirms 
 
 **Durable Object migration tags.** `wrangler.toml` declares `ExactGate` (binding `EXACT_GATE`) in
 `[[migrations]]` with `tag = "v1"` and `JobLock` (binding `JOB_LOCK`, the scheduler's per-job
-no-overlap lease) with `tag = "v2"`, both in `new_sqlite_classes`. Never edit or reuse a deployed
-tag: a new class or a rename needs a new `[[migrations]]` entry with the next tag (`v3`).
+no-overlap lease) with `tag = "v2"`, and `RevolutGate` (binding `REVOLUT_GATE`, one per Revolut
+connection, ADR 0030) with `tag = "v3"`, all in `new_sqlite_classes`. Never edit or reuse a deployed
+tag: a new class or a rename needs a new `[[migrations]]` entry with the next tag (`v4`).
 
 ## Step 3. Create the queues
 
@@ -123,9 +124,12 @@ left:
 | `OAUTH_REDIRECT_URI`                     | exactly the redirect URI registered on Google, `https://<app host>/api/auth/callback`; its origin is the CSRF origin | `app.example.com` placeholder or not https                      |
 | `EXACT_CLIENT_ID`                        | Exact app client ID (item 7)                                                                                       | empty                                                           |
 | `EXACT_REDIRECT_URI`                     | `https://<app host>/api/connections/exact/callback`, same origin as `OAUTH_REDIRECT_URI`                            | placeholder, not https, or wrong origin or path                 |
+| `REVOLUT_CLIENT_ID`                      | client ID of the Revolut Business API certificate (Revolut Business, Settings, APIs)                               | empty or a test value                                           |
+| `REVOLUT_REDIRECT_URI`                   | `https://<app host>/api/connections/revolut/callback`, same origin as `OAUTH_REDIRECT_URI`; register it on the certificate | placeholder, not https, or wrong origin or path          |
+| `REVOLUT_ISSUER`                         | the host of `REVOLUT_REDIRECT_URI`, without `https://` (the `iss` of the client assertion)                         | empty, or not that host                                         |
 | `routes`                                 | uncomment one of the two examples and set your hostname (same host as the redirect URIs)                           | no routes set, or the redirect URI host is not a route          |
 | `[triggers] crons = ["* * * * *"]`       | leave as is                                                                                                        | no cron trigger                                                 |
-| `EXACT_GATE` / `JOB_LOCK` bindings + migrations `v1`, `v2` | leave as is                                                                                      | ExactGate or JobLock binding or migration missing               |
+| `EXACT_GATE` / `JOB_LOCK` / `REVOLUT_GATE` bindings + migrations `v1`, `v2`, `v3` | leave as is                                                               | a gate or lock binding or migration missing                     |
 | `JOBS_QUEUE` producer, consumer, `dead_letter_queue` | leave as is (names from step 3)                                                                        | producer, consumer or dead-letter queue missing                 |
 
 The guard only checks that `INITIAL_ADMIN_EMAIL` looks like an email address and `ALLOWED_HD` is
@@ -180,6 +184,9 @@ prompt; read from wrangler 4.160's source, not yet run here). For staging add `-
 pnpm exec wrangler secret put GOOGLE_CLIENT_SECRET
 openssl rand -base64 48 | pnpm exec wrangler secret put SESSION_SECRET
 pnpm exec wrangler secret put EXACT_CLIENT_SECRET
+# Revolut Business API private key, PKCS#8 PEM (`openssl pkcs8 -topk8 -nocrypt`); its certificate
+# is the one registered with Revolut. Paste the whole PEM, or pipe the file.
+pnpm exec wrangler secret put REVOLUT_PRIVATE_KEY < revolut-private-pkcs8.pem
 # AES-256-GCM key for stored Exact tokens: exactly 32 random bytes as standard, padded base64
 # (44 characters ending in "="). Anything else is rejected at startup.
 openssl rand -base64 32 | pnpm exec wrangler secret put TOKEN_ENC_KEY
@@ -620,6 +627,9 @@ each deploy and when Settings, Schedules shows repeated failures.
   lost without a previous copy, reconnect Exact (Settings, Connections).
 - `GOOGLE_CLIENT_SECRET`: create a new secret on the Google OAuth client, `secret put`, then remove
   the old one in Google.
+- `REVOLUT_PRIVATE_KEY`: create a new certificate in Revolut Business, `secret put` the new key, update
+  `REVOLUT_CLIENT_ID` if it changed, deploy. Existing refresh tokens belong to the old client;
+  whether they survive is **unverified**, be ready to re-authorise (Settings, Connections).
 - `EXACT_CLIENT_SECRET`: regenerate it in the Exact App Center, `secret put`. Whether existing
   refresh tokens survive a secret change is **unverified**; be ready to reconnect.
 - `SESSION_SECRET`: `secret put` a new value. It signs only the short sign-in round-trip cookie;

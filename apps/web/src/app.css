@@ -122,6 +122,43 @@
   min-height: 32px;
   color: var(--ink);
 }
+/* Revolut card: radio choices with a plain-language explanation under each option. */
+.choices {
+  display: grid;
+  gap: 10px;
+  border: 0;
+  margin: 8px 0;
+  padding: 0;
+}
+.choices legend {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  padding: 0;
+  margin-bottom: 6px;
+}
+.sub-h {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  margin: 12px 0 4px;
+}
+.choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--ink);
+}
+.choice .check {
+  margin-top: 2px;
+  flex: none;
+}
+.choice .hint {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
 .app .scroll {
   margin-top: 8px;
 }

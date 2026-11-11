@@ -11,10 +11,16 @@ SESSION_SECRET=replace-with-at-least-32-random-characters-xxxxxxxx
 EXACT_CLIENT_SECRET=replace-with-exact-app-secret
 TOKEN_ENC_KEY=replace-with-32-random-bytes-in-base64-xxxxxxxxxx=
 
+# Revolut Business (placeholders). The PEM goes in double quotes with \n between its lines.
+REVOLUT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nreplace-with-your-pkcs8-key\n-----END PRIVATE KEY-----"
+# REVOLUT_CLIENT_ID=your-revolut-api-client-id
+
 # Local overrides of public vars. The browser talks to the Vite dev server on 5173, which proxies
 # /api to the Worker on 8787, so the redirect URI uses port 5173.
 OAUTH_REDIRECT_URI=http://localhost:5173/api/auth/callback
 EXACT_REDIRECT_URI=http://localhost:5173/api/connections/exact/callback
+REVOLUT_REDIRECT_URI=http://localhost:5173/api/connections/revolut/callback
+REVOLUT_ISSUER=localhost:5173
 # EXACT_CLIENT_ID=your-exact-app-client-id
 # Needed locally until the committed placeholder is filled:
 # GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com

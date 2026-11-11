@@ -13,7 +13,7 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     environment: "node",
-    include: ["scripts/k3b-screens.e2e.ts"],
+    include: ["scripts/k3b-screens.e2e.ts", "scripts/r2-screens.e2e.ts"],
     testTimeout: 300_000,
     hookTimeout: 120_000,
   },

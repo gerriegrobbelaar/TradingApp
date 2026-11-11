@@ -27,6 +27,7 @@ import { json, type Ctx, type Router } from "../router";
 import { fetchCurrentMe, type CurrentMe } from "@camelthorn/exact";
 import { encryptToken } from "../crypto/token-crypto";
 import { DEFAULT_EXACT_HOST, loadExactConfig, type ExactConfig } from "./config";
+import { loadRevolutConfig } from "../revolut/config";
 import { createCurrentGateTransport } from "./gate-transport";
 import { authorizeUrl, exchangeCode, TokenEndpointError } from "./oauth";
 import { aad, EXACT_CONNECTION_NAME } from "./store";
@@ -117,7 +118,8 @@ export function registerExactRoutes(router: Router): void {
     const db = ctx.env.DB;
     const { results } = await db
       .prepare(
-        `SELECT id, kind, name, status, expires_at, last_error, connected_by, connected_at
+        `SELECT id, kind, name, status, expires_at, last_error, connected_by, connected_at,
+           revolut_environment, creates_bank_entries, payments_mode, bank_entries_decided_at
          FROM connections ORDER BY id`,
       )
       .all<{
@@ -129,6 +131,10 @@ export function registerExactRoutes(router: Router): void {
         last_error: string | null;
         connected_by: string | null;
         connected_at: string | null;
+        revolut_environment: string | null;
+        creates_bank_entries: number;
+        payments_mode: string;
+        bank_entries_decided_at: string | null;
       }>();
     const divs = await db
       .prepare(
@@ -146,6 +152,7 @@ export function registerExactRoutes(router: Router): void {
     const configured = loadExactConfig(ctx.env, ctx.config.appOrigin).ok;
     return json({
       exactConfigured: configured,
+      revolutConfigured: loadRevolutConfig(ctx.env, ctx.config.appOrigin).ok,
       connections: results.map((c) => ({
         kind: c.kind,
         name: c.name,
@@ -154,6 +161,18 @@ export function registerExactRoutes(router: Router): void {
         lastError: c.last_error,
         connectedBy: c.connected_by,
         connectedAt: c.connected_at,
+        // Revolut only: the two settings and the environment, never a token or key. `null` for
+        // createsBankEntries means the admin has not decided yet.
+        ...(c.kind === "revolut"
+          ? {
+              revolut: {
+                environment: c.revolut_environment,
+                createsBankEntries:
+                  c.bank_entries_decided_at === null ? null : c.creates_bank_entries === 1,
+                paymentsMode: c.payments_mode,
+              },
+            }
+          : {}),
         divisions: divs.results
           .filter((d) => d.connection_id === c.id)
           .map((d) => ({

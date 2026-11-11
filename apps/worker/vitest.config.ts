@@ -1,5 +1,13 @@
 import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-plugin";
+import { generateKeyPairSync } from "node:crypto";
 import { defineConfig } from "vitest/config";
+
+// A throwaway PKCS#8 key for the Revolut client assertion (never a real key, regenerated per run).
+const REVOLUT_TEST_KEY = generateKeyPairSync("rsa", {
+  modulusLength: 2048,
+  privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  publicKeyEncoding: { type: "spki", format: "pem" },
+}).privateKey;
 
 export default defineConfig(async () => {
   const migrations = await readD1Migrations("./migrations");
@@ -20,6 +28,10 @@ export default defineConfig(async () => {
             EXACT_CLIENT_ID: "test-exact-client-id",
             EXACT_CLIENT_SECRET: "test-exact-client-secret",
             EXACT_REDIRECT_URI: "https://app.test/api/connections/exact/callback",
+            REVOLUT_CLIENT_ID: "test-revolut-client-id",
+            REVOLUT_PRIVATE_KEY: REVOLUT_TEST_KEY,
+            REVOLUT_ISSUER: "app.test",
+            REVOLUT_REDIRECT_URI: "https://app.test/api/connections/revolut/callback",
             // 32 bytes, base64. Test-only.
             TOKEN_ENC_KEY: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
           },

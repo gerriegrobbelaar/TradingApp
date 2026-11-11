@@ -224,8 +224,20 @@ export const restoreUser = (id: number, roles: Role[]) =>
 
 export type ConnectionStatus = "pending" | "active" | "expired" | "disabled" | "needs_reauth";
 
+export type RevolutEnvironment = "production" | "sandbox";
+export type RevolutPaymentsMode = "drafts" | "pay";
+
+/** The Revolut-only part of a connection row; never carries a token, key or secret. */
+export interface RevolutSettings {
+  environment: RevolutEnvironment | null;
+  /** True: this app creates the bank entries in Exact. False: someone else does. Null: undecided. */
+  createsBankEntries: boolean | null;
+  paymentsMode: RevolutPaymentsMode;
+}
+
 export interface ConnectionRow {
   kind: "exact" | "revolut";
+  revolut?: RevolutSettings;
   name: string;
   status: ConnectionStatus;
   expiresAt: string | null;
@@ -246,6 +258,8 @@ export interface ConnectionRow {
 export interface ConnectionsResponse {
   /** False while the Worker lacks Exact settings (client id, secret, encryption key). */
   exactConfigured: boolean;
+  /** False while the Worker lacks Revolut settings (client id, key, issuer, redirect URI). */
+  revolutConfigured?: boolean;
   connections: ConnectionRow[];
 }
 
@@ -256,6 +270,29 @@ export const disconnectExact = () =>
 export const EXACT_START_URL = "/api/connections/exact/start";
 /** Same, but confirms replacing the connection with a different Exact account. */
 export const EXACT_REPLACE_URL = "/api/connections/exact/start?confirm_replace=1";
+/** Full-page navigation to Revolut's consent page; every choice is explicit (no defaults). */
+export const revolutStartUrl = (
+  environment: RevolutEnvironment,
+  createsBankEntries: boolean,
+  paymentsMode: RevolutPaymentsMode,
+): string =>
+  `/api/connections/revolut/start?environment=${environment}&creates_bank_entries=${
+    createsBankEntries ? 1 : 0
+  }&payments_mode=${paymentsMode}`;
+export const disconnectRevolut = () =>
+  request<{ ok: true; changed: boolean }>("/api/connections/revolut/disconnect", {
+    method: "POST",
+  });
+export const changeRevolutSettings = (body: {
+  createsBankEntries?: boolean;
+  paymentsMode?: RevolutPaymentsMode;
+}) =>
+  request<{
+    ok: true;
+    changed: boolean;
+    createsBankEntries?: boolean;
+    paymentsMode?: RevolutPaymentsMode;
+  }>("/api/connections/revolut/settings", { method: "PATCH", body });
 export const setDivisionSync = (divisionId: number, enabled: boolean) =>
   request<{ id: number; syncEnabled: boolean }>(`/api/divisions/${divisionId}/sync-enabled`, {
     method: "PUT",

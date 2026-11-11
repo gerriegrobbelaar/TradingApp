@@ -67,7 +67,7 @@ export async function completeIdempotencyKey(
  * Scopes whose keys are short-lived by nature and may be purged: an exact allow-list, not a
  * prefix, so no look-alike scope name can opt in. Payment and booking scopes never appear here.
  */
-const PURGEABLE_SCOPES: ReadonlySet<string> = new Set(["auth.flow", "exact.flow"]);
+const PURGEABLE_SCOPES: ReadonlySet<string> = new Set(["auth.flow", "exact.flow", "revolut.flow"]);
 /**
  * Floor for retention. Purging a key while the token it guards is still usable would re-open
  * replay, so callers may not go below this (the sign-in flow cookie lives 10 minutes).

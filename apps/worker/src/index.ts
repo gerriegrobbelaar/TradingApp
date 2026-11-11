@@ -2,6 +2,7 @@ import { registerAuthRoutes } from "./auth/routes";
 import { registerUserRoutes } from "./auth/users-routes";
 import { registerExactRoutes } from "./exact/routes";
 import { registerSyncRoutes } from "./exact/sync-routes";
+import { registerRevolutRoutes } from "./revolut/routes";
 import { registerApprovalsRoutes } from "./read/approvals-routes";
 import { registerLedgerRoutes } from "./read/ledger-routes";
 import { registerReadRoutes } from "./read/routes";
@@ -15,6 +16,7 @@ import { json, Router } from "./router";
 export type { Env } from "./env";
 export { ExactGate } from "./exact/gate";
 export { JobLock } from "./jobs/job-lock";
+export { RevolutGate } from "./revolut/gate";
 
 /**
  * A failed seed (transient D1 error, bad INITIAL_ADMIN_EMAIL) must not take the app down; it is
@@ -37,6 +39,7 @@ const router = new Router();
 registerAuthRoutes(router);
 registerUserRoutes(router);
 registerExactRoutes(router);
+registerRevolutRoutes(router);
 registerSyncRoutes(router);
 registerReadRoutes(router);
 registerLedgerRoutes(router);

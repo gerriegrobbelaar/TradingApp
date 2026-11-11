@@ -14,7 +14,8 @@
   },
   "dependencies": {
     "@camelthorn/core": "workspace:*",
-    "@camelthorn/exact": "workspace:*"
+    "@camelthorn/exact": "workspace:*",
+    "@camelthorn/revolut": "workspace:*"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.7.0",

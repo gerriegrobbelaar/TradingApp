@@ -70,7 +70,7 @@ describe("migration 0012 on a populated database", () => {
       ).results;
     const before = await snapshot();
 
-    await applyD1Migrations(mdb, all);
+    await applyD1Migrations(mdb, all.slice(0, idx + 1)); // 0012 itself; later migrations have their own tests
 
     expect(await snapshot()).toEqual(before);
     expect((await mdb.prepare("PRAGMA foreign_key_check").all()).results).toEqual([]);

@@ -28,11 +28,12 @@ const INHERITED = [
   "logpush",
 ];
 
-/** The four Worker secrets: never in [vars] (they would be stored and shown in plain text). */
+/** The Worker secrets: never in [vars] (they would be stored and shown in plain text). */
 const SECRET_NAMES = [
   "GOOGLE_CLIENT_SECRET",
   "SESSION_SECRET",
   "EXACT_CLIENT_SECRET",
+  "REVOLUT_PRIVATE_KEY",
   "TOKEN_ENC_KEY",
   "TOKEN_ENC_KEY_PREVIOUS",
 ];
@@ -180,6 +181,30 @@ function environmentProblems(config) {
       );
     }
   }
+  if (!v("REVOLUT_CLIENT_ID")) problems.push("REVOLUT_CLIENT_ID is empty");
+  else if (/^test-/i.test(v("REVOLUT_CLIENT_ID"))) {
+    problems.push("REVOLUT_CLIENT_ID is a test value");
+  }
+  const revolutRedirect = v("REVOLUT_REDIRECT_URI");
+  const revolutBad = badUrl(revolutRedirect);
+  if (revolutBad) {
+    problems.push("REVOLUT_REDIRECT_URI is still the app.example.com placeholder or not https");
+  }
+  // The Revolut callback lives on the app's own origin at the fixed path, and the client
+  // assertion's issuer is that redirect URI's host (Revolut's rule).
+  if (!redirectBad && !revolutBad) {
+    const g = new URL(redirect);
+    const r = new URL(revolutRedirect);
+    if (r.origin !== g.origin || r.pathname !== "/api/connections/revolut/callback") {
+      problems.push(
+        "REVOLUT_REDIRECT_URI must be <OAUTH_REDIRECT_URI origin>/api/connections/revolut/callback",
+      );
+    }
+  }
+  if (!v("REVOLUT_ISSUER")) problems.push("REVOLUT_ISSUER is empty");
+  else if (!revolutBad && v("REVOLUT_ISSUER") !== new URL(revolutRedirect).host) {
+    problems.push("REVOLUT_ISSUER must be the host of REVOLUT_REDIRECT_URI (no https://)");
+  }
   if (!/^[^@\s]+@[^@\s]+$/.test(v("INITIAL_ADMIN_EMAIL"))) {
     problems.push("INITIAL_ADMIN_EMAIL is missing or not an email address");
   }
@@ -211,6 +236,9 @@ function environmentProblems(config) {
   }
   if (!bound("JOB_LOCK", "JobLock") || !declared("JobLock")) {
     problems.push("the JobLock Durable Object binding or its migration is missing");
+  }
+  if (!bound("REVOLUT_GATE", "RevolutGate") || !declared("RevolutGate")) {
+    problems.push("the RevolutGate Durable Object binding or its migration is missing");
   }
   for (const d of dos) {
     if (d.script_name !== undefined) {
@@ -343,7 +371,7 @@ function isolationProblems(a, aName, b, bName) {
     }
   }
   const varOf = (c, k) => (isObject(c.vars) ? str(c.vars[k]) : null);
-  for (const k of ["OAUTH_REDIRECT_URI", "EXACT_REDIRECT_URI"]) {
+  for (const k of ["OAUTH_REDIRECT_URI", "EXACT_REDIRECT_URI", "REVOLUT_REDIRECT_URI"]) {
     const x = varOf(a, k);
     if (x && x === varOf(b, k)) share(k, x);
   }

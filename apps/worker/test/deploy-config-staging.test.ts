@@ -28,6 +28,9 @@ GOOGLE_CLIENT_ID = "123-abc.apps.googleusercontent.com"
 OAUTH_REDIRECT_URI = "https://finance.camelthorncapital.com/api/auth/callback"
 EXACT_CLIENT_ID = "11111111-2222-3333-4444-555555555555"
 EXACT_REDIRECT_URI = "https://finance.camelthorncapital.com/api/connections/exact/callback"
+REVOLUT_CLIENT_ID = "aaaaaaaa-1111-2222-3333-444444444444"
+REVOLUT_REDIRECT_URI = "https://finance.camelthorncapital.com/api/connections/revolut/callback"
+REVOLUT_ISSUER = "finance.camelthorncapital.com"
 
 [[d1_databases]]
 binding = "DB"
@@ -42,6 +45,10 @@ class_name = "ExactGate"
 name = "JOB_LOCK"
 class_name = "JobLock"
 
+[[durable_objects.bindings]]
+name = "REVOLUT_GATE"
+class_name = "RevolutGate"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ExactGate"]
@@ -49,6 +56,10 @@ new_sqlite_classes = ["ExactGate"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["JobLock"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["RevolutGate"]
 
 [[queues.producers]]
 binding = "JOBS_QUEUE"
@@ -84,6 +95,9 @@ GOOGLE_CLIENT_ID = "123-abc.apps.googleusercontent.com"
 OAUTH_REDIRECT_URI = "https://staging.camelthorncapital.com/api/auth/callback"
 EXACT_CLIENT_ID = "11111111-2222-3333-4444-555555555555"
 EXACT_REDIRECT_URI = "https://staging.camelthorncapital.com/api/connections/exact/callback"
+REVOLUT_CLIENT_ID = "aaaaaaaa-1111-2222-3333-444444444444"
+REVOLUT_REDIRECT_URI = "https://staging.camelthorncapital.com/api/connections/revolut/callback"
+REVOLUT_ISSUER = "staging.camelthorncapital.com"
 
 [[env.staging.d1_databases]]
 binding = "DB"
@@ -98,6 +112,10 @@ class_name = "ExactGate"
 name = "JOB_LOCK"
 class_name = "JobLock"
 
+[[env.staging.durable_objects.bindings]]
+name = "REVOLUT_GATE"
+class_name = "RevolutGate"
+
 [[env.staging.migrations]]
 tag = "v1"
 new_sqlite_classes = ["ExactGate"]
@@ -105,6 +123,10 @@ new_sqlite_classes = ["ExactGate"]
 [[env.staging.migrations]]
 tag = "v2"
 new_sqlite_classes = ["JobLock"]
+
+[[env.staging.migrations]]
+tag = "v3"
+new_sqlite_classes = ["RevolutGate"]
 
 [[env.staging.queues.producers]]
 binding = "JOBS_QUEUE"
@@ -381,7 +403,7 @@ describe("M1 review: wrangler's inheritance rules, read with a real TOML parser"
     );
     expect(deployConfigProblems(emptyCron, "staging").join("\n")).toContain("no cron trigger");
     const noMigrations = both.replace(
-      /\[\[env\.staging\.migrations\]\]\ntag = "v1"\nnew_sqlite_classes = \["ExactGate"\]\n\n\[\[env\.staging\.migrations\]\]\ntag = "v2"\nnew_sqlite_classes = \["JobLock"\]\n/,
+      /\[\[env\.staging\.migrations\]\]\ntag = "v1"\nnew_sqlite_classes = \["ExactGate"\]\n\n\[\[env\.staging\.migrations\]\]\ntag = "v2"\nnew_sqlite_classes = \["JobLock"\]\n\n\[\[env\.staging\.migrations\]\]\ntag = "v3"\nnew_sqlite_classes = \["RevolutGate"\]\n/,
       "",
     );
     expect(noMigrations).not.toBe(both);
@@ -390,13 +412,13 @@ describe("M1 review: wrangler's inheritance rules, read with a real TOML parser"
 
   it("refuses staging migrations that drift from production's", () => {
     const t = both.replace(
-      '[[migrations]]\ntag = "v2"\nnew_sqlite_classes = ["JobLock"]\n',
-      '[[migrations]]\ntag = "v2"\nnew_sqlite_classes = ["JobLock"]\n\n[[migrations]]\ntag = "v3"\nnew_sqlite_classes = ["Other"]\n',
+      '[[migrations]]\ntag = "v3"\nnew_sqlite_classes = ["RevolutGate"]\n',
+      '[[migrations]]\ntag = "v3"\nnew_sqlite_classes = ["RevolutGate"]\n\n[[migrations]]\ntag = "v4"\nnew_sqlite_classes = ["Other"]\n',
     );
     expect(t).not.toBe(both);
     for (const env of ["production", "staging"]) {
       expect(deployConfigProblems(t, env).join("\n")).toContain(
-        "staging Durable Object migrations (v1,v2) differ from production (v1,v2,v3)",
+        "staging Durable Object migrations (v1,v2,v3) differ from production (v1,v2,v3,v4)",
       );
     }
   });
@@ -535,6 +557,10 @@ describe("M1 review: the committed file once filled in", () => {
       )
       .replace(/GOOGLE_CLIENT_ID = ""/g, 'GOOGLE_CLIENT_ID = "1-a.apps.googleusercontent.com"')
       .replace(/EXACT_CLIENT_ID = ""/g, 'EXACT_CLIENT_ID = "11111111-2222-3333-4444-555555555555"')
+      .replace(
+        /REVOLUT_CLIENT_ID = ""/g,
+        'REVOLUT_CLIENT_ID = "aaaaaaaa-1111-2222-3333-444444444444"',
+      )
       .replace(/app\.example\.com/g, "finance.camelthorncapital.com")
       .replace(/staging\.example\.com/g, "staging.camelthorncapital.com")
       .replace(

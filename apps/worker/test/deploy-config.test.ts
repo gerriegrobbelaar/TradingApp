@@ -26,6 +26,9 @@ GOOGLE_CLIENT_ID = "123-abc.apps.googleusercontent.com"
 OAUTH_REDIRECT_URI = "https://finance.camelthorncapital.com/api/auth/callback"
 EXACT_CLIENT_ID = "11111111-2222-3333-4444-555555555555"
 EXACT_REDIRECT_URI = "https://finance.camelthorncapital.com/api/connections/exact/callback"
+REVOLUT_CLIENT_ID = "aaaaaaaa-1111-2222-3333-444444444444"
+REVOLUT_REDIRECT_URI = "https://finance.camelthorncapital.com/api/connections/revolut/callback"
+REVOLUT_ISSUER = "finance.camelthorncapital.com"
 
 [[d1_databases]]
 binding = "DB"
@@ -40,6 +43,10 @@ class_name = "ExactGate"
 name = "JOB_LOCK"
 class_name = "JobLock"
 
+[[durable_objects.bindings]]
+name = "REVOLUT_GATE"
+class_name = "RevolutGate"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ExactGate"]
@@ -47,6 +54,10 @@ new_sqlite_classes = ["ExactGate"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["JobLock"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["RevolutGate"]
 
 [[queues.producers]]
 binding = "JOBS_QUEUE"

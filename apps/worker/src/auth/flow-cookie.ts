@@ -18,6 +18,12 @@ export interface FlowState {
   bind?: string;
   /** Exact connect flow: the admin confirmed replacing the connection with a different account. */
   confirmReplace?: boolean;
+  /** Revolut connect flow: the choices the admin made before leaving for Revolut's consent page. */
+  revolut?: {
+    environment: "production" | "sandbox";
+    createsBankEntries: boolean;
+    paymentsMode: "drafts" | "pay";
+  };
   /** Expiry, epoch milliseconds. */
   exp: number;
 }
@@ -49,6 +55,14 @@ export async function openFlow(
       typeof f.returnTo !== "string" ||
       (f.bind !== undefined && typeof f.bind !== "string") ||
       (f.confirmReplace !== undefined && typeof f.confirmReplace !== "boolean") ||
+      (f.revolut !== undefined &&
+        !(
+          typeof f.revolut === "object" &&
+          f.revolut !== null &&
+          (f.revolut.environment === "production" || f.revolut.environment === "sandbox") &&
+          typeof f.revolut.createsBankEntries === "boolean" &&
+          (f.revolut.paymentsMode === "drafts" || f.revolut.paymentsMode === "pay")
+        )) ||
       typeof f.exp !== "number" ||
       f.exp < nowMs
     ) {

@@ -90,6 +90,9 @@ importers:
       '@camelthorn/exact':
         specifier: workspace:*
         version: link:../../packages/exact
+      '@camelthorn/revolut':
+        specifier: workspace:*
+        version: link:../../packages/revolut
     devDependencies:
       '@cloudflare/vitest-plugin':
         specifier: ^1.7.0

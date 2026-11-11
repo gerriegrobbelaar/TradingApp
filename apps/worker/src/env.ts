@@ -1,4 +1,5 @@
 import type { ExactGate } from "./exact/gate";
+import type { RevolutGate } from "./revolut/gate";
 import type { JobMessage } from "./jobs/types";
 import type { JobLock } from "./jobs/job-lock";
 
@@ -25,6 +26,16 @@ export interface Env {
   TOKEN_ENC_KEY: string;
   /** Workers secret, optional: previous TOKEN_ENC_KEY, accepted for decryption during rotation. */
   TOKEN_ENC_KEY_PREVIOUS?: string;
+  /** Workers var: client ID of the Revolut Business API certificate (empty placeholder until set). */
+  REVOLUT_CLIENT_ID: string;
+  /** Workers var: `iss` of the client assertion, the HOST of REVOLUT_REDIRECT_URI. */
+  REVOLUT_ISSUER: string;
+  /** Workers var: absolute callback URL, https://<app host>/api/connections/revolut/callback. */
+  REVOLUT_REDIRECT_URI: string;
+  /** Workers secret: PKCS#8 PEM private key whose certificate is registered with Revolut. */
+  REVOLUT_PRIVATE_KEY: string;
+  /** One instance per Revolut connection ("revolut:<connection id>"). */
+  REVOLUT_GATE: DurableObjectNamespace<RevolutGate>;
   /** One instance per Exact division ("exact:<division>"), plus token authorities. */
   EXACT_GATE: DurableObjectNamespace<ExactGate>;
   /** One JobLock per job name ("job:<name>"): the no-overlap lease (CLAUDE.md 4.1). */

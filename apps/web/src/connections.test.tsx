@@ -43,6 +43,13 @@ const REAUTH: api.ConnectionsResponse = {
   ],
 };
 
+/** The Exact card only: the Revolut card repeats some phrases ("Not connected", "Only admins..."). */
+const exactCard = () => {
+  const card = screen.getByRole("heading", { name: "Exact Online" }).parentElement?.parentElement;
+  if (!card) throw new Error("no Exact card");
+  return within(card);
+};
+
 const list = (body: api.ConnectionsResponse) => ({ "GET /api/connections": () => ({ body }) });
 
 describe("Settings, Connections", () => {
@@ -61,8 +68,8 @@ describe("Settings, Connections", () => {
   it("shows Not connected with a Connect button", async () => {
     mockFetch({ ...ME_OK(ADMIN), ...list(NONE) });
     renderApp("/settings/connections");
-    expect(await screen.findByText("Not connected")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Connect Exact Online" })).toBeTruthy();
+    await screen.findByRole("button", { name: "Connect Exact Online" });
+    expect(exactCard().getByText("Not connected")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Disconnect" })).toBeNull();
   });
 
@@ -105,7 +112,7 @@ describe("Settings, Connections", () => {
     expect(await screen.findByText("Connected")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Re-authorise" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Disconnect" })).toBeNull();
-    expect(screen.getByText(/Only admins can change this connection/)).toBeTruthy();
+    expect(exactCard().getByText(/Only admins can change this connection/)).toBeTruthy();
   });
 
   it("disables Connect and says why when the server is not configured", async () => {
@@ -113,7 +120,7 @@ describe("Settings, Connections", () => {
     renderApp("/settings/connections");
     const btn = await screen.findByRole("button", { name: "Connect Exact Online" });
     expect((btn as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getByText(/not set up on the server yet/)).toBeTruthy();
+    expect(exactCard().getByText(/not set up on the server yet/)).toBeTruthy();
   });
 
   it("navigates to the start route when the sign-in is fresh", async () => {
