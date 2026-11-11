@@ -3,7 +3,7 @@ import type { FxRatesResponse, RateTable } from "@camelthorn/core";
 import { norm } from "../test-norm";
 import {
   ageingTotalsInBase,
-  buildRateTable,
+  rateTableFromResponse,
   chartGeometry,
   differenceOf,
   differenceSentence,
@@ -147,8 +147,8 @@ describe("rateDateFor and rateText", () => {
     expect(rateDateFor(TABLE, ["EUR"])).toBeNull();
   });
   it("shows the ECB number for a EUR administration and a cross rate otherwise", () => {
-    expect(rateText(TABLE, "USD", "EUR")).toBe("rate 1.0853");
-    expect(rateText(TABLE, "USD", "GBP")).toBe("1 USD = 0.803464 GBP");
+    expect(rateText(TABLE, "USD", "EUR")).toBe("rate 1,0853");
+    expect(rateText(TABLE, "USD", "GBP")).toBe("1 USD = 0,803464 GBP");
     expect(rateText(NO_GBP, "USD", "GBP")).toBeNull();
   });
 });
@@ -293,14 +293,14 @@ describe("rates response", () => {
   });
 
   it("builds the table with each currency's own date", () => {
-    const t = buildRateTable(resp());
+    const t = rateTableFromResponse(resp());
     expect(t).toEqual({
       asOf: "2026-11-06",
       base: "EUR",
       rates: { USD: "1.0853", GBP: "0.872" },
       ratesDate: { USD: "2026-11-06", GBP: "2026-11-05" },
     });
-    expect(buildRateTable(null)).toBeNull();
+    expect(rateTableFromResponse(null)).toBeNull();
   });
 
   it("words the stale chip", () => {

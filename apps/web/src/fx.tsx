@@ -12,15 +12,23 @@ import type { FxRatesResponse, RateTable } from "@camelthorn/core";
 import { getFxRates } from "./api";
 import { useDivision } from "./division";
 import { isAbort } from "./lib/errors";
-import { FALLBACK_BASE, buildRateTable } from "./lib/fx";
+import { FALLBACK_BASE, estimatesHidden, rateTableFromResponse } from "./lib/fx";
 import { useAutoRefresh } from "./lib/useAutoRefresh";
 
 export interface FxState {
   /** idle: no provider (tests, or a screen outside the signed-in shell). */
   status: "idle" | "loading" | "ready" | "error";
   data: FxRatesResponse | null;
-  /** The rates as a core table; null until the first answer. */
+  /**
+   * The rates as a core table; null until the first answer, after a response that cannot be
+   * turned into a table, and while the rates are too old to estimate with (`hidden`).
+   */
   table: RateTable | null;
+  /**
+   * The rates are older than the cut-off (review S7): no estimate is shown anywhere, only the
+   * original amounts and the stale notice.
+   */
+  hidden: boolean;
   /** The selected administration's currency. EUR only when none is known (see `baseAssumed`). */
   base: string;
   /** True when no administration is selected yet, so `base` is the EUR fall-back. */
@@ -45,6 +53,7 @@ const DEFAULT: FxState = {
   status: "idle",
   data: null,
   table: null,
+  hidden: false,
   base: FALLBACK_BASE,
   baseAssumed: true,
   ready: false,
@@ -110,11 +119,22 @@ export function FxProvider({ children }: { children: ReactNode }) {
   const selected = division.selected;
   const divisionLoading = division.status === "loading";
   const value = useMemo<FxState>(() => {
-    const table = buildRateTable(raw.data);
+    // Building the table must never throw during render (review S2): a response that cannot be
+    // turned into a table is the same as one that could not be read.
+    let table: RateTable | null = null;
+    let failed = false;
+    try {
+      table = rateTableFromResponse(raw.data);
+    } catch {
+      failed = true;
+    }
+    const hidden = estimatesHidden(raw.data);
+    if (hidden || failed) table = null;
     return {
-      status: raw.status,
-      data: raw.data,
+      status: failed ? "error" : raw.status,
+      data: failed ? null : raw.data,
       table,
+      hidden,
       base: selected?.currency ?? FALLBACK_BASE,
       baseAssumed: selected === null,
       ready: table !== null && !divisionLoading,

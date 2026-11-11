@@ -67,6 +67,16 @@ describe("FX text, chips and chart line keep their contrast", () => {
     }
   }
 
+  it("the error fallback (.notice.warn) and the page chip take the tested warn pair", () => {
+    const appCss = readFileSync(join(__dirname, "app.css"), "utf8");
+    const rule = /\.notice\.warn\s*\{([^}]*)\}/.exec(appCss)?.[1] ?? "";
+    expect(rule).toContain("var(--warn-soft)");
+    expect(rule).toContain("var(--warn-text)");
+    // fx.css gives the page chip a margin only, so the chip keeps the pair tested above
+    const chipRule = /\.fx-page-chip\s*\{([^}]*)\}/.exec(fxCss)?.[1] ?? "";
+    expect(chipRule).not.toMatch(/color|background/);
+  });
+
   it("fx.css uses tokens only: no hex or rgb colours", () => {
     const code = fxCss.replace(/\/\*[\s\S]*?\*\//g, "");
     expect(/#[0-9a-fA-F]{3,8}\b/.test(code)).toBe(false);

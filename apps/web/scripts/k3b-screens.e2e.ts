@@ -25,6 +25,7 @@ import {
   profitLossResponse,
   type AgeingFixtureItem,
 } from "../src/test-fixtures-reports";
+import { fxRates } from "../src/test-fixtures-fx";
 
 const VIEWER = {
   email: "v@camelthorncapital.com",
@@ -126,6 +127,10 @@ function api(path: string, search: URLSearchParams): unknown {
       return VIEWER;
     case "/api/divisions":
       return ONE_DIVISION;
+    case "/api/fx/rates":
+      // F3 added a rates request to every signed-in screen: a screen without this mock logs a
+      // console 404 (review S2). A realistic, fresh answer (rates of 10 Nov 2026).
+      return fxRates();
     case "/api/reports/ageing":
       return ageingResponse(
         search.get("kind") === "payable" ? ageingItems(9) : ageingItems(11),

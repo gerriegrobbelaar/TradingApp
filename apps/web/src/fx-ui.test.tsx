@@ -31,7 +31,7 @@ const amt = (minor: number, dc: number, complete = true, count = 1): KpiAmountDt
   dcMinor: dc,
   dcComplete: complete,
 });
-const NOW_RATE = "about € 92,14 at today's ECB rate (rate 1.0853 USD per EUR, 10 Nov)";
+const NOW_RATE = "about € 92,14 at today's ECB rate (rate 1,0853 USD per EUR, 10 Nov)";
 
 /** USD receivables: 100,00 USD open, 90,00 EUR booked. */
 const usdKpis = (path: "/api/invoices" | "/api/bills", over = {}) =>
@@ -64,7 +64,7 @@ describe("Overview: foreign currency figures", () => {
     await waitFor(() => expect(norm(recv.textContent)).toContain(NOW_RATE));
     const text = norm(recv.textContent);
     expect(text).toContain("$ 100,00"); // the original stays the big number
-    expect(text).toContain("Booked € 90,00 · difference +€ 2,14");
+    expect(text).toContain("Booked € 90,00 · estimated difference +€ 2,14");
     expect(text).toContain("You would receive € 2,14 more than booked. (unrealised gain)");
     // the old "Exact's own amount" line is replaced, not repeated
     expect(text).not.toContain("(booked rate in Exact)");
@@ -122,7 +122,7 @@ describe("Overview: foreign currency figures", () => {
     });
     const { unmount } = renderApp("/overview");
     await recvRegion();
-    expect(await screen.findAllByText("Rates from 6 Nov, one working day old")).not.toHaveLength(0);
+    expect(await screen.findAllByText("Rates from 6 Nov, 3 working days old")).not.toHaveLength(0);
     unmount();
 
     mockFetch({
@@ -146,7 +146,7 @@ describe("Overview: foreign currency figures", () => {
     });
     renderApp("/overview");
     const recv = await recvRegion();
-    expect(norm(recv.textContent)).toContain("about € 90,00 (booked rate in Exact)");
+    expect(norm(recv.textContent)).toContain("€ 90,00 booked in Exact");
     expect(norm(recv.textContent)).not.toContain("today's ECB rate");
   });
 });
@@ -230,7 +230,7 @@ describe("Overview: total in € at today's ECB rates", () => {
     expect(norm(head.textContent)).toContain("Open receivables about £ 217,55");
     // the USD line is converted straight to pounds, with the cross rate and the older GBP date
     expect(norm(recv.textContent)).toContain(
-      "about £ 80,35 at today's ECB rate (1 USD = 0.803464 GBP, 6 Nov)",
+      "about £ 80,35 at the ECB rate of 6 Nov (1 USD = 0,803464 GBP)",
     );
     expect(norm(recv.textContent)).toContain("Booked £ 90,00");
   });
@@ -268,7 +268,8 @@ describe("Invoices and payables: rows and the item sheet", () => {
     await within(dialog).findByText(/Open balance in EUR at today's ECB rate/);
     const t = norm(dialog.textContent);
     expect(t).toContain(NOW_RATE);
-    expect(t).toContain("Booked € 90,00 · difference +€ 2,14");
+    // an item: "difference" (computed from this one item), with the rate wording
+    expect(t).toContain("Booked € 90,00 · difference +€ 2,14 at today's ECB rate");
     expect(t).toContain("You would receive € 2,14 more than booked. (unrealised gain)");
     expect(t).toContain("An estimate with today's rate, not the rate on the day.");
     expect(await axe(dialog)).toHaveNoViolations();
@@ -448,7 +449,9 @@ describe("Bank: total at today's ECB rates and the transaction sheet", () => {
     const strip = await screen.findByRole("region", { name: "Balance by currency" });
     // 12.345,67 EUR + 500,25 GBP / 0.872 (573,68 EUR)
     await waitFor(() =>
-      expect(norm(strip.textContent)).toContain("About € 12.919,35 in total at today's ECB rates"),
+      expect(norm(strip.textContent)).toContain(
+        "About € 12.919,35 in total at the ECB rate of 6 Nov",
+      ),
     );
     expect(norm(strip.textContent)).toContain("Estimate, ECB rates of 6 Nov");
     expect(norm(strip.textContent)).toContain("£ 500,25");
@@ -612,16 +615,15 @@ describe("Settings, FX rates", () => {
     const table = await screen.findByRole("table", { name: /Latest ECB reference rate/ });
     const t = norm(table.textContent);
     expect(t).toContain("USD");
-    expect(within(table).getByRole("row", { name: /USD 1\.0853 10 Nov 2026/ })).toBeTruthy();
+    expect(within(table).getByRole("row", { name: /USD 1,0853 10 Nov 2026/ })).toBeTruthy();
     expect(
-      within(table).getByRole("row", { name: /GBP 0\.872 6 Nov 2026 Not published since 6 Nov/ }),
+      within(table).getByRole("row", { name: /GBP 0,8720 6 Nov 2026 Not published since 6 Nov/ }),
     ).toBeTruthy();
     expect(screen.getByText(NOTICE)).toBeTruthy();
     expect(screen.getByText("Rates from 10 Nov, up to date")).toBeTruthy();
     expect(screen.getByText(/^Last import: 10 Nov 2026, \d\d:\d\d — OK/)).toBeTruthy();
-    expect(
-      screen.getByText("Confirm with your accountant before using these rates for revaluation."),
-    ).toBeTruthy();
+    // N6: the accountant caveat is the API notice, once; no second copy of it on the tab
+    expect(document.body.textContent?.match(/accountant/g)).toHaveLength(1);
     expect(screen.getByRole("link", { name: "Open schedules" }).getAttribute("href")).toBe(
       "/settings/schedules",
     );
@@ -631,7 +633,7 @@ describe("Settings, FX rates", () => {
   it("shows the stale chip and a failed last import", async () => {
     tab(VIEWER, { ...fxStale(), lastImportStatus: "error" });
     renderApp("/settings/fx");
-    expect(await screen.findByText("Rates from 6 Nov, one working day old")).toBeTruthy();
+    expect(await screen.findByText("Rates from 6 Nov, 3 working days old")).toBeTruthy();
     expect(screen.getByText(/^Last import: .* — failed/)).toBeTruthy();
     expect(screen.getByText(/The last import failed/)).toBeTruthy();
   });
@@ -671,8 +673,8 @@ describe("Settings, FX rates", () => {
       name: /GBP per 1 EUR over 5 ECB publication days/,
     });
     const label = chart.getAttribute("aria-label") ?? "";
-    expect(label).toContain("from 1.0712 on 2 Nov to 1.0853 on 6 Nov");
-    expect(label).toContain("Lowest 1.0712 on 2 Nov, highest 1.0953 on 4 Nov");
+    expect(label).toContain("from 1,0712 on 2 Nov to 1,0853 on 6 Nov");
+    expect(label).toContain("Lowest 1,0712 on 2 Nov, highest 1,0953 on 4 Nov");
     expect(chart.querySelector("path.fx-series")?.getAttribute("d")).toBe(
       "M0 160 L150 109 L300 0 L450 89 L600 67",
     );

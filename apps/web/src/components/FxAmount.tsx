@@ -5,10 +5,13 @@ import { formatDayMonth, formatMoney } from "../lib/format";
 import {
   differenceOf,
   differenceSentence,
+  hiddenNoticeText,
+  isTodaysRate,
   missingRates,
   rateDateFor,
   rateText,
   rateUnitText,
+  rateWording,
   resultWord,
   signedMoney,
   staleChipText,
@@ -27,12 +30,33 @@ export interface BookedAmount {
   kind: "invoice" | "bill";
 }
 
-/** Amber chip for rates that are old or missing; nothing when they are fresh. */
+/**
+ * Amber chip for rates that are old or missing; nothing when they are fresh. Rates past the
+ * cut-off (review S7) get the notice that estimates are hidden instead.
+ */
 export function FxStaleChip() {
   const fx = useFxRates();
-  const text = fx.data ? staleChipText(fx.data) : null;
+  const text = fx.data ? (hiddenNoticeText(fx.data) ?? staleChipText(fx.data)) : null;
   if (!text) return null;
   return <Chip tone="warn">{text}</Chip>;
+}
+
+/**
+ * The stale-rates chip ONCE at the top of a page that shows foreign-currency figures (the
+ * Invoices and Payables lists, the Overview, the ageing reports). `foreign` is false for a page
+ * whose amounts are all in the administration currency: nothing is estimated there, so a warning
+ * about the rates would only be noise.
+ */
+export function FxPageChip({ foreign }: { foreign: boolean }) {
+  const fx = useFxRates();
+  if (!foreign) return null;
+  const text = fx.data ? (hiddenNoticeText(fx.data) ?? staleChipText(fx.data)) : null;
+  if (!text) return null;
+  return (
+    <div className="fx-page-chip">
+      <Chip tone="warn">{text}</Chip>
+    </div>
+  );
 }
 
 /**
@@ -81,6 +105,7 @@ export function FxAmount({
   compact = false,
   note,
   count,
+  aggregate = false,
 }: {
   currency: string;
   minor: number | bigint;
@@ -93,6 +118,11 @@ export function FxAmount({
   note?: ReactNode;
   /** Number of items behind the figure; 0 renders nothing. */
   count?: number;
+  /**
+   * The figure adds up many items (Overview, ageing): its difference is labelled an ESTIMATE, as
+   * it will not equal the month-end journal, which is built from item-level differences.
+   */
+  aggregate?: boolean;
 }) {
   const fx = useFxRates();
   const table = fx.table;
@@ -104,6 +134,17 @@ export function FxAmount({
     </p>
   ) : null;
   if (currency === base) return original;
+  if (fx.hidden) {
+    // Rates past the cut-off: the original amount only, and why there is no estimate.
+    return (
+      <div className="fx-amount">
+        {original}
+        <p className="cap fx-line fx-missing">
+          No estimate: the ECB rates are {fx.data?.workingDaysOld} working days old
+        </p>
+      </div>
+    );
+  }
   if (!fx.ready || !table) {
     if (!fx.pending) {
       if (fx.status !== "error") return original;
@@ -146,6 +187,8 @@ export function FxAmount({
   }
   const date = rateDateFor(table, [currency, base]);
   const rate = rateText(table, currency, base);
+  const wording = rateWording(fx.data, date);
+  const current = isTodaysRate(fx.data, date);
   const diff = booked
     ? differenceOf(table, {
         kind: booked.kind,
@@ -160,13 +203,13 @@ export function FxAmount({
     <div className="fx-amount">
       {original}
       <p className="cap fx-line">
-        about <span className="num">{formatMoney(today.minor, base)}</span> at today&apos;s ECB rate
+        about <span className="num">{formatMoney(today.minor, base)}</span> {wording}
         {rate && (
           <>
             {" "}
             ({rate}
             <span className="sr-only">{rateUnitText(currency, base)}</span>
-            {date ? `, ${formatDayMonth(date)}` : ""})
+            {date && current ? `, ${formatDayMonth(date)}` : ""})
           </>
         )}
       </p>
@@ -186,8 +229,10 @@ export function FxAmount({
       {booked && diff && diff.ok && (
         <>
           <p className="cap fx-line">
-            Booked <span className="num">{formatMoney(diff.bookedMinor, base)}</span> · difference{" "}
+            Booked <span className="num">{formatMoney(diff.bookedMinor, base)}</span> ·{" "}
+            {aggregate ? "estimated difference" : "difference"}{" "}
             <span className="num">{signedMoney(diff.differenceMinor, base)}</span>
+            {aggregate ? "" : ` ${wording}`}
           </p>
           <p className="cap fx-line">
             {differenceSentence(booked.kind, minor, diff.differenceMinor, base)}
@@ -252,14 +297,15 @@ export function FxDcLine({
       booked={{ minor: dcMinor, complete: dcComplete, kind }}
       showOriginal={false}
       compact
+      aggregate
     />
   );
 }
 
 /** One compact line under a row's amount: "about € 90,00" for a foreign-currency row. */
 export function FxRowLine({ currency, minor }: { currency: string; minor: number | bigint }) {
-  const { table, base, ready, pending } = useFxRates();
-  if (currency === base) return null;
+  const { table, base, ready, pending, data, hidden } = useFxRates();
+  if (currency === base || hidden) return null;
   if (!ready || !table) {
     // Keep the row's height while the rates load, so the table does not jump.
     return pending ? (
@@ -274,10 +320,18 @@ export function FxRowLine({ currency, minor }: { currency: string; minor: number
   }
   const c = toBase(table, minor, currency, base);
   if (!c.ok) return null;
+  // Fresh rates: "about € 90,00" (the wording is for screen readers). Stale rates: the date is
+  // part of the visible line, "about € 90,00 at the ECB rate of 6 Nov" (review S7).
+  const date = rateDateFor(table, [currency, base]);
+  const todays = isTodaysRate(data, date);
   return (
     <span className="cap fx-row">
       about <span className="num">{formatMoney(c.minor, base)}</span>
-      <span className="sr-only"> at today&apos;s ECB rate</span>
+      {todays ? (
+        <span className="sr-only"> {rateWording(data, date)}</span>
+      ) : (
+        <> {rateWording(data, date)}</>
+      )}
     </span>
   );
 }

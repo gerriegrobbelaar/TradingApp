@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, type ReactNode } from "react";
+import { ErrorBoundary } from "./ErrorBoundary";
 
 export interface SheetProps {
   open: boolean;
@@ -71,7 +72,19 @@ export function Sheet({ open, title, onClose, children }: SheetProps) {
         <h2 id={titleId} className="h3">
           {title}
         </h2>
-        {children}
+        {/* A child that throws leaves the sheet (title, Escape, close) and the page working. */}
+        <ErrorBoundary
+          fallback={
+            <div role="alert" className="notice warn">
+              <p>Something went wrong in this panel. Close it and try again.</p>
+              <button type="button" className="btn sm" onClick={onClose}>
+                Close
+              </button>
+            </div>
+          }
+        >
+          {children}
+        </ErrorBoundary>
       </div>
     </>
   );

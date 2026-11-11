@@ -375,7 +375,9 @@ describe("Invoices list", () => {
     expect(dl("Has VAT number")).toBe("Yes");
     expect(dl("Country")).toBe("NL");
     expect(dl("Document")).toBe("INV-1");
-    expect(dl("Exchange rate")).toBe("1.0856");
+    expect(norm(dl("Booked rate in Exact") ?? "")).toBe(
+      "1 EUR = € 1,0856 (as stored; direction unverified)",
+    );
     expect(norm(dl("Invoice total") ?? "")).toBe("€ 1.000,00");
     expect(norm(dl("Amount as stored") ?? "")).toBe("€ 1.000,00");
     expect(dl("Due date")).toBe("1 Oct 2026");

@@ -5,7 +5,6 @@ import { useFxRates } from "../fx";
 import { BUCKET_LABEL } from "../lib/ageing";
 import { NO_VALUE, formatDayMonth, formatMoney } from "../lib/format";
 import { ageingTotalsInBase, baseLabel, notIncludedText, type ConvertedTotal } from "../lib/fx";
-import { FxStaleChip } from "./FxAmount";
 import { ScrollRegion } from "./ReportParts";
 
 /** "Total in € at today's ECB rates": the heading every converted total carries. */
@@ -43,22 +42,22 @@ export function ConvertedNote({
 }
 
 /**
- * Explains a block of converted totals once: it is an estimate at today's rates, original
- * amounts are not added together, and the stale chip when the rates are old. Renders nothing when
- * the rates are not there.
+ * Explains a block of converted totals once: it is an estimate at the ECB rates, original
+ * amounts are not added together. The stale chip is shown once per page (FxStaleChip at the top
+ * of the page), not in every block. Renders nothing when the rates are not there.
  */
 export function FxEstimateIntro({ children }: { children?: ReactNode }) {
-  const { ready, baseAssumed, base } = useFxRates();
+  const { ready, baseAssumed, base, data } = useFxRates();
   if (!ready) return null;
   return (
     <div className="fx-intro">
       <p className="cap">
-        An estimate at today&apos;s ECB rates, for information only. Each currency is converted
-        once, then the results are added. The original amounts stay as they are.
+        An estimate at {data?.stale ? "the latest" : "today's"} ECB rates, for information only.
+        Each currency is converted once, then the results are added. The original amounts stay as
+        they are.
         {baseAssumed && ` The administration currency is not known yet, so ${base} is assumed.`}
       </p>
       {children}
-      <FxStaleChip />
     </div>
   );
 }
@@ -93,7 +92,12 @@ export function AgeingFxTotalsCard({ data }: { data: AgeingReportResponse }) {
       <h2 id="ageing-fx" className="h2">
         {title}
       </h2>
-      <FxEstimateIntro />
+      <FxEstimateIntro>
+        <p className="cap">
+          Each column is converted on its own and the Total is the sum of the columns, so it can
+          differ by a few cents from converting each currency&apos;s total once.
+        </p>
+      </FxEstimateIntro>
       <ScrollRegion label={`${title}, per days past due`}>
         <table className="tbl report-table ageing-table">
           <caption className="sr-only">

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { strFromU8, unzipSync } from "fflate";
-import { ageingTotalsInBase, buildRateTable } from "../lib/fx";
+import { ageingTotalsInBase, rateTableFromResponse } from "../lib/fx";
 import { ageingResponse } from "../test-fixtures-reports";
 import { fxRatesNoGbp } from "../test-fixtures-fx";
 import { ageingExport } from "./report-workbooks";
@@ -55,7 +55,7 @@ const ITEMS = [
 
 describe("ageing export with the converted total", () => {
   const r = ageingResponse(ITEMS);
-  const table0 = buildRateTable(fxRatesNoGbp());
+  const table0 = rateTableFromResponse(fxRatesNoGbp());
   const fx = ageingTotalsInBase(table0 as NonNullable<typeof table0>, "EUR", r.currencies);
 
   it("adds one sheet with the rate date, the estimate wording and exact amounts", () => {
@@ -101,7 +101,7 @@ describe("ageing export with the converted total", () => {
       ],
       "receivable",
     );
-    const t = buildRateTable(fxRatesNoGbp());
+    const t = rateTableFromResponse(fxRatesNoGbp());
     const totals = ageingTotalsInBase(t as NonNullable<typeof t>, "GBP", gbpReport.currencies);
     const out = ageingExport(gbpReport, CTX, "outstanding", totals);
     const sheet = out.sheets.at(-1) as SheetSpec;

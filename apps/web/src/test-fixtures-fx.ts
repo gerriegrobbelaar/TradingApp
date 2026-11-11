@@ -47,7 +47,19 @@ export function fxStale(): FxRatesResponse {
     rates: fxRates().rates.map((r) => ({ ...r, rateDate: "2026-11-06" })),
     stale: true,
     staleReason: "older_than_one_working_day",
-    workingDaysOld: 1,
+    // Rates of Friday 6 Nov, seen on Wednesday 11 Nov: 9, 10 and 11 Nov are three working days.
+    workingDaysOld: 3,
+  });
+}
+
+/** An outage: the newest rates are those of Monday 2 Nov, seen on 11 Nov (7 working days). */
+export function fxOutage(): FxRatesResponse {
+  return fxRates({
+    asOf: "2026-11-02",
+    rates: fxRates().rates.map((r) => ({ ...r, rateDate: "2026-11-02" })),
+    stale: true,
+    staleReason: "older_than_one_working_day",
+    workingDaysOld: 7,
   });
 }
 

@@ -2,6 +2,7 @@ export const UI_PACKAGE = "@camelthorn/ui";
 
 export { Button, type ButtonProps, type ButtonSize, type ButtonVariant } from "./components/Button";
 export { Card, type CardProps } from "./components/Card";
+export { ErrorBoundary, type ErrorBoundaryProps } from "./components/ErrorBoundary";
 export { Chip, type ChipProps, type ChipTone } from "./components/Chip";
 export { Segmented, type SegmentedOption, type SegmentedProps } from "./components/Segmented";
 export { Sheet, type SheetProps } from "./components/Sheet";

@@ -44,7 +44,7 @@ describe("Overview", () => {
     expect(within(recv).getByRole("heading", { name: "USD", level: 3 })).toBeTruthy();
     // The foreign currency shows its division-currency amount without adding to the EUR line.
     expect(norm(recv.textContent)).toContain("$ 500,00");
-    expect(norm(recv.textContent)).toContain("about € 460,00 (booked rate in Exact)");
+    expect(norm(recv.textContent)).toContain("€ 460,00 booked in Exact");
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
     expect(await axe(container)).toHaveNoViolations();
   });
@@ -134,7 +134,7 @@ describe("Overview", () => {
     expect(text).toContain("Not known yet.");
   });
 
-  it("says 'about' with the booked rate when every item has a division amount", async () => {
+  it("states the booked amount (no 'about') when every item has a division amount", async () => {
     mockFetch({
       ...me(),
       ...divs(),
@@ -153,7 +153,7 @@ describe("Overview", () => {
     });
     renderApp("/overview");
     await screen.findByRole("region", { name: "Receivables" });
-    expect(norm(document.body.textContent)).toContain("about € 800,00 (booked rate in Exact)");
+    expect(norm(document.body.textContent)).toContain("€ 800,00 booked in Exact");
   });
 
   it("opens the items behind a figure with the drilldown filters and the division", async () => {

@@ -86,3 +86,23 @@ Review K3a: table rows (`.dt-table`) no longer use `--accent-soft` for the selec
 ## K3b reporting screens
 
 Screenshots: `docs/design/screens/k3b-{creditors-ageing,receivables-ageing,balance-sheet,profit-loss}-{light,dark}-{360,1280}.png`, sheets `k3b-*-sheet-*.png`, and first-page print previews `k3b-print-*.png` (A4, light, from Playwright `page.pdf()`). Regenerate: `pnpm --filter @camelthorn/web build`, then `PLAYWRIGHT_PATH=<playwright/index.mjs> pnpm --filter @camelthorn/web exec vitest run --config scripts/vitest.screens.config.ts` (also asserts no page-level sideways scroll, print orientation, no clipped columns, repeated headers). Decisions: `docs/decisions/0027-reporting-screens-and-export.md`.
+
+## FX wording (Phase 6 review: S5, S6, S7, S11, N1, N6)
+
+Addendum to ADR 0037, which the orchestrator edits (see the T2 report for the exact lines).
+
+- **"about" is for ECB estimates only.** A figure Exact booked is never "about": `€ 1.234,00 booked in Exact` (was "about € 1.234,00 (booked rate in Exact)"). Incomplete: `At least € 500,00 in EUR as stored in Exact. Some items have no amount in EUR yet.`
+- **Aggregate versus item.** Any difference that adds up many items (Overview figures, ageing sections) reads `Booked € 90,00 · estimated difference +€ 2,14`. An item's own difference (item sheet) reads `Booked € 90,00 · difference +€ 2,14 at today's ECB rate`, because it is computed from one item. Phase 12 books from item-level differences, so an aggregate "estimated difference" is not expected to equal the journal.
+- **Ageing converted row cross-foots.** Every bucket is converted once per currency; the Total cell is the SUM of the bucket cells (screen, print and Excel show the same numbers). Consequence, stated in the card and in the Excel header: the Total can differ by a few cents from converting each currency's grand total once (at most half a cent per bucket and currency). A currency without a usable rate in any one cell is left out of every cell.
+- **Old rates (S7).** `workingDaysOld` from the API decides. Fresh: `about € 90,00` with `at today's ECB rate` for screen readers. More than one working day old (stale): the line says `about € 90,00 at the ECB rate of 6 Nov` (the OLDEST rate date used, also for a currency the ECB stopped publishing while the feed is fresh), intro text says "latest" instead of "today's", and one amber chip sits at the top of Overview, Invoices, Payables and the ageing reports (only when the page shows a foreign-currency amount). More than 5 working days old: no estimate anywhere, only original amounts and Exact's booked amounts, plus the chip `ECB rates are 7 working days old; estimates are hidden`. The FX tab still lists the rates and their dates.
+- **Item sheet rates (S11).** Three labelled rows: `Booked rate in Exact`: `1 USD = € 0,92 (as stored; direction unverified)` (Exact's raw RateFC, only when present), `Implied booked rate`: `1 USD = € 0,9000 (booked amount divided by open amount)` (same direction as the booked rate, from the booked and open amounts), and `ECB today`: `1 EUR = 1,0853 USD (10 Nov)` (the ECB's own direction; `ECB rate of 6 Nov` when old).
+- **Rate formatting (N1).** Rates on screen and in print use the number locale (nl-NL) with at least four fraction digits, from the decimal string (no Number): `1,0853`, `1,0820`, `165,5000`, `17.000,1200`. Excel keeps exact dot-decimal text.
+- **FX tab (N6).** The API notice is shown once, verbatim; it already carries the accountant caveat, so there is no second copy.
+
+## Error fallback (Phase 6 review S2)
+
+A render error inside a screen shows `Something went wrong on this page. Reload, or go back.` (heading "Something went wrong" as the page's h1, buttons Reload and Go back) inside `<main>`; the menu, skip link and footer keep working, and the fallback clears when the route changes. A sheet body that throws shows `Something went wrong in this panel. Close it and try again.` with a Close button; the sheet's title, Escape and scrim keep working. Neither shows error text; the console gets `ui render error: <ErrorName>` once (React's own report of caught errors is switched off in `main.tsx`, `lib/root-errors.ts`). Screens suite scene: `f3-page-error-*.png`.
+
+## Running the screens suites
+
+Before each phase review run all five suites (K3b, R2, R3b, Q2, F3); they are not part of `pnpm test`. See `apps/web/README.md`.

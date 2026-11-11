@@ -4,9 +4,10 @@ import { formatMoney } from "../lib/format";
  * The one wording for "what this foreign-currency figure is in the administration's own currency,
  * as Exact stored it" (review S3). Used by the Overview figures and the ageing report so they
  * cannot disagree. We never convert: the amount is Exact's own division-currency amount at the
- * rate booked on each item, not today's rate.
+ * rate booked on each item, not today's rate. It is a booked figure, not an estimate, so it never
+ * says "about" (review S5); that word is kept for ECB estimates.
  *
- *  - complete: "about € 1.234,00 (booked rate in Exact)"
+ *  - complete: "€ 1.234,00 booked in Exact"
  *  - some items have no such amount, total above 0: "At least € 500,00 in EUR as stored in Exact.
  *    Some items have no amount in EUR yet."
  *  - some items have none and the total is 0: "Not known yet", never "At least € 0,00".
@@ -17,7 +18,7 @@ export function dcLineText(p: {
   dcCurrency: string;
 }): string {
   const cur = p.dcCurrency;
-  if (p.dcComplete) return `about ${formatMoney(p.dcMinor, cur)} (booked rate in Exact)`;
+  if (p.dcComplete) return `${formatMoney(p.dcMinor, cur)} booked in Exact`;
   if (p.dcMinor === 0) {
     return `Not known yet. Exact has no amount in ${cur} for these items yet.`;
   }
@@ -44,5 +45,3 @@ export function DcLine({
   if (currency === dcCurrency || count <= 0) return null;
   return <p className="cap">{dcLineText({ dcMinor, dcComplete, dcCurrency })}</p>;
 }
-
-export { DcLine as DivisionCurrencyAmount };

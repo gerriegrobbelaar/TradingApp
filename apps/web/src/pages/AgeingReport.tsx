@@ -14,7 +14,7 @@ import { getAgeingReport } from "../api";
 import { EmptyState, ErrorNotice } from "../components/EmptyState";
 import { SearchBox } from "../components/FilterBar";
 import { FreshnessStamp } from "../components/FreshnessStamp";
-import { FxDcLine } from "../components/FxAmount";
+import { FxDcLine, FxPageChip } from "../components/FxAmount";
 import { AgeingFxTotalsCard } from "../components/FxTotals";
 import { Money } from "../components/Money";
 import { useFxRates } from "../fx";
@@ -420,6 +420,11 @@ export function AgeingReport({ kind }: { kind: AgeingKind }) {
         </p>
       )}
       {gate}
+      <FxPageChip
+        foreign={
+          data !== null && data.currencies.some((c) => c.currency !== data.division.currency)
+        }
+      />
       {selected && (
         <>
           <div className="report-bar no-print">

@@ -7,7 +7,7 @@
  * copy. Both are exported so a user setting can replace them later. Dates are shown in
  * Europe/Amsterdam; calendar dates (YYYY-MM-DD) carry no time zone and are never shifted.
  */
-import { currencyScale } from "@camelthorn/core";
+import { currencyScale, formatRateForDisplay } from "@camelthorn/core";
 
 export const NUMBER_LOCALE = "nl-NL";
 export const DATE_LOCALE = "en-GB";
@@ -248,6 +248,31 @@ const DECIMAL_SEPARATOR =
   new Intl.NumberFormat(NUMBER_LOCALE, { minimumFractionDigits: 1 })
     .formatToParts(1.5)
     .find((p) => p.type === "decimal")?.value ?? ".";
+
+const GROUP_SEPARATOR =
+  new Intl.NumberFormat(NUMBER_LOCALE).formatToParts(1234567).find((p) => p.type === "group")
+    ?.value ?? "";
+
+/**
+ * An exchange rate (a decimal STRING, never a Number) in the number locale: decimal comma,
+ * thousands separator, at least `minFraction` fraction digits (default 4: "1,0853", "1,0820",
+ * "165,5000") and at most `maxFraction` (default 6, rounded half away from zero by core). Used on
+ * screen and in print; Excel keeps the exact dot-decimal text. Text that is not a plain decimal is
+ * returned as it came.
+ */
+export function formatRate(rate: string, minFraction = 4, maxFraction = 6): string {
+  const plain = formatRateForDisplay(rate, Math.max(minFraction, maxFraction));
+  if (!/^-?\d+(\.\d+)?$/.test(plain)) return rate;
+  const negative = plain.startsWith("-");
+  const [whole = "", frac = ""] = (negative ? plain.slice(1) : plain).split(".");
+  let grouped = "";
+  for (let i = whole.length; i > 0; i -= 3) {
+    const chunk = whole.slice(Math.max(0, i - 3), i);
+    grouped = i === whole.length ? chunk : `${chunk}${GROUP_SEPARATOR}${grouped}`;
+  }
+  const digits = frac.padEnd(minFraction, "0");
+  return `${negative ? "-" : ""}${grouped}${digits ? `${DECIMAL_SEPARATOR}${digits}` : ""}`;
+}
 
 /**
  * A variance in basis points (1 % = 100 bp) as a percentage with one decimal: 1234 -> "12,3%".

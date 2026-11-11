@@ -23,6 +23,9 @@
   display: block;
   text-align: right;
 }
+.app .fx-page-chip {
+  margin: 0 0 12px;
+}
 .app .fx-intro {
   display: flex;
   flex-wrap: wrap;

@@ -14,7 +14,7 @@ import { useFxRates } from "../fx";
 import { DrillDownSheet, type DrillExpected } from "../components/OpenItemSheets";
 import { EmptyState, ErrorNotice } from "../components/EmptyState";
 import { FreshnessStamp } from "../components/FreshnessStamp";
-import { FxDcLine } from "../components/FxAmount";
+import { FxDcLine, FxPageChip } from "../components/FxAmount";
 import {
   ConvertedAmount,
   ConvertedNote,
@@ -318,6 +318,14 @@ export function Overview() {
         lede="What customers owe you, what you owe suppliers, and what is late. Every figure opens the items behind it."
         tools={
           <FreshnessStamp freshness={data?.freshness ?? null} what="Open invoices and bills" />
+        }
+      />
+      <FxPageChip
+        foreign={
+          data !== null &&
+          [...data.kpis.receivable, ...data.kpis.payable].some(
+            (k) => k.currency !== data.division.currency,
+          )
         }
       />
       {division.status === "loading" && <Skeletons />}

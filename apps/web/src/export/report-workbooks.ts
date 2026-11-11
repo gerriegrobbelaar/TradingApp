@@ -116,7 +116,8 @@ function ageingFxSheet(
   const block = headerBlock(`${title}: ${label}`, ctx, `As of: ${formatDate(r.asOf)}`, [
     `Currency: ${fx.base}`,
     note,
-    "An estimate: each currency is converted once at today's rate, then the results are added.",
+    "An estimate: each currency is converted once per column, then the results are added.",
+    "The Total is the sum of the columns, so it can differ by a few cents from converting each currency's total once.",
     ...(fx.excluded.length > 0
       ? [
           `Not included (no ECB rate${

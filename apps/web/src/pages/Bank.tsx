@@ -9,7 +9,7 @@ import { Card, Segmented, Skeleton } from "@camelthorn/ui";
 import { getBankAccounts, listBankTransactions } from "../api";
 import { useMe } from "../auth";
 import { useFxRates } from "../fx";
-import { sumInBase } from "../lib/fx";
+import { rateWording, sumInBase } from "../lib/fx";
 import {
   AccountCard,
   BankAmount,
@@ -151,13 +151,20 @@ function WaitingForSync({ admin }: { admin: boolean }) {
  * An estimate under the strip; the per-currency balances stay the real figures.
  */
 function FxBankTotal({ data }: { data: BankAccountsResponse }) {
-  const { table, base, baseAssumed, ready, pending } = useFxRates();
+  const { table, base, baseAssumed, ready, pending, hidden, data: fxData } = useFxRates();
   if (pending && data.totalsByCurrency.some((t) => t.currency !== base)) {
     // The two lines to come, so the transactions below do not jump when the rates arrive.
     return (
       <div className="fx-bank-total" aria-hidden="true" data-fx-pending="">
         <Skeleton height={20} width="12em" />
         <Skeleton height={14} width="20em" />
+      </div>
+    );
+  }
+  if (hidden && data.totalsByCurrency.some((t) => t.currency !== base)) {
+    return (
+      <div className="fx-bank-total">
+        <FxStaleChip />
       </div>
     );
   }
@@ -172,7 +179,7 @@ function FxBankTotal({ data }: { data: BankAccountsResponse }) {
     <div className="fx-bank-total">
       <p>
         <span className="num money">About {formatMoney(total.totalMinor, base)}</span>{" "}
-        <span className="cap">in total at today&apos;s ECB rates</span>
+        <span className="cap">in total {rateWording(fxData, total.rateDate)}</span>
       </p>
       <p className="cap">
         <ConvertedNote total={total} className="" /> · For information only; each currency is

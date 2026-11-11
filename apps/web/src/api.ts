@@ -22,6 +22,8 @@ import {
   type Schedule,
 } from "@camelthorn/core";
 
+import { parseFxRatesResponse } from "./lib/fx-response";
+
 export { ROLES, safeReturnTo, type Role } from "@camelthorn/core";
 
 export interface Me {
@@ -86,6 +88,12 @@ export class StepUpRequired extends ApiError {
 export const nav = {
   assign(url: string): void {
     window.location.assign(url);
+  },
+  reload(): void {
+    window.location.reload();
+  },
+  back(): void {
+    window.history.back();
   },
 };
 
@@ -628,8 +636,16 @@ export const getBankTransaction = (id: number, signal?: AbortSignal) =>
 
 // ---- ECB exchange rates (Phase 6) --------------------------------------------------------------
 
-export const getFxRates = (signal?: AbortSignal) =>
-  request<FxRatesResponse>("/api/fx/rates", signal ? { signal } : {});
+/**
+ * The ECB rates, shape-checked: an answer that is not a valid FxRatesResponse is an ApiError
+ * (`bad_response`), which the screens show as "the ECB rates could not be read" (review S2).
+ */
+export async function getFxRates(signal?: AbortSignal): Promise<FxRatesResponse> {
+  const raw = await request<unknown>("/api/fx/rates", signal ? { signal } : {});
+  const parsed = parseFxRatesResponse(raw);
+  if (!parsed) throw new ApiError(200, "bad_response");
+  return parsed;
+}
 export const getFxHistory = (currency: string, days: number, signal?: AbortSignal) =>
   request<FxHistoryResponse>(
     `/api/fx/history${queryString({ currency, days })}`,

@@ -16,12 +16,12 @@ describe("dcLineText (review S3)", () => {
     );
   });
 
-  it("says 'about' with the booked rate when complete, also for a true 0", () => {
+  it("states the booked figure without 'about' (S5: that word is for ECB estimates)", () => {
     expect(norm(dcLineText({ dcMinor: 12_345, dcComplete: true, dcCurrency: "EUR" }))).toBe(
-      "about € 123,45 (booked rate in Exact)",
+      "€ 123,45 booked in Exact",
     );
     expect(norm(dcLineText({ dcMinor: 0, dcComplete: true, dcCurrency: "EUR" }))).toBe(
-      "about € 0,00 (booked rate in Exact)",
+      "€ 0,00 booked in Exact",
     );
   });
 });
@@ -33,6 +33,11 @@ describe("DcLine", () => {
     expect(render(<DcLine {...props} currency="USD" count={0} />).container.textContent).toBe("");
   });
   it("renders the line for a foreign currency", () => {
-    expect(render(<DcLine {...props} currency="USD" />).container.textContent).toContain("about");
+    expect(
+      render(<DcLine {...props} currency="USD" />).container.textContent?.replace(/\u00a0/g, " "),
+    ).toContain("€ 1,00 booked in Exact");
+    expect(render(<DcLine {...props} currency="USD" />).container.textContent).not.toContain(
+      "about",
+    );
   });
 });

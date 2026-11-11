@@ -16,6 +16,7 @@ import { account, accounts, tx, txDetail, txs } from "../src/test-fixtures-bank"
 import {
   fxHistory,
   fxNever,
+  fxOutage,
   fxRates,
   fxStale,
   importJob,
@@ -141,7 +142,10 @@ type Scene =
   | "bank"
   | "fx-ok"
   | "fx-stale"
-  | "fx-never";
+  | "fx-never"
+  | "list-stale"
+  | "overview-outage"
+  | "page-error";
 
 const PATH: Record<Scene, string> = {
   overview: "/overview",
@@ -152,6 +156,9 @@ const PATH: Record<Scene, string> = {
   "fx-ok": "/settings/fx",
   "fx-stale": "/settings/fx",
   "fx-never": "/settings/fx",
+  "list-stale": "/invoices",
+  "overview-outage": "/overview",
+  "page-error": "/overview",
 };
 
 function api(pathname: string, scene: Scene): unknown {
@@ -163,14 +170,21 @@ function api(pathname: string, scene: Scene): unknown {
     case "/api/fx/rates":
       return scene === "fx-stale"
         ? { ...fxStale(), lastImportStatus: "error", lastImportCode: "rate_not_published" }
-        : scene === "fx-never"
-          ? fxNever()
-          : fxRates();
+        : scene === "list-stale"
+          ? fxStale()
+          : scene === "overview-outage"
+            ? fxOutage()
+            : scene === "fx-never"
+              ? fxNever()
+              : fxRates();
     case "/api/fx/history":
       return fxHistory("USD", 5);
     case "/api/jobs":
       return jobsResponse([importJob()]);
     case "/api/overview":
+      // A well-formed JSON answer with the wrong shape: the Overview throws while rendering and
+      // the page boundary has to catch it (review S2).
+      if (scene === "page-error") return { kpis: null, division: null, freshness: null };
       return overview({
         kpis: {
           receivable: [kpis("/api/invoices"), usd("/api/invoices"), gbp("/api/invoices")],
@@ -182,7 +196,7 @@ function api(pathname: string, scene: Scene): unknown {
     case "/api/bills":
       return listResponse([USD_BILL]);
     case "/api/open-items/1":
-      return detail(USD_INV);
+      return detail(USD_INV, { rate: "0.9" });
     case "/api/open-items/3":
       return detail(USD_BILL);
     case "/api/reports/ageing":
@@ -306,6 +320,16 @@ async function open(scene: Scene, theme: "light" | "dark", width: number, reduce
     case "fx-never":
       await page.waitForSelector(".empty", { timeout: 15_000 });
       break;
+    case "list-stale":
+      await page.waitForSelector(".fx-page-chip", { timeout: 15_000 });
+      await page.waitForSelector(".fx-row:not([data-fx-pending])", { timeout: 15_000 });
+      break;
+    case "overview-outage":
+      await page.waitForSelector(".fx-page-chip", { timeout: 15_000 });
+      break;
+    case "page-error":
+      await page.waitForSelector("[role='alert']", { timeout: 15_000 });
+      break;
   }
   // Review F3: no placeholder line may be left once the rates are in.
   await page.waitForSelector("body:not(:has([data-fx-pending]))", { timeout: 15_000 });
@@ -322,6 +346,9 @@ describe("F3 FX screens", () => {
     "fx-ok",
     "fx-stale",
     "fx-never",
+    "list-stale",
+    "overview-outage",
+    "page-error",
   ];
   for (const scene of scenes) {
     for (const theme of ["light", "dark"] as const) {
@@ -340,7 +367,19 @@ describe("F3 FX screens", () => {
               (v) => `${v.id}: ${v.nodes.map((n) => n.target.join(" ")).join(", ")}`,
             ),
           ).toEqual([]);
-          expect(seen.filter((m) => !/404/.test(m))).toEqual([]);
+          // page-error logs the error NAME once (and nothing else); every other scene is silent
+          const allowed = scene === "page-error" ? /^ui render error: TypeError$/ : /404/;
+          expect(seen.filter((m) => !allowed.test(m))).toEqual([]);
+          if (scene === "page-error") {
+            expect(seen).toEqual(["ui render error: TypeError"]);
+            // the menu is still there and the fallback has no error text
+            expect(
+              await page.evaluate<number>(() => document.querySelectorAll("nav a").length),
+            ).toBeGreaterThan(3);
+            expect(await page.evaluate<string>(() => document.body.innerText)).toContain(
+              "Something went wrong on this page. Reload, or go back.",
+            );
+          }
           await page.screenshot({
             path: join(OUT, `f3-${scene}-${theme}-${width}.png`),
             fullPage: true,

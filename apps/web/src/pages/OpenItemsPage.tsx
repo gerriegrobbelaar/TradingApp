@@ -8,7 +8,8 @@ import { DataTable, KeyboardHint, LoadMore, type Column } from "../components/Da
 import { EmptyState } from "../components/EmptyState";
 import { ActiveFilter, FilterBar } from "../components/FilterBar";
 import { FreshnessStamp } from "../components/FreshnessStamp";
-import { FxRowLine } from "../components/FxAmount";
+import { FxPageChip, FxRowLine } from "../components/FxAmount";
+import { useFxRates } from "../fx";
 import { Money } from "../components/Money";
 import { POSSIBLY_PAID_LABEL, itemTitle } from "../components/OpenItemDetailBody";
 import { OpenItemSheet } from "../components/OpenItemSheets";
@@ -156,6 +157,7 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
   }, [invalid, params, rawView, currency, relationId, rawSort, setParam]);
 
   const divisionId = selected?.id ?? null;
+  const fxBase = useFxRates().base;
   // The open sheet belongs to one administration: after a switch it is gone in the same render
   // (state tagged with the division, not reset by an effect a render later).
   const [sheet, setSheet] = useState<{ division: number; id: number } | null>(null);
@@ -336,6 +338,7 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
           </>
         }
       />
+      <FxPageChip foreign={list.items.some((r) => r.currency !== fxBase)} />
       <Card>
         <FilterBar
           search={{

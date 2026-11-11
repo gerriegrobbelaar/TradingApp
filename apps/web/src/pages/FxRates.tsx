@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router";
 import type { FxHistoryResponse, FxRatesResponse } from "@camelthorn/core";
-import { formatRateForDisplay } from "@camelthorn/core";
 import { Button, Card, Chip, Skeleton } from "@camelthorn/ui";
 import { ApiError, StepUpRequired, getFxHistory, listJobs, runJobNow, stepUp } from "../api";
 import { useMe } from "../auth";
@@ -9,7 +8,7 @@ import { FxChart } from "../components/FxChart";
 import { ScrollRegion } from "../components/ReportParts";
 import { EmptyState, ErrorNotice } from "../components/EmptyState";
 import { useFxRates } from "../fx";
-import { formatAgo, formatDate, formatDateTime, formatDayMonth } from "../lib/format";
+import { formatAgo, formatDate, formatDateTime, formatDayMonth, formatRate } from "../lib/format";
 import { staleChipText } from "../lib/fx";
 import { useResource } from "../lib/useResource";
 import { useToast } from "../toasts";
@@ -269,7 +268,7 @@ function History({ currencies }: { currencies: string[] }) {
                 {[...points].reverse().map((p) => (
                   <tr key={p.rateDate}>
                     <th scope="row">{formatDate(p.rateDate)}</th>
-                    <td className="r num">{formatRateForDisplay(p.rate, 6)}</td>
+                    <td className="r num">{formatRate(p.rate)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -310,10 +309,8 @@ export function FxRates() {
           Daily euro reference rates from the European Central Bank, in units of currency per 1 EUR.
           The screens use them to show what a foreign-currency amount is worth today.
         </p>
+        {/* The API's notice, verbatim, once: it already carries the accountant caveat. */}
         {resp && <p className="notice">{resp.notice}</p>}
-        <p className="cap">
-          Confirm with your accountant before using these rates for revaluation.
-        </p>
 
         {fx.status === "loading" && (
           <div className="stack" role="status" aria-label="Loading rates">
@@ -377,7 +374,7 @@ export function FxRates() {
                   return (
                     <tr key={r.currency}>
                       <th scope="row">{r.currency}</th>
-                      <td className="r num">{formatRateForDisplay(r.rate, 6)}</td>
+                      <td className="r num">{formatRate(r.rate)}</td>
                       <td>
                         {formatDate(r.rateDate)}{" "}
                         {old && (

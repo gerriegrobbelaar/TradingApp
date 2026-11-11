@@ -82,7 +82,7 @@ describe("no layout jump while the rates load", () => {
       Array.from(recv.querySelectorAll(".fx-amount")).map((el) => el.children.length);
     expect(figureLines()).toEqual([3]);
     // nothing converted to a guessed currency, and Exact's line does not flash in and out
-    expect(norm(recv.textContent)).not.toContain("booked rate in Exact");
+    expect(norm(recv.textContent)).not.toContain("booked in Exact");
     expect(norm(recv.textContent)).not.toContain("about €");
     // the headline block holds its place too
     expect(recv.querySelector(".fx-headline[data-fx-pending]")).not.toBeNull();
@@ -92,7 +92,7 @@ describe("no layout jump while the rates load", () => {
     });
     await waitFor(() => expect(recv.querySelector("[data-fx-pending]")).toBeNull());
     expect(figureLines()).toEqual([3]);
-    expect(norm(recv.textContent)).toContain("Booked € 90,00 · difference +€ 2,14");
+    expect(norm(recv.textContent)).toContain("Booked € 90,00 · estimated difference +€ 2,14");
   });
 
   it("keeps a row's height in the invoices table while the rates load", async () => {
@@ -207,9 +207,7 @@ describe("switching administration", () => {
     });
     renderApp("/overview");
     const recv = await screen.findByRole("region", { name: "Receivables" });
-    await waitFor(() =>
-      expect(norm(recv.textContent)).toContain("about € 90,00 (booked rate in Exact)"),
-    );
+    await waitFor(() => expect(norm(recv.textContent)).toContain("€ 90,00 booked in Exact"));
     expect(norm(recv.textContent)).not.toContain("today's ECB rate");
     expect(norm(recv.textContent)).not.toMatch(/£/);
   });
@@ -238,7 +236,9 @@ describe("switching administration", () => {
     const dialog = await screen.findByRole("dialog");
     await within(dialog).findByText(/Open balance in EUR at today's ECB rate/);
     await waitFor(() =>
-      expect(norm(dialog.textContent)).toContain("Booked € 90,00 · difference +€ 2,14"),
+      expect(norm(dialog.textContent)).toContain(
+        "Booked € 90,00 · difference +€ 2,14 at today's ECB rate",
+      ),
     );
     // never booked euros against today's pounds
     expect(norm(dialog.textContent)).not.toMatch(/Booked £|difference [+-]?£/);

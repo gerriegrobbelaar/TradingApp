@@ -11,6 +11,7 @@ import { createRequire } from "node:module";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { fxRates } from "../src/test-fixtures-fx";
 
 const ADMIN = {
   email: "gerrie.grobbelaar@camelthorncapital.com",
@@ -111,6 +112,10 @@ function api(path: string, state: State): unknown {
       return ADMIN;
     case "/api/divisions":
       return { selectedId: null, divisions: [] };
+    case "/api/fx/rates":
+      // F3 added a rates request to every signed-in screen: a screen without this mock logs a
+      // console 404 (review S2). A realistic, fresh answer (rates of 10 Nov 2026).
+      return fxRates();
     case "/api/connections":
       return {
         exactConfigured: true,

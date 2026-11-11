@@ -12,7 +12,6 @@ import {
   AGEING_BUCKETS,
   convertMinor,
   crossRate,
-  formatRateForDisplay,
   parseDecimal,
   unrealisedDifference,
   unrealisedResultMinor,
@@ -21,13 +20,13 @@ import {
   type FxRatesResponse,
   type RateTable,
 } from "@camelthorn/core";
-import { NO_VALUE, formatDayMonth, formatMoney } from "./format";
+import { NO_VALUE, formatDayMonth, formatMoney, formatRate } from "./format";
 
 /** Fall-back administration currency when none is known (and the screen says so). */
 export const FALLBACK_BASE = "EUR";
 
 /** The rate table of an API response; null while there is no response. */
-export function buildRateTable(resp: FxRatesResponse | null): RateTable | null {
+export function rateTableFromResponse(resp: FxRatesResponse | null): RateTable | null {
   if (!resp) return null;
   const rates: Record<string, string> = {};
   const ratesDate: Record<string, string> = {};
@@ -90,15 +89,70 @@ export function toBase(
 export function rateText(table: RateTable, currency: string, base: string): string | null {
   if (base === "EUR") {
     const raw = table.rates[currency];
-    return raw === undefined ? null : `rate ${formatRateForDisplay(raw)}`;
+    return raw === undefined ? null : `rate ${formatRate(raw)}`;
   }
   const x = crossRate(currency, base, table);
-  return x === null ? null : `1 ${currency} = ${formatRateForDisplay(x)} ${base}`;
+  return x === null ? null : `1 ${currency} = ${formatRate(x)} ${base}`;
 }
 
 /** Spoken form of `rateText` for the EUR case: what the number is a number of. */
 export function rateUnitText(currency: string, base: string): string {
   return base === "EUR" ? ` ${currency} per EUR` : "";
+}
+
+/**
+ * The ECB rate as an equation, in the ECB's own direction: "1 EUR = 1,0853 USD" when the
+ * administration currency is EUR, else the cross rate "1 USD = 0,8000 GBP". Null when a rate is
+ * missing.
+ */
+export function ecbEquation(table: RateTable, currency: string, base: string): string | null {
+  if (base === "EUR") {
+    const raw = table.rates[currency];
+    return raw === undefined ? null : `1 EUR = ${formatRate(raw)} ${currency}`;
+  }
+  const x = crossRate(currency, base, table);
+  return x === null ? null : `1 ${currency} = ${formatRate(x)} ${base}`;
+}
+
+// ---- how old rates are used (review S7) -------------------------------------------------------
+
+/**
+ * Rates older than this many TARGET working days are not used for estimates at all: only the
+ * original amounts are shown, with a notice. Between "one working day" (stale chip) and this
+ * limit estimates are shown, worded "at the ECB rate of <date>" instead of "today's".
+ */
+export const HIDE_ESTIMATES_AFTER_WORKING_DAYS = 5;
+
+/** True when the feed is so old that no estimate may be shown (the API's `workingDaysOld`). */
+export function estimatesHidden(resp: FxRatesResponse | null): boolean {
+  return (
+    resp !== null &&
+    resp.workingDaysOld !== null &&
+    resp.workingDaysOld > HIDE_ESTIMATES_AFTER_WORKING_DAYS
+  );
+}
+
+/** "ECB rates are 7 working days old; estimates are hidden"; null when estimates are shown. */
+export function hiddenNoticeText(resp: FxRatesResponse | null): string | null {
+  if (!resp || !estimatesHidden(resp)) return null;
+  return `ECB rates are ${resp.workingDaysOld} working days old; estimates are hidden`;
+}
+
+/**
+ * Whether an estimate may be called "today's": the feed is not stale and the rate used is the
+ * newest one. A currency the ECB stopped publishing keeps an older date and is worded by date.
+ */
+export function isTodaysRate(resp: FxRatesResponse | null, rateDate: string | null): boolean {
+  if (!resp || resp.stale) return false;
+  if (rateDate === null || resp.asOf === null) return true;
+  return rateDate >= resp.asOf;
+}
+
+/** "at today's ECB rate" or "at the ECB rate of 6 Nov" (the oldest rate date used). */
+export function rateWording(resp: FxRatesResponse | null, rateDate: string | null): string {
+  if (isTodaysRate(resp, rateDate)) return "at today's ECB rate";
+  if (rateDate === null) return "at the latest ECB rate";
+  return `at the ECB rate of ${formatDayMonth(rateDate)}`;
 }
 
 export interface ConvertedTotal {
@@ -225,8 +279,17 @@ export interface AgeingFxTotals {
 
 /**
  * The "Total in base at today's ECB rates" row of an ageing report: for each bucket, every
- * currency's bucket total is converted once and the converted totals are added (the same rule as
- * the Overview). Null when every currency is already the base currency (nothing to convert).
+ * currency's bucket total is converted ONCE (one rounding per currency and bucket) and the
+ * converted totals are added (the same rule as the Overview). The Total cell is the SUM of the
+ * bucket cells, so the row always cross-foots (review S6).
+ *
+ * Consequence, stated on screen, in print and in the Excel file: because every bucket is rounded
+ * on its own, the Total can differ by a few cents from converting each currency's grand total
+ * once. We show the row that adds up; the per-currency tables above stay exact.
+ *
+ * A currency left out of one cell (no rate, or an amount that cannot be used exactly) is left out
+ * of EVERY cell, so no column mixes in a currency another one lacks. Null when every currency is
+ * already the base currency (nothing to convert).
  */
 export function ageingTotalsInBase(
   table: RateTable,
@@ -234,38 +297,78 @@ export function ageingTotalsInBase(
   currencies: AgeingReportResponse["currencies"],
 ): AgeingFxTotals | null {
   if (!currencies.some((c) => c.currency !== base)) return null;
-  const cells = {} as Record<AgeingBucket | "total", ConvertedTotal>;
   const counts = {} as Record<AgeingBucket | "total", number>;
   counts.total = currencies.reduce((n, c) => n + c.totals.count, 0);
   for (const b of AGEING_BUCKETS) {
     counts[b] = currencies.reduce((n, c) => n + c.totals.bucketCounts[b], 0);
-    cells[b] = sumInBase(
-      table,
-      base,
-      currencies.map((c) => ({ currency: c.currency, minor: c.totals.buckets[b] })),
-    );
   }
-  cells.total = sumInBase(
-    table,
-    base,
-    currencies.map((c) => ({ currency: c.currency, minor: c.totals.totalMinor })),
-  );
-  // A currency left out of any bucket is left out of the note too, not only out of the total.
-  const union = (pick: (c: ConvertedTotal) => string[]) => {
-    const out: string[] = [];
-    for (const k of [...AGEING_BUCKETS, "total"] as const) {
-      for (const code of pick(cells[k])) if (!out.includes(code)) out.push(code);
+  const out = new Set<string>();
+  const excluded = new Set<string>();
+  const invalid = new Set<string>();
+  const noRate = new Set<string>();
+  let cells: ConvertedTotal[] = [];
+  for (let pass = 0; pass <= currencies.length; pass++) {
+    const usable = currencies.filter((c) => !out.has(c.currency));
+    cells = AGEING_BUCKETS.map((b) =>
+      sumInBase(
+        table,
+        base,
+        usable.map((c) => ({ currency: c.currency, minor: c.totals.buckets[b] })),
+      ),
+    );
+    let grew = false;
+    for (const c of cells) {
+      for (const code of c.excluded) excluded.add(code);
+      for (const code of c.invalid) invalid.add(code);
+      for (const code of c.noRate) noRate.add(code);
+      for (const code of [...c.excluded, ...c.invalid]) {
+        if (!out.has(code)) {
+          out.add(code);
+          grew = true;
+        }
+      }
     }
-    return out.sort();
-  };
+    if (!grew) break;
+  }
+  const sorted = (s: Set<string>) => [...s].sort();
+  const tidy = (c: ConvertedTotal): ConvertedTotal => ({
+    ...c,
+    excluded: sorted(excluded),
+    invalid: sorted(invalid),
+    noRate: sorted(noRate),
+  });
+  const byBucket = {} as Record<AgeingBucket | "total", ConvertedTotal>;
+  AGEING_BUCKETS.forEach((b, i) => {
+    byBucket[b] = tidy(cells[i] as ConvertedTotal);
+  });
+  const included: string[] = [];
+  let rateDate: string | null = null;
+  let totalMinor = 0n;
+  let converted = false;
+  for (const b of AGEING_BUCKETS) {
+    const c = byBucket[b];
+    totalMinor += c.totalMinor;
+    converted = converted || c.converted;
+    for (const code of c.included) if (!included.includes(code)) included.push(code);
+    if (c.rateDate && (rateDate === null || c.rateDate < rateDate)) rateDate = c.rateDate;
+  }
+  byBucket.total = tidy({
+    totalMinor,
+    included,
+    excluded: [],
+    noRate: [],
+    invalid: [],
+    rateDate,
+    converted,
+  });
   return {
     base,
-    cells,
+    cells: byBucket,
     counts,
-    excluded: union((c) => c.excluded),
-    invalid: union((c) => c.invalid),
-    noRate: union((c) => c.noRate),
-    rateDate: cells.total.rateDate,
+    excluded: sorted(excluded),
+    invalid: sorted(invalid),
+    noRate: sorted(noRate),
+    rateDate,
   };
 }
 

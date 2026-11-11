@@ -7,10 +7,11 @@ import "./bank.css";
 import "./fx.css";
 import "./print.css";
 import { App } from "./App";
+import { rootErrorHandlers } from "./lib/root-errors";
 
 const root = document.getElementById("root");
 if (root) {
-  createRoot(root).render(
+  createRoot(root, rootErrorHandlers).render(
     <StrictMode>
       <App />
     </StrictMode>,
