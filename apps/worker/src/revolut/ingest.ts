@@ -15,7 +15,7 @@
  *
  * Matching data (review S6): fee, balance after the leg, counterparty id / account id / type, reason
  * code, card bill amount, the card's last four digits and the merchant are stored with the leg.
- * Once a final row is matched (a live match, or match_status other than 'unmatched') it is FROZEN
+ * Once a final row is matched (a live match, or match_status 'matched' or 'ignored') it is FROZEN
  * (review S9): the fields a match was built on are never rewritten; different data from Revolut
  * only sets `state_conflict` (and is counted) for Phase 7/8 to alert on. A refused final -> final
  * change (failed -> completed, ...) sets the same flag (review S7); a stale pending read of a final
@@ -178,7 +178,8 @@ interface StoredLeg extends Values {
 }
 
 /**
- * Review S9. A row is frozen when it has a live match or its match_status is not 'unmatched'.
+ * Review S9. A row is frozen when it has a live match or its match_status is 'matched' or 'ignored'.
+ * 'suggested' is only the matching job's advice (Phase 7, ADR 0042): it does not freeze the row.
  * The ingest only freezes FINAL rows: a pending row is not matched yet (only final states are
  * booked), and its amount can still legitimately change.
  */
@@ -187,7 +188,10 @@ export function isFrozen(row: {
   live_matches: number;
   is_final: number;
 }): boolean {
-  return row.is_final === 1 && (row.live_matches > 0 || row.match_status !== "unmatched");
+  return (
+    row.is_final === 1 &&
+    (row.live_matches > 0 || row.match_status === "matched" || row.match_status === "ignored")
+  );
 }
 
 interface PreparedLeg {

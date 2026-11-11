@@ -48,7 +48,9 @@ async function seedDomain(): Promise<void> {
 async function clearDomain(): Promise<void> {
   await db.batch([
     db.prepare("DELETE FROM payments"),
+    db.prepare("DELETE FROM match_allocations"),
     db.prepare("DELETE FROM matches"),
+    db.prepare("DELETE FROM bank_account_exact_map"),
     db.prepare("DELETE FROM open_items"),
     db.prepare("DELETE FROM bank_transactions"),
     db.prepare("DELETE FROM bank_accounts"),
@@ -190,17 +192,23 @@ describe("schema", () => {
     await clearDomain();
   });
 
-  it("allows only one live match per bank line and open item", async () => {
+  it("allows only one live match per bank line", async () => {
     await seedDomain();
+    await db
+      .prepare(
+        "INSERT INTO bank_account_exact_map (bank_account_id, division_id, journal_code, bank_gl_account_code, created_by, updated_by) VALUES (1, 1, '90', '1210', 'a@b.com', 'a@b.com')",
+      )
+      .run();
     const match = () =>
       db
         .prepare(
-          "INSERT INTO matches (bank_transaction_id, open_item_id, amount_minor, currency, mode, matched_by) VALUES (1, 1, 1250, 'EUR', 'manual', 'a@b.com')",
+          "INSERT INTO matches (bank_transaction_id, division_id, source, ledger_account_code, amount_minor, currency, created_by) VALUES (1, 1, 'ledger', '1300', 1250, 'EUR', 'a@b.com')",
         )
         .run();
     await match();
     await expect(match()).rejects.toThrow();
     await db.prepare("UPDATE matches SET undone_at = 'now', undone_by = 'a@b.com'").run();
+    await db.prepare("UPDATE bank_transactions SET match_status = 'unmatched'").run();
     await match();
     await clearDomain();
   });

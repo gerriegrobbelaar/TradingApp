@@ -15,7 +15,7 @@ import { nextRun, type Schedule } from "@camelthorn/core";
 import { auditStatement } from "../db/audit";
 import { FULL_SYNC_BUDGET, INCREMENTAL_SYNC_BUDGET } from "./exact-handlers";
 
-export const DEFAULT_JOBS_VERSION = 2;
+export const DEFAULT_JOBS_VERSION = 3;
 const MARKER = "seed.default_jobs";
 
 export interface DefaultJob {
@@ -51,6 +51,16 @@ export const DEFAULT_JOBS: readonly DefaultJob[] = [
     schedule: { kind: "cron", expr: "15 3 * * *" },
     enabled: false,
     disabledReason: AWAITING_LIVE_VERIFICATION,
+    exactBudget: 0,
+  },
+  {
+    name: "bank.match",
+    handler: "bank.match",
+    // After the Revolut poll; writes suggestions and internal matches only, never to Exact. Automatic
+    // matching has its own switch (settings matching.auto_enabled, off by default; ADR 0042), so the
+    // job itself ships enabled on new installs. Existing rows are never flipped.
+    schedule: { kind: "cron", expr: "2,12,22,32,42,52 * * * *" },
+    enabled: true,
     exactBudget: 0,
   },
   {

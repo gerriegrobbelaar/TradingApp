@@ -84,12 +84,15 @@ describe("S6: the Exact sync jobs ship disabled (the public ECB import is the on
     resetDefaultJobsMemoForTests();
   });
 
-  it("new installs get them disabled with the reason code; only the public, credential-free ECB import is enabled", async () => {
+  it("new installs get them disabled with the reason code; only the public ECB import and the internal bank matching are enabled", async () => {
     for (const n of ["exact.full_sync", "exact.incremental_sync"]) {
       const j = DEFAULT_JOBS.find((x) => x.name === n);
       expect(j).toMatchObject({ enabled: false, disabledReason: AWAITING_LIVE_VERIFICATION });
     }
-    expect(DEFAULT_JOBS.filter((j) => j.enabled).map((j) => j.name)).toEqual(["ecb.fx_import"]);
+    expect(DEFAULT_JOBS.filter((j) => j.enabled).map((j) => j.name)).toEqual([
+      "bank.match",
+      "ecb.fx_import",
+    ]);
     expect(DEFAULT_JOBS.find((j) => j.name === "ecb.fx_import")?.exactBudget).toBe(0);
     await seedDefaultJobs(db);
     const rows = await db

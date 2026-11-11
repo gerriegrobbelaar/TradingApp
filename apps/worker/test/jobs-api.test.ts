@@ -96,6 +96,7 @@ describe("GET /api/jobs", () => {
     expect(body.jobs.map((j) => j.name)).toEqual([
       "revolut.sync",
       "revolut.backfill",
+      "bank.match",
       "exact.bank_balances",
       "ecb.fx_import",
       "dq.checks",

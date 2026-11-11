@@ -9,6 +9,7 @@ import {
   recordEcbTooLate,
   runEcbImport,
 } from "../fx/ecb-import";
+import { runMatching } from "../matching/run";
 import { loadRevolutConfig } from "../revolut/config";
 import { runRevolutBackfill, runRevolutSync } from "../revolut/sync";
 import { FULL_SYNC_MAX_ATTEMPTS, runExactSync } from "./exact-handlers";
@@ -77,6 +78,18 @@ export const HANDLERS: Record<string, HandlerDef> = {
     scheduleRules: { minIntervalMinutes: 12 * 60 },
     maxLatenessMs: 6 * HOUR,
     run: whenRevolutConfigured(runRevolutBackfill),
+  },
+  "bank.match": {
+    title: "Bank matching",
+    description:
+      "Matches completed Revolut transactions to open invoices and bills and writes suggestions for the review queue. Automatic matching stays off until an admin switches it on in Settings; it never writes to Exact (the booking step is separate).",
+    usesExact: false,
+    phase: null,
+    // The next slot is the retry.
+    maxAttempts: 1,
+    scheduleRules: { minIntervalMinutes: 5 },
+    maxLatenessMs: 30 * MIN,
+    run: runMatching,
   },
   "exact.bank_balances": {
     title: "Bank balances from Exact",

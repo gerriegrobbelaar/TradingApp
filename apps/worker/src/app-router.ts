@@ -11,6 +11,7 @@ import { registerApprovalsRoutes } from "./read/approvals-routes";
 import { registerBankRoutes } from "./read/bank-routes";
 import { registerFxRoutes } from "./read/fx-routes";
 import { registerLedgerRoutes } from "./read/ledger-routes";
+import { registerMatchingRoutes } from "./matching/routes";
 import { registerReadRoutes } from "./read/routes";
 import { registerRevolutRoutes } from "./revolut/routes";
 import { registerRevolutWebhookRoute } from "./revolut/webhook-route";
@@ -29,6 +30,7 @@ export function buildRouter(): Router {
   registerLedgerRoutes(router);
   registerFxRoutes(router);
   registerApprovalsRoutes(router);
+  registerMatchingRoutes(router);
   registerJobRoutes(router);
   return router;
 }

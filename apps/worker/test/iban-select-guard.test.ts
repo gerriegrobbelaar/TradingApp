@@ -34,6 +34,12 @@ const ALLOWED_COLUMN_NAMES: Record<string, string> = {
   "../src/read/bank-routes.ts": "reads it only to mask it (counterpartyIbanMasked)",
   "../src/revolut/counterparties.ts":
     "copies a looked-up counterparty IBAN to UNMATCHED bank_transactions rows for matching rule 2 (never returned or logged, ADR 0034)",
+  "../src/matching/assemble.ts":
+    "reads counterparty and relation IBANs into memory for the matching engine (never returned or logged, ADR 0042)",
+  "../src/matching/config.ts":
+    "reads bank_accounts.iban for the engine's own-IBAN list (in memory only)",
+  "../src/matching/dto.ts": "reads counterparty_iban only to mask it (counterpartyIbanMasked)",
+  "../src/matching/routes.ts": "reads bank_accounts.iban only to mask it (ibanMasked)",
 };
 const ALLOWED_SELECT_IBAN: Record<string, string> = {
   "../src/exact/sync.ts":
@@ -41,6 +47,12 @@ const ALLOWED_SELECT_IBAN: Record<string, string> = {
   "../src/read/bank-routes.ts": "reads bank_accounts.iban only to mask it (ibanMasked)",
   "../src/revolut/counterparties.ts":
     "reads revolut_counterparties.iban (the lookup cache) to fill unmatched transactions; never returned or logged (ADR 0034)",
+  "../src/matching/assemble.ts":
+    "reads relations.iban and bank_transactions.counterparty_iban for the matching engine (in memory only, ADR 0042)",
+  "../src/matching/config.ts":
+    "reads bank_accounts.iban for the engine's own-IBAN list (in memory only)",
+  "../src/matching/dto.ts": "selects counterparty_iban only to mask it (counterpartyIbanMasked)",
+  "../src/matching/routes.ts": "selects bank_accounts.iban only to mask it (ibanMasked)",
 };
 
 /** A column that holds a full IBAN: `iban` or `<prefix>_iban` (not `iban_changed_at`). */

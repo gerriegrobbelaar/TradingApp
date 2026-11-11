@@ -70,7 +70,11 @@ describe("migration 0007 on a populated database", () => {
       ).results;
     const triggersBefore = await objects("trigger");
 
-    await applyD1Migrations(mdb, all);
+    // Up to 0022: the matching rebuild (0022) has its own test and replaces match_* tables and triggers.
+    await applyD1Migrations(
+      mdb,
+      all.filter((m) => m.name < "0022"),
+    );
 
     // Every trigger survives unchanged (audit log append-only, open item status rules).
     expect(await objects("trigger")).toEqual(triggersBefore);

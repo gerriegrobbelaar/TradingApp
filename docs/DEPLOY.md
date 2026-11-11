@@ -796,6 +796,29 @@ Schedules.
 - The rates are for information only. Whether your accountant accepts them for revaluation is open
   decision 4.
 
+### Bank matching (Phase 7, M7b; ADR 0042)
+
+`bank.match` is switched **on** after a fresh install (every 10 minutes at :02, :12, ...). It reads
+completed Revolut transactions and open invoices and bills from D1 and writes **suggestions** for
+the review queue. It never writes to Exact or Revolut in this release (the booking step is a later
+task). Existing databases get the job when the new release starts (default jobs version 3).
+
+- **Automatic matching is off.** Turn it on only after reviewing suggestions for a while:
+  `PUT /api/matching/config` with `{"autoEnabled":true,"confirm":"ENABLE AUTOMATIC MATCHING"}`
+  (admin, sign-in within 15 minutes). An automatic match is only an internal match with an Undo
+  while it is not booked in Exact. Turn it off the same way (`{"autoEnabled":false}`).
+- **Every Revolut account must be mapped to an Exact administration** before anything is matched:
+  `PUT /api/matching/account-map` with `{"bankAccountId":..,"divisionId":..,"journalCode":"90",
+  "bankGlAccountCode":"1210"}` (admin, step-up). Unmapped accounts are counted in the job result
+  (`unmapped_accounts`) and in `GET /api/matching/stats`; their lines are never matched.
+- Matching settings, patterns and the map are audited (`matching.*` actions). Patterns for bank
+  fees and similar ledger postings are suggestions only unless `autoLedgerPatterns` is switched on.
+- Emergency stop: `{"enabled":false}` on the same config route, or switch the job off in Settings,
+  Schedules. Open matches stay; use `POST /api/matching/matches/<id>/undo` per match.
+- Check after the first live run: the `bank.match` run in Settings, Schedules is `ok` with
+  `evaluated` > 0; `GET /api/matching/queue` shows candidates with plain-English explanations;
+  no response contains a full IBAN.
+
 ### Emergency stop of all jobs
 
 Pick the first that works:

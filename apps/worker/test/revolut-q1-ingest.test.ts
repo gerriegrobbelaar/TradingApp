@@ -6,6 +6,7 @@ import { mapTransaction, parseJsonRawNumbers } from "@camelthorn/revolut";
 import { beforeEach, describe, expect, it } from "vitest";
 import { isFrozen, upsertTransaction, type IngestSource } from "../src/revolut/ingest";
 import { db } from "./helpers";
+import { insertLiveMatch } from "./matching-helpers";
 import { resetRevolut, seedRevolut } from "./revolut-helpers";
 import { rawLeg, rawTx, type RawRow } from "./revolut-q1-helpers";
 import { rowsOf } from "./revolut-r3-helpers";
@@ -56,15 +57,7 @@ const rich = (over: RawRow = {}): RawRow =>
 
 async function markMatched(opts: { liveMatch?: boolean; status?: string } = {}): Promise<number> {
   const id = (await row())["id"] as number;
-  if (opts.liveMatch !== false) {
-    await db
-      .prepare(
-        `INSERT INTO matches (bank_transaction_id, ledger_account, amount_minor, currency, mode, matched_by)
-         VALUES (?1, '1300', -10050, 'EUR', 'manual', 'test@example.com')`,
-      )
-      .bind(id)
-      .run();
-  }
+  if (opts.liveMatch !== false) await insertLiveMatch(id);
   if (opts.status !== undefined) {
     await db
       .prepare("UPDATE bank_transactions SET match_status = ?2 WHERE id = ?1")
@@ -163,12 +156,13 @@ describe("S9: freezing a matched final row", () => {
   const completed = (over: RawRow = {}, legOver: RawRow = {}, updated = 5): RawRow =>
     rawTx("tx-f", T0, [rawLeg("l1", legOver)], { updated_at: at(updated), ...over });
 
-  it("isFrozen: final and (live match or match_status other than unmatched)", () => {
+  it("isFrozen: final and (live match or match_status matched/ignored)", () => {
     const base = { match_status: "unmatched", live_matches: 0, is_final: 1 };
     expect(isFrozen(base)).toBe(false);
     expect(isFrozen({ ...base, live_matches: 1 })).toBe(true);
     expect(isFrozen({ ...base, match_status: "matched" })).toBe(true);
-    expect(isFrozen({ ...base, match_status: "suggested" })).toBe(true);
+    // Phase 7: a suggestion is advice, not a decision.
+    expect(isFrozen({ ...base, match_status: "suggested" })).toBe(false);
     expect(isFrozen({ ...base, match_status: "ignored" })).toBe(true);
     expect(isFrozen({ ...base, is_final: 0, live_matches: 1 })).toBe(false);
   });
@@ -228,7 +222,8 @@ describe("S9: freezing a matched final row", () => {
 
   it("a pending row is never frozen (only final rows are booked)", async () => {
     await ingest(completed({ state: "pending" }, { amount: -10 }, 0));
-    await markMatched();
+    // The matching guards (migration 0022) refuse a match on a pending line, so only the status is set.
+    await markMatched({ liveMatch: false, status: "matched" });
     const r = await ingest(completed({ state: "pending" }, { amount: -99 }));
     expect(r.frozenConflicts).toBe(0);
     expect((await row())["amount_minor"]).toBe(-9900);

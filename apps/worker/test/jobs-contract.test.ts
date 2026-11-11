@@ -18,6 +18,14 @@ import { HANDLERS } from "../src/jobs/handlers";
 import type { HandlerResult, JobContext } from "../src/jobs/types";
 import { assertCountsAndCodesOnly, MAX_STRING } from "./counts-only";
 import { stubEcb, type FakeEcb } from "./fx-helpers";
+import {
+  addItem,
+  addRelation,
+  addTx,
+  CUSTOMER_IBAN,
+  enableAuto,
+  resetWorld,
+} from "./matching-helpers";
 import { resetRevolut, seedRevolut, stubRevolut } from "./revolut-helpers";
 import { cpRecord, rawApi, rawLeg, rawTx } from "./revolut-q1-helpers";
 import { fakeRevolut, simpleTx } from "./revolut-r3-helpers";
@@ -28,11 +36,15 @@ const NOW = Date.parse("2026-07-15T00:00:00Z"); // 02:00 CEST
 
 /** Tables where a repeated run must not add rows. */
 const DATA_TABLES = [
+  // Children first: the delete order below is also the order of the foreign keys.
+  "match_suggestions",
+  "match_allocations",
+  "matches",
+  "bank_account_exact_map",
   "open_items",
   "relations",
   "relation_bank_accounts",
-  "match_suggestions",
-  "matches",
+
   "bank_transactions",
   "bank_accounts",
   "revolut_sync_state",
@@ -68,6 +80,8 @@ interface Effects {
 }
 
 interface Fixture {
+  /** The handler works on D1 only: there is no external boundary to observe. */
+  internal?: true;
   /** Prepares the database and the fakes; returns the syncDeps-style test seam and the effects log. */
   setup(): Promise<{ syncDeps: JobContext["syncDeps"]; effects: Effects }>;
   /** Restores whatever setup stubbed. */
@@ -182,6 +196,34 @@ async function ecbFixture(): Promise<{ syncDeps: JobContext["syncDeps"]; effects
   return { syncDeps: undefined, effects };
 }
 
+/**
+ * bank.match reads and writes D1 only (suggestions, and automatic matches when switched on). The
+ * fixture has one perfect match (automatic matching ON, so the first run creates the match) and
+ * one amount-only suggestion; the second run must change nothing.
+ */
+async function matchingFixture(): Promise<{ syncDeps: JobContext["syncDeps"]; effects: Effects }> {
+  const w = await resetWorld();
+  await enableAuto();
+  const rel = await addRelation({ divisionId: w.divisionId, ibans: [CUSTOMER_IBAN] });
+  const a = await addItem({
+    divisionId: w.divisionId,
+    invoiceNumber: "INV-2026-0042",
+    openMinor: 12_345,
+    relationExactId: rel.exactId,
+  });
+  expect(a).toBeGreaterThan(0);
+  await addItem({ divisionId: w.divisionId, invoiceNumber: "INV-2026-0099", openMinor: 5_000 });
+  await addTx({
+    accountId: w.accountId,
+    connectionId: w.revolutConnectionId,
+    amountMinor: 12_345,
+    reference: "Payment INV-2026-0042",
+    counterpartyIban: CUSTOMER_IBAN,
+  });
+  await addTx({ accountId: w.accountId, connectionId: w.revolutConnectionId, amountMinor: 5_000 });
+  return { syncDeps: undefined, effects: { calls: [], writes: [] } };
+}
+
 /** One entry per implemented handler. */
 const FIXTURES: Record<string, Fixture> = {
   "exact.full_sync": { setup: exactFixture },
@@ -189,6 +231,7 @@ const FIXTURES: Record<string, Fixture> = {
   "revolut.sync": { setup: revolutFixture, teardown: () => revolutStub?.restore() },
   "revolut.backfill": { setup: revolutFixture, teardown: () => revolutStub?.restore() },
   "ecb.fx_import": { setup: ecbFixture, teardown: () => ecbStub?.restore() },
+  "bank.match": { setup: matchingFixture, internal: true },
 };
 
 function contextFor(
@@ -196,7 +239,8 @@ function contextFor(
   trigger: JobContext["trigger"],
   syncDeps: JobContext["syncDeps"],
 ): JobContext {
-  const budget = key === "exact.full_sync" ? 240 : key.startsWith("revolut.") ? 0 : 40;
+  const budget =
+    key === "exact.full_sync" ? 240 : key.startsWith("revolut.") || key === "bank.match" ? 0 : 40;
   return {
     env,
     job: { id: 1, name: key, handler: key, exactBudget: budget },
@@ -249,10 +293,13 @@ describe("handler contract: every implemented handler", () => {
           const run = def.run as (ctx: JobContext) => Promise<HandlerResult>;
 
           const first = await run(contextFor(key, trigger, syncDeps));
-          expect(
-            effects.calls.length,
-            "the first run should really talk to the boundary",
-          ).toBeGreaterThan(0);
+          if (fixture.internal) expect(effects.calls).toEqual([]);
+          else {
+            expect(
+              effects.calls.length,
+              "the first run should really talk to the boundary",
+            ).toBeGreaterThan(0);
+          }
           const writes1 = effects.writes.length;
           const idemAfterFirst = (await counts())["idempotency_keys"];
           const rowsAfterFirst = await counts();

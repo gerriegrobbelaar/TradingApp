@@ -67,9 +67,14 @@ describe("default jobs (CLAUDE.md 4.1)", () => {
     expect(sched("exact.full_sync")).toEqual({ kind: "cron", expr: "0 2 * * *" });
     expect(sched("exact.incremental_sync")).toMatchObject({ kind: "cron" });
     expect(sched("fx.revaluation")).toEqual({ kind: "last_working_day", time: "16:30" });
-    // Only the ECB import ships enabled (public, read-only, no credentials; ADR 0036). Later phases
-    // are not built and the Exact and Revolut jobs wait for the first live checks (review S6).
-    expect(rows.filter((r) => r.enabled === 1).map((r) => r.name)).toEqual(["ecb.fx_import"]);
+    // Only the ECB import (public, read-only, no credentials; ADR 0036) and the internal bank
+    // matching (suggestions only; automatic matching has its own switch, ADR 0042) ship enabled.
+    // Later phases are not built and the Exact and Revolut jobs wait for the first live checks.
+    expect(rows.filter((r) => r.enabled === 1).map((r) => r.name)).toEqual([
+      "bank.match",
+      "ecb.fx_import",
+    ]);
+    expect(sched("bank.match")).toEqual({ kind: "cron", expr: "2,12,22,32,42,52 * * * *" });
     expect(rows.every((r) => r.timezone === "Europe/Amsterdam" && r.kind === "system")).toBe(true);
     // Enabled jobs have a next run in the future; disabled ones none.
     for (const r of rows) {
@@ -179,7 +184,11 @@ describe("migration 0008 on a populated database", () => {
       expect.arrayContaining(["audit_log_no_update", "audit_log_no_delete"]),
     );
 
-    await applyD1Migrations(mdb, all);
+    // Up to 0022: the matching migration adds triggers of its own (migration-0022.test.ts).
+    await applyD1Migrations(
+      mdb,
+      all.filter((m) => m.name < "0022"),
+    );
     // Every trigger survives unchanged (append-only audit log, open item rules).
     expect(await triggers()).toEqual(triggersBefore);
 

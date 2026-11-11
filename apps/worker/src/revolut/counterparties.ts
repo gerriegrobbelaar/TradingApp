@@ -134,7 +134,7 @@ export async function counterpartiesToLookUp(
            ON c.connection_id = t.connection_id AND c.counterparty_ref = t.counterparty_ref
          WHERE t.connection_id = ?1 AND t.counterparty_ref IS NOT NULL
            AND (t.counterparty_iban IS NULL OR t.counterparty_iban_cached = 1)
-           AND t.match_status = 'unmatched'
+           AND t.match_status IN ('unmatched', 'suggested')
            AND COALESCE(t.counterparty_account_type, '') <> 'self'
            AND NOT EXISTS (SELECT 1 FROM matches m WHERE m.bank_transaction_id = t.id AND m.undone_at IS NULL)
            AND (c.id IS NULL
@@ -220,7 +220,7 @@ async function saveLookup(
                 WHERE json_extract(j.value, '$.a') = bank_transactions.counterparty_account_ref),
                ?3) IS NULL THEN 0 ELSE 1 END
            WHERE connection_id = ?1 AND counterparty_ref = ?2 AND counterparty_iban_cached = 1
-             AND match_status = 'unmatched'
+             AND match_status IN ('unmatched', 'suggested')
              AND NOT EXISTS (SELECT 1 FROM matches m WHERE m.bank_transaction_id = bank_transactions.id
                                AND m.undone_at IS NULL)`,
         )
@@ -259,7 +259,7 @@ export async function applyCounterpartyCache(
          FROM bank_transactions t
          JOIN revolut_counterparties c
            ON c.connection_id = t.connection_id AND c.counterparty_ref = t.counterparty_ref
-         WHERE t.connection_id = ?1 AND t.counterparty_iban IS NULL AND t.match_status = 'unmatched'
+         WHERE t.connection_id = ?1 AND t.counterparty_iban IS NULL AND t.match_status IN ('unmatched', 'suggested')
            AND c.status = 'ok' AND c.iban IS NOT NULL
            AND NOT EXISTS (SELECT 1 FROM matches m WHERE m.bank_transaction_id = t.id AND m.undone_at IS NULL)
          ORDER BY t.id LIMIT ?2`,
@@ -273,7 +273,7 @@ export async function applyCounterpartyCache(
       db
         .prepare(
           `UPDATE bank_transactions SET counterparty_iban = ?2, counterparty_iban_cached = 1
-           WHERE id = ?1 AND counterparty_iban IS NULL AND match_status = 'unmatched'
+           WHERE id = ?1 AND counterparty_iban IS NULL AND match_status IN ('unmatched', 'suggested')
              AND NOT EXISTS (SELECT 1 FROM matches m WHERE m.bank_transaction_id = ?1 AND m.undone_at IS NULL)`,
         )
         .bind(r.id, pickIban(r.iban, r.accounts_json, r.account_ref ?? undefined)),

@@ -64,7 +64,11 @@ describe("migration 0017 on a populated database", () => {
       ),
     ]);
 
-    await applyD1Migrations(mdb, all);
+    // Up to 0022: the matching rebuild (0022) has its own test and replaces match_* tables and triggers.
+    await applyD1Migrations(
+      mdb,
+      all.filter((m) => m.name < "0022"),
+    );
 
     expect((await mdb.prepare("PRAGMA foreign_key_check").all()).results).toEqual([]);
 

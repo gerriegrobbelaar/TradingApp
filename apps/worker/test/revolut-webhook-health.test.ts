@@ -530,7 +530,10 @@ describe("S4: housekeeping of webhook_events and webhook_rejections", () => {
     await tickScheduler(e(), NOW);
     expect(queue.sent).toEqual([]);
     await tickScheduler(e(), NOW + HOUSEKEEPING_MINUTE * MIN);
-    expect(queue.sent).toEqual([{ type: "revolut_event", webhookEventId: id }]);
+    // Only the webhook event: the default bank.match job may be due at that minute too.
+    expect(queue.sent.filter((b) => "type" in b)).toEqual([
+      { type: "revolut_event", webhookEventId: id },
+    ]);
   });
 
   it("an idle tick sends no housekeeping statement; the housekeeping tick at most two", async () => {
