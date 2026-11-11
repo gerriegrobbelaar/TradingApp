@@ -6,11 +6,12 @@ import { describe, expect, it } from "vitest";
  * detail route (which labels it "Amount as stored") may touch it. Everything else must use
  * `open_minor` / `original_minor`.
  */
-const files = import.meta.glob("../src/**/*.ts", {
-  query: "?raw",
-  import: "default",
-  eager: true,
-}) as Record<string, string>;
+// vite's glob, typed locally (the worker tsconfig has no vite/client types)
+const files = (
+  import.meta as unknown as {
+    glob: (p: string, o: object) => Record<string, string>;
+  }
+).glob("../src/**/*.ts", { query: "?raw", import: "default", eager: true });
 
 const ALLOWED = new Set(["../src/exact/sync.ts", "../src/read/routes.ts"]);
 
@@ -40,6 +41,7 @@ describe("open_items.amount_minor is not read outside the allow-list (review S11
     // inside routes.ts it appears only in the detail row type, DETAIL_SQL and the detail body
     const lines = routes.split("\n").filter((l) => /amount_minor/.test(l));
     expect(lines.length).toBeLessThanOrEqual(3);
-    for (const l of lines) expect(l).toMatch(/amount_minor: number|oi\.amount_minor|row\.amount_minor/);
+    for (const l of lines)
+      expect(l).toMatch(/amount_minor: number|oi\.amount_minor|row\.amount_minor/);
   });
 });

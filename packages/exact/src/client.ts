@@ -153,18 +153,6 @@ export interface OpenItem {
   timestamp: string | null;
 }
 
-export interface GlBalance {
-  glAccountId: string;
-  glAccountCode: string | null;
-  glAccountDescription: string | null;
-  reportingYear: number;
-  reportingPeriod: number;
-  /** 'B' balance sheet, 'W' profit and loss (Exact's BalanceType). */
-  balanceType: string | null;
-  /** Division currency, integer minor units. */
-  amount: Money;
-}
-
 /**
  * One account of the chart (`financial/GLAccounts`). Every field name here is a recollection to
  * VERIFY with credentials (ADR 0024).
@@ -334,16 +322,6 @@ export const OPEN_ITEM_SYNC_FIELDS = [
   "InvoiceDate",
   "InvoiceNumber",
   "Timestamp",
-] as const;
-export const GL_BALANCE_FIELDS = [
-  "ID",
-  "GLAccount",
-  "GLAccountCode",
-  "GLAccountDescription",
-  "ReportingYear",
-  "ReportingPeriod",
-  "BalanceType",
-  "Amount",
 ] as const;
 /**
  * Ledger resources (ADR 0024). ALL names are recollections: VERIFY with credentials. A 400 on
@@ -1122,52 +1100,6 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
         (r) => mapOpenItem("payable", r, true),
         opts.maxPages,
       );
-    },
-
-    /**
-     * GL account balance rows for one reporting year, limited to periods <= `upToPeriod` when
-     * given. Rows are returned as Exact sends them (one per account/period, assumed per-period
-     * movements, not cumulative; ADR 0014 item 8): the caller sums. `currency` is the division
-     * currency and sets the minor-unit scale.
-     */
-    async listGlBalances(opts: {
-      year: number;
-      upToPeriod?: number;
-      currency: string;
-    }): Promise<GlBalance[]> {
-      if (!/^[A-Z]{3}$/.test(opts.currency)) throw new RangeError("invalid currency");
-      if (!Number.isInteger(opts.year) || opts.year < 1900 || opts.year > 2200) {
-        throw new RangeError("invalid reporting year");
-      }
-      let filter = `ReportingYear eq ${opts.year}`;
-      if (opts.upToPeriod !== undefined) {
-        if (!Number.isInteger(opts.upToPeriod) || opts.upToPeriod < 0 || opts.upToPeriod > 99) {
-          throw new RangeError("invalid reporting period");
-        }
-        filter += ` and ReportingPeriod le ${opts.upToPeriod}`;
-      }
-      const { rows } = await readAll(
-        "/financial/ReportingBalance",
-        GL_BALANCE_FIELDS,
-        { $filter: filter },
-        "throw",
-      );
-      return rows.map((r) => {
-        const year = intField(r, "ReportingYear");
-        const period = intField(r, "ReportingPeriod");
-        if (year === null || period === null) {
-          throw badData("Incomplete GL balance row", "BAD_SHAPE");
-        }
-        return {
-          glAccountId: reqGuid(r, "GLAccount"),
-          glAccountCode: trimField(r, "GLAccountCode"),
-          glAccountDescription: trimField(r, "GLAccountDescription"),
-          reportingYear: year,
-          reportingPeriod: period,
-          balanceType: trimField(r, "BalanceType"),
-          amount: moneyField(r, "Amount", opts.currency),
-        };
-      });
     },
 
     /**

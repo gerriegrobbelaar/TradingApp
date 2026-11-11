@@ -73,15 +73,26 @@ describe("isInvoiceApprovedForPayment", () => {
     expect(isInvoiceApprovedForPayment(fresh({ missedCycles: 1 }), v)).toBe(false);
     expect(isInvoiceApprovedForPayment(fresh({ statusCode: 999 }), v)).toBe(false);
     expect(
-      isInvoiceApprovedForPayment(fresh({ lastSeenAt: new Date(NOW - 40 * HOUR).toISOString() }), v),
+      isInvoiceApprovedForPayment(
+        fresh({ lastSeenAt: new Date(NOW - 40 * HOUR).toISOString() }),
+        v,
+      ),
     ).toBe(false);
   });
 
   it("parses the stored marker strictly", () => {
     const good = { verifiedAt: "2026-11-11T10:00:00.000Z", verifiedBy: "a@b.c", adrRef: "0025" };
     expect(parseApprovalMappingVerified(JSON.stringify(good))).toEqual(good);
-    for (const bad of [null, "", "x", "[]", "null", JSON.stringify({ ...good, adrRef: "" }),
-      JSON.stringify({ ...good, verifiedAt: "soon" }), JSON.stringify({ verifiedAt: good.verifiedAt })]) {
+    for (const bad of [
+      null,
+      "",
+      "x",
+      "[]",
+      "null",
+      JSON.stringify({ ...good, adrRef: "" }),
+      JSON.stringify({ ...good, verifiedAt: "soon" }),
+      JSON.stringify({ verifiedAt: good.verifiedAt }),
+    ]) {
       expect(parseApprovalMappingVerified(bad)).toBeNull();
     }
   });

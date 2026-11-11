@@ -16,3 +16,7 @@ Status: accepted. Code: `packages/core/src/{ageing,kpis,search,api-types}.ts`, `
 - **Privacy.** Lists and details never return IBANs or email addresses; relations expose presence flags only.
 - **Exact deep link** is `null`: the URL pattern for opening an entry in Exact is not verified. Verify with credentials, then fill `exactDeepLink()`.
 - **Division visibility.** A division is readable when its Exact connection is not disabled (as in the switcher). All signed-in roles see all such divisions.
+
+## Addendum (M2, Phase 4 review S11, N3)
+
+`open_items.amount_minor` is "the amount as stored" and for rows from the list endpoints may equal the open balance. Guard tests (`apps/worker/test/amount-minor-guard.test.ts`, `apps/web/src/amount-minor-guard.test.ts`) forbid reading it outside `exact/sync.ts` (upsert) and the detail route, and forbid `amountMinor` in web and core code other than the item sheet row "Amount as stored" and the type definitions. `provenance.source`: `list` = the nightly full read of the open-item lists, `sync` = the hourly incremental read (labels fixed). Migration 0012 changes the default of `connections.creates_bank_entries` to **0** for new rows (existing rows keep their value; FK-safe copy-aside rebuild as in 0004). **Phase 5 must set it explicitly per connection** (open decision 2: whether Revolut's own Exact integration creates the bank entries).

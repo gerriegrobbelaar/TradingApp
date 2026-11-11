@@ -32,7 +32,6 @@ describe("passthrough to the transport", () => {
       ok(fx.SYNC_ACCOUNTS),
       ok(fx.EMPTY),
       ok(fx.EMPTY),
-      ok(fx.GL_BALANCES),
     ]);
     const c = createExactClient(transport, { ...base, priority: "user" });
     await c.currentMe();
@@ -44,8 +43,7 @@ describe("passthrough to the transport", () => {
     await c.syncAccounts("0");
     await c.syncReceivables("0");
     await c.syncPayables("0");
-    await c.listGlBalances({ year: 2025, currency: "EUR" });
-    expect(calls).toHaveLength(10);
+    expect(calls).toHaveLength(9);
     for (const call of calls) {
       expect(call.method).toBe("GET");
       expect(call.api).toBe("rest");
@@ -594,35 +592,6 @@ describe("accounts and bank accounts", () => {
         accountId: "x' or 1 eq 1",
       }),
     ).rejects.toThrow(RangeError);
-  });
-});
-
-describe("GL balances", () => {
-  it("filters and converts", async () => {
-    const { transport, calls } = scripted([ok(fx.GL_BALANCES)]);
-    const r = await createExactClient(transport, base).listGlBalances({
-      year: 2025,
-      upToPeriod: 3,
-      currency: "EUR",
-    });
-    expect(calls[0]?.query?.["$filter"]).toBe("ReportingYear eq 2025 and ReportingPeriod le 3");
-    expect(r[0]).toMatchObject({ amount: { minor: -150005, currency: "EUR" }, balanceType: "B" });
-  });
-
-  it("validates inputs", async () => {
-    const c = createExactClient(scripted([]).transport, base);
-    await expect(c.listGlBalances({ year: 20, currency: "EUR" })).rejects.toThrow(RangeError);
-    await expect(c.listGlBalances({ year: 2025, upToPeriod: -1, currency: "EUR" })).rejects.toThrow(
-      RangeError,
-    );
-    await expect(c.listGlBalances({ year: 2025, currency: "eur" })).rejects.toThrow(RangeError);
-  });
-
-  it("rejects incomplete rows", async () => {
-    const { transport } = scripted([ok(`{"d":{"results":[{"GLAccount":"g"}]}}`)]);
-    await expect(
-      createExactClient(transport, base).listGlBalances({ year: 2025, currency: "EUR" }),
-    ).rejects.toMatchObject({ code: "BAD_SHAPE" });
   });
 });
 

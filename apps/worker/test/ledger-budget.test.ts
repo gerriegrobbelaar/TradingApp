@@ -107,11 +107,15 @@ describe("ledger call arithmetic", () => {
     expect(nightly).toBeGreaterThan(FULL_SYNC_BUDGET);
     expect(nightly).toBeLessThanOrEqual(2 * FULL_SYNC_BUDGET);
     // Still inside the unchanged daily worst case: the cap per attempt does not move.
-    expect(FULL_SYNC_MAX_ATTEMPTS * FULL_SYNC_BUDGET + MAX_INCREMENTAL_RUNS_PER_DAY * INCREMENTAL_SYNC_BUDGET).toBe(
-      SCHEDULED_WORST_CASE_CALLS_PER_DAY,
-    );
+    expect(
+      FULL_SYNC_MAX_ATTEMPTS * FULL_SYNC_BUDGET +
+        MAX_INCREMENTAL_RUNS_PER_DAY * INCREMENTAL_SYNC_BUDGET,
+    ).toBe(SCHEDULED_WORST_CASE_CALLS_PER_DAY);
     // The nightly read replaces the weekly one in those months, it does not add to it.
-    const weekly = other + purchases + estimateLedgerCalls({ accounts: 300, balanceYears: 2, budgetAccounts: 150 });
+    const weekly =
+      other +
+      purchases +
+      estimateLedgerCalls({ accounts: 300, balanceYears: 2, budgetAccounts: 150 });
     expect(weekly).toBe(319);
     expect(weekly).toBeLessThanOrEqual(2 * FULL_SYNC_BUDGET);
   });

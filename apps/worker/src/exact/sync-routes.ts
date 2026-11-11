@@ -34,10 +34,7 @@
  */
 import { auditStatement } from "../db/audit";
 import { json, type Ctx, type Router } from "../router";
-import {
-  PRIOR_YEAR_NIGHTLY_UNTIL_MONTH_KEY,
-  readPriorYearNightlyUntilMonth,
-} from "./ledger-sync";
+import { PRIOR_YEAR_NIGHTLY_UNTIL_MONTH_KEY, readPriorYearNightlyUntilMonth } from "./ledger-sync";
 import {
   INCREMENTAL_OPEN_ITEMS_KEY,
   readBoolSetting,

@@ -11,7 +11,11 @@ import { formatMoney } from "../lib/format";
  *    Some items have no amount in EUR yet."
  *  - some items have none and the total is 0: "Not known yet", never "At least € 0,00".
  */
-export function dcLineText(p: { dcMinor: number; dcComplete: boolean; dcCurrency: string }): string {
+export function dcLineText(p: {
+  dcMinor: number;
+  dcComplete: boolean;
+  dcCurrency: string;
+}): string {
   const cur = p.dcCurrency;
   if (p.dcComplete) return `about ${formatMoney(p.dcMinor, cur)} (booked rate in Exact)`;
   if (p.dcMinor === 0) {

@@ -52,9 +52,7 @@ describe("migration 0012 on a populated database", () => {
     ).toBe(2);
 
     // A new row without the column gets 0; the CHECK still holds.
-    await mdb
-      .prepare("INSERT INTO connections (kind, name) VALUES ('revolut', 'rev2')")
-      .run();
+    await mdb.prepare("INSERT INTO connections (kind, name) VALUES ('revolut', 'rev2')").run();
     expect(
       (
         await mdb
@@ -64,7 +62,9 @@ describe("migration 0012 on a populated database", () => {
     ).toBe(0);
     await expect(
       mdb
-        .prepare("INSERT INTO connections (kind, name, creates_bank_entries) VALUES ('exact', 'z', 2)")
+        .prepare(
+          "INSERT INTO connections (kind, name, creates_bank_entries) VALUES ('exact', 'z', 2)",
+        )
         .run(),
     ).rejects.toThrow();
     // The unique key and the kind check survived the rebuild.

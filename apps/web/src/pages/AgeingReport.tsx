@@ -184,7 +184,6 @@ function CurrencySection({
   onDrill: (d: DrillRequest) => void;
 }) {
   const copy = COPY[kind];
-  const foreign = currency !== dcCurrency;
   const open = (
     who: string,
     col: { key: AgeingBucket | "total"; label: string },
@@ -410,11 +409,7 @@ export function AgeingReport({ kind }: { kind: AgeingKind }) {
         <>
           <div className="report-bar no-print">
             <div className="filters" role="group" aria-label="Filters">
-              <SearchBox
-                value={q}
-                onChange={setQ}
-                label={`Search ${copy.party.toLowerCase()}s`}
-              />
+              <SearchBox value={q} onChange={setQ} label={`Search ${copy.party.toLowerCase()}s`} />
               <Segmented<SortMode>
                 label="Sort by"
                 value={sort}

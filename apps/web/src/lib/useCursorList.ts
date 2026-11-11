@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isAbort } from "./errors";
+import { useAutoRefresh } from "./useAutoRefresh";
 
 export interface CursorPage<T> {
   items: T[];
@@ -137,6 +138,18 @@ export function useCursorList<T, P extends CursorPage<T>>(
   }, []);
 
   const reload = useCallback(() => setTick((t) => t + 1), []);
+
+  // Quiet refresh of the first page's summary (freshness, totals, as-of) on focus and every 30
+  // minutes (review N5). The rows already shown stay, so scroll position and "Load more" progress
+  // survive; a failure is ignored.
+  useAutoRefresh(async () => {
+    const s = latest.current;
+    if (s.key === null || s.status !== "ready") return;
+    const key = s.key;
+    const p = await fetchRef.current(null, new AbortController().signal);
+    setState((c) => (c.key === key && c.status === "ready" ? { ...c, first: p } : c));
+  }, queryKey !== null);
+
   const view: State<T, P> =
     queryKey === null
       ? blank(null, "idle")

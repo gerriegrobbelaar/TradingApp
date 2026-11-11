@@ -383,9 +383,10 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
         {(view === "closed" || view === "all") && <p className="cap">{CLOSED_SCOPE_NOTE}</p>}
         {possiblyPaidTotal > 0 && (
           <p className="cap" role="status">
-            {formatCount(possiblyPaidTotal)} of the matching items {possiblyPaidTotal === 1 ? "is" : "are"}{" "}
-            possibly paid: Exact did not list {possiblyPaidTotal === 1 ? "it" : "them"} in the last
-            nightly read, so the totals may include paid items.
+            {formatCount(possiblyPaidTotal)} of the matching items{" "}
+            {possiblyPaidTotal === 1 ? "is" : "are"} possibly paid: Exact did not list{" "}
+            {possiblyPaidTotal === 1 ? "it" : "them"} in the last nightly read, so the totals may
+            include paid items.
           </p>
         )}
         {noDivision ? (

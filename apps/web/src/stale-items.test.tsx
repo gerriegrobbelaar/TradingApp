@@ -31,7 +31,9 @@ describe("possibly paid (review S8)", () => {
     const table = await loaded();
     expect(within(table).getAllByText(CHIP)).toHaveLength(1);
     expect(screen.getByText("Open items refresh nightly")).toBeTruthy();
-    expect(norm(document.body.textContent)).toContain("possibly paid: Exact did not list it in the last nightly read");
+    expect(norm(document.body.textContent)).toContain(
+      "possibly paid: Exact did not list it in the last nightly read",
+    );
     await user.click(within(table).getByRole("button", { name: "INV-1" }));
     const dialog = await screen.findByRole("dialog");
     expect(await within(dialog).findByText(CHIP)).toBeTruthy();
@@ -60,7 +62,9 @@ describe("closed and all views (review S9)", () => {
     mockFetch({ ...base(), "GET /api/invoices": () => ({ body: listResponse([closed]) }) });
     renderApp("/invoices?view=closed");
     const table = await loaded();
-    expect(screen.getByText(/only items that were open at some sync since this app first read Exact/)).toBeTruthy();
+    expect(
+      screen.getByText(/only items that were open at some sync since this app first read Exact/),
+    ).toBeTruthy();
     expect(norm(table.textContent)).not.toContain("0,00");
     expect(within(table).getAllByText("—").length).toBeGreaterThan(0);
   });

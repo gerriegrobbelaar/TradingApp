@@ -69,7 +69,7 @@ export const HANDLERS: Record<string, HandlerDef> = {
   "exact.full_sync": {
     title: "Full sync from Exact",
     description:
-      "Copies relations, open receivables and open payables from Exact, and closes items Exact no longer lists. Continues by itself if it stops partway.",
+      "Copies relations and bank accounts, open receivables and payables, purchase-entry approval status and the ledger (accounts, balances, budgets) from Exact, and closes items Exact no longer lists. Continues by itself if it stops partway.",
     usesExact: true,
     phase: null,
     maxAttempts: FULL_SYNC_MAX_ATTEMPTS,
@@ -79,7 +79,8 @@ export const HANDLERS: Record<string, HandlerDef> = {
   },
   "exact.incremental_sync": {
     title: "Incremental sync from Exact",
-    description: "Refreshes administrations and relations. Open items are left to the full sync.",
+    description:
+      "Refreshes administrations, relations and approval status of purchase entries. Open items and the ledger are left to the nightly full sync.",
     usesExact: true,
     phase: null,
     maxAttempts: 1,

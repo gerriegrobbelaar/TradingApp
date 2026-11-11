@@ -375,7 +375,9 @@ describe("list filters in the address", () => {
     expect(callsTo(calls, "/api/relations/7").length).toBeGreaterThan(0);
     await waitFor(() => expect(nav.search).toBe("?relationId=7"));
     await user.type(screen.getByRole("searchbox", { name: "Search invoices" }), "secret");
-    await waitFor(() => expect(params(callsTo(calls, "/api/invoices").at(-1)).get("q")).toBe("secret"));
+    await waitFor(() =>
+      expect(params(callsTo(calls, "/api/invoices").at(-1)).get("q")).toBe("secret"),
+    );
     expect(nav.search).toBe("?relationId=7");
   });
 

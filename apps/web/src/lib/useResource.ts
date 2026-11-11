@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isAbort } from "./errors";
+import { useAutoRefresh } from "./useAutoRefresh";
 
 export type ResourceStatus = "idle" | "loading" | "ready" | "error";
 
@@ -53,6 +54,20 @@ export function useResource<T>(
   }, [key, tick]);
 
   const reload = useCallback(() => setTick((t) => t + 1), []);
+
+  // Quiet refresh on focus and every 30 minutes (review N5): keeps what is shown, replaces the
+  // data when the answer arrives, ignores failures (the next trigger tries again).
+  const current = useRef<{ key: string | null; ready: boolean }>({ key: null, ready: false });
+  current.current = { key, ready: state.key === key && state.status === "ready" };
+  useAutoRefresh(async () => {
+    const at = current.current.key;
+    if (at === null || !current.current.ready) return;
+    const data = await fetchRef.current(new AbortController().signal);
+    if (current.current.key === at) {
+      setState((s) => (s.key === at && s.status === "ready" ? { ...s, data } : s));
+    }
+  }, key !== null);
+
   if (key === null) return { status: "idle", data: null, error: null, reload };
   if (state.key !== key) return { status: "loading", data: null, error: null, reload };
   return { status: state.status, data: state.data, error: state.error, reload };

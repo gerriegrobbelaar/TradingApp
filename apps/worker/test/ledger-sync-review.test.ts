@@ -405,7 +405,9 @@ describe("the Amsterdam year boundary", () => {
     expect(balanceCalls(2026)).toHaveLength(1);
     // a malformed value falls back to the default (4): June is then weekly
     await db
-      .prepare("UPDATE settings SET value_json = '\"x\"' WHERE key = 'exact.prior_year_nightly_until_month'")
+      .prepare(
+        "UPDATE settings SET value_json = '\"x\"' WHERE key = 'exact.prior_year_nightly_until_month'",
+      )
       .run();
     clock = Date.parse("2027-06-04T01:00:00Z");
     unlimited();

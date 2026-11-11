@@ -79,8 +79,7 @@ const APPROVAL_FUTURE_TOLERANCE_MS = 5 * 60 * 1000;
 export const APPROVAL_MAPPING_VERIFIED_SETTING = "exact.approval_mapping_verified";
 
 /** The exact text an admin must send to record the verification (a deliberate, typed act). */
-export const APPROVAL_MAPPING_CONFIRMATION =
-  "I verified the approval status mapping against Exact";
+export const APPROVAL_MAPPING_CONFIRMATION = "I verified the approval status mapping against Exact";
 
 /** What the stored "verified" marker looks like (all three are required). */
 export interface ApprovalMappingVerified {
@@ -90,7 +89,9 @@ export interface ApprovalMappingVerified {
 }
 
 /** Parses the stored setting; null (= not verified) for anything that is not complete. */
-export function parseApprovalMappingVerified(valueJson: string | null): ApprovalMappingVerified | null {
+export function parseApprovalMappingVerified(
+  valueJson: string | null,
+): ApprovalMappingVerified | null {
   if (valueJson === null) return null;
   try {
     const v: unknown = JSON.parse(valueJson);

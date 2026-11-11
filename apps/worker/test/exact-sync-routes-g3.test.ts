@@ -159,11 +159,15 @@ describe("incremental open items setting (review S4)", () => {
   });
 
   it("holds the prior-year nightly month: default 4, admin only, validated, audited when it changes (review S4)", async () => {
-    await db.prepare("DELETE FROM settings WHERE key = 'exact.prior_year_nightly_until_month'").run();
+    await db
+      .prepare("DELETE FROM settings WHERE key = 'exact.prior_year_nightly_until_month'")
+      .run();
     expect((await get("viewer")).priorYearNightlyUntilMonth).toBe(4);
     expect((await put("finance", { priorYearNightlyUntilMonth: 6 })).status).toBe(403);
     for (const bad of [13, -1, 2.5, "4", null, true]) {
-      expect((await put("admin", { priorYearNightlyUntilMonth: bad })).status, String(bad)).toBe(400);
+      expect((await put("admin", { priorYearNightlyUntilMonth: bad })).status, String(bad)).toBe(
+        400,
+      );
     }
     expect((await put("admin", { priorYearNightlyUntilMonth: 4, other: 1 })).status).toBe(400);
     expect((await get("admin")).priorYearNightlyUntilMonth).toBe(4);
