@@ -48,7 +48,7 @@ export const MANUAL_SYNC_BUDGET = 60;
 /** One new manual run per division per this long, unless it continues a partial one. */
 export const MANUAL_COOLDOWN_MS = 60_000;
 
-interface DivisionJoin {
+export interface DivisionJoin {
   id: number;
   connection_id: number;
   exact_division: number;
@@ -125,7 +125,7 @@ function positiveInt(v: unknown): number | null {
  * The user's stored selection if it is still valid, else the first division that syncs, else the
  * first division, else null.
  */
-async function selectedId(
+export async function selectedId(
   db: D1Database,
   userId: number,
   divisions: readonly DivisionJoin[],
