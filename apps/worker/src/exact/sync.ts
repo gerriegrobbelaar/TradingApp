@@ -50,6 +50,7 @@ import type { Env } from "../env";
 import { createGateTransport, gateName, getExactGate } from "./gate-transport";
 import {
   LEDGER_ENTITIES,
+  GATE_REJECT_CODES,
   isLedgerEntity,
   syncGlAccounts,
   syncGlBalances,
@@ -83,9 +84,12 @@ export {
 import {
   amsterdamDate,
   amsterdamParts,
+  bookedAtRate,
   isPlausibleIban,
+  isRateDirection,
   normalizeIban,
   searchText,
+  type RateDirection,
 } from "@camelthorn/core";
 
 export type SyncMode = "full" | "incremental";
@@ -162,6 +166,20 @@ function assertSyncEntity(v: string): void {
 }
 /** Admin setting (settings table): read open items in INCREMENTAL runs too. Default off. */
 export const INCREMENTAL_OPEN_ITEMS_KEY = "exact.incremental_open_items";
+
+/**
+ * Admin setting (settings table, ADR 0038 option 1): ask the bulk lists for AmountDC and RateFC
+ * too. Default OFF until the field names are verified with credentials. A 400 on the extended
+ * `$select` degrades to the plain one and is remembered for LIST_DC_UNAVAILABLE_MS.
+ */
+export const LIST_DC_FIELDS_KEY = "exact.list_dc_fields";
+/**
+ * Admin setting (ADR 0038 option 3): direction of Exact's booked rate (`RateFC`), 'base_per_foreign'
+ * or 'foreign_per_base'. Unset = the booked division-currency amount is never computed from a rate.
+ */
+export const RATE_DIRECTION_KEY = "exact.rate_direction";
+/** How long a rejected extended `$select` is not tried again (sync_state.unavailable_until). */
+export const LIST_DC_UNAVAILABLE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export const DEFAULT_SYNC_BUDGET = 300;
 /** A full cycle that has not finished after this long is abandoned and started again. */
@@ -487,7 +505,10 @@ function openItemStmt(
   // Amount model (migration 0005, ADR 0017): open_minor is the open balance in the item
   // currency; original_minor the invoice total when known. Original amount and rate describe the
   // booked invoice and are kept when a later read (the bulk list) does not carry them, unless the
-  // currency changed. open_dc_minor is a snapshot of the open balance and is never kept stale.
+  // currency changed. open_dc_minor is a snapshot of the open balance: a read that carries it
+  // replaces it; a read that does not (the nightly list) keeps it only while the open amount and
+  // the currency are unchanged, and clears it otherwise (a part payment changes the open amount,
+  // and the division-currency value of the remainder is unknown until a read gives it; ADR 0038).
   // A closed item we have never seen is not inserted (the sync endpoints return the whole paid
   // history from cursor 0); a closed item we do know is updated.
   // The DO UPDATE only applies when this run is not older than the run that last saw the row, so
@@ -520,7 +541,14 @@ function openItemStmt(
                      WHEN open_items.currency = excluded.currency THEN open_items.rate
                      ELSE NULL END,
          currency = excluded.currency, open_minor = excluded.open_minor,
-         open_dc_minor = excluded.open_dc_minor, dc_currency = excluded.dc_currency,
+         open_dc_minor = CASE WHEN excluded.open_dc_minor IS NOT NULL THEN excluded.open_dc_minor
+                              WHEN open_items.currency = excluded.currency
+                               AND open_items.open_minor = excluded.open_minor
+                              THEN open_items.open_dc_minor ELSE NULL END,
+         dc_currency = CASE WHEN excluded.open_dc_minor IS NOT NULL THEN excluded.dc_currency
+                            WHEN open_items.currency = excluded.currency
+                             AND open_items.open_minor = excluded.open_minor
+                            THEN open_items.dc_currency ELSE NULL END,
          invoice_date = excluded.invoice_date, due_date = excluded.due_date,
          status = excluded.status,
          closed_at = CASE WHEN excluded.status = 'closed'
@@ -799,8 +827,10 @@ export async function syncDivision(
       const ctx: Ctx = {
         db,
         client: makeClient(division.currency ?? "EUR"),
+        currency: division.currency ?? "EUR",
         setCurrency: (currency) => {
           ctx.client = makeClient(currency);
+          ctx.currency = currency;
         },
         restart: opts.restart === true,
         division,
@@ -1160,6 +1190,8 @@ interface Ctx {
   db: D1Database;
   /** Replaced by setCurrency once the division's own currency has been read. */
   client: ExactClient;
+  /** The division's own currency (scale of division-currency amounts). */
+  currency: string;
   /** Rebuilds the client with this division currency (scale of division-currency amounts). */
   setCurrency: (currency: string) => void;
   /** Full mode: start cursor-based reads from 0 instead of the saved cursor. */
@@ -1392,15 +1424,38 @@ async function syncOpenItemsFull(
   const nowIso = ctx.nowIso();
   let rows = 0;
   ctx.pass = { read: readTotal, total };
+  // Booked division-currency amount (ADR 0038): the optional list fields (option 1) and/or the
+  // rate computation (option 3), both admin settings that are OFF by default. One D1 read.
+  const opts = await readBookedOptions(ctx);
+  let dcFields =
+    opts.listDcFields &&
+    !(
+      !ctx.restart &&
+      st?.unavailable_until != null &&
+      Date.parse(st.unavailable_until) > ctx.nowMs()
+    );
   for (let chunk = 0; chunk < MAX_CHUNKS; chunk++) {
     if (ctx.pastDeadline()) {
       return { status: "partial", rows, calls: 0, error: "time_limit", progress: ctx.pass };
     }
-    const page = await (receivable
-      ? ctx.client.listReceivablesChunk(token, { maxPages: ctx.chunkPages })
-      : ctx.client.listPayablesChunk(token, { maxPages: ctx.chunkPages }));
+    const read = (withDc: boolean) =>
+      receivable
+        ? ctx.client.listReceivablesChunk(token, { maxPages: ctx.chunkPages, dcFields: withDc })
+        : ctx.client.listPayablesChunk(token, { maxPages: ctx.chunkPages, dcFields: withDc });
+    let page;
+    try {
+      page = await read(dcFields);
+    } catch (e) {
+      // Exact's own refusal of the extended $select (not our gate's 400s): degrade to the plain
+      // read ONCE, remember it for a week instead of failing every night (ADR 0038).
+      if (!dcFields || !isSelectRefusal(e)) throw e;
+      dcFields = false;
+      await markListDcUnavailable(ctx, entity);
+      page = await read(false);
+    }
     readTotal += page.items.length;
-    const units: D1PreparedStatement[][] = page.items.map((it) => [
+    const items = await withComputedBooked(ctx, page.items, opts.rateDirection);
+    const units: D1PreparedStatement[][] = items.map((it) => [
       openItemStmt(ctx.db, ctx.division.id, it, ctx.runSeq, nowIso, "list"),
     ]);
     units.push([
@@ -1435,6 +1490,130 @@ async function syncOpenItemsFull(
     token = page.nextToken;
   }
   return { status: "partial", rows, calls: 0, error: "chunk_limit", progress: ctx.pass };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Booked division-currency amount of foreign-currency open items (ADR 0038)
+// ---------------------------------------------------------------------------------------------
+
+interface BookedOptions {
+  listDcFields: boolean;
+  rateDirection: RateDirection | null;
+}
+
+/** The two admin settings behind the booked amount, in one read. Unreadable = off. */
+export async function readBookedSettings(db: D1Database): Promise<BookedOptions> {
+  const rows = await db
+    .prepare("SELECT key, value_json FROM settings WHERE key IN (?1, ?2)")
+    .bind(LIST_DC_FIELDS_KEY, RATE_DIRECTION_KEY)
+    .all<{ key: string; value_json: string }>();
+  const out: BookedOptions = { listDcFields: false, rateDirection: null };
+  for (const r of rows.results) {
+    let v: unknown;
+    try {
+      v = JSON.parse(r.value_json);
+    } catch {
+      continue;
+    }
+    if (r.key === LIST_DC_FIELDS_KEY && v === true) out.listDcFields = true;
+    if (r.key === RATE_DIRECTION_KEY && isRateDirection(v)) out.rateDirection = v;
+  }
+  return out;
+}
+
+async function readBookedOptions(ctx: Ctx): Promise<BookedOptions> {
+  ctx.meter.used += 1;
+  return readBookedSettings(ctx.db).catch(() => ({ listDcFields: false, rateDirection: null }));
+}
+
+/** Exact refused the request (400) as opposed to our own gate rejecting it. */
+function isSelectRefusal(e: unknown): boolean {
+  return (
+    e instanceof ExactApiError &&
+    e.status === 400 &&
+    !(e.code !== undefined && GATE_REJECT_CODES.has(e.code))
+  );
+}
+
+/**
+ * Remembers on the entity's own sync_state row that the extended `$select` was refused. The
+ * stateStmt upserts at the end of a run never touch unavailable_until, so it survives.
+ */
+async function markListDcUnavailable(ctx: Ctx, entity: "receivables" | "payables"): Promise<void> {
+  assertSyncEntity(entity);
+  await runBatches(ctx.db, ctx.meter, [
+    [
+      ctx.db
+        .prepare(
+          `INSERT INTO sync_state (division_id, entity, mode, last_started_at, unavailable_until)
+           SELECT ?1, ?2, 'full', ?3, ?4 WHERE ${leaseHeld("?5", "?6")}
+           ON CONFLICT (division_id, entity) DO UPDATE SET
+             unavailable_until = excluded.unavailable_until
+           WHERE ${leaseHeld("?5", "?6")}`,
+        )
+        .bind(
+          ctx.division.id,
+          entity,
+          ctx.startedAt,
+          new Date(ctx.nowMs() + LIST_DC_UNAVAILABLE_MS).toISOString(),
+          ctx.lease.holder,
+          ctx.lease.runSeq,
+        ),
+    ],
+  ]);
+}
+
+/**
+ * Option 3 (ADR 0038): for foreign-currency items of a list chunk that carry no division-currency
+ * amount, compute it as open amount x booked rate, but ONLY when an admin set the rate direction
+ * after checking it against Exact. The rate is the one the list read carried, else the one stored
+ * from an earlier sync read for the same currency. Anything missing leaves the item as it is
+ * (the upsert then keeps or clears the stored amount).
+ */
+async function withComputedBooked(
+  ctx: Ctx,
+  items: OpenItem[],
+  direction: RateDirection | null,
+): Promise<OpenItem[]> {
+  if (direction === null) return items;
+  const wanted = items.filter((i) => i.amountDc === null && i.amount.currency !== ctx.currency);
+  if (wanted.length === 0) return items;
+  interface Stored {
+    currency: string;
+    rate: string | null;
+    open_minor: number;
+    open_dc_minor: number | null;
+  }
+  const stored = new Map<string, Stored>();
+  ctx.meter.used += 1;
+  const rows = await ctx.db
+    .prepare(
+      `SELECT exact_id, currency, rate, open_minor, open_dc_minor FROM open_items
+       WHERE division_id = ?1 AND exact_id IN (SELECT value FROM json_each(?2))`,
+    )
+    .bind(ctx.division.id, JSON.stringify(wanted.map((i) => i.id.toLowerCase())))
+    .all<Stored & { exact_id: string }>();
+  for (const r of rows.results) stored.set(r.exact_id, r);
+  const limit = BigInt(Number.MAX_SAFE_INTEGER);
+  return items.map((it) => {
+    if (it.amountDc !== null || it.amount.currency === ctx.currency) return it;
+    const s = stored.get(it.id.toLowerCase());
+    const same = s !== undefined && s.currency === it.amount.currency;
+    // A stored amount for this very open balance (read from Exact earlier) is kept by the upsert
+    // and is better than a computed one.
+    if (same && s.open_minor === it.amount.minor && s.open_dc_minor !== null) return it;
+    const rate = it.rate ?? (same ? s.rate : null);
+    if (rate === null) return it;
+    const dc = bookedAtRate({
+      openMinor: it.amount.minor,
+      currency: it.amount.currency,
+      baseCurrency: ctx.currency,
+      rate,
+      direction,
+    });
+    if (dc === null || dc > limit || dc < -limit) return it;
+    return { ...it, amountDc: { minor: Number(dc), currency: ctx.currency } };
+  });
 }
 
 /**

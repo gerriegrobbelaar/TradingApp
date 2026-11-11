@@ -36,6 +36,9 @@ export interface FakeItem {
   amountDc?: number;
   rate?: number;
   fullyPaid?: boolean;
+  /** List rows only, and only when `$select` asks for them (ADR 0038 option 1). */
+  listAmountDc?: number;
+  listRate?: number;
 }
 
 /** A chart account as Exact's financial/GLAccounts would send it. */
@@ -117,6 +120,8 @@ export class FakeExact {
   beforeCall: (n: number, req: ExactRequest) => void = () => undefined;
   /** Per-path override: return a response instead of data. */
   override: Record<string, () => ExactResponse> = {};
+  /** Answers 400 (Exact's refusal of a bad $select) when the list $select contains this field. */
+  rejectSelect: string | undefined;
 
   constructor(private readonly division: number) {}
 
@@ -125,6 +130,17 @@ export class FakeExact {
     this.beforeCall(this.calls.length, req);
     const over = this.override[req.path];
     if (over) return over();
+    if (
+      this.rejectSelect !== undefined &&
+      req.path.startsWith("/read/financial/") &&
+      (req.query?.["$select"] ?? "").split(",").includes(this.rejectSelect)
+    ) {
+      return {
+        status: 400,
+        headers: {},
+        body: '{"error":{"code":"","message":{"lang":"","value":"bad $select"}}}',
+      };
+    }
     const rows = this.rows(req);
     const offset = Number(req.query?.["$skiptoken"] ?? 0);
     const size =
@@ -194,9 +210,9 @@ export class FakeExact {
           Main: b.main ?? true,
         }));
       case "/read/financial/ReceivablesList":
-        return this.receivables.map((i) => this.listRow(i));
+        return this.receivables.map((i) => this.listRow(i, req));
       case "/read/financial/PayablesList":
-        return this.payables.map((i) => this.listRow(i));
+        return this.payables.map((i) => this.listRow(i, req));
       case "/sync/Cashflow/Receivables": {
         const c = this.cursorOf(req);
         return this.receivables
@@ -296,8 +312,13 @@ export class FakeExact {
       }));
   }
 
-  private listRow(i: FakeItem): unknown {
+  private listRow(i: FakeItem, req: ExactRequest): unknown {
+    const wanted = (req.query?.["$select"] ?? "").split(",");
     return {
+      ...(wanted.includes("AmountDC") && i.listAmountDc !== undefined
+        ? { AmountDC: i.listAmountDc }
+        : {}),
+      ...(wanted.includes("RateFC") && i.listRate !== undefined ? { RateFC: i.listRate } : {}),
       ID: guid(i.n),
       AccountId: guid(i.account),
       AccountCode: String(i.account),

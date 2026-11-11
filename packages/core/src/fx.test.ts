@@ -4,6 +4,8 @@ import {
   convertMinor,
   crossRate,
   formatRateForDisplay,
+  bookedAtRate,
+  isRateDirection,
   parseRate,
   unrealisedDifference,
 } from "./fx";
@@ -395,5 +397,87 @@ describe("formatRateForDisplay", () => {
     expect(formatRateForDisplay("abc")).toBe("abc");
     expect(formatRateForDisplay("1.5", -1)).toBe("1.5");
     expect(formatRateForDisplay("1.5", 1.5)).toBe("1.5");
+  });
+});
+
+describe("bookedAtRate (ADR 0038, option 3)", () => {
+  it("base_per_foreign multiplies, foreign_per_base divides, rounding once half away from zero", () => {
+    // USD 1,000.00 at 0.92 EUR per USD = EUR 920.00
+    expect(
+      bookedAtRate({
+        openMinor: 100000,
+        currency: "USD",
+        baseCurrency: "EUR",
+        rate: "0.92",
+        direction: "base_per_foreign",
+      }),
+    ).toBe(92000n);
+    // USD 1,000.00 at 1.25 USD per EUR = EUR 800.00
+    expect(
+      bookedAtRate({
+        openMinor: 100000,
+        currency: "USD",
+        baseCurrency: "EUR",
+        rate: "1.25",
+        direction: "foreign_per_base",
+      }),
+    ).toBe(80000n);
+    // tie: 0.01 USD * 0.5 = 0.005 EUR -> 0.01 away from zero; negative mirrors
+    const t = (n: number) =>
+      bookedAtRate({
+        openMinor: n,
+        currency: "USD",
+        baseCurrency: "EUR",
+        rate: "0.5",
+        direction: "base_per_foreign",
+      });
+    expect(t(1)).toBe(1n);
+    expect(t(-1)).toBe(-1n);
+    expect(t(3)).toBe(2n);
+  });
+
+  it("respects currency scales (JPY has none)", () => {
+    // JPY 10,000 at 0.0062 EUR per JPY = EUR 62.00
+    expect(
+      bookedAtRate({
+        openMinor: 10000,
+        currency: "JPY",
+        baseCurrency: "EUR",
+        rate: "0.0062",
+        direction: "base_per_foreign",
+      }),
+    ).toBe(6200n);
+    // EUR 62.00 in a JPY division at 161.29 JPY per EUR
+    expect(
+      bookedAtRate({
+        openMinor: 6200,
+        currency: "EUR",
+        baseCurrency: "JPY",
+        rate: "161.29",
+        direction: "base_per_foreign",
+      }),
+    ).toBe(10000n);
+  });
+
+  it("returns null for bad input and the amount for the same currency", () => {
+    const base = {
+      openMinor: 100,
+      currency: "USD",
+      baseCurrency: "EUR",
+      direction: "base_per_foreign" as const,
+    };
+    expect(bookedAtRate({ ...base, rate: "0" })).toBeNull();
+    expect(bookedAtRate({ ...base, rate: "-1" })).toBeNull();
+    expect(bookedAtRate({ ...base, rate: "1e3" })).toBeNull();
+    expect(bookedAtRate({ ...base, rate: "1", currency: "us" })).toBeNull();
+    expect(bookedAtRate({ ...base, rate: "1", openMinor: 1.5 })).toBeNull();
+    expect(bookedAtRate({ ...base, rate: "1", currency: "EUR" })).toBe(100n);
+  });
+
+  it("isRateDirection accepts exactly the two values", () => {
+    expect(isRateDirection("base_per_foreign")).toBe(true);
+    expect(isRateDirection("foreign_per_base")).toBe(true);
+    expect(isRateDirection("x")).toBe(false);
+    expect(isRateDirection(null)).toBe(false);
   });
 });

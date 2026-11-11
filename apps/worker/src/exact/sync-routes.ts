@@ -19,10 +19,15 @@
  *                                 returned is enabled by default; the others are listed but off.
  *                                 Sync (manual and scheduled) only handles enabled divisions.
  *  GET  /api/sync/settings        any signed-in role: `{ incrementalOpenItems,
- *                                 priorYearNightlyUntilMonth }`
+ *                                 priorYearNightlyUntilMonth, listDcFields, rateDirection }`
  *  PUT  /api/sync/settings        admin (no step-up): `{ incrementalOpenItems?: boolean,
- *                                 priorYearNightlyUntilMonth?: integer 0..12 }` (at least one
- *                                 key; unknown keys are refused). `exact.incremental_open_items`
+ *                                 priorYearNightlyUntilMonth?: integer 0..12,
+ *                                 listDcFields?: boolean,
+ *                                 rateDirection?: 'base_per_foreign' | 'foreign_per_base' | null }`
+ *                                 (at least one key; unknown keys are refused). `listDcFields`
+ *                                 and `rateDirection` are the booked-amount switches of ADR 0038
+ *                                 (both off/unset by default, set after live verification;
+ *                                 changing listDcFields forgets a remembered 400). `exact.incremental_open_items`
  *                                 is OFF until the same-ID assumption of ADR 0017 is verified.
  *                                 `exact.prior_year_nightly_until_month` (default 4): while the
  *                                 Amsterdam month is at most this, last year's balances are read
@@ -32,11 +37,15 @@
  * `:id` and `divisionId` are our divisions.id, never the raw Exact division number. A division
  * whose connection is disabled is not offered and cannot be selected or synced.
  */
+import { isRateDirection, type RateDirection } from "@camelthorn/core";
 import { auditStatement } from "../db/audit";
 import { json, type Ctx, type Router } from "../router";
 import { PRIOR_YEAR_NIGHTLY_UNTIL_MONTH_KEY, readPriorYearNightlyUntilMonth } from "./ledger-sync";
 import {
   INCREMENTAL_OPEN_ITEMS_KEY,
+  LIST_DC_FIELDS_KEY,
+  RATE_DIRECTION_KEY,
+  readBookedSettings,
   readBoolSetting,
   syncDivision,
   type PrevRun,
@@ -232,6 +241,10 @@ export function registerSyncRoutes(router: Router): void {
   const readSettings = async (db: D1Database) => ({
     incrementalOpenItems: await readBoolSetting(db, INCREMENTAL_OPEN_ITEMS_KEY, false),
     priorYearNightlyUntilMonth: await readPriorYearNightlyUntilMonth(db),
+    ...(await readBookedSettings(db).then((b) => ({
+      listDcFields: b.listDcFields,
+      rateDirection: b.rateDirection,
+    }))),
   });
 
   router.add("GET", "/api/sync/settings", ANY_ROLE, async (ctx) => {
@@ -246,10 +259,20 @@ export function registerSyncRoutes(router: Router): void {
     const keys = Object.keys(body);
     const incremental = body["incrementalOpenItems"];
     const month = body["priorYearNightlyUntilMonth"];
+    const listDc = body["listDcFields"];
+    const direction = body["rateDirection"];
     if (
       keys.length === 0 ||
-      keys.some((k) => k !== "incrementalOpenItems" && k !== "priorYearNightlyUntilMonth") ||
+      keys.some(
+        (k) =>
+          k !== "incrementalOpenItems" &&
+          k !== "priorYearNightlyUntilMonth" &&
+          k !== "listDcFields" &&
+          k !== "rateDirection",
+      ) ||
       (incremental !== undefined && typeof incremental !== "boolean") ||
+      (listDc !== undefined && typeof listDc !== "boolean") ||
+      (direction !== undefined && direction !== null && !isRateDirection(direction)) ||
       (month !== undefined &&
         (typeof month !== "number" || !Number.isInteger(month) || month < 0 || month > 12))
     ) {
@@ -306,6 +329,57 @@ export function registerSyncRoutes(router: Router): void {
           },
         ),
         upsert(PRIOR_YEAR_NIGHTLY_UNTIL_MONTH_KEY, month),
+      );
+    }
+    if (typeof listDc === "boolean") {
+      statements.push(
+        auditStatement(
+          db,
+          {
+            actorEmail: session.email,
+            action: "settings.exact_list_dc_fields",
+            entity: "settings",
+            entityId: LIST_DC_FIELDS_KEY,
+            before: { value: before.listDcFields },
+            after: { value: listDc },
+          },
+          {
+            sql: `COALESCE((SELECT value_json FROM settings WHERE key = ?7), 'false') <> ?8`,
+            binds: [LIST_DC_FIELDS_KEY, JSON.stringify(listDc)],
+          },
+        ),
+        // A changed switch is a new decision: forget a remembered 400 (ADR 0038).
+        db
+          .prepare(
+            `UPDATE sync_state SET unavailable_until = NULL
+           WHERE entity IN ('receivables', 'payables') AND unavailable_until IS NOT NULL
+             AND ?1 <> COALESCE((SELECT value_json FROM settings WHERE key = ?2), 'false')`,
+          )
+          .bind(JSON.stringify(listDc), LIST_DC_FIELDS_KEY),
+        upsert(LIST_DC_FIELDS_KEY, listDc),
+      );
+    }
+    if (direction !== undefined) {
+      const want: RateDirection | null = direction;
+      statements.push(
+        auditStatement(
+          db,
+          {
+            actorEmail: session.email,
+            action: "settings.exact_rate_direction",
+            entity: "settings",
+            entityId: RATE_DIRECTION_KEY,
+            before: { value: before.rateDirection },
+            after: { value: want },
+          },
+          {
+            sql: `COALESCE((SELECT value_json FROM settings WHERE key = ?7), 'x') <> ?8`,
+            binds: [RATE_DIRECTION_KEY, want === null ? "x" : JSON.stringify(want)],
+          },
+        ),
+        want === null
+          ? db.prepare("DELETE FROM settings WHERE key = ?1").bind(RATE_DIRECTION_KEY)
+          : upsert(RATE_DIRECTION_KEY, want),
       );
     }
     await db.batch(statements);

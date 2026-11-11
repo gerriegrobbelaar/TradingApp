@@ -302,6 +302,14 @@ export const OPEN_ITEM_LIST_FIELDS = [
   "InvoiceNumber",
 ] as const;
 /**
+ * OPTIONAL extra fields for the bulk list reads, requested only when an admin turned on
+ * `exact.list_dc_fields` (ADR 0038, option 1). Names are a GUESS copied from the sync resource:
+ * VERIFY with credentials. The documented ReceivablesList/PayablesList fields carry no
+ * division-currency amount or rate; a 400 on `$select` means they do not exist and the worker
+ * retries the read without them (and remembers it for 7 days).
+ */
+export const OPEN_ITEM_LIST_DC_FIELDS = ["AmountDC", "RateFC"] as const;
+/**
  * Cashflow sync resources. Field names follow the Exact cashflow model (`AmountFC`/`AmountDC`,
  * `TransactionAmountFC`, `RateFC`, `IsFullyPaid`): VERIFY with credentials (ADR 0014 item 4).
  */
@@ -743,7 +751,7 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
     return v;
   }
 
-  function mapOpenItem(kind: OpenItemKind, r: Row, sync: boolean): OpenItem {
+  function mapOpenItem(kind: OpenItemKind, r: Row, sync: boolean, listDc = false): OpenItem {
     let amount: Money;
     let originalAmount: Money | null = null;
     let amountDc: Money | null = null;
@@ -758,6 +766,11 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
       rate = rateField(r, "RateFC");
     } else {
       amount = moneyField(r, "Amount", trimField(r, "CurrencyCode"));
+      if (listDc) {
+        // Only when the optional fields were requested (ADR 0038); absent or null stays null.
+        amountDc = optionalMoney(r, "AmountDC", divisionCurrency);
+        rate = rateField(r, "RateFC");
+      }
     }
     return {
       kind,
@@ -823,13 +836,17 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
   async function listChunk(
     kind: OpenItemKind,
     token: string | null,
-    opts: { maxPages?: number },
+    opts: { maxPages?: number; dcFields?: boolean },
   ): Promise<ListChunk<OpenItem>> {
     const cap = opts.maxPages === undefined ? maxPages : assertMaxPages(opts.maxPages);
     const path =
       kind === "receivable" ? "/read/financial/ReceivablesList" : "/read/financial/PayablesList";
-    const r = await readChunk(path, OPEN_ITEM_LIST_FIELDS, {}, token, cap, true);
-    const items = r.rows.map((row) => mapOpenItem(kind, row, false));
+    const dc = opts.dcFields === true;
+    const select = dc
+      ? [...OPEN_ITEM_LIST_FIELDS, ...OPEN_ITEM_LIST_DC_FIELDS]
+      : OPEN_ITEM_LIST_FIELDS;
+    const r = await readChunk(path, select, {}, token, cap, true);
+    const items = r.rows.map((row) => mapOpenItem(kind, row, false, dc));
     return r.error === undefined
       ? { items, nextToken: r.nextToken, complete: r.complete }
       : { items, nextToken: r.nextToken, complete: false, error: r.error };
@@ -1067,7 +1084,7 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
      */
     listReceivablesChunk(
       token: string | null,
-      opts: { maxPages?: number } = {},
+      opts: { maxPages?: number; dcFields?: boolean } = {},
     ): Promise<ListChunk<OpenItem>> {
       return listChunk("receivable", token, opts);
     },
@@ -1075,7 +1092,7 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
     /** Resumable read of the open payables list; see `listReceivablesChunk`. */
     listPayablesChunk(
       token: string | null,
-      opts: { maxPages?: number } = {},
+      opts: { maxPages?: number; dcFields?: boolean } = {},
     ): Promise<ListChunk<OpenItem>> {
       return listChunk("payable", token, opts);
     },

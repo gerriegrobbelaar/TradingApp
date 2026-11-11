@@ -32,6 +32,7 @@ import { auditStatement } from "../db/audit";
 import { scheduledDate, scheduledForMs } from "../jobs/period";
 import type { HandlerResult, JobContext } from "../jobs/types";
 import type { Env } from "../env";
+import { upsertConflictStatement } from "./conflicts";
 import { fetchEcb } from "./ecb-fetch";
 
 export const ECB_MAX_ATTEMPTS = 8;
@@ -44,6 +45,12 @@ export const ECB_RETRY_SECONDS = 600;
  */
 export const ECB_RETRY_MARGIN_MS = 3 * 60_000;
 export const FIRST_IMPORT_DAYS = 400;
+/**
+ * Shorter windows tried, in this order, when the first import's answer is `response_too_large`
+ * (the 5 MiB cap): the same run asks again with 120 days, then 30. Nothing is remembered; the
+ * next run's window starts from the newest stored date as usual (review N2, ADR 0036 addendum).
+ */
+export const FIRST_IMPORT_FALLBACK_DAYS = [120, 30] as const;
 export const INCREMENTAL_DAYS = 10;
 /** Back from the newest stored date, so a publication that came after 17:30 is picked up later. */
 export const OVERLAP_DAYS = 3;
@@ -135,7 +142,7 @@ export async function storeObservations(
     inserted += res.meta.changes ?? 0;
   }
 
-  if (conflictRows.length > 0) await auditConflicts(db, conflictRows);
+  if (conflictRows.length > 0) await auditConflicts(db, conflictRows, nowIso);
   return { inserted, conflicts, skipped };
 }
 
@@ -148,6 +155,7 @@ export async function storeObservations(
 async function auditConflicts(
   db: D1Database,
   rows: { currency: string; date: string; stored: string; ecb: string }[],
+  nowIso: string,
 ): Promise<void> {
   const entityIds = [...new Set(rows.map((c) => `${c.currency}@${c.date}`))];
   const done = new Set<string>();
@@ -163,29 +171,49 @@ async function auditConflicts(
     for (const k of known.results) done.add(`${k.entity_id}|${k.after_json ?? ""}`);
   }
   const todo = rows
-    .map((c) => ({ id: `${c.currency}@${c.date}`, after: { stored: c.stored, ecb: c.ecb } }))
+    .map((c) => ({ ...c, id: `${c.currency}@${c.date}`, after: { stored: c.stored, ecb: c.ecb } }))
     .filter((c) => !done.has(`${c.id}|${JSON.stringify(c.after)}`))
     .slice(0, MAX_CONFLICT_AUDITS);
-  if (todo.length === 0) return;
-  await db.batch(
-    todo.map((c) =>
-      auditStatement(
-        db,
-        {
-          actorEmail: "system",
-          action: "fx.rate_conflict",
-          entity: "fx_rate",
-          entityId: c.id,
-          after: c.after,
-        },
-        {
-          sql: `NOT EXISTS (SELECT 1 FROM audit_log WHERE entity = 'fx_rate' AND entity_id = ?7
-                  AND action = 'fx.rate_conflict' AND after_json = ?8)`,
-          binds: [c.id, JSON.stringify(c.after)],
-        },
-      ),
-    ),
-  );
+  // Every disagreement is recorded as a conflict to resolve (fx_rate_conflicts, ADR 0039), also
+  // one whose audit row exists or is beyond this run's cap: the upsert is idempotent and a
+  // resolved one stays resolved. The audit row, where due, goes in the same batch as its upsert.
+  const due = new Set(todo.map((c) => c.id + "|" + c.ecb));
+  const ordered = [
+    ...todo,
+    ...rows
+      .filter((c) => !due.has(`${c.currency}@${c.date}|${c.ecb}`))
+      .map((c) => ({
+        ...c,
+        id: `${c.currency}@${c.date}`,
+        after: { stored: c.stored, ecb: c.ecb },
+      })),
+  ];
+  for (let i = 0; i < ordered.length; i += INSERT_CHUNK / 2) {
+    await db.batch(
+      ordered.slice(i, i + INSERT_CHUNK / 2).flatMap((c) => [
+        ...(due.has(c.id + "|" + c.ecb)
+          ? [
+              auditStatement(
+                db,
+                {
+                  actorEmail: "system",
+                  action: "fx.rate_conflict",
+                  entity: "fx_rate",
+                  entityId: c.id,
+                  after: c.after,
+                },
+                {
+                  sql: `NOT EXISTS (SELECT 1 FROM audit_log WHERE entity = 'fx_rate'
+                          AND entity_id = ?7 AND action = 'fx.rate_conflict' AND after_json = ?8)`,
+                  binds: [c.id, JSON.stringify(c.after)],
+                },
+              ),
+            ]
+          : []),
+        upsertConflictStatement(db, c, nowIso),
+      ]),
+    );
+  }
 }
 
 async function importWindow(
@@ -205,7 +233,7 @@ async function importWindow(
 
 interface StateWrite {
   nowIso: string;
-  status: "ok" | "partial" | "error" | "skipped";
+  status: "ok" | "partial" | "error" | "skipped" | "no_data";
   code: string | null;
   inserted: number;
   success: boolean;
@@ -223,7 +251,12 @@ function stateStatement(db: D1Database, s: StateWrite): D1PreparedStatement {
          last_status = excluded.last_status,
          last_error_code = excluded.last_error_code,
          newest_rate_date = excluded.newest_rate_date,
-         rows_inserted = excluded.rows_inserted`,
+         rows_inserted = excluded.rows_inserted
+       ${
+         // A skip (weekend, holiday) is not news: it must not hide a failure that is still
+         // waiting to be looked at (review S10). The failed attempt stays the last attempt.
+         s.status === "skipped" ? "WHERE fx_import_state.last_status IS NOT 'error'" : ""
+       }`,
     )
     .bind(s.nowIso, s.success ? s.nowIso : null, s.status, s.code, s.inserted);
 }
@@ -245,7 +278,7 @@ export async function recordEcbTooLate(env: Env, nowMs: number): Promise<void> {
 async function finishWith(
   ctx: JobContext,
   result: HandlerResult,
-  extra: { inserted?: number; conflicts?: number } = {},
+  extra: { inserted?: number; conflicts?: number; stateStatus?: "no_data" } = {},
 ): Promise<HandlerResult> {
   const db = ctx.env.DB;
   const nowIso = new Date(ctx.now()).toISOString();
@@ -253,7 +286,7 @@ async function finishWith(
   const statements = [
     stateStatement(db, {
       nowIso,
-      status: result.status,
+      status: extra.stateStatus ?? result.status,
       code: result.code ?? null,
       inserted,
       success: result.status === "ok",
@@ -359,9 +392,16 @@ async function importOnce(ctx: JobContext): Promise<HandlerResult> {
     }
   }
 
-  const { start, first } = await importWindow(db, today);
-  const url = ecbRequestUrl({ startDate: start });
-  const fetched = await fetchEcb(url, ctx.signal, ctx.now);
+  const window = await importWindow(db, today);
+  const first = window.first;
+  let start = window.start;
+  let fetched = await fetchEcb(ecbRequestUrl({ startDate: start }), ctx.signal, ctx.now);
+  // The first import is all-or-nothing at the size cap: ask again with a shorter window.
+  for (const days of FIRST_IMPORT_FALLBACK_DAYS) {
+    if (!(first && fetched.kind === "permanent" && fetched.code === "response_too_large")) break;
+    start = addDaysIso(today, -days);
+    fetched = await fetchEcb(ecbRequestUrl({ startDate: start }), ctx.signal, ctx.now);
+  }
 
   const fail = (code: string, summary: Record<string, string | number> = {}) =>
     finishWith(ctx, { status: "error", code, summary });
@@ -415,6 +455,18 @@ async function importOnce(ctx: JobContext): Promise<HandlerResult> {
   };
   const extra = { inserted: res.inserted, conflicts: res.conflicts };
 
+  if (!scheduled && observations.length === 0) {
+    // The portal had nothing for the window (404, 204, a header-only CSV). Not a success: the
+    // last_success_at stays, and the state says no_data (review S10).
+    return finishWith(
+      ctx,
+      { status: "partial", code: "no_data", summary },
+      {
+        ...extra,
+        stateStatus: "no_data",
+      },
+    );
+  }
   if (!scheduled || todayCount > 0) {
     return finishWith(ctx, { status: "ok", summary }, extra);
   }

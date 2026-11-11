@@ -25,6 +25,7 @@ const RATES_KEYS = keysOf<FxRatesResponse>()([
   "lastImportAt",
   "lastImportStatus",
   "lastImportCode",
+  "unresolvedConflicts",
   "notice",
 ]);
 const RATE_KEYS = keysOf<FxRateDto>()(["currency", "rate", "rateDate", "source"]);
