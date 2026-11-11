@@ -39,7 +39,8 @@ const ALLOWED_COLUMN_NAMES: Record<string, string> = {
   "../src/matching/config.ts":
     "reads bank_accounts.iban for the engine's own-IBAN list (in memory only)",
   "../src/matching/dto.ts": "reads counterparty_iban only to mask it (counterpartyIbanMasked)",
-  "../src/matching/routes.ts": "reads bank_accounts.iban only to mask it (ibanMasked)",
+  "../src/matching/routes.ts":
+    "reads bank_accounts.iban only to mask it (ibanMasked) and counterparty_iban for the different-relation check on a manual match (in memory, never returned or logged)",
 };
 const ALLOWED_SELECT_IBAN: Record<string, string> = {
   "../src/exact/sync.ts":
@@ -52,7 +53,8 @@ const ALLOWED_SELECT_IBAN: Record<string, string> = {
   "../src/matching/config.ts":
     "reads bank_accounts.iban for the engine's own-IBAN list (in memory only)",
   "../src/matching/dto.ts": "selects counterparty_iban only to mask it (counterpartyIbanMasked)",
-  "../src/matching/routes.ts": "selects bank_accounts.iban only to mask it (ibanMasked)",
+  "../src/matching/routes.ts":
+    "selects bank_accounts.iban only to mask it (ibanMasked) and counterparty_iban for the different-relation check on a manual match (in memory, never returned or logged)",
 };
 
 /** A column that holds a full IBAN: `iban` or `<prefix>_iban` (not `iban_changed_at`). */

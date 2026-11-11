@@ -3,7 +3,8 @@
 Status: provisional, verify with credentials. Written from memory, no network. Code:
 `packages/exact/src/write-payloads.ts` (pure), `writer.ts` (transport only) and
 `write-brand.ts` (internal). All Exact names live in one table, `EXACT_WRITE_NAMES`; fix it and
-the fixtures together. Nothing is wired yet: no worker code holds a writer (enforced, see Guard).
+the fixtures together. Wired in M7c (ADR 0044): exactly one worker file, the booker, holds a writer, and it is OFF by
+default and fail-closed (enforced, see Guard).
 
 ## What is built
 - Bank entry: `POST /financialtransaction/BankEntries` (the brief said `/bookkeeping/...`; see A1).
@@ -53,13 +54,14 @@ the fixtures together. Nothing is wired yet: no worker code holds a writer (enfo
   carry the writer's division (`ExactWritePayloadError` otherwise). No raw XML or JSON is accepted.
 - `apps/worker/test/exact-write-guard.test.ts` scans the worker sources: the write API names
   (`createExactWriter`, `createBankEntry`, `submitMatchSet`, `xmlUpload`, the resource names) may
-  appear only in allow-listed files (none yet), and no Exact-area file may contain a non-GET request
-  literal except the OAuth token exchange. The future matching booker adds itself, with a reason.
+  appear only in allow-listed files (the booker and the gate write policy, each with a reason), and
+  no Exact-area file may contain a non-GET request literal except the OAuth token exchange.
 - Done in M7c (ADR 0044): `ExactGate` refuses every non-GET request except the two booking writes, and
   those only while the fail-closed switch and the verification mark say so; the booker is the one
   allow-listed caller of the writer.
-- The idempotency key is NOT sent as a header: the gate only allows `content-type`, `accept`,
-  `prefer`, `if-match`, `if-none-match`, and Exact has no idempotency support we know of. The
+- The idempotency key is NOT sent as a header: the gate's write policy (`write-policy.ts`) allows
+  only `content-type` and `accept` on a write (earlier drafts also listed `prefer`, `if-match`,
+  `if-none-match`; they are not allowed on writes), and Exact has no idempotency support we know of. The
   worker stores the key in `idempotency_keys` before the call.
 
 ## Idempotency and read-back
