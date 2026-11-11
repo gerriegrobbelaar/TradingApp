@@ -95,6 +95,8 @@ export async function seedRevolut(
     createsBankEntries?: boolean;
     paymentsMode?: string;
     webhookId?: string;
+    /** Staging window of a 'pending' row (default: 15 minutes from now). */
+    pendingUntilMs?: number;
   } = {},
 ): Promise<number> {
   const r = await db
@@ -109,6 +111,7 @@ export async function seedRevolut(
       `UPDATE connections SET status = ?2, access_token_enc = ?3, refresh_token_enc = ?4, expires_at = ?5,
          revolut_environment = ?6, creates_bank_entries = ?7, payments_mode = ?8,
          bank_entries_decided_at = '2026-01-01T00:00:00.000Z', webhook_id = ?9,
+         pending_until = ?10, pending_ref = ?11,
          connected_by = 'gerrie.grobbelaar@camelthorncapital.com' WHERE id = ?1`,
     )
     .bind(
@@ -121,6 +124,10 @@ export async function seedRevolut(
       opts.createsBankEntries ? 1 : 0,
       opts.paymentsMode ?? "drafts",
       opts.webhookId ?? null,
+      opts.status === "pending"
+        ? new Date(Date.now() + (opts.pendingUntilMs ?? 15 * 60_000)).toISOString()
+        : null,
+      opts.status === "pending" ? "test-ref" : null,
     )
     .run();
   return id;

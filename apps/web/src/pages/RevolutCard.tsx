@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { Button, Card, Chip, Sheet, type ChipTone } from "@camelthorn/ui";
 import {
   ApiError,
   StepUpRequired,
   changeRevolutSettings,
+  confirmRevolut,
   disconnectRevolut,
   me as fetchMe,
   nav,
@@ -12,10 +13,13 @@ import {
   type ConnectionRow,
   type RevolutEnvironment,
   type RevolutPaymentsMode,
+  type RevolutPending,
 } from "../api";
+import { formatCount, formatDateTime } from "../lib/format";
 import { useToast } from "../toasts";
 
-type RevolutState = "connected" | "credentials_rejected" | "needs_reauth" | "not_connected";
+type RevolutState =
+  "connected" | "credentials_rejected" | "needs_reauth" | "pending_confirmation" | "not_connected";
 
 /** Set by the gate when Revolut keeps rejecting the app's client id, key or issuer. */
 export const REVOLUT_CREDENTIALS_REJECTED = "token_endpoint_rejected_credentials";
@@ -26,6 +30,7 @@ export function revolutState(row: ConnectionRow | undefined): RevolutState {
     return row.lastError === REVOLUT_CREDENTIALS_REJECTED ? "credentials_rejected" : "connected";
   }
   if (row.status === "needs_reauth" || row.status === "expired") return "needs_reauth";
+  if (row.status === "pending" && row.revolut?.pending) return "pending_confirmation";
   return "not_connected";
 }
 
@@ -33,11 +38,14 @@ const STATE_LABEL: Record<RevolutState, { text: string; tone: ChipTone }> = {
   connected: { text: "Connected", tone: "ok" },
   credentials_rejected: { text: "Configuration problem", tone: "warn" },
   needs_reauth: { text: "Needs re-authorisation", tone: "warn" },
+  pending_confirmation: { text: "Waiting for your confirmation", tone: "warn" },
   not_connected: { text: "Not connected", tone: "neutral" },
 };
 
 export const REVOLUT_RESULT_MESSAGE: Record<string, string> = {
   connected: "Revolut Business is connected.",
+  confirm:
+    "Revolut Business accepted the sign-in. Check the accounts below, then confirm the connection.",
   denied: "Revolut Business access was not granted. Nothing changed.",
   error: "Could not finish connecting to Revolut Business. Try again.",
   unverified:
@@ -82,6 +90,15 @@ function describeError(e: unknown): string {
     if (e.code === "environment_change_requires_disconnect") {
       return "Disconnect Revolut Business before switching between production and sandbox.";
     }
+    if (e.code === "pending_expired") {
+      return "This connection was not confirmed within 15 minutes and was removed. Connect again.";
+    }
+    if (e.code === "nothing_to_confirm" || e.code === "not_verified") {
+      return "There is nothing to confirm any more. Reload the page.";
+    }
+    if (e.code === "different_account_confirmation_required") {
+      return "These are not the accounts connected before. Tick the second box to replace them.";
+    }
     return "Something went wrong. Try again.";
   }
   return "Could not reach the server. Try again.";
@@ -91,6 +108,7 @@ type Dialog =
   | null
   | "stepup"
   | "disconnect"
+  | "cancel_pending"
   | { kind: "bank"; value: boolean }
   | { kind: "mode"; value: RevolutPaymentsMode };
 
@@ -105,6 +123,7 @@ interface Props {
 
 export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Props) {
   const toast = useToast();
+  const requiredId = useId();
   const state = revolutState(row);
   const label = STATE_LABEL[state];
   const live = row?.revolut;
@@ -128,7 +147,9 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
     el?.focus();
   }, [dialog, busy]);
 
-  const connected = state !== "not_connected";
+  const pending = state === "pending_confirmation" ? (live?.pending ?? null) : null;
+  // A staged connection is not usable yet: its settings are shown read-only in the summary.
+  const connected = state !== "not_connected" && state !== "pending_confirmation";
   // What the form shows: the saved values for a connection, else the admin's pending choice.
   const shownBank = connected ? (live?.createsBankEntries ?? null) : bank;
   const shownMode = connected ? (live?.paymentsMode ?? "drafts") : mode;
@@ -150,12 +171,17 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
   }
 
   async function disconnect() {
+    const cancelling = dialog === "cancel_pending";
     setBusy(true);
     setSheetError(null);
     try {
       await disconnectRevolut();
       setDialog(null);
-      toast.show("Disconnected from Revolut Business. Saved sign-in details were removed.");
+      toast.show(
+        cancelling
+          ? "Connection cancelled. The Revolut sign-in details were removed."
+          : "Disconnected from Revolut Business. Saved sign-in details were removed.",
+      );
       await onChanged();
     } catch (e) {
       if (e instanceof StepUpRequired) setDialog("stepup");
@@ -210,6 +236,9 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
             <p className="lede">
               <Chip tone={label.tone}>{label.text}</Chip>
               {state === "connected" && row?.connectedBy && <> Connected by {row.connectedBy}.</>}
+              {state === "not_connected" && row?.lastError === "pending_expired" && (
+                <> The last connection was not confirmed within 15 minutes and was removed.</>
+              )}
               {connected && live?.environment && <> Environment: {ENV_LABEL[live.environment]}.</>}
             </p>
             {!configured && (
@@ -237,12 +266,29 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
             )}
             {connected && needsBankChoice && (
               <p role="alert" className="notice warn">
-                Nobody has said yet who creates bank entries in Exact. Choose below, then
-                re-authorise, before any bank line is booked.
+                Nobody has said yet who creates bank entries in Exact. Choose below before any bank
+                line is booked.
               </p>
             )}
 
-            {!connected && isAdmin && (
+            {pending && (
+              <PendingPanel
+                pending={pending}
+                environment={live?.environment ?? null}
+                createsBankEntries={live?.createsBankEntries ?? null}
+                paymentsMode={live?.paymentsMode ?? "drafts"}
+                isAdmin={isAdmin}
+                onStepUp={() => setDialog("stepup")}
+                onCancel={(e) => {
+                  remember(e);
+                  setSheetError(null);
+                  setDialog("cancel_pending");
+                }}
+                onConfirmed={onChanged}
+              />
+            )}
+
+            {!pending && !connected && isAdmin && (
               <fieldset className="choices">
                 <legend>Environment</legend>
                 {(["production", "sandbox"] as const).map((v) => (
@@ -261,58 +307,64 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
               </fieldset>
             )}
 
-            <fieldset className="choices">
-              <legend>Who creates bank entries in Exact?</legend>
-              {BANK_OPTIONS.map((o) => (
-                <label key={String(o.value)} className="choice">
-                  <input
-                    className="check"
-                    type="radio"
-                    name="revolut-bank-entries"
-                    checked={shownBank === o.value}
-                    disabled={busy || !isAdmin}
-                    onChange={(e) => {
-                      if (!connected) setBank(o.value);
-                      else if (o.value !== shownBank) change({ kind: "bank", value: o.value })(e);
-                    }}
-                  />
-                  <span>
-                    {o.label}
-                    <span className="hint">{o.hint}</span>
-                  </span>
-                </label>
-              ))}
-              {!connected && isAdmin && needsBankChoice && (
-                <p className="stamp">Required before you can connect.</p>
-              )}
-            </fieldset>
+            {!pending && (
+              <fieldset className="choices">
+                <legend>Who creates bank entries in Exact?</legend>
+                {BANK_OPTIONS.map((o) => (
+                  <label key={String(o.value)} className="choice">
+                    <input
+                      className="check"
+                      type="radio"
+                      name="revolut-bank-entries"
+                      checked={shownBank === o.value}
+                      disabled={busy || !isAdmin}
+                      onChange={(e) => {
+                        if (!connected) setBank(o.value);
+                        else if (o.value !== shownBank) change({ kind: "bank", value: o.value })(e);
+                      }}
+                    />
+                    <span>
+                      {o.label}
+                      <span className="hint">{o.hint}</span>
+                    </span>
+                  </label>
+                ))}
+                {!connected && isAdmin && needsBankChoice && (
+                  <p className="stamp" id={requiredId}>
+                    Required before you can connect.
+                  </p>
+                )}
+              </fieldset>
+            )}
 
-            <fieldset className="choices">
-              <legend>Payments mode</legend>
-              {MODE_OPTIONS.map((o) => (
-                <label key={o.value} className="choice">
-                  <input
-                    className="check"
-                    type="radio"
-                    name="revolut-payments-mode"
-                    checked={shownMode === o.value}
-                    disabled={busy || !isAdmin}
-                    onChange={(e) => {
-                      if (!connected) setMode(o.value);
-                      else if (o.value !== shownMode) change({ kind: "mode", value: o.value })(e);
-                    }}
-                  />
-                  <span>
-                    {o.label}
-                    <span className="hint">{o.hint}</span>
-                  </span>
-                </label>
-              ))}
-              <p className="notice">
-                Pay mode is not active yet. The app does not send payments in this version; your
-                choice is saved for later.
-              </p>
-            </fieldset>
+            {!pending && (
+              <fieldset className="choices">
+                <legend>Payments mode</legend>
+                {MODE_OPTIONS.map((o) => (
+                  <label key={o.value} className="choice">
+                    <input
+                      className="check"
+                      type="radio"
+                      name="revolut-payments-mode"
+                      checked={shownMode === o.value}
+                      disabled={busy || !isAdmin}
+                      onChange={(e) => {
+                        if (!connected) setMode(o.value);
+                        else if (o.value !== shownMode) change({ kind: "mode", value: o.value })(e);
+                      }}
+                    />
+                    <span>
+                      {o.label}
+                      <span className="hint">{o.hint}</span>
+                    </span>
+                  </label>
+                ))}
+                <p className="notice">
+                  Pay mode is not active yet. The app does not send payments in this version; your
+                  choice is saved for later.
+                </p>
+              </fieldset>
+            )}
 
             {connected && (
               <section aria-label="Revolut accounts">
@@ -321,12 +373,13 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
               </section>
             )}
 
-            {isAdmin ? (
+            {pending ? null : isAdmin ? (
               <div className="chips" ref={actions}>
-                {state !== "credentials_rejected" && (
+                {(state === "not_connected" || state === "needs_reauth") && (
                   <Button
                     variant="primary"
                     disabled={busy || !configured || needsBankChoice}
+                    aria-describedby={needsBankChoice && !connected ? requiredId : undefined}
                     onClick={(e) => {
                       remember(e);
                       void connect();
@@ -359,8 +412,8 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
 
       <Sheet open={dialog === "stepup"} title="Confirm it's you" onClose={() => setDialog(null)}>
         <p className="lede">
-          Connecting, disconnecting or changing Revolut Business settings needs a Google sign-in
-          from the last 15 minutes. Sign in again, then repeat the action.
+          Connecting, confirming, disconnecting or changing Revolut Business settings needs a Google
+          sign-in from the last 15 minutes. Sign in again, then repeat the action.
         </p>
         <div className="chips">
           <Button variant="primary" onClick={() => stepUp("/settings/connections")}>
@@ -371,13 +424,16 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
       </Sheet>
 
       <Sheet
-        open={dialog === "disconnect"}
-        title="Disconnect Revolut Business"
+        open={dialog === "disconnect" || dialog === "cancel_pending"}
+        title={
+          dialog === "cancel_pending" ? "Cancel this connection" : "Disconnect Revolut Business"
+        }
         onClose={() => setDialog(null)}
       >
         <p className="lede">
-          The app stops reading Revolut and the saved sign-in details are deleted. Data already
-          copied stays. To connect again you approve access in Revolut once more.
+          {dialog === "cancel_pending"
+            ? "The sign-in Revolut just gave the app is deleted and nothing is read from these accounts. If these are not Camelthorn's accounts, tell whoever manages the Revolut Business account."
+            : "The app stops reading Revolut and the saved sign-in details are deleted. Data already copied stays. To connect again you approve access in Revolut once more."}
         </p>
         {sheetError && (
           <p role="alert" className="notice warn">
@@ -386,7 +442,7 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
         )}
         <div className="chips">
           <Button variant="primary" disabled={busy} onClick={() => void disconnect()}>
-            Disconnect
+            {dialog === "cancel_pending" ? "Cancel connection" : "Disconnect"}
           </Button>
           <Button onClick={() => setDialog(null)}>Cancel</Button>
         </div>
@@ -428,5 +484,206 @@ export function RevolutCard({ row, loaded, configured, isAdmin, onChanged }: Pro
         </div>
       </Sheet>
     </>
+  );
+}
+
+const shortTime = (iso: string): string => formatDateTime(iso);
+
+function Fact({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="dl-row">
+      <dt>{label}</dt>
+      <dd>{children}</dd>
+    </div>
+  );
+}
+
+interface PendingProps {
+  pending: RevolutPending;
+  environment: RevolutEnvironment | null;
+  createsBankEntries: boolean | null;
+  paymentsMode: RevolutPaymentsMode;
+  isAdmin: boolean;
+  onStepUp: () => void;
+  onCancel: (e: { currentTarget: HTMLElement }) => void;
+  onConfirmed: () => Promise<void>;
+}
+
+/**
+ * What a staged connection can see, for the admin to check before the app uses it (review R2:
+ * a substituted authorisation code would connect somebody else's Revolut account). Masked facts
+ * only: account names, currencies, the last 4 characters of each IBAN.
+ */
+function PendingPanel({
+  pending,
+  environment,
+  createsBankEntries,
+  paymentsMode,
+  isAdmin,
+  onStepUp,
+  onCancel,
+  onConfirmed,
+}: PendingProps) {
+  const toast = useToast();
+  const [own, setOwn] = useState(false);
+  const [replaces, setReplaces] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const ownId = useId();
+  const errorId = useId();
+  const heading = useRef<HTMLHeadingElement | null>(null);
+  useEffect(() => {
+    heading.current?.focus();
+  }, []);
+  const summary = pending.summary;
+  const different =
+    summary !== null && summary.previousAccounts > 0 && summary.matchingAccounts === 0;
+  const ready = summary !== null && own && (!different || replaces) && pending.ref !== undefined;
+
+  async function confirm() {
+    if (!ready || pending.ref === undefined) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await confirmRevolut({
+        ref: pending.ref,
+        ownAccount: true,
+        ...(different ? { replacesAccounts: true } : {}),
+      });
+      toast.show("Revolut Business is connected.");
+      await onConfirmed();
+    } catch (e) {
+      if (e instanceof StepUpRequired) onStepUp();
+      else setError(describeError(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section aria-labelledby={`${ownId}-h`} className="pending-panel">
+      <h3 className="sub-h" id={`${ownId}-h`} ref={heading} tabIndex={-1}>
+        Check what was connected
+      </h3>
+      <p className="lede">
+        Revolut Business gave the app access. Before the app reads anything, make sure these are
+        Camelthorn&apos;s own accounts. This expires at {shortTime(pending.until)}; after that the
+        sign-in is removed.
+      </p>
+      {summary === null ? (
+        <p role="alert" className="notice warn">
+          The accounts could not be read yet. Cancel and connect again.
+        </p>
+      ) : (
+        <>
+          <dl className="dl">
+            <Fact label="Account holder">
+              {summary.holders.length > 0 ? summary.holders.join(", ") : "Not reported by Revolut"}
+            </Fact>
+            <Fact label="Accounts">
+              {formatCount(summary.accountCount, "account", "accounts")} in{" "}
+              {summary.currencies.length > 0 ? summary.currencies.join(", ") : "no currency"}
+            </Fact>
+            <Fact label="Environment">{environment ? ENV_LABEL[environment] : "Unknown"}</Fact>
+            <Fact label="Bank entries in Exact">
+              {createsBankEntries === null
+                ? "Not decided"
+                : createsBankEntries
+                  ? "This app creates them"
+                  : "Someone else creates them"}
+            </Fact>
+            <Fact label="Payments mode">
+              {paymentsMode === "pay" ? "Pay directly (not active yet)" : "Payment drafts"}
+            </Fact>
+          </dl>
+          {summary.accounts.length > 0 && (
+            <div className="scroll">
+              <table className="tbl">
+                <caption className="sr-only">Revolut accounts that were connected</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Account</th>
+                    <th scope="col">Currency</th>
+                    <th scope="col">IBAN ends in</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {summary.accounts.map((a, i) => (
+                    <tr key={i}>
+                      <td>
+                        {a.name}
+                        {a.state !== "active" && <span className="hint"> ({a.state})</span>}
+                      </td>
+                      <td>{a.currency}</td>
+                      <td>{a.last4 ? `•••• ${a.last4}` : "No IBAN"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {summary.accountCount > summary.accounts.length && (
+            <p className="stamp">
+              Showing {summary.accounts.length} of {summary.accountCount} accounts.
+            </p>
+          )}
+          {different && (
+            <p role="alert" className="notice warn">
+              None of these {formatCount(summary.accountCount, "account is", "accounts are")} the
+              ones connected before ({formatCount(summary.previousAccounts, "account", "accounts")}
+              ). This may be a different Revolut Business.
+            </p>
+          )}
+        </>
+      )}
+      {isAdmin ? (
+        <>
+          {summary !== null && (
+            <div className="choices">
+              <label className="choice">
+                <input
+                  className="check"
+                  type="checkbox"
+                  checked={own}
+                  disabled={busy}
+                  aria-describedby={error ? errorId : undefined}
+                  onChange={(e) => setOwn(e.currentTarget.checked)}
+                />
+                <span>This is our Revolut Business account</span>
+              </label>
+              {different && (
+                <label className="choice">
+                  <input
+                    className="check"
+                    type="checkbox"
+                    checked={replaces}
+                    disabled={busy}
+                    onChange={(e) => setReplaces(e.currentTarget.checked)}
+                  />
+                  <span>Replace the accounts connected before with these</span>
+                </label>
+              )}
+            </div>
+          )}
+          {error && (
+            <p role="alert" id={errorId} className="notice warn">
+              {error}
+            </p>
+          )}
+          <div className="chips">
+            {summary !== null && (
+              <Button variant="primary" disabled={busy || !ready} onClick={() => void confirm()}>
+                Confirm connection
+              </Button>
+            )}
+            <Button disabled={busy} onClick={onCancel}>
+              {summary === null ? "Cancel" : "Cancel, not our account"}
+            </Button>
+          </div>
+        </>
+      ) : (
+        <p className="lede">An admin must confirm this connection before the app uses it.</p>
+      )}
+    </section>
   );
 }

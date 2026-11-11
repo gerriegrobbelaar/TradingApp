@@ -32,6 +32,15 @@ ALTER TABLE connections ADD COLUMN webhook_id TEXT;
 -- AES-GCM ciphertext (crypto/token-crypto.ts), AAD revolut:<connection id>:webhook_secret[_prev].
 ALTER TABLE connections ADD COLUMN webhook_secret_enc TEXT;
 ALTER TABLE connections ADD COLUMN webhook_secret_prev_enc TEXT;
+-- Staged (not yet confirmed) Revolut connection, review R2: the callback stores new tokens as
+-- status 'pending' with these, and an admin must confirm what was connected before the app uses
+-- it. pending_until: staging expiry (UTC ISO); after it the tokens are wiped. pending_ref: random
+-- id the confirm request must echo (binds the confirmation to the summary the admin saw).
+-- pending_summary: JSON of masked facts only (account names, currencies, last 4 of IBANs).
+ALTER TABLE connections ADD COLUMN pending_until TEXT;
+ALTER TABLE connections ADD COLUMN pending_ref TEXT;
+ALTER TABLE connections ADD COLUMN pending_by TEXT;
+ALTER TABLE connections ADD COLUMN pending_summary TEXT;
 
 -- (b) -------------------------------------------------------------------------------------------
 ALTER TABLE bank_accounts ADD COLUMN bic TEXT;

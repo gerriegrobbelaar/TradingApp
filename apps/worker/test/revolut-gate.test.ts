@@ -99,6 +99,26 @@ describe("token refresh", () => {
     expect(stub.apiCalls[1]?.headers.authorization).toBe("Bearer racc-1");
   });
 
+  it("a short expires_in is not refreshed on every call (margin becomes half the lifetime)", async () => {
+    const id = await seedRevolut({ expiresInMs: 1000 });
+    const clock = await fakeRevolutClock(id);
+    stub.token = (_f, n) =>
+      Response.json({ access_token: `racc-${n}`, token_type: "bearer", expires_in: 30 });
+    await go(id);
+    expect(stub.tokenCalls).toHaveLength(1);
+    clock.t += 10_000; // 20 s left, margin 15 s
+    await go(id);
+    expect(stub.tokenCalls).toHaveLength(1);
+    clock.t += 6_000; // 14 s left
+    await go(id);
+    expect(stub.tokenCalls).toHaveLength(2);
+    expect(stub.apiCalls.map((c) => c.headers.authorization)).toEqual([
+      "Bearer racc-1",
+      "Bearer racc-1",
+      "Bearer racc-2",
+    ]);
+  });
+
   it("takes the real lifetime from expires_in (about 40 minutes assumed)", async () => {
     const id = await seedRevolut({ expiresInMs: 1000 });
     await go(id);
@@ -309,6 +329,30 @@ describe("rotated tokens survive a failing D1 write", () => {
     expect((await storedRevolut(id)).status).toBe("active");
   });
 
+  it("while a pair is stashed, calls use the stashed access token, not D1's stale one", async () => {
+    // D1 still holds a token that looks fresh (a 401 forced the refresh), the stash the new one.
+    const id = await seedRevolut({ expiresInMs: 3600_000 });
+    stub.token = (_f, n) => rotatedOk(n);
+    stub.api = (c) =>
+      c.headers.authorization === "Bearer racc-0"
+        ? new Response("revoked", { status: 401 })
+        : Response.json([]);
+    await runInDurableObject(revolutGate(id), (g: RevolutGate) => {
+      g.persistTokens = async () => {
+        throw new Error("d1 down");
+      };
+    });
+    expect((await go(id)).status).toBe(200);
+    expect((await go(id)).status).toBe(200);
+    expect(stub.apiCalls.map((c) => c.headers.authorization)).toEqual([
+      "Bearer racc-0",
+      "Bearer racc-1",
+      "Bearer racc-1",
+    ]);
+    expect(stub.tokenCalls).toHaveLength(1);
+    expect(await storedRevolut(id)).toMatchObject({ access: "racc-0", refresh: "rref-0" });
+  });
+
   it("without rotation a failed D1 write costs nothing: no stash, the token still works", async () => {
     const id = await seedRevolut({ expiresInMs: 1000 });
     await runInDurableObject(revolutGate(id), failFirst(2));
@@ -334,11 +378,19 @@ describe("instance role", () => {
     const id = await seedRevolut({ expiresInMs: 1000 });
     const other = id + 1000;
     const gate = revolutGate(id);
-    expect((await gate.refreshAccessToken(id)).ok).toBe(true);
-    expect(await gate.refreshAccessToken(other)).toMatchObject({
-      ok: false,
-      code: "wrong_token_authority",
+    // The token authority is not reachable over RPC at all (it returns a plaintext token).
+    const rpc = gate as unknown as { refreshAccessToken: (id: number) => Promise<unknown> };
+    const outcome = await Promise.resolve()
+      .then(() => rpc.refreshAccessToken(id))
+      .then(
+        () => "resolved",
+        (e: unknown) => (e instanceof Error ? e.message : "rejected"),
+      );
+    expect(outcome).toMatch(/does not implement "refreshAccessToken"/);
+    await runInDurableObject(gate, (g: RevolutGate) => {
+      expect((g as unknown as Record<string, unknown>).refreshAccessToken).toBeUndefined();
     });
+    expect((await gate.call(rreq(id))).ok).toBe(true);
     expect(await gate.call(rreq(other))).toEqual({
       ok: false,
       error: { kind: "api", status: 400, code: "connection_mismatch" },
@@ -380,7 +432,7 @@ describe("request building and validation (SSRF, injection)", () => {
   const refused = (over: Partial<RevolutRequest>) =>
     expect(() => validateRequest(ok(over))).toThrow(RevolutApiError);
 
-  it("accepts the read paths and the webhook paths on API 2.0", () => {
+  it("accepts the read paths, and on API 2.0 only creating and deleting a webhook", () => {
     const uuid = "123e4567-e89b-12d3-a456-426614174000";
     for (const path of [
       "/accounts",
@@ -393,12 +445,8 @@ describe("request building and validation (SSRF, injection)", () => {
       expect(() => validateRequest(ok({ path }))).not.toThrow();
     }
     for (const [method, path] of [
-      ["GET", "/webhooks"],
       ["POST", "/webhooks"],
-      ["GET", `/webhooks/${uuid}`],
       ["DELETE", `/webhooks/${uuid}`],
-      ["POST", `/webhooks/${uuid}/rotate-signing-secret`],
-      ["GET", `/webhooks/${uuid}/failed-events`],
     ] as const) {
       expect(() =>
         validateRequest(
@@ -406,6 +454,56 @@ describe("request building and validation (SSRF, injection)", () => {
         ),
       ).not.toThrow();
     }
+    // Reading a webhook returns its signing secret; rotation and failed events are not built.
+    for (const [method, path] of [
+      ["GET", "/webhooks"],
+      ["GET", `/webhooks/${uuid}`],
+      ["POST", `/webhooks/${uuid}`],
+      ["DELETE", "/webhooks"],
+      ["POST", `/webhooks/${uuid}/rotate-signing-secret`],
+      ["GET", `/webhooks/${uuid}/failed-events`],
+    ] as const) {
+      expect(
+        () =>
+          validateRequest(
+            ok({ method, path, apiVersion: "2.0", body: method === "POST" ? "{}" : undefined }),
+          ),
+        `${method} ${path}`,
+      ).toThrow(RevolutApiError);
+    }
+  });
+
+  it("anchors every path pattern: trailing slashes, encoded slashes, newlines, look-alikes", () => {
+    const uuid = "123e4567-e89b-12d3-a456-426614174000";
+    for (const path of [
+      "/accounts/",
+      "/accounts//",
+      `/accounts/${uuid}/`,
+      `/accounts/${uuid}%2Fbank-details`,
+      `/accounts/${uuid}/bank-details/`,
+      `/accounts/${uuid}/bank-details/../../pay`,
+      "/accounts%2F..%2Fpay",
+      "/accounts\n",
+      "/accounts\n/pay",
+      "/transactions/",
+      "/transactions;x",
+      "/transaction/abc%2Fdef",
+      "/transaction/..",
+      `/transaction/${"a".repeat(101)}`,
+      "/ACCOUNTS",
+      "/accounts\u0000",
+      `/accounts/${uuid.replace("1", "g")}`,
+      `/accounts/${uuid}x`,
+      "/counterparties/",
+    ]) {
+      refused({ path });
+    }
+    refused({ path: `/webhooks/${uuid}/`, method: "DELETE", apiVersion: "2.0" });
+    refused({ path: "/webhooks/not-a-uuid", method: "DELETE", apiVersion: "2.0" });
+    // The query cannot smuggle a path: values are encoded into the query string.
+    expect(buildUrl("production", ok({ query: { count: "1/../../pay?x=#" } })).pathname).toBe(
+      "/api/1.0/accounts",
+    );
   });
 
   it("REFUSES every payment endpoint in this phase", () => {
@@ -495,6 +593,42 @@ describe("request building and validation (SSRF, injection)", () => {
     expect(stub.tokenCalls).toHaveLength(0);
   });
 
+  it("a webhook may only be created for this app's own webhook URL", async () => {
+    const id = await seedRevolut();
+    const create = (body: string | undefined) =>
+      revolutGate(id).call(
+        rreq(id, {
+          method: "POST",
+          path: "/webhooks",
+          apiVersion: "2.0",
+          ...(body ? { body } : {}),
+        }),
+      );
+    for (const body of [
+      JSON.stringify({ url: "https://evil.example/api/webhooks/revolut" }),
+      JSON.stringify({ url: "https://app.test/api/webhooks/revolut/" }),
+      JSON.stringify({ url: "https://app.test.evil.example/api/webhooks/revolut" }),
+      JSON.stringify({ url: "http://app.test/api/webhooks/revolut" }),
+      JSON.stringify({ events: ["TransactionCreated"] }),
+      "not json",
+      undefined,
+    ]) {
+      expect(await create(body), String(body)).toMatchObject({
+        ok: false,
+        error: { kind: "api", status: 400, code: "webhook_url" },
+      });
+    }
+    expect(stub.apiCalls).toHaveLength(0);
+    const good = await create(
+      JSON.stringify({
+        url: "https://app.test/api/webhooks/revolut",
+        events: ["TransactionCreated", "TransactionStateChanged"],
+      }),
+    );
+    expect(good.ok).toBe(true);
+    expect(stub.apiCalls[0]?.url.href).toBe("https://b2b.revolut.com/api/2.0/webhooks");
+  });
+
   it("calls the sandbox host for a sandbox connection and never the production one", async () => {
     const id = await seedRevolut({ environment: "sandbox", expiresInMs: 1000 });
     stub.hosts = new Set(["sandbox-b2b.revolut.com"]);
@@ -527,16 +661,49 @@ describe("request building and validation (SSRF, injection)", () => {
 });
 
 describe("verifying a pending connection", () => {
-  it("serves GET /accounts with staged tokens and nothing else", async () => {
+  const connect = { priority: "user", jobId: "revolut-connect" } as const;
+  const uuid = "123e4567-e89b-12d3-a456-426614174000";
+
+  it("serves the account list and bank details to the connect call and nothing else", async () => {
     const id = await seedRevolut({ status: "pending" });
-    expect((await go(id)).status).toBe(200);
-    await expect(go(id, { path: "/transactions" })).rejects.toMatchObject({
-      message: "not_connected",
-    });
-    await expect(go(id, { path: "/webhooks", apiVersion: "2.0" })).rejects.toMatchObject({
-      message: "not_connected",
-    });
-    expect(stub.apiCalls).toHaveLength(1);
+    expect((await go(id, connect)).status).toBe(200);
+    expect((await go(id, { ...connect, path: `/accounts/${uuid}/bank-details` })).status).toBe(200);
+    for (const over of [
+      { ...connect, path: "/transactions" },
+      { ...connect, path: `/accounts/${uuid}` },
+      { ...connect, path: "/counterparties" },
+      {
+        ...connect,
+        method: "POST",
+        path: "/webhooks",
+        apiVersion: "2.0",
+        body: JSON.stringify({ url: "https://app.test/api/webhooks/revolut" }),
+      },
+      // Any other caller, including a job (the scheduler), cannot use staged tokens at all.
+      { priority: "user", jobId: "manual" },
+      { priority: "job", jobId: "revolut-connect" },
+      { priority: "job", jobId: "revolut-sync" },
+    ] as Partial<RevolutRequest>[]) {
+      await expect(go(id, over), JSON.stringify(over)).rejects.toMatchObject({
+        message: "not_connected",
+      });
+    }
+    expect(stub.apiCalls).toHaveLength(2);
+  });
+
+  it("stops serving staged tokens once the 15-minute window has closed", async () => {
+    const id = await seedRevolut({ status: "pending", pendingUntilMs: -1 });
+    await expect(go(id, connect)).rejects.toMatchObject({ message: "not_connected" });
+    await db.prepare("UPDATE connections SET pending_until = NULL WHERE id = ?1").bind(id).run();
+    await expect(go(id, connect)).rejects.toMatchObject({ message: "not_connected" });
+    expect(stub.apiCalls).toHaveLength(0);
+  });
+
+  it("never refreshes staged tokens", async () => {
+    const id = await seedRevolut({ status: "pending", expiresInMs: 1000 });
+    await expect(go(id, connect)).rejects.toBeInstanceOf(RevolutAuthError);
+    expect(stub.tokenCalls).toHaveLength(0);
+    expect(stub.apiCalls).toHaveLength(0);
   });
 
   it("a needs_reauth connection fails fast without a call", async () => {

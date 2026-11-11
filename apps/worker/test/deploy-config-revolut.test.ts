@@ -98,7 +98,20 @@ describe("deploy guard: Revolut settings", () => {
     );
     expect(deployConfigProblems(t)).toEqual([
       "REVOLUT_PRIVATE_KEY is a secret and must not be in [vars]: use wrangler secret put",
+      "a private key (PEM) is in wrangler.toml: use wrangler secret put REVOLUT_PRIVATE_KEY",
     ]);
+    // Hostile variants: the PEM under another name, a lower-case name, or in staging.
+    const pem = '"-----BEGIN PRIVATE KEY-----\\nMIIE\\n-----END PRIVATE KEY-----"';
+    for (const [toml, env] of [
+      [filled().replace("[vars]\n", `[vars]\nREVOLUT_KEY = ${pem}\n`), undefined],
+      [filled().replace("[vars]\n", `[vars]\nrevolut_private_key = ${pem}\n`), undefined],
+      [filled().replace("[env.staging.vars]\n", `[env.staging.vars]\nKEY = ${pem}\n`), "staging"],
+      [filled().replace("[vars]\n", `[vars]\nK = "-----begin rsa private key-----"\n`), undefined],
+    ] as const) {
+      expect(deployConfigProblems(toml, env), toml.slice(0, 0)).toContain(
+        "a private key (PEM) is in wrangler.toml: use wrangler secret put REVOLUT_PRIVATE_KEY",
+      );
+    }
     const s = filled().replace(
       "[env.staging.vars]\n",
       '[env.staging.vars]\nREVOLUT_PRIVATE_KEY = "x"\n',

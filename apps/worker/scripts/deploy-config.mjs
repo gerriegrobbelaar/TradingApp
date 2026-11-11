@@ -217,6 +217,12 @@ function environmentProblems(config) {
   for (const name of Object.keys(vars)) {
     if (/^TEST_/.test(name)) problems.push(`${name} is a test-only variable`);
   }
+  // Key material under any name (or case) is a secret too: never in [vars] or anywhere in the file.
+  if (/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/i.test(JSON.stringify(config))) {
+    problems.push(
+      "a private key (PEM) is in wrangler.toml: use wrangler secret put REVOLUT_PRIVATE_KEY",
+    );
+  }
   if (JSON.stringify(config).includes("DO_JURISDICTION_DISABLED")) {
     problems.push(
       "DO_JURISDICTION_DISABLED has no effect and must not be set: Durable Objects are always EU (ADR 0018)",

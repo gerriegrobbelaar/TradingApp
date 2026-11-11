@@ -233,6 +233,29 @@ export interface RevolutSettings {
   /** True: this app creates the bank entries in Exact. False: someone else does. Null: undecided. */
   createsBankEntries: boolean | null;
   paymentsMode: RevolutPaymentsMode;
+  /** A connection staged by the connect callback, waiting for an admin's confirmation. */
+  pending?: RevolutPending | null;
+}
+
+/** Masked facts about a staged Revolut connection: never a full IBAN, a balance or an id. */
+export interface RevolutPendingSummary {
+  accountCount: number;
+  currencies: string[];
+  holders: string[];
+  accounts: { name: string; currency: string; state: string; last4: string | null }[];
+  previousAccounts: number;
+  matchingAccounts: number;
+  stateEchoed: boolean;
+}
+
+export interface RevolutPending {
+  /** UTC ISO time the staging expires (its tokens are then wiped). */
+  until: string;
+  stagedBy: string | null;
+  /** Admins only: echoed by the confirm request. */
+  ref?: string;
+  /** Null while the accounts have not been read yet. */
+  summary: RevolutPendingSummary | null;
 }
 
 export interface ConnectionRow {
@@ -283,6 +306,12 @@ export const disconnectRevolut = () =>
   request<{ ok: true; changed: boolean }>("/api/connections/revolut/disconnect", {
     method: "POST",
   });
+/** Activates a staged Revolut connection after the admin checked what was connected. */
+export const confirmRevolut = (body: {
+  ref: string;
+  ownAccount: true;
+  replacesAccounts?: boolean;
+}) => request<{ ok: true }>("/api/connections/revolut/confirm", { method: "POST", body });
 export const changeRevolutSettings = (body: {
   createsBankEntries?: boolean;
   paymentsMode?: RevolutPaymentsMode;

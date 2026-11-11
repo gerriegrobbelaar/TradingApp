@@ -28,6 +28,7 @@ import { fetchCurrentMe, type CurrentMe } from "@camelthorn/exact";
 import { encryptToken } from "../crypto/token-crypto";
 import { DEFAULT_EXACT_HOST, loadExactConfig, type ExactConfig } from "./config";
 import { loadRevolutConfig } from "../revolut/config";
+import { expireRevolutPending, parsePendingSummary } from "../revolut/store";
 import { createCurrentGateTransport } from "./gate-transport";
 import { authorizeUrl, exchangeCode, TokenEndpointError } from "./oauth";
 import { aad, EXACT_CONNECTION_NAME } from "./store";
@@ -116,10 +117,13 @@ export function registerExactRoutes(router: Router): void {
   // Status only: tokens are never selected.
   router.add("GET", "/api/connections", ANY_ROLE, async (ctx) => {
     const db = ctx.env.DB;
+    // A staged Revolut connection nobody confirmed in 15 minutes is wiped (audited) before it is shown.
+    await expireRevolutPending(db, ctx.nowMs);
     const { results } = await db
       .prepare(
         `SELECT id, kind, name, status, expires_at, last_error, connected_by, connected_at,
-           revolut_environment, creates_bank_entries, payments_mode, bank_entries_decided_at
+           revolut_environment, creates_bank_entries, payments_mode, bank_entries_decided_at,
+           pending_until, pending_ref, pending_by, pending_summary
          FROM connections ORDER BY id`,
       )
       .all<{
@@ -135,6 +139,10 @@ export function registerExactRoutes(router: Router): void {
         creates_bank_entries: number;
         payments_mode: string;
         bank_entries_decided_at: string | null;
+        pending_until: string | null;
+        pending_ref: string | null;
+        pending_by: string | null;
+        pending_summary: string | null;
       }>();
     const divs = await db
       .prepare(
@@ -150,6 +158,7 @@ export function registerExactRoutes(router: Router): void {
         sync_enabled: number;
       }>();
     const configured = loadExactConfig(ctx.env, ctx.config.appOrigin).ok;
+    const isAdmin = ctx.session?.roles.includes("admin") === true;
     return json({
       exactConfigured: configured,
       revolutConfigured: loadRevolutConfig(ctx.env, ctx.config.appOrigin).ok,
@@ -170,6 +179,17 @@ export function registerExactRoutes(router: Router): void {
                 createsBankEntries:
                   c.bank_entries_decided_at === null ? null : c.creates_bank_entries === 1,
                 paymentsMode: c.payments_mode,
+                // A staged connection waiting for an admin's confirmation: masked facts only
+                // (account names, currencies, last 4 of IBANs). The ref goes to admins only.
+                pending:
+                  c.status === "pending" && c.pending_until !== null
+                    ? {
+                        until: c.pending_until,
+                        stagedBy: c.pending_by,
+                        ...(isAdmin && c.pending_ref !== null ? { ref: c.pending_ref } : {}),
+                        summary: parsePendingSummary(c.pending_summary),
+                      }
+                    : null,
               },
             }
           : {}),

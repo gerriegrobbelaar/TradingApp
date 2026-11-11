@@ -19,8 +19,11 @@ REVOLUT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nreplace-with-your-pkcs8-key\n-
 # /api to the Worker on 8787, so the redirect URI uses port 5173.
 OAUTH_REDIRECT_URI=http://localhost:5173/api/auth/callback
 EXACT_REDIRECT_URI=http://localhost:5173/api/connections/exact/callback
-REVOLUT_REDIRECT_URI=http://localhost:5173/api/connections/revolut/callback
-REVOLUT_ISSUER=localhost:5173
+# Revolut only accepts an https redirect URI on the app's own origin, so the Revolut connect flow
+# needs an https tunnel locally (set OAUTH_REDIRECT_URI to the same origin). With plain
+# http://localhost the Revolut card reports "not set up on the server".
+# REVOLUT_REDIRECT_URI=https://your-tunnel.example/api/connections/revolut/callback
+# REVOLUT_ISSUER=your-tunnel.example
 # EXACT_CLIENT_ID=your-exact-app-client-id
 # Needed locally until the committed placeholder is filled:
 # GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com

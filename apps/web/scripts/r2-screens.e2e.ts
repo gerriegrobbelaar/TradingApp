@@ -1,7 +1,7 @@
 /**
  * R2 browser checks (see vitest.screens.config.ts): screenshots of Settings, Connections with the
- * Revolut Business card at 360 and 1280 in light and dark, in three states (not connected,
- * connected, needs re-authorisation), plus axe (with colour contrast) in the real browser. The API
+ * Revolut Business card at 360 and 1280 in light and dark, in four states (not connected,
+ * connected, needs re-authorisation, waiting for the admin's confirmation), plus axe (with colour contrast) in the real browser. The API
  * is mocked in the browser; the app is the production build in dist/.
  */
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -45,23 +45,64 @@ let server: Server;
 let base = "";
 let browser: Browser;
 
-type State = "none" | "connected" | "reauth";
+type State = "none" | "connected" | "reauth" | "pending";
+const PENDING = {
+  until: "2026-11-11T09:15:00.000Z",
+  stagedBy: "gerrie.grobbelaar@camelthorncapital.com",
+  ref: "screens-ref",
+  summary: {
+    accountCount: 3,
+    currencies: ["EUR", "GBP", "USD"],
+    holders: ["Camelthorn Advisory B.V."],
+    accounts: [
+      { name: "Main", currency: "EUR", state: "active", last4: "5678" },
+      { name: "Sterling", currency: "GBP", state: "active", last4: "1290" },
+      { name: "Dollars", currency: "USD", state: "inactive", last4: null },
+    ],
+    previousAccounts: 0,
+    matchingAccounts: 0,
+    stateEchoed: false,
+  },
+};
 const revolutRow = (state: State) =>
   state === "none"
     ? []
-    : [
-        {
-          kind: "revolut",
-          name: "revolut",
-          status: state === "connected" ? "active" : "needs_reauth",
-          expiresAt: null,
-          lastError: state === "connected" ? null : "invalid_grant",
-          connectedBy: ADMIN.email,
-          connectedAt: "2026-11-11T09:00:00.000Z",
-          divisions: [],
-          revolut: { environment: "production", createsBankEntries: false, paymentsMode: "drafts" },
-        },
-      ];
+    : state === "pending"
+      ? [
+          {
+            kind: "revolut",
+            name: "revolut",
+            status: "pending",
+            expiresAt: null,
+            lastError: null,
+            connectedBy: null,
+            connectedAt: null,
+            divisions: [],
+            revolut: {
+              environment: "production",
+              createsBankEntries: false,
+              paymentsMode: "drafts",
+              pending: PENDING,
+            },
+          },
+        ]
+      : [
+          {
+            kind: "revolut",
+            name: "revolut",
+            status: state === "connected" ? "active" : "needs_reauth",
+            expiresAt: null,
+            lastError: state === "connected" ? null : "invalid_grant",
+            connectedBy: ADMIN.email,
+            connectedAt: "2026-11-11T09:00:00.000Z",
+            divisions: [],
+            revolut: {
+              environment: "production",
+              createsBankEntries: false,
+              paymentsMode: "drafts",
+            },
+          },
+        ];
 
 function api(path: string, state: State): unknown {
   switch (path) {
@@ -135,7 +176,7 @@ afterAll(async () => {
 });
 
 describe("Settings, Connections, Revolut Business card", () => {
-  for (const state of ["none", "connected", "reauth"] as const) {
+  for (const state of ["none", "connected", "reauth", "pending"] as const) {
     for (const theme of ["light", "dark"] as const) {
       for (const width of [360, 1280] as const) {
         it(`${state} ${theme} ${width}: renders, no console or CSP errors, no axe violations`, async () => {
@@ -161,7 +202,10 @@ describe("Settings, Connections, Revolut Business card", () => {
           });
           await page.goto(`${base}/settings/connections`);
           await page.waitForSelector("#revolut-heading", { timeout: 15_000 });
-          await page.waitForSelector("input[name='revolut-bank-entries']", { timeout: 15_000 });
+          await page.waitForSelector(
+            state === "pending" ? "input[type='checkbox']" : "input[name='revolut-bank-entries']",
+            { timeout: 15_000 },
+          );
           // No page-level sideways scroll at phone width.
           const overflow = await page.evaluate<number>(
             () => document.documentElement.scrollWidth - document.documentElement.clientWidth,

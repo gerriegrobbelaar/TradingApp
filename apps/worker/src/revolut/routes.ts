@@ -12,9 +12,15 @@
  * refused, and the choice is stored with the time it was made.
  *
  * Every change is one db.batch of the change plus its audit row (ADR 0013). Tokens are encrypted
- * before they are stored and never appear in a response, a log line or an audit row. New tokens
- * are staged as 'pending' (the gate serves only GET /accounts with them) until that call proved
- * the credentials work; only then the connection becomes 'active'.
+ * before they are stored and never appear in a response, a log line or an audit row.
+ *
+ * Account substitution (review R2, ADR 0031): Revolut may not echo `state` on the consent
+ * redirect, so the callback cannot prove that the authorisation code came from the flow this
+ * browser started. An attacker could make an admin's browser deliver the attacker's code and
+ * connect the attacker's Revolut account. Defence in depth: the callback only STAGES the tokens
+ * ('pending', 15 minutes, usable for nothing but reading the account list), and a second explicit
+ * admin action with a fresh sign-in (POST /confirm) activates them after the admin has seen which
+ * accounts were connected. When Revolut does echo `state`, it must match (a mismatch is refused).
  */
 import { auditStatement } from "../db/audit";
 import { claimOnceAndPurge } from "../db/idempotency";
@@ -24,11 +30,20 @@ import { FLOW_TTL_SECONDS, openFlow, sealFlow } from "../auth/flow-cookie";
 import { isStepUpFresh } from "../auth/session";
 import { encryptToken } from "../crypto/token-crypto";
 import { json, type Ctx, type Router } from "../router";
-import { probeAccounts } from "./accounts-probe";
+import { inspectAccounts } from "./accounts-probe";
 import { isRevolutEnvironment, loadRevolutConfig, type RevolutConfig } from "./config";
 import { createRevolutGateTransport } from "./gate-transport";
 import { authorizeUrl, exchangeCode, TokenEndpointError } from "./oauth";
-import { aad, environmentOf, loadRevolutConnection, REVOLUT_CONNECTION_NAME } from "./store";
+import {
+  aad,
+  environmentOf,
+  expireRevolutPending,
+  isLivePending,
+  loadRevolutConnection,
+  parsePendingSummary,
+  PENDING_TTL_MS,
+  REVOLUT_CONNECTION_NAME,
+} from "./store";
 
 const ADMIN_STEP_UP = { roles: ["admin"], stepUp: true } as const;
 const ADMIN = { roles: ["admin"] } as const;
@@ -87,9 +102,13 @@ export function registerRevolutRoutes(router: Router): void {
     const session = ctx.session;
     if (!session) return json({ error: "unauthenticated" }, 401);
 
+    await expireRevolutPending(ctx.env.DB, ctx.nowMs);
+    const existing = await loadRevolutConnection(ctx.env.DB);
+    // A working connection is never replaced by a new consent: a substituted code could otherwise
+    // take it over. Disconnect first (re-authorising is for needs_reauth / expired).
+    if (existing?.status === "active") return json({ error: "already_connected" }, 409);
     // Switching between production and sandbox would orphan the webhook subscription and mix
     // data of two Revolut accounts: disconnect first.
-    const existing = await loadRevolutConnection(ctx.env.DB);
     if (
       existing &&
       existing.status !== "disabled" &&
@@ -110,10 +129,14 @@ export function registerRevolutRoutes(router: Router): void {
       exp: ctx.nowMs + FLOW_TTL_SECONDS * 1000,
       revolut: { environment, createsBankEntries: bankEntries === "1", paymentsMode: mode },
     });
-    const headers = new Headers({
-      location: authorizeUrl(environment, cfg.config, state),
-      "cache-control": "no-store",
-    });
+    let location: string;
+    try {
+      location = authorizeUrl(environment, cfg.config, state);
+    } catch {
+      console.error("revolut configuration incomplete", "consent_url");
+      return json({ error: "server_misconfigured" }, 500);
+    }
+    const headers = new Headers({ location, "cache-control": "no-store" });
     headers.append("set-cookie", setCookie(REVOLUT_FLOW_COOKIE, sealed, FLOW_TTL_SECONDS));
     return new Response(null, { status: 302, headers });
   });
@@ -130,9 +153,16 @@ export function registerRevolutRoutes(router: Router): void {
       parseCookies(ctx.request.headers.get("cookie")).get(REVOLUT_FLOW_COOKIE),
       ctx.nowMs,
     );
+    if (!flow || !flow.revolut) {
+      console.warn("revolut connect denied", "no_flow");
+      return back("denied");
+    }
+    // When Revolut echoes `state` it must be ours. Without it (unverified whether Revolut sends
+    // it) the flow is bound by the signed cookie only, and the staged connection must be
+    // confirmed by an admin who has seen what was connected before anything uses it.
     const state = ctx.url.searchParams.get("state");
-    const code = ctx.url.searchParams.get("code");
-    if (!flow || !flow.revolut || !state || !(await safeEqual(state, flow.state))) {
+    const stateEchoed = state !== null;
+    if (stateEchoed && !(await safeEqual(state, flow.state))) {
       console.warn("revolut connect denied", "bad_state");
       return back("denied");
     }
@@ -151,11 +181,29 @@ export function registerRevolutRoutes(router: Router): void {
       console.warn("revolut connect denied", "flow_replayed");
       return back("denied");
     }
-    if (ctx.url.searchParams.has("error") || !code) {
+    const code = ctx.url.searchParams.get("code");
+    if (ctx.url.searchParams.has("error") || !code || code.length > 2048) {
       console.warn("revolut connect denied", "revolut_error");
       return back("denied");
     }
     const { environment, createsBankEntries, paymentsMode } = flow.revolut;
+
+    await expireRevolutPending(db, ctx.nowMs);
+    const existing = await loadRevolutConnection(db);
+    // Re-checked here: the connection may have changed since the flow started.
+    if (existing?.status === "active") {
+      console.warn("revolut connect denied", "already_connected");
+      return back("denied");
+    }
+    if (
+      existing &&
+      existing.status !== "disabled" &&
+      environmentOf(existing) !== null &&
+      environmentOf(existing) !== environment
+    ) {
+      console.warn("revolut connect denied", "environment_changed");
+      return back("denied");
+    }
 
     let tokens;
     try {
@@ -170,45 +218,63 @@ export function registerRevolutRoutes(router: Router): void {
     if (tokens.refreshToken === null) return back("error"); // exchangeCode already guarantees one
 
     // The ciphertext is bound to the connection id, so make sure the (single) row exists first.
-    // creates_bank_entries is written explicitly, never left to the column default.
+    // It starts 'disabled' (no tokens); creates_bank_entries is written explicitly below.
     await db
       .prepare(
         `INSERT INTO connections (kind, name, status, creates_bank_entries)
-         VALUES ('revolut', ?1, 'pending', ?2)
+         VALUES ('revolut', ?1, 'disabled', ?2)
          ON CONFLICT (kind, name) DO NOTHING`,
       )
       .bind(REVOLUT_CONNECTION_NAME, createsBankEntries ? 1 : 0)
       .run();
     const row = await loadRevolutConnection(db);
-    if (!row) return back("error");
+    if (!row || row.status === "active") return back("error");
 
     const key = ctx.env.TOKEN_ENC_KEY;
     const accessEnc = await encryptToken(key, tokens.accessToken, aad(row.id, "access"));
     const refreshEnc = await encryptToken(key, tokens.refreshToken, aad(row.id, "refresh"));
     const expiresAt = new Date(ctx.nowMs + tokens.expiresInS * 1000).toISOString();
     const nowIso = new Date(ctx.nowMs).toISOString();
-    await db.batch([
-      auditStatement(db, {
-        actorEmail: session.email,
-        action: "connection.revolut_authorized",
-        entity: "connection",
-        entityId: row.id,
-        before: {
-          status: row.status,
-          environment: row.revolut_environment,
-          createsBankEntries:
-            row.bank_entries_decided_at === null ? null : row.creates_bank_entries === 1,
-          paymentsMode: row.payments_mode,
+    const pendingUntil = new Date(ctx.nowMs + PENDING_TTL_MS).toISOString();
+    const ref = randomBase64Url(18);
+    // Staged only while the row is not active (a concurrent confirm must never be overwritten).
+    const staged = await db.batch([
+      auditStatement(
+        db,
+        {
+          actorEmail: session.email,
+          action: "connection.revolut_staged",
+          entity: "connection",
+          entityId: row.id,
+          before: {
+            status: row.status,
+            environment: row.revolut_environment,
+            createsBankEntries:
+              row.bank_entries_decided_at === null ? null : row.creates_bank_entries === 1,
+            paymentsMode: row.payments_mode,
+          },
+          after: {
+            status: "pending",
+            environment,
+            createsBankEntries,
+            paymentsMode,
+            stateEchoed,
+            pendingUntil,
+          },
         },
-        after: { status: "pending", environment, createsBankEntries, paymentsMode },
-      }),
+        {
+          sql: "EXISTS (SELECT 1 FROM connections WHERE id = ?7 AND kind = 'revolut' AND status <> 'active')",
+          binds: [row.id],
+        },
+      ),
       db
         .prepare(
           `UPDATE connections
            SET status = 'pending', access_token_enc = ?2, refresh_token_enc = ?3, expires_at = ?4,
                revolut_environment = ?5, creates_bank_entries = ?6, payments_mode = ?7,
-               bank_entries_decided_at = ?8, last_error = NULL, token_ref = NULL, updated_at = ?8
-           WHERE id = ?1 AND kind = 'revolut'`,
+               bank_entries_decided_at = ?8, last_error = NULL, token_ref = NULL, updated_at = ?8,
+               pending_until = ?9, pending_ref = ?10, pending_by = ?11, pending_summary = NULL
+           WHERE id = ?1 AND kind = 'revolut' AND status <> 'active'`,
         )
         .bind(
           row.id,
@@ -219,25 +285,37 @@ export function registerRevolutRoutes(router: Router): void {
           createsBankEntries ? 1 : 0,
           paymentsMode,
           nowIso,
+          pendingUntil,
+          ref,
+          session.email,
         ),
     ]);
+    if ((staged[1]?.meta.changes ?? 0) !== 1) return back("error");
 
     // Every later statement only acts while the staged tokens are still OURS (a second callback
-    // running at the same time must not have its tokens activated by this one). The refresh
-    // ciphertext is unique (random IV), so it identifies this callback's tokens.
-    const mine = (enc: string, id = "?1"): string =>
+    // running at the same time must not have its tokens summarised or wiped by this one).
+    const mine = (refParam: string, id = "?1"): string =>
       `EXISTS (SELECT 1 FROM connections WHERE id = ${id} AND kind = 'revolut' AND status = 'pending'
-               AND refresh_token_enc = ${enc})`;
-    const guard = { sql: mine("?7", "?8"), binds: [refreshEnc, row.id] };
+               AND pending_ref = ${refParam})`;
 
-    // Prove the credentials work, through the gate (the same path every later call takes).
-    let accounts: number | null = null;
+    // Prove the credentials work and collect what the admin must check, through the gate (the
+    // same path every later call takes; it serves a staged connection nothing but the account list).
+    const previous = await db
+      .prepare("SELECT external_id FROM bank_accounts WHERE connection_id = ?1")
+      .bind(row.id)
+      .all<{ external_id: string }>();
+    let summary = null;
     try {
-      accounts = await probeAccounts(createRevolutGateTransport(ctx.env, row.id), row.id);
+      summary = await inspectAccounts(
+        createRevolutGateTransport(ctx.env, row.id),
+        row.id,
+        previous.results.map((r) => r.external_id),
+        stateEchoed,
+      );
     } catch (e) {
       console.warn("revolut accounts check failed", e instanceof Error ? e.name : "error");
     }
-    if (accounts === null) {
+    if (summary === null) {
       await db.batch([
         auditStatement(
           db,
@@ -248,43 +326,109 @@ export function registerRevolutRoutes(router: Router): void {
             entityId: row.id,
             after: { status: "disabled", refused: true },
           },
-          guard,
+          { sql: mine("?8", "?7"), binds: [row.id, ref] },
         ),
         db
           .prepare(
             `UPDATE connections
              SET status = 'disabled', last_error = 'verification_failed',
                  access_token_enc = NULL, refresh_token_enc = NULL, token_ref = NULL,
-                 expires_at = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 expires_at = NULL, pending_until = NULL, pending_ref = NULL, pending_by = NULL,
+                 pending_summary = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
              WHERE id = ?1 AND ${mine("?2")}`,
           )
-          .bind(row.id, refreshEnc),
+          .bind(row.id, ref),
       ]);
       return back("unverified");
     }
 
+    const saved = await db
+      .prepare(
+        `UPDATE connections SET pending_summary = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id = ?1 AND ${mine("?3")}`,
+      )
+      .bind(row.id, JSON.stringify(summary), ref)
+      .run();
+    return saved.meta.changes === 1 ? back("confirm") : back("error");
+  });
+
+  /**
+   * Activates a staged connection. The admin has seen the summary (accounts, currencies, last 4
+   * of the IBANs) and ticked that it is the company's own Revolut Business account. `ref` must be
+   * the one of the summary shown, so a different staging that happened meanwhile is not
+   * confirmed blindly. If the connection replaces one whose accounts all differ, that needs its
+   * own explicit flag.
+   */
+  router.add("POST", "/api/connections/revolut/confirm", ADMIN_STEP_UP, async (ctx) => {
+    const session = ctx.session;
+    if (!session) return json({ error: "unauthenticated" }, 401);
+    const body = await readJson(ctx.request);
+    const keys = body ? Object.keys(body) : [];
+    if (
+      !body ||
+      keys.some((k) => k !== "ref" && k !== "ownAccount" && k !== "replacesAccounts") ||
+      typeof body.ref !== "string" ||
+      body.ref === "" ||
+      body.ref.length > 64 ||
+      (body.replacesAccounts !== undefined && typeof body.replacesAccounts !== "boolean")
+    ) {
+      return json({ error: "invalid_body" }, 400);
+    }
+    if (body.ownAccount !== true) return json({ error: "own_account_confirmation_required" }, 400);
+    const db = ctx.env.DB;
+    if (await expireRevolutPending(db, ctx.nowMs)) return json({ error: "pending_expired" }, 410);
+    const row = await loadRevolutConnection(db);
+    if (!row || row.status !== "pending" || row.pending_ref === null) {
+      return json({ error: "nothing_to_confirm" }, 409);
+    }
+    if (!(await safeEqual(body.ref, row.pending_ref))) {
+      return json({ error: "nothing_to_confirm" }, 409);
+    }
+    if (!isLivePending(row, ctx.nowMs)) return json({ error: "pending_expired" }, 410);
+    const summary = parsePendingSummary(row.pending_summary);
+    if (!summary) return json({ error: "not_verified" }, 409);
+    const replaces = summary.previousAccounts > 0 && summary.matchingAccounts === 0;
+    if (replaces && body.replacesAccounts !== true) {
+      return json({ error: "different_account_confirmation_required" }, 409);
+    }
+    const nowIso = new Date(ctx.nowMs).toISOString();
+    const live = `kind = 'revolut' AND status = 'pending' AND pending_ref = ?REF AND pending_until > ?NOW
+                  AND pending_summary IS NOT NULL`;
     const results = await db.batch([
       auditStatement(
         db,
         {
           actorEmail: session.email,
-          action: "connection.revolut_connected",
+          action: "connection.revolut_confirmed",
           entity: "connection",
           entityId: row.id,
-          before: { status: "pending" },
-          after: { status: "active", environment, accounts },
+          before: { status: "pending", stagedBy: row.pending_by },
+          after: {
+            status: "active",
+            environment: row.revolut_environment,
+            accountCount: summary.accountCount,
+            currencies: summary.currencies,
+            holders: summary.holders,
+            replacesAccounts: replaces,
+            stateEchoed: summary.stateEchoed,
+          },
         },
-        guard,
+        {
+          sql: `EXISTS (SELECT 1 FROM connections WHERE id = ?7 AND ${live.replace("?REF", "?8").replace("?NOW", "?9")})`,
+          binds: [row.id, row.pending_ref, nowIso],
+        },
       ),
       db
         .prepare(
-          `UPDATE connections SET status = 'active', connected_by = ?2, connected_at = ?3,
+          `UPDATE connections SET status = 'active', connected_by = ?4, connected_at = ?3,
+             pending_until = NULL, pending_ref = NULL, pending_by = NULL, pending_summary = NULL,
              updated_at = ?3
-           WHERE id = ?1 AND ${mine("?4")}`,
+           WHERE id = ?1 AND ${live.replace("?REF", "?2").replace("?NOW", "?3")}`,
         )
-        .bind(row.id, session.email, nowIso, refreshEnc),
+        .bind(row.id, row.pending_ref, nowIso, session.email),
     ]);
-    return (results[1]?.meta.changes ?? 0) === 1 ? back("connected") : back("error");
+    if ((results[1]?.meta.changes ?? 0) !== 1) return json({ error: "nothing_to_confirm" }, 409);
+    return json({ ok: true });
   });
 
   router.add("POST", "/api/connections/revolut/disconnect", ADMIN_STEP_UP, async (ctx) => {
@@ -320,7 +464,9 @@ export function registerRevolutRoutes(router: Router): void {
         webhookRemoved = false;
       }
     }
-    const live = `status IN ('active','needs_reauth','expired') OR (status = 'pending' AND refresh_token_enc IS NOT NULL)`;
+    // A staged connection counts too: "Cancel, this is not our account" is a disconnect.
+    const live = `status IN ('active','needs_reauth','expired','pending')
+      OR access_token_enc IS NOT NULL OR refresh_token_enc IS NOT NULL`;
     const results = await db.batch([
       auditStatement(
         db,
@@ -330,7 +476,7 @@ export function registerRevolutRoutes(router: Router): void {
           entity: "connection",
           entityId: before.id,
           before: { status: before.status, environment: before.revolut_environment },
-          after: { status: "disabled", webhookRemoved },
+          after: { status: "disabled", webhookRemoved, wasStaged: before.status === "pending" },
         },
         {
           sql: `EXISTS (SELECT 1 FROM connections WHERE id = ?7 AND kind = 'revolut' AND (${live}))`,
@@ -342,7 +488,9 @@ export function registerRevolutRoutes(router: Router): void {
           `UPDATE connections
            SET status = 'disabled', access_token_enc = NULL, refresh_token_enc = NULL, token_ref = NULL,
                expires_at = NULL, last_error = NULL, webhook_id = NULL, webhook_secret_enc = NULL,
-               webhook_secret_prev_enc = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+               webhook_secret_prev_enc = NULL, pending_until = NULL, pending_ref = NULL,
+               pending_by = NULL, pending_summary = NULL,
+               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
            WHERE id = ?1 AND kind = 'revolut' AND (${live})`,
         )
         .bind(before.id),

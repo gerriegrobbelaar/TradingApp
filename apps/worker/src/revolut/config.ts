@@ -58,7 +58,10 @@ export function loadRevolutConfig(env: Partial<Env>, appOrigin: string): Revolut
   if (redirectUri !== "") {
     try {
       const u = new URL(redirectUri);
-      if (u.origin !== appOrigin || u.pathname !== REVOLUT_CALLBACK_PATH) {
+      // R1's consent URL builder refuses anything but https (Revolut's rule too).
+      if (u.protocol !== "https:") {
+        missing.push("REVOLUT_REDIRECT_URI(https)");
+      } else if (u.origin !== appOrigin || u.pathname !== REVOLUT_CALLBACK_PATH) {
         missing.push("REVOLUT_REDIRECT_URI(origin/path)");
       } else if (issuer !== "" && issuer !== u.host) {
         missing.push("REVOLUT_ISSUER(host)");

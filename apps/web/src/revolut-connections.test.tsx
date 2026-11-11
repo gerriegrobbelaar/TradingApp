@@ -126,7 +126,8 @@ describe("Settings, Connections: Revolut Business", () => {
     expect(card().getByText(/Pay mode is not active yet/)).toBeTruthy();
     expect(radio(/^This app creates them/).checked).toBe(true);
     expect(radio(/Pay directly/).checked).toBe(true);
-    expect(card().getByRole("button", { name: "Re-authorise Revolut Business" })).toBeTruthy();
+    // A working connection is never re-authorised over (disconnect first, review R2).
+    expect(card().queryByRole("button", { name: "Re-authorise Revolut Business" })).toBeNull();
     expect(card().queryByRole("group", { name: "Environment" })).toBeNull();
     expect(card().queryByText(/token|PRIVATE KEY/i)).toBeNull();
   });
@@ -241,6 +242,7 @@ describe("Settings, Connections: Revolut Business", () => {
       ...list(
         body([
           row({
+            status: "needs_reauth",
             revolut: {
               environment: "production",
               createsBankEntries: null,
@@ -252,7 +254,9 @@ describe("Settings, Connections: Revolut Business", () => {
     });
     renderApp("/settings/connections");
     await ready();
-    expect((await card().findByRole("alert")).textContent).toContain("Nobody has said yet");
+    const alerts = await card().findAllByRole("alert");
+    expect(alerts.map((a) => a.textContent).join(" ")).toContain("Nobody has said yet");
+    expect(alerts.map((a) => a.textContent).join(" ")).not.toContain("re-authorise,");
     expect(
       (card().getByRole("button", { name: "Re-authorise Revolut Business" }) as HTMLButtonElement)
         .disabled,
@@ -289,10 +293,184 @@ describe("Settings, Connections: Revolut Business", () => {
     ["denied", /access was not granted/],
     ["unverified", /accounts could not be read/],
     ["error", /Could not finish connecting/],
+    ["confirm", /Check the accounts below, then confirm the connection/],
   ])("explains a %s connect", async (result, text) => {
     mockFetch({ ...ME_OK(ADMIN), ...list(NONE) });
     renderApp(`/settings/connections?revolut=${result}`);
     expect(await screen.findByText(text)).toBeTruthy();
+  });
+
+  const SUMMARY: api.RevolutPendingSummary = {
+    accountCount: 2,
+    currencies: ["EUR", "USD"],
+    holders: ["Camelthorn Advisory B.V."],
+    accounts: [
+      { name: "Main", currency: "EUR", state: "active", last4: "5678" },
+      { name: "Dollars", currency: "USD", state: "inactive", last4: null },
+    ],
+    previousAccounts: 0,
+    matchingAccounts: 0,
+    stateEchoed: false,
+  };
+  const pendingRow = (
+    pending: Partial<api.RevolutPending> = {},
+    summary: Partial<api.RevolutPendingSummary> = {},
+  ) =>
+    row({
+      status: "pending",
+      connectedBy: null,
+      revolut: {
+        environment: "production",
+        createsBankEntries: false,
+        paymentsMode: "drafts",
+        pending: {
+          until: "2026-11-11T12:15:00.000Z",
+          stagedBy: "gerrie@camelthorncapital.com",
+          ref: "the-ref",
+          summary: { ...SUMMARY, ...summary },
+          ...pending,
+        },
+      },
+    });
+
+  it("a staged connection shows what was connected and needs the tick before Confirm", async () => {
+    const calls = mockFetch({
+      ...ME_OK(ADMIN),
+      ...list(body([pendingRow()])),
+      "POST /api/connections/revolut/confirm": () => ({ body: { ok: true } }),
+    });
+    const user = userEvent.setup();
+    renderApp("/settings/connections");
+    const confirmBtn = (await screen.findByRole("button", {
+      name: "Confirm connection",
+    })) as HTMLButtonElement;
+    expect(card().getByText("Waiting for your confirmation")).toBeTruthy();
+    expect(card().getByText("Camelthorn Advisory B.V.")).toBeTruthy();
+    expect(card().getByText("2 accounts in EUR, USD")).toBeTruthy();
+    const table = card().getByRole("table", { name: "Revolut accounts that were connected" });
+    expect(within(table).getByText("•••• 5678")).toBeTruthy();
+    expect(within(table).getByText("No IBAN")).toBeTruthy();
+    expect(within(table).getByText(/inactive/)).toBeTruthy();
+    // The setup form is not offered while a staging waits.
+    expect(card().queryByRole("radio")).toBeNull();
+    expect(card().queryByRole("button", { name: /Connect Revolut Business/ })).toBeNull();
+    expect(confirmBtn.disabled).toBe(true);
+    // Focus moves to the panel heading so a keyboard or screen reader user lands on it.
+    expect(document.activeElement?.textContent).toBe("Check what was connected");
+
+    await user.click(
+      card().getByRole("checkbox", { name: "This is our Revolut Business account" }),
+    );
+    expect(confirmBtn.disabled).toBe(false);
+    await user.click(confirmBtn);
+    const post = calls.find((c) => c.method === "POST");
+    expect(post?.url).toBe("/api/connections/revolut/confirm");
+    expect(post?.body).toEqual({ ref: "the-ref", ownAccount: true });
+    expect(await screen.findByText("Revolut Business is connected.")).toBeTruthy();
+  });
+
+  it("accounts that all differ from the ones connected before need a second tick", async () => {
+    const calls = mockFetch({
+      ...ME_OK(ADMIN),
+      ...list(body([pendingRow({}, { previousAccounts: 3, matchingAccounts: 0 })])),
+      "POST /api/connections/revolut/confirm": () => ({ body: { ok: true } }),
+    });
+    const user = userEvent.setup();
+    renderApp("/settings/connections");
+    const confirmBtn = (await screen.findByRole("button", {
+      name: "Confirm connection",
+    })) as HTMLButtonElement;
+    expect(card().getByRole("alert").textContent).toContain("may be a different Revolut Business");
+    await user.click(
+      card().getByRole("checkbox", { name: "This is our Revolut Business account" }),
+    );
+    expect(confirmBtn.disabled).toBe(true);
+    await user.click(
+      card().getByRole("checkbox", { name: /Replace the accounts connected before/ }),
+    );
+    await user.click(confirmBtn);
+    expect(calls.find((c) => c.method === "POST")?.body).toEqual({
+      ref: "the-ref",
+      ownAccount: true,
+      replacesAccounts: true,
+    });
+  });
+
+  it("confirming with a stale sign-in opens the step-up sheet; an expired staging is explained", async () => {
+    let answer: { status: number; body: unknown } = {
+      status: 401,
+      body: { error: "step_up_required" },
+    };
+    mockFetch({
+      ...ME_OK(ADMIN),
+      ...list(body([pendingRow()])),
+      "POST /api/connections/revolut/confirm": () => answer,
+    });
+    const user = userEvent.setup();
+    renderApp("/settings/connections");
+    await user.click(
+      await screen.findByRole("checkbox", { name: "This is our Revolut Business account" }),
+    );
+    await user.click(card().getByRole("button", { name: "Confirm connection" }));
+    const sheet = await screen.findByRole("dialog", { name: "Confirm it's you" });
+    await user.click(within(sheet).getByRole("button", { name: "Cancel" }));
+    answer = { status: 410, body: { error: "pending_expired" } };
+    await user.click(card().getByRole("button", { name: "Confirm connection" }));
+    expect((await card().findByRole("alert")).textContent).toContain("not confirmed within 15");
+  });
+
+  it("Cancel, not our account removes the staging after a confirmation sheet", async () => {
+    const calls = mockFetch({
+      ...ME_OK(ADMIN),
+      ...list(body([pendingRow()])),
+      "POST /api/connections/revolut/disconnect": () => ({ body: { ok: true, changed: true } }),
+    });
+    const user = userEvent.setup();
+    renderApp("/settings/connections");
+    await user.click(await screen.findByRole("button", { name: "Cancel, not our account" }));
+    expect(calls.some((c) => c.method === "POST")).toBe(false);
+    const sheet = await screen.findByRole("dialog", { name: "Cancel this connection" });
+    await user.click(within(sheet).getByRole("button", { name: "Cancel connection" }));
+    expect(calls.find((c) => c.method === "POST")?.url).toBe("/api/connections/revolut/disconnect");
+    expect(await screen.findByText(/Connection cancelled/)).toBeTruthy();
+  });
+
+  it("non-admins see the staged summary but no ref-bound buttons", async () => {
+    mockFetch({ ...ME_OK(VIEWER), ...list(body([pendingRow({ ref: undefined })])) });
+    renderApp("/settings/connections");
+    await ready();
+    expect(await card().findByText("Waiting for your confirmation")).toBeTruthy();
+    expect(card().getByText(/An admin must confirm this connection/)).toBeTruthy();
+    expect(card().queryByRole("button")).toBeNull();
+    expect(card().queryByRole("checkbox")).toBeNull();
+  });
+
+  it("a staging whose accounts could not be read only offers Cancel", async () => {
+    mockFetch({ ...ME_OK(ADMIN), ...list(body([pendingRow({ summary: null })])) });
+    renderApp("/settings/connections");
+    expect(await screen.findByRole("button", { name: "Cancel" })).toBeTruthy();
+    expect(card().queryByRole("button", { name: "Confirm connection" })).toBeNull();
+    expect(card().getByRole("alert").textContent).toContain("could not be read yet");
+  });
+
+  it("says when the last staging expired unconfirmed", async () => {
+    mockFetch({
+      ...ME_OK(ADMIN),
+      ...list(body([row({ status: "disabled", lastError: "pending_expired", connectedBy: null })])),
+    });
+    renderApp("/settings/connections");
+    expect(await screen.findByText(/was not confirmed within 15 minutes/)).toBeTruthy();
+    expect(card().getByRole("button", { name: "Connect Revolut Business" })).toBeTruthy();
+  });
+
+  it("has no accessibility violations: waiting for confirmation (admin and viewer)", async () => {
+    for (const me of [ADMIN, VIEWER]) {
+      mockFetch({ ...ME_OK(me), ...list(body([pendingRow()])) });
+      const { unmount } = renderApp("/settings/connections");
+      await screen.findByText("Check what was connected");
+      expect(await axe(document.body)).toHaveNoViolations();
+      unmount();
+    }
   });
 
   it("has no accessibility violations: not connected, connected and needs re-authorisation", async () => {

@@ -29,12 +29,13 @@ import {
 import { auditStatement } from "../db/audit";
 import { decryptToken, encryptToken, keyring, TokenCryptoError } from "../crypto/token-crypto";
 import type { Env } from "../env";
-import { loadRevolutConfig } from "./config";
+import { loadRevolutConfig, revolutWebhookUrl } from "./config";
 import { refreshTokens, TokenEndpointError } from "./oauth";
-import { buildUrl, JOB_ID_RE, validateRequest } from "./request";
+import { buildUrl, JOB_ID_RE, validateRequest, versionOf } from "./request";
 import {
   aad,
   environmentOf,
+  isLivePending,
   loadRevolutById,
   markNeedsReauth,
   type RevolutConnectionRow,
@@ -87,6 +88,11 @@ const JOB_TTL_MS = 24 * 3600 * 1000;
 const USER_BURST = 5;
 
 type GateRole = `connection:${number}`;
+
+/** The job id of the connect callback's account check (the only use of a staged connection). */
+export const CONNECT_JOB_ID = "revolut-connect";
+const PENDING_DETAILS_RE =
+  /^\/accounts\/[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\/bank-details$/;
 
 interface LimiterState {
   day: string;
@@ -154,6 +160,8 @@ export class RevolutGate extends DurableObject<Env> {
   private userStreak = 0;
   private refreshCooldownUntil = 0;
   private clientRejectedUntil = 0;
+  /** The last token this instance obtained (in memory only: an eviction costs one refresh). */
+  private issued: { issuedAt: number; expiresAt: number } | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -281,7 +289,9 @@ export class RevolutGate extends DurableObject<Env> {
    * share one refresh. `staleExpiresAt` is the `expires_at` of a token Revolut just rejected: a
    * refresh is forced only if the stored token is still that one.
    */
-  refreshAccessToken(connectionId: number, staleExpiresAt?: string): Promise<TokenResult> {
+  // A JS-private method on purpose: Workers RPC exposes every public method of a Durable Object,
+  // and this one returns a plaintext access token. It must never be callable from outside.
+  #refreshAccessToken(connectionId: number, staleExpiresAt?: string): Promise<TokenResult> {
     if (this.refreshing && this.refreshing.connectionId === connectionId) {
       return this.refreshing.promise;
     }
@@ -426,7 +436,7 @@ export class RevolutGate extends DurableObject<Env> {
           : null;
       const stillFresh =
         row.access_token_enc !== null &&
-        exp - now > REFRESH_MARGIN_MS &&
+        exp - now > this.marginFor(exp) &&
         (staleExpiresAt === undefined || row.expires_at !== staleExpiresAt);
       if (stillFresh) {
         // A refresh (or a reconnect) already produced a good token: do not refresh again.
@@ -574,6 +584,7 @@ export class RevolutGate extends DurableObject<Env> {
         return { ok: false, code: "connection_changed", retryable: true };
       }
       this.clientRejectedUntil = 0;
+      this.issued = { issuedAt, expiresAt };
       try {
         if (!stashed) await this.ctx.storage.delete(pendingKey(row.id));
         await this.ctx.storage.delete(clientRejectsKey(row.id));
@@ -756,14 +767,19 @@ export class RevolutGate extends DurableObject<Env> {
   private async execute(item: Queued): Promise<RevolutResponse | null> {
     const { req } = item;
     const row = await loadRevolutById(this.env.DB, req.connectionId);
-    // A 'pending' connection holds tokens the connect callback has not verified yet: they serve
-    // GET /accounts (API 1.0) and nothing else, exactly what the callback needs to prove the
-    // credentials work.
+    // A 'pending' connection holds tokens an admin has not confirmed yet (they may belong to
+    // somebody else's Revolut account, review R2). While the confirmation window is open they
+    // serve exactly what the connect callback needs to show the admin what was connected: the
+    // account list and each account's bank details, on API 1.0, for the connect call only. No
+    // job, no webhook, no transactions, no refresh.
     const verifying =
-      row?.status === "pending" &&
+      row !== null &&
+      isLivePending(row, this.now()) &&
+      req.priority === "user" &&
+      req.jobId === CONNECT_JOB_ID &&
       req.method === "GET" &&
-      req.path === "/accounts" &&
-      (req.apiVersion ?? "1.0") === "1.0";
+      versionOf(req) === "1.0" &&
+      (req.path === "/accounts" || PENDING_DETAILS_RE.test(req.path));
     if (!row || (row.status === "pending" && !verifying) || row.status === "disabled") {
       throw new RevolutAuthError("not_connected");
     }
@@ -771,6 +787,7 @@ export class RevolutGate extends DurableObject<Env> {
     const environment = environmentOf(row);
     if (!environment) throw new RevolutAuthError("not_connected");
     const url = buildUrl(environment, req);
+    if (req.method === "POST" && req.path === "/webhooks") this.checkWebhookTarget(req.body);
     const token = await this.accessTokenFor(row);
 
     const headers: Record<string, string> = {};
@@ -812,7 +829,7 @@ export class RevolutGate extends DurableObject<Env> {
       if (item.retried) throw new RevolutAuthError("unauthorized");
       // Revoked or replaced elsewhere: force one refresh (only if the stored token is still the
       // one Revolut rejected) and retry once.
-      const forced = await this.refreshAccessToken(row.id, row.expires_at ?? undefined);
+      const forced = await this.#refreshAccessToken(row.id, row.expires_at ?? undefined);
       if (!forced.ok) throw this.tokenError(forced);
       item.retried = true;
       this.queue.unshift(item);
@@ -820,6 +837,24 @@ export class RevolutGate extends DurableObject<Env> {
     }
     if (res.status === 401) throw new RevolutAuthError("unauthorized");
     return { status: res.status, headers: outHeaders, body };
+  }
+
+  /**
+   * A webhook subscription receives every transaction of the account: it may only ever point at
+   * this app's own webhook endpoint (derived from the configured redirect URI's origin).
+   */
+  private checkWebhookTarget(body: string | undefined): void {
+    let target: unknown;
+    let expected: string;
+    try {
+      expected = revolutWebhookUrl(new URL(this.env.REVOLUT_REDIRECT_URI).origin);
+      target = (JSON.parse(body ?? "") as { url?: unknown }).url;
+    } catch {
+      throw new RevolutApiError(400, "invalid revolut request", "webhook_url");
+    }
+    if (target !== expected) {
+      throw new RevolutApiError(400, "invalid revolut request", "webhook_url");
+    }
   }
 
   private tokenError(r: Extract<TokenResult, { ok: false }>): Error {
@@ -830,16 +865,30 @@ export class RevolutGate extends DurableObject<Env> {
       : new RevolutAuthError(r.code);
   }
 
+  /**
+   * How much lifetime must be left for a token to be used without a refresh. Normally
+   * REFRESH_MARGIN_MS; for a token this instance obtained with an unusually short `expires_in`
+   * (two margins or less) half its lifetime, so a short-lived token is not refreshed on every call.
+   */
+  private marginFor(expMs: number): number {
+    const i = this.issued;
+    if (i === null || i.expiresAt !== expMs) return REFRESH_MARGIN_MS;
+    return Math.min(REFRESH_MARGIN_MS, Math.floor((i.expiresAt - i.issuedAt) / 2));
+  }
+
   private async accessTokenFor(row: RevolutConnectionRow): Promise<string> {
     const exp = row.expires_at ? Date.parse(row.expires_at) : 0;
-    if (row.access_token_enc && exp - this.now() > REFRESH_MARGIN_MS) {
+    // While a rotated pair is stashed (D1 write failed), D1's access token is the old one: let
+    // the token authority answer from the stash instead.
+    const stashed = (await this.ctx.storage.get(pendingKey(row.id))) !== undefined;
+    if (!stashed && row.access_token_enc && exp - this.now() > this.marginFor(exp)) {
       try {
         return await decryptToken(keyring(this.env), row.access_token_enc, aad(row.id, "access"));
       } catch {
         throw new RevolutAuthError("token_unreadable");
       }
     }
-    const r = await this.refreshAccessToken(row.id);
+    const r = await this.#refreshAccessToken(row.id);
     if (!r.ok) throw this.tokenError(r);
     return r.accessToken;
   }

@@ -26,11 +26,119 @@ export interface RevolutConnectionRow {
   webhook_id: string | null;
   connected_by: string | null;
   connected_at: string | null;
+  /** Staged connection (status 'pending'): when it expires, its confirm ref, who staged it. */
+  pending_until: string | null;
+  pending_ref: string | null;
+  pending_by: string | null;
+  /** JSON of a PendingSummary (masked facts only), or null while not inspected yet. */
+  pending_summary: string | null;
 }
 
 const COLUMNS = `id, status, access_token_enc, refresh_token_enc, expires_at, last_error,
   revolut_environment, creates_bank_entries, payments_mode, bank_entries_decided_at, webhook_id,
-  connected_by, connected_at`;
+  connected_by, connected_at, pending_until, pending_ref, pending_by, pending_summary`;
+
+/** A staged connection must be confirmed within this long, else its tokens are wiped. */
+export const PENDING_TTL_MS = 15 * 60_000;
+/** last_error of a connection whose staged tokens expired unconfirmed. */
+export const PENDING_EXPIRED = "pending_expired";
+
+/**
+ * What the admin is shown before confirming a staged connection. Masked facts only: never a full
+ * IBAN, a balance amount or a Revolut id. Stored as JSON in pending_summary.
+ */
+export interface PendingSummary {
+  accountCount: number;
+  currencies: string[];
+  /** Account holder names Revolut reports in the bank details (the business name). */
+  holders: string[];
+  accounts: { name: string; currency: string; state: string; last4: string | null }[];
+  /** Accounts this connection had before (bank_accounts rows) and how many of them came back. */
+  previousAccounts: number;
+  matchingAccounts: number;
+  /** False when Revolut's redirect carried no `state` (the flow was bound by the cookie only). */
+  stateEchoed: boolean;
+}
+
+const isStrArr = (v: unknown): v is string[] =>
+  Array.isArray(v) && v.every((x) => typeof x === "string");
+
+/** Parses a stored summary; null when absent or not the expected shape. */
+export function parsePendingSummary(raw: string | null): PendingSummary | null {
+  if (raw === null) return null;
+  try {
+    const v = JSON.parse(raw) as Partial<PendingSummary>;
+    if (
+      !v ||
+      typeof v !== "object" ||
+      !Number.isSafeInteger(v.accountCount) ||
+      !isStrArr(v.currencies) ||
+      !isStrArr(v.holders) ||
+      !Array.isArray(v.accounts) ||
+      !Number.isSafeInteger(v.previousAccounts) ||
+      !Number.isSafeInteger(v.matchingAccounts) ||
+      typeof v.stateEchoed !== "boolean"
+    ) {
+      return null;
+    }
+    return v as PendingSummary;
+  } catch {
+    return null;
+  }
+}
+
+/** A staged row whose confirmation window is still open. */
+export function isLivePending(
+  row: Pick<RevolutConnectionRow, "status" | "pending_until">,
+  nowMs: number,
+): boolean {
+  if (row.status !== "pending" || row.pending_until === null) return false;
+  const until = Date.parse(row.pending_until);
+  return Number.isFinite(until) && until > nowMs;
+}
+
+/**
+ * Wipes the tokens of a staged connection nobody confirmed in time (status 'disabled',
+ * last_error 'pending_expired'), in one batch with its audit row (ADR 0013). A 'pending' row
+ * without an expiry (left over by an interrupted callback) counts as expired. Returns true if it
+ * changed anything. Called lazily (connections list, start, confirm) and by the gate.
+ */
+export async function expireRevolutPending(db: D1Database, nowMs: number): Promise<boolean> {
+  const nowIso = new Date(nowMs).toISOString();
+  const stale = `kind = 'revolut' AND status = 'pending' AND (pending_until IS NULL OR pending_until <= ?1)`;
+  const row = await db
+    .prepare(`SELECT id, pending_by FROM connections WHERE ${stale} ORDER BY id LIMIT 1`)
+    .bind(nowIso)
+    .first<{ id: number; pending_by: string | null }>();
+  if (!row) return false;
+  const results = await db.batch([
+    auditStatement(
+      db,
+      {
+        actorEmail: "system",
+        action: "connection.revolut_pending_expired",
+        entity: "connection",
+        entityId: row.id,
+        before: { status: "pending", stagedBy: row.pending_by },
+        after: { status: "disabled", reason: PENDING_EXPIRED },
+      },
+      {
+        sql: `EXISTS (SELECT 1 FROM connections WHERE id = ?7 AND ${stale.replace("?1", "?8")})`,
+        binds: [row.id, nowIso],
+      },
+    ),
+    db
+      .prepare(
+        `UPDATE connections
+         SET status = 'disabled', last_error = '${PENDING_EXPIRED}', access_token_enc = NULL,
+             refresh_token_enc = NULL, token_ref = NULL, expires_at = NULL, pending_until = NULL,
+             pending_ref = NULL, pending_by = NULL, pending_summary = NULL, updated_at = ?1
+         WHERE id = ?2 AND ${stale}`,
+      )
+      .bind(nowIso, row.id),
+  ]);
+  return (results[1]?.meta.changes ?? 0) === 1;
+}
 
 export const loadRevolutConnection = (db: D1Database): Promise<RevolutConnectionRow | null> =>
   db

@@ -27,9 +27,11 @@ If any of these is missing or malformed, every route except `/api/health` answer
 | `TOKEN_ENC_KEY`          | secret                | 32-byte base64 AES-GCM key for stored tokens: `openssl rand -base64 32 \| wrangler secret put TOKEN_ENC_KEY` |
 | `TOKEN_ENC_KEY_PREVIOUS` | secret, optional      | Old key, accepted for decryption while rotating.                                                             |
 
-Revolut Business (ADR 0031) adds `REVOLUT_CLIENT_ID`, `REVOLUT_REDIRECT_URI` and `REVOLUT_ISSUER`
-(vars; the issuer is the host of the redirect URI) and the secret `REVOLUT_PRIVATE_KEY` (PKCS#8 PEM).
-If any is missing, `/api/connections/revolut/start` answers `500 server_misconfigured`.
+Revolut Business (ADR 0031) adds `REVOLUT_CLIENT_ID`, `REVOLUT_REDIRECT_URI` (https, on the app
+origin, path `/api/connections/revolut/callback`) and `REVOLUT_ISSUER` (vars; the issuer is the host
+of the redirect URI) and the secret `REVOLUT_PRIVATE_KEY` (unencrypted PKCS#8 PEM, RSA 2048 bits or
+more). If any is missing, `/api/connections/revolut/start` and `/callback` answer
+`500 server_misconfigured` and `GET /api/connections` reports `revolutConfigured: false`.
 
 If any is missing, `/api/connections/exact/start` and `/callback` answer
 `500 server_misconfigured`; `GET /api/connections` still works and reports `exactConfigured: false`.

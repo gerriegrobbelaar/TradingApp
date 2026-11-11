@@ -10,7 +10,8 @@ Phase 5 connects Revolut Business (CLAUDE.md section 3): OAuth with a client ass
 our private key), short-lived access tokens, webhooks, and later payments. The Exact side already has
 the pattern (ADRs 0013, 0015, 0016, 0018, 0019, 0021, 0029). This task adds the storage, the
 `RevolutGate` Durable Object, the connect flow and the Connections screen. The typed client, auth
-helpers and webhook verification are task R1; sync, webhook route and the Bank screen are R3.
+helpers and webhook verification are task R1 (ADR 0030, Revolut API assumptions); sync, webhook
+route and the Bank screen are R3.
 
 ## Decisions
 
@@ -18,11 +19,14 @@ helpers and webhook verification are task R1; sync, webhook route and the Bank s
 
 - Migration `0013`. `connections` gets `revolut_environment` (`production`|`sandbox`),
   `payments_mode` (`drafts`|`pay`, default `drafts`), `bank_entries_decided_at`, `webhook_id`,
-  `webhook_secret_enc`, `webhook_secret_prev_enc` (all `ADD COLUMN`, no rebuild). The Revolut client id
+  `webhook_secret_enc`, `webhook_secret_prev_enc`, and for a staged connection `pending_until`,
+  `pending_ref`, `pending_by`, `pending_summary` (all `ADD COLUMN`, no rebuild). The Revolut client id
   is configuration (a Workers var), not per connection.
-- `creates_bank_entries` (default 0 since 0012) is written **explicitly** at connect time from the
-  admin's choice; `bank_entries_decided_at` records when. `NULL` means never decided: later phases
-  must refuse to book bank entries for such a connection. `1` = this app creates the bank entries in
+- `creates_bank_entries` (`NOT NULL DEFAULT 0` since 0012, so "undecided" cannot live in that
+  column) is written **explicitly** at connect time from the admin's choice;
+  `bank_entries_decided_at` records when. `bank_entries_decided_at IS NULL` means never decided (the
+  API reports `createsBankEntries: null`): later phases must refuse to book bank entries for such a
+  connection. `1` = this app creates the bank entries in
   Exact; `0` = Revolut's own Exact integration (or someone else) does, and this app only matches.
 - `bank_transactions` is rebuilt (review S11): unique `(connection_id, external_id, leg_id)` with
   `leg_id TEXT NOT NULL DEFAULT ''`, because one Revolut transaction (a transfer between own accounts,
@@ -80,14 +84,25 @@ helpers and webhook verification are task R1; sync, webhook route and the Bank s
   (`Retry-After` seconds or date, default 60 s, capped at 1 h). There is no daily budget: Revolut
   documents none that we know of. A queued request that would wait over 90 s fails with a retryable
   error.
-- Request validation: a strict allow-list of method + path + API version (`GET /accounts`,
-  `/accounts/{uuid}`, `/accounts/{uuid}/bank-details`, `/transactions`, `/transaction/{id}`,
-  `/counterparties`; on API 2.0 the webhook paths). The host is fixed by the connection's environment
+- Request validation: a strict allow-list of method + path + API version, anchored regexes, no
+  trailing slash, no percent-encoding, UUID account ids (`GET /accounts`, `/accounts/{uuid}`,
+  `/accounts/{uuid}/bank-details`, `/transactions`, `/transaction/{id}`, `/counterparties`; on API
+  2.0 only `POST /webhooks` and `DELETE /webhooks/{uuid}`: reading a webhook returns its signing
+  secret, and rotation is not built yet). A created subscription must point at this app's own
+  webhook URL (`<redirect URI origin>/api/webhooks/revolut`), checked in the gate. The host is fixed by the connection's environment
   (`b2b.revolut.com` or `sandbox-b2b.revolut.com`), redirects are never followed, caller headers are
   limited to `content-type` and `accept`. **Payment endpoints (`/pay`, `/payment-drafts`, `/transfer`,
   counterparty creation) are not on the list in this phase**; Phase 9 adds them behind four-eyes
   controls. A test asserts they are refused.
-- A `pending` connection (tokens just issued, not yet proven) can only call `GET /accounts`.
+- A `pending` (staged, unconfirmed) connection serves only `GET /accounts` and
+  `GET /accounts/{uuid}/bank-details` on API 1.0, only for the connect call (`priority: user`,
+  `jobId: revolut-connect`) and only while `pending_until` is in the future. No job, no webhook, no
+  refresh.
+- The token authority (`#refreshAccessToken`) is a JS-private method: Workers RPC exposes every
+  public Durable Object method, and this one returns a plaintext access token. A token Revolut
+  issued with a short `expires_in` (two margins or less) is refreshed at half its lifetime, not on
+  every call. While a rotated pair is stashed after a D1 failure, calls take the token from the
+  stash, not D1's stale one.
 
 ### Connect flow
 
@@ -98,10 +113,26 @@ helpers and webhook verification are task R1; sync, webhook route and the Bank s
   connection exists is refused (409): disconnect first (the webhook subscription and the data belong
   to one Revolut account).
 - Callback: admin; same session as started the flow; single-use `state` claimed (scope `revolut.flow`)
-  before the code is spent; the exchange uses the client assertion; tokens are staged as `pending`
-  together with the audit row (ADR 0013), then `GET /accounts` through the gate proves the credentials;
-  only then the connection is `active`. If the proof fails, the staged tokens are wiped
-  (`disabled`, `last_error = verification_failed`) and the admin is told.
+  before the code is spent; the exchange uses the client assertion; tokens are **staged** as `pending`
+  together with the audit row (ADR 0013), then the gate reads the account list and bank details and
+  stores a summary of masked facts (account names, currencies, account holder names, last 4 of each
+  IBAN, how many accounts match the ones connected before; never a full IBAN, balance or id). If the
+  read fails, the staged tokens are wiped (`disabled`, `last_error = verification_failed`).
+- **Account substitution defence (review R2).** Whether Revolut echoes `state` on the consent
+  redirect is unverified. Without it the callback cannot prove the code came from the flow this
+  browser started: an attacker could make an admin's browser deliver the attacker's code and connect
+  the attacker's Revolut account. So: when `state` is echoed it must match (else refused); when it is
+  missing the flow is bound by the signed cookie only, which is allowed **only because** a staged
+  connection is useless until `POST /api/connections/revolut/confirm` (admin + step-up, body
+  `{ref, ownAccount: true}`; `ref` is a random id of the staging the admin saw, so a newer staging is
+  never confirmed blindly; `replacesAccounts: true` is also required when none of the accounts match
+  the ones connected before). Unconfirmed stagings expire after **15 minutes**: tokens wiped,
+  `last_error = pending_expired`, audited (`connection.revolut_pending_expired`), swept lazily by the
+  connections list, start, callback and confirm; the gate refuses an expired staging on its own.
+  "Cancel, not our account" is a disconnect. Start is refused (409 `already_connected`) while a
+  connection is active, so a substituted code can never replace a working connection; re-authorising
+  is for `needs_reauth` / `expired`. Audit actions: `revolut_staged`, `revolut_verification_failed`,
+  `revolut_confirmed`, `revolut_pending_expired`, `revolut_disconnected` (`wasStaged`).
 - `POST .../disconnect`: admin + step-up, idempotent, deletes the webhook subscription best effort while
   the tokens still work (outcome in the audit row), then wipes tokens and webhook secrets.
 - `PATCH .../settings`: admin; changing `creates_bank_entries` or `payments_mode` needs a fresh
@@ -119,8 +150,7 @@ helpers and webhook verification are task R1; sync, webhook route and the Bank s
    `https://revolut.com`, RS256, short expiry (R1 builds it).
 5. Consent URL `https://business.revolut.com/app-confirm` (sandbox `sandbox-business.revolut.com`)
    with `client_id`, `redirect_uri`, `response_type=code`; whether Revolut echoes a `state` parameter
-   back is **unverified**. If it does not, the callback cannot match `state` and the flow needs another
-   binding (the signed cookie alone proves the browser, not the redirect).
+   back is **unverified**. Handled either way by the staged-then-confirmed flow above.
 6. Token endpoint `POST https://<api host>/api/1.0/auth/token` with form fields `grant_type`, `code` /
    `refresh_token`, `client_id`, `client_assertion_type`, `client_assertion`; error bodies follow RFC
    6749 (`invalid_grant`, `invalid_client`).
@@ -132,5 +162,8 @@ helpers and webhook verification are task R1; sync, webhook route and the Bank s
 
 - One more Durable Object class and migration tag; the deploy guard checks the binding, `v3`, the
   three vars and that the private key is not in `[vars]`, in both environments.
-- R1 replaces the stubbed `transport.ts` / `auth.ts` in `packages/revolut`; the only consumer of
-  `parseTokenResponse`'s shape is `apps/worker/src/revolut/oauth.ts`.
+- R1's `packages/revolut` (`buildClientAssertion`, `buildAuthorizeUrl`, `buildTokenRequestBody`,
+  `parseTokenResponse` returning `expiresInSeconds` and an optional `refreshToken`) is used through one
+  adapter, `apps/worker/src/revolut/oauth.ts`; the account check uses R1's client through the gate.
+- `REVOLUT_REDIRECT_URI` must be https (R1's consent URL builder and Revolut require it), so local
+  development of the connect flow needs an https tunnel.

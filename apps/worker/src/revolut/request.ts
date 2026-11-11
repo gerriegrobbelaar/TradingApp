@@ -3,8 +3,9 @@
  * (it may be built from data that came from Revolut), so a request must match an entry of a
  * strict allow-list (method + path shape + API version) and the final URL is verified to stay on
  * the connection's Revolut API host. Anything not listed is refused: that includes the token
- * endpoint (only the gate talks to it) and every payment endpoint (/pay, /payment-drafts,
- * /transfer, /counterparty creation): payments are Phase 9, behind four-eyes controls.
+ * endpoint (only the gate talks to it), every payment endpoint (/pay, /payment-drafts,
+ * /transfer, /counterparty creation: payments are Phase 9, behind four-eyes controls) and every
+ * webhook call except creating and deleting the subscription.
  */
 import { RevolutApiError, type RevolutRequest } from "@camelthorn/revolut";
 import { revolutApiHost, type RevolutEnvironment } from "./config";
@@ -28,15 +29,12 @@ const ALLOWED: readonly Allowed[] = [
   { version: "1.0", methods: ["GET"], re: /^\/transactions$/ },
   { version: "1.0", methods: ["GET"], re: new RegExp(`^/transaction/${TX_ID}$`) },
   { version: "1.0", methods: ["GET"], re: /^\/counterparties$/ },
-  // Webhooks (API 2.0): list, create, read, delete, rotate the signing secret, failed deliveries.
-  { version: "2.0", methods: ["GET", "POST"], re: /^\/webhooks$/ },
-  { version: "2.0", methods: ["GET", "DELETE"], re: new RegExp(`^/webhooks/${UUID}$`) },
-  {
-    version: "2.0",
-    methods: ["POST"],
-    re: new RegExp(`^/webhooks/${UUID}/rotate-signing-secret$`),
-  },
-  { version: "2.0", methods: ["GET"], re: new RegExp(`^/webhooks/${UUID}/failed-events$`) },
+  // Webhooks (API 2.0): create our one subscription and delete it, nothing else (review R2).
+  // Reading a webhook returns its signing secret, and rotation is not built yet; a later task
+  // that needs them adds them here with a review. The gate also checks that a created
+  // subscription points at this app's own webhook URL.
+  { version: "2.0", methods: ["POST"], re: /^\/webhooks$/ },
+  { version: "2.0", methods: ["DELETE"], re: new RegExp(`^/webhooks/${UUID}$`) },
 ];
 
 const QUERY_KEY_RE = /^[A-Za-z0-9_$.]{1,64}$/;

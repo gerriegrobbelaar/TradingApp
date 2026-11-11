@@ -172,6 +172,49 @@ describe("migration 0013 on a populated database", () => {
           .first<{ f: number }>()
       )?.f,
     ).toBe(0);
+    // is_final for every allowed state: exactly the four final states CLAUDE.md 3 books.
+    const finals: Record<string, number> = {
+      created: 0,
+      pending: 0,
+      unknown: 0,
+      completed: 1,
+      declined: 1,
+      failed: 1,
+      reverted: 1,
+    };
+    for (const [state, f] of Object.entries(finals)) {
+      await mdb
+        .prepare(
+          `INSERT INTO bank_transactions (connection_id, bank_account_id, external_id, state, amount_minor,
+             currency, booked_at) VALUES (6, 1, ?1, ?2, 1, 'EUR', '2026-02-01T00:00:00Z')`,
+        )
+        .bind(`f-${state}`, state)
+        .run();
+      const got = await mdb
+        .prepare("SELECT is_final AS f FROM bank_transactions WHERE external_id = ?1")
+        .bind(`f-${state}`)
+        .first<{ f: number }>();
+      expect(got?.f, state).toBe(f);
+    }
+    // A state change re-derives it.
+    await mdb
+      .prepare("UPDATE bank_transactions SET state = 'reverted' WHERE external_id = 'f-pending'")
+      .run();
+    expect(
+      (
+        await mdb
+          .prepare("SELECT is_final AS f FROM bank_transactions WHERE external_id = 'f-pending'")
+          .first<{ f: number }>()
+      )?.f,
+    ).toBe(1);
+    // AUTOINCREMENT continued after the carried rows (ids are never reused).
+    expect(
+      (
+        await mdb
+          .prepare("SELECT MIN(id) AS m FROM bank_transactions WHERE external_id LIKE 'f-%'")
+          .first<{ m: number }>()
+      )?.m,
+    ).toBeGreaterThan(2);
     for (const bad of ["state", "source"]) {
       await expect(
         mdb
@@ -205,10 +248,22 @@ describe("migration 0013 on a populated database", () => {
     const conn = await mdb
       .prepare(
         `SELECT creates_bank_entries AS c, payments_mode AS p, revolut_environment AS e,
-           bank_entries_decided_at AS d, webhook_id AS w FROM connections WHERE id = 6`,
+           bank_entries_decided_at AS d, webhook_id AS w, pending_until AS pu, pending_ref AS pr,
+           pending_by AS pb, pending_summary AS ps FROM connections WHERE id = 6`,
       )
       .first();
-    expect(conn).toEqual({ c: 1, p: "drafts", e: null, d: null, w: null });
+    // A pre-existing 'pending' Revolut row has no staging window: the app treats it as expired.
+    expect(conn).toEqual({
+      c: 1,
+      p: "drafts",
+      e: null,
+      d: null,
+      w: null,
+      pu: null,
+      pr: null,
+      pb: null,
+      ps: null,
+    });
     await expect(
       mdb.prepare("UPDATE connections SET payments_mode = 'auto' WHERE id = 6").run(),
     ).rejects.toThrow();

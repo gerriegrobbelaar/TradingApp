@@ -14,6 +14,8 @@ import {
 import worker from "../src/index";
 import { loadWebhookSecrets, saveWebhookSecret } from "../src/revolut/store";
 import { loadRevolutConfig } from "../src/revolut/config";
+import { getRevolutGate } from "../src/revolut/gate-transport";
+import type { RevolutRequest } from "@camelthorn/revolut";
 import { authorizeUrl } from "../src/revolut/oauth";
 import {
   auditActions,
@@ -22,6 +24,7 @@ import {
   seedRevolut,
   storedRevolut,
   stubRevolut,
+  type ApiCall,
   type RevolutStub,
 } from "./revolut-helpers";
 
@@ -41,8 +44,65 @@ beforeEach(async () => {
   adminTok = await addSession(adminId);
   stub = stubRevolut();
   stub.token = (_f, n) => rotatedOk(n + 100);
-  stub.api = () => Response.json([{ id: "acc-1", name: "Main", currency: "EUR", balance: 100 }]);
+  stub.api = ourAccounts;
 });
+
+const ACC_EUR = "0f1e2d3c-4b5a-4968-8776-655443322110";
+const ACC_USD = "1f1e2d3c-4b5a-4968-8776-655443322111";
+const OUR_IBAN = "GB33REVO00996912345678";
+
+/** Revolut's answers for our own business: two accounts, bank details with IBAN and holder. */
+function ourAccounts(c: ApiCall): Response {
+  if (c.url.pathname === "/api/1.0/accounts") {
+    return Response.json([
+      { id: ACC_EUR, name: "Main", currency: "EUR", balance: 1234.5, state: "active" },
+      { id: ACC_USD, name: "Dollars", currency: "USD", balance: 10, state: "active" },
+    ]);
+  }
+  if (c.url.pathname === `/api/1.0/accounts/${ACC_EUR}/bank-details`) {
+    return Response.json([
+      { iban: OUR_IBAN, bic: "REVOGB21", beneficiary: "Camelthorn Advisory B.V.", schemes: [] },
+    ]);
+  }
+  return Response.json([]);
+}
+
+/** The attacker's Revolut business, reached with the attacker's authorisation code. */
+function attackerAccounts(c: ApiCall): Response {
+  if (c.url.pathname === "/api/1.0/accounts") {
+    return Response.json([
+      {
+        id: ACC_EUR.replace("0f", "9f"),
+        name: "Mule",
+        currency: "EUR",
+        balance: 1,
+        state: "active",
+      },
+    ]);
+  }
+  if (c.url.pathname.endsWith("/bank-details")) {
+    return Response.json([{ iban: "LT601010012345678901", beneficiary: "Evil Ltd", schemes: [] }]);
+  }
+  return Response.json([]);
+}
+
+const confirm = (json: unknown, token = adminTok) =>
+  authed("/api/connections/revolut/confirm", token, { method: "POST", json });
+
+/** The ref of the staged connection, as the admin's connections list shows it. */
+async function pendingRef(token = adminTok): Promise<string> {
+  const body = (await (await authed("/api/connections", token)).json()) as {
+    connections: { kind: string; revolut?: { pending: { ref?: string } | null } }[];
+  };
+  return body.connections.find((c) => c.kind === "revolut")?.revolut?.pending?.ref ?? "";
+}
+
+/** Callback and confirmation, the whole happy path. */
+async function connectFully(s: Started): Promise<Response> {
+  const res = await callback(s);
+  expect(res.headers.get("location")).toBe("/settings/connections?revolut=confirm");
+  return confirm({ ref: await pendingRef(), ownAccount: true });
+}
 afterEach(() => stub.restore());
 
 interface Started {
@@ -63,15 +123,20 @@ async function start(token = adminTok, query = Q): Promise<Started> {
 }
 
 const callback = (
-  s: { state: string; flowCookie: string },
+  s: { state: string | null; flowCookie: string },
   token = adminTok,
   query = "code=the-code",
 ) =>
-  call(`/api/connections/revolut/callback?${query}&state=${encodeURIComponent(s.state)}`, {
-    headers: {
-      cookie: `__Host-session=${token}${s.flowCookie ? `; ${FLOW}=${s.flowCookie}` : ""}`,
+  call(
+    `/api/connections/revolut/callback?${query}${
+      s.state === null ? "" : `&state=${encodeURIComponent(s.state)}`
+    }`,
+    {
+      headers: {
+        cookie: `__Host-session=${token}${s.flowCookie ? `; ${FLOW}=${s.flowCookie}` : ""}`,
+      },
     },
-  });
+  );
 
 const row = () =>
   db
@@ -171,7 +236,7 @@ describe("GET /api/connections/revolut/start", () => {
   });
 
   it("refuses to switch environment while a connection exists", async () => {
-    await seedRevolut({ environment: "production" });
+    await seedRevolut({ environment: "production", status: "needs_reauth" });
     const res = await authed(
       "/api/connections/revolut/start?environment=sandbox&creates_bank_entries=0",
       adminTok,
@@ -181,17 +246,48 @@ describe("GET /api/connections/revolut/start", () => {
     // Same environment (re-authorise) is fine.
     expect((await authed(`/api/connections/revolut/start${Q}`, adminTok)).status).toBe(302);
   });
+
+  it("refuses to start over a working connection (it could be taken over): disconnect first", async () => {
+    await seedRevolut({ environment: "production" });
+    const res = await authed(`/api/connections/revolut/start${Q}`, adminTok);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: "already_connected" });
+  });
 });
 
 describe("GET /api/connections/revolut/callback", () => {
-  it("stores encrypted tokens, proves them with GET /accounts through the gate and audits", async () => {
+  it("stages encrypted tokens, reads the accounts through the gate, and activates only on confirm", async () => {
     const s = await start(
       adminTok,
       "?environment=production&creates_bank_entries=1&payments_mode=pay",
     );
     const res = await callback(s);
     expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("/settings/connections?revolut=connected");
+    expect(res.headers.get("location")).toBe("/settings/connections?revolut=confirm");
+    const staged = await row();
+    expect(staged).toMatchObject({ status: "pending", pending_by: ADMIN, connected_by: null });
+    const until = Date.parse(String(staged?.["pending_until"])) - Date.now();
+    expect(until).toBeGreaterThan(14 * 60_000);
+    expect(until).toBeLessThanOrEqual(15 * 60_000);
+    // The summary holds masked facts only: no full IBAN, no balance, no Revolut id.
+    const summary = String(staged?.["pending_summary"]);
+    expect(JSON.parse(summary)).toEqual({
+      accountCount: 2,
+      currencies: ["EUR", "USD"],
+      holders: ["Camelthorn Advisory B.V."],
+      accounts: [
+        { name: "Main", currency: "EUR", state: "active", last4: "5678" },
+        { name: "Dollars", currency: "USD", state: "active", last4: null },
+      ],
+      previousAccounts: 0,
+      matchingAccounts: 0,
+      stateEchoed: true,
+    });
+    expect(summary).not.toMatch(new RegExp(`${OUR_IBAN}|${ACC_EUR}|1234`));
+
+    const ok = await confirm({ ref: await pendingRef(), ownAccount: true });
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toEqual({ ok: true });
 
     const form = stub.tokenCalls[0];
     expect(form?.get("grant_type")).toBe("authorization_code");
@@ -220,9 +316,13 @@ describe("GET /api/connections/revolut/callback", () => {
     expect(expiry).toBeGreaterThan(2390_000);
     expect(expiry).toBeLessThanOrEqual(2400_000);
 
-    expect(stub.apiCalls).toHaveLength(1);
-    expect(stub.apiCalls[0]?.url.pathname).toBe("/api/1.0/accounts");
-    expect(stub.apiCalls[0]?.headers.authorization).toBe("Bearer racc-101");
+    expect(r).toMatchObject({ pending_until: null, pending_ref: null, pending_summary: null });
+    expect(stub.apiCalls.map((c) => c.url.pathname)).toEqual([
+      "/api/1.0/accounts",
+      `/api/1.0/accounts/${ACC_EUR}/bank-details`,
+      `/api/1.0/accounts/${ACC_USD}/bank-details`,
+    ]);
+    expect(stub.apiCalls.every((c) => c.headers.authorization === "Bearer racc-101")).toBe(true);
 
     const audit = await db
       .prepare(
@@ -230,18 +330,21 @@ describe("GET /api/connections/revolut/callback", () => {
       )
       .all<{ actor_email: string; action: string; after_json: string }>();
     expect(audit.results.map((a) => a.action)).toEqual([
-      "connection.revolut_authorized",
-      "connection.revolut_connected",
+      "connection.revolut_staged",
+      "connection.revolut_confirmed",
     ]);
     expect(audit.results.every((a) => a.actor_email === ADMIN)).toBe(true);
     expect(audit.results[0]?.after_json).toMatch(/"createsBankEntries":true/);
-    expect(JSON.stringify(audit.results)).not.toMatch(/racc-|rref-|the-code|PRIVATE KEY|eyJ/);
+    expect(audit.results[1]?.after_json).toContain("Camelthorn Advisory B.V.");
+    expect(JSON.stringify(audit.results)).not.toMatch(
+      new RegExp(`racc-|rref-|the-code|PRIVATE KEY|eyJ|${OUR_IBAN}`),
+    );
   });
 
   it("stores the explicit creates_bank_entries = 0 and the sandbox environment", async () => {
     stub.hosts = new Set(["sandbox-b2b.revolut.com"]);
     const s = await start(adminTok, "?environment=sandbox&creates_bank_entries=0");
-    expect((await callback(s)).headers.get("location")).toContain("revolut=connected");
+    expect((await connectFully(s)).status).toBe(200);
     expect(await row()).toMatchObject({
       status: "active",
       revolut_environment: "sandbox",
@@ -253,7 +356,7 @@ describe("GET /api/connections/revolut/callback", () => {
 
   it("is single use: replaying the same callback does nothing", async () => {
     const s = await start();
-    expect((await callback(s)).headers.get("location")).toContain("revolut=connected");
+    expect((await connectFully(s)).status).toBe(200);
     stub.tokenCalls.length = 0;
     const again = await callback(s);
     expect(again.headers.get("location")).toBe("/settings/connections?revolut=denied");
@@ -316,11 +419,11 @@ describe("GET /api/connections/revolut/callback", () => {
 
   it("reports an error and stores nothing when the code exchange fails", async () => {
     stub.token = () => Response.json({ error: "invalid_grant" }, { status: 400 });
-    const audited = await auditActions("connection.revolut_connected");
+    const audited = await auditActions("connection.revolut_staged");
     const res = await callback(await start());
     expect(res.headers.get("location")).toBe("/settings/connections?revolut=error");
     expect(await row()).toBeNull();
-    expect(await auditActions("connection.revolut_connected")).toBe(audited);
+    expect(await auditActions("connection.revolut_staged")).toBe(audited);
   });
 
   it("an exchange answer without a refresh token is an error (the connection could not last)", async () => {
@@ -333,7 +436,7 @@ describe("GET /api/connections/revolut/callback", () => {
   it("removes the sign-in again when GET /accounts fails (credentials not proven)", async () => {
     stub.api = () => new Response("nope", { status: 500 });
     const failedBefore = await auditActions("connection.revolut_verification_failed");
-    const connectedBefore = await auditActions("connection.revolut_connected");
+    const connectedBefore = await auditActions("connection.revolut_confirmed");
     const res = await callback(await start());
     expect(res.headers.get("location")).toBe("/settings/connections?revolut=unverified");
     const r = await row();
@@ -344,7 +447,8 @@ describe("GET /api/connections/revolut/callback", () => {
       refresh_token_enc: null,
     });
     expect(await auditActions("connection.revolut_verification_failed")).toBe(failedBefore + 1);
-    expect(await auditActions("connection.revolut_connected")).toBe(connectedBefore);
+    expect(await auditActions("connection.revolut_confirmed")).toBe(connectedBefore);
+    expect(r).toMatchObject({ pending_ref: null, pending_summary: null, pending_until: null });
   });
 
   it("removes the sign-in when GET /accounts answers something that is not an account list", async () => {
@@ -368,7 +472,10 @@ describe("GET /api/connections/revolut/callback", () => {
       refresh: "old",
       createsBankEntries: false,
     });
-    await callback(await start(adminTok, "?environment=production&creates_bank_entries=1"));
+    expect(
+      (await connectFully(await start(adminTok, "?environment=production&creates_bank_entries=1")))
+        .status,
+    ).toBe(200);
     const rows = await db
       .prepare("SELECT id, status, creates_bank_entries FROM connections WHERE kind = 'revolut'")
       .all<{ id: number; status: string; creates_bank_entries: number }>();
@@ -376,10 +483,266 @@ describe("GET /api/connections/revolut/callback", () => {
     expect(await storedRevolut(id)).toMatchObject({ access: "racc-101", refresh: "rref-101" });
     const audit = await db
       .prepare(
-        "SELECT before_json FROM audit_log WHERE action = 'connection.revolut_authorized' ORDER BY id DESC",
+        "SELECT before_json FROM audit_log WHERE action = 'connection.revolut_staged' ORDER BY id DESC",
       )
       .first<{ before_json: string }>();
     expect(audit?.before_json).toContain('"createsBankEntries":false');
+  });
+});
+
+describe("account substitution defence: staged connection and confirmation", () => {
+  // audit_log is append-only (never reset): count from a baseline.
+  let base: Record<string, number> = {};
+  const ACTIONS = ["connection.revolut_confirmed", "connection.revolut_pending_expired"];
+  beforeEach(async () => {
+    base = {};
+    for (const a of ACTIONS) base[a] = await auditActions(a);
+  });
+  const audited = async (a: string) => (await auditActions(a)) - (base[a] ?? 0);
+  const job = (id: number, over: Partial<RevolutRequest> = {}) =>
+    getRevolutGate(env, id).call({
+      method: "GET",
+      path: "/accounts",
+      connectionId: id,
+      priority: "job",
+      jobId: "revolut-sync",
+      ...over,
+    });
+
+  it("an attacker's code delivered without `state` is only staged: unusable until an admin confirms", async () => {
+    // The admin started a flow; the attacker makes the admin's browser land on the callback with
+    // the attacker's own authorisation code and no state (Revolut may not echo it).
+    const s = await start();
+    stub.api = attackerAccounts;
+    const res = await callback({ ...s, state: null }, adminTok, "code=attacker-code");
+    expect(res.headers.get("location")).toBe("/settings/connections?revolut=confirm");
+    const r = await row();
+    const id = r?.["id"] as number;
+    expect(r?.["status"]).toBe("pending");
+    const summary = JSON.parse(String(r?.["pending_summary"])) as Record<string, unknown>;
+    expect(summary).toMatchObject({
+      holders: ["Evil Ltd"],
+      accounts: [{ name: "Mule", currency: "EUR", state: "active", last4: "8901" }],
+      stateEchoed: false,
+    });
+
+    // Nothing can use the staged tokens: no job, no transactions, no webhook, no counterparty.
+    stub.apiCalls.length = 0;
+    expect(await job(id)).toMatchObject({
+      ok: false,
+      error: { kind: "auth", code: "not_connected" },
+    });
+    for (const over of [
+      { path: "/transactions", priority: "user", jobId: "revolut-connect" },
+      { path: "/accounts", priority: "user", jobId: "manual" },
+      {
+        method: "POST",
+        path: "/webhooks",
+        apiVersion: "2.0",
+        body: JSON.stringify({ url: "https://app.test/api/webhooks/revolut" }),
+        priority: "user",
+        jobId: "revolut-connect",
+      },
+    ] as Partial<RevolutRequest>[]) {
+      expect(await job(id, over), JSON.stringify(over)).toMatchObject({ ok: false });
+    }
+    expect(stub.apiCalls).toHaveLength(0);
+
+    // The admin sees "Evil Ltd" and cancels: tokens wiped, audited.
+    const cancel = await authed("/api/connections/revolut/disconnect", adminTok, {
+      method: "POST",
+    });
+    expect(await cancel.json()).toEqual({ ok: true, changed: true });
+    expect(await storedRevolut(id)).toMatchObject({
+      status: "disabled",
+      access: null,
+      refresh: null,
+    });
+    expect(await row()).toMatchObject({ pending_summary: null, pending_ref: null });
+    const a = await db
+      .prepare(
+        "SELECT after_json FROM audit_log WHERE action = 'connection.revolut_disconnected' ORDER BY id DESC",
+      )
+      .first<{ after_json: string }>();
+    expect(a?.after_json).toContain('"wasStaged":true');
+    expect(await audited("connection.revolut_confirmed")).toBe(0);
+  });
+
+  it("a state that IS echoed must match (a mismatch is refused before the code is spent)", async () => {
+    const s = await start();
+    const res = await callback({ ...s, state: "someone-elses" });
+    expect(res.headers.get("location")).toBe("/settings/connections?revolut=denied");
+    expect(stub.tokenCalls).toHaveLength(0);
+  });
+
+  it("confirm needs the tick, the matching ref, admin and a fresh sign-in", async () => {
+    await callback(await start());
+    const ref = await pendingRef();
+    expect(ref.length).toBeGreaterThanOrEqual(20);
+    for (const body of [{ ref }, { ref, ownAccount: "yes" }, { ref, ownAccount: false }]) {
+      const r = await confirm(body);
+      expect(r.status, JSON.stringify(body)).toBe(400);
+      expect(await r.json()).toEqual({ error: "own_account_confirmation_required" });
+    }
+    for (const body of [
+      {},
+      { ownAccount: true },
+      { ref: 1, ownAccount: true },
+      { ref, ownAccount: true, x: 1 },
+      [],
+      null,
+    ]) {
+      expect((await confirm(body)).status, JSON.stringify(body)).toBe(400);
+    }
+    const wrong = await confirm({ ref: `${ref}x`, ownAccount: true });
+    expect(wrong.status).toBe(409);
+    expect(await wrong.json()).toEqual({ error: "nothing_to_confirm" });
+
+    const stale = await addSession(adminId, { lastAuthAgoMs: 20 * 60 * 1000 });
+    expect((await confirm({ ref, ownAccount: true }, stale)).status).toBe(401);
+    for (const role of ["finance", "approver", "viewer"] as const) {
+      const t = await addSession(await addUser(`${role}@camelthorncapital.com`, [role]));
+      expect((await confirm({ ref, ownAccount: true }, t)).status).toBe(403);
+    }
+    const noCsrf = await call("/api/connections/revolut/confirm", {
+      method: "POST",
+      headers: { cookie: `__Host-session=${adminTok}`, "content-type": "application/json" },
+      body: JSON.stringify({ ref, ownAccount: true }),
+    });
+    expect(noCsrf.status).toBe(403);
+    expect((await row())?.["status"]).toBe("pending");
+    expect(await audited("connection.revolut_confirmed")).toBe(0);
+  });
+
+  it("only admins see the confirm ref; everyone sees masked facts only", async () => {
+    await callback(await start());
+    const viewer = await addSession(await addUser("v@camelthorncapital.com", ["viewer"]));
+    const text = await (await authed("/api/connections", viewer)).text();
+    expect(text).not.toMatch(new RegExp(`${OUR_IBAN}|${ACC_EUR}|racc-|rref-`));
+    const body = JSON.parse(text) as {
+      connections: {
+        kind: string;
+        status: string;
+        revolut: { pending: Record<string, unknown> };
+      }[];
+    };
+    const rv = body.connections.find((c) => c.kind === "revolut");
+    expect(rv?.status).toBe("pending");
+    expect(rv?.revolut.pending).toMatchObject({ stagedBy: ADMIN, summary: { accountCount: 2 } });
+    expect(rv?.revolut.pending["ref"]).toBeUndefined();
+    expect(await pendingRef()).not.toBe("");
+  });
+
+  it("double confirm: the second one changes nothing and writes no audit row", async () => {
+    await callback(await start());
+    const ref = await pendingRef();
+    const [a, b] = await Promise.all([
+      confirm({ ref, ownAccount: true }),
+      confirm({ ref, ownAccount: true }),
+    ]);
+    expect([a.status, b.status].sort()).toEqual([200, 409]);
+    expect((await confirm({ ref, ownAccount: true })).status).toBe(409);
+    expect(await audited("connection.revolut_confirmed")).toBe(1);
+    expect((await row())?.["status"]).toBe("active");
+  });
+
+  it("an unconfirmed staging expires after 15 minutes: tokens wiped, audited, unusable", async () => {
+    await callback(await start());
+    const id = (await row())?.["id"] as number;
+    const ref = await pendingRef();
+    // The gate stops serving it the moment the window closes, before any sweep ran.
+    await db
+      .prepare("UPDATE connections SET pending_until = ?2 WHERE id = ?1")
+      .bind(id, new Date(Date.now() - 1000).toISOString())
+      .run();
+    expect(
+      await getRevolutGate(env, id).call({
+        method: "GET",
+        path: "/accounts",
+        connectionId: id,
+        priority: "user",
+        jobId: "revolut-connect",
+      }),
+    ).toMatchObject({ ok: false, error: { kind: "auth", code: "not_connected" } });
+    const res = await confirm({ ref, ownAccount: true });
+    expect(res.status).toBe(410);
+    expect(await res.json()).toEqual({ error: "pending_expired" });
+    expect(await storedRevolut(id)).toMatchObject({
+      status: "disabled",
+      lastError: "pending_expired",
+      access: null,
+      refresh: null,
+    });
+    expect(await row()).toMatchObject({
+      pending_ref: null,
+      pending_summary: null,
+      expires_at: null,
+    });
+    expect(await audited("connection.revolut_pending_expired")).toBe(1);
+    expect(await audited("connection.revolut_confirmed")).toBe(0);
+    // Sweeping again does nothing more.
+    await authed("/api/connections", adminTok);
+    expect(await audited("connection.revolut_pending_expired")).toBe(1);
+  });
+
+  it("the connections list sweeps an expired staging too", async () => {
+    await callback(await start());
+    await db
+      .prepare("UPDATE connections SET pending_until = ?1 WHERE kind = 'revolut'")
+      .bind(new Date(Date.now() - 1).toISOString())
+      .run();
+    const body = (await (await authed("/api/connections", adminTok)).json()) as {
+      connections: { kind: string; status: string; lastError: string | null }[];
+    };
+    expect(body.connections.find((c) => c.kind === "revolut")).toMatchObject({
+      status: "disabled",
+      lastError: "pending_expired",
+    });
+    expect(await audited("connection.revolut_pending_expired")).toBe(1);
+  });
+
+  it("a staging whose accounts all differ from the ones connected before needs its own flag", async () => {
+    const id = await seedRevolut({ status: "needs_reauth" });
+    await db
+      .prepare(
+        "INSERT INTO bank_accounts (connection_id, external_id, name, currency) VALUES (?1, 'old-acc', 'Old', 'EUR')",
+      )
+      .bind(id)
+      .run();
+    await callback(await start());
+    const ref = await pendingRef();
+    const r1 = await confirm({ ref, ownAccount: true });
+    expect(r1.status).toBe(409);
+    expect(await r1.json()).toEqual({ error: "different_account_confirmation_required" });
+    expect((await confirm({ ref, ownAccount: true, replacesAccounts: true })).status).toBe(200);
+    const a = await db
+      .prepare(
+        "SELECT after_json FROM audit_log WHERE action = 'connection.revolut_confirmed' ORDER BY id DESC",
+      )
+      .first<{ after_json: string }>();
+    expect(a?.after_json).toContain('"replacesAccounts":true');
+  });
+
+  it("the same accounts as before need no extra flag", async () => {
+    const id = await seedRevolut({ status: "needs_reauth" });
+    await db
+      .prepare(
+        "INSERT INTO bank_accounts (connection_id, external_id, name, currency) VALUES (?1, ?2, 'Main', 'EUR')",
+      )
+      .bind(id, ACC_EUR)
+      .run();
+    await callback(await start());
+    expect(JSON.parse(String((await row())?.["pending_summary"]))).toMatchObject({
+      previousAccounts: 1,
+      matchingAccounts: 1,
+    });
+    expect((await confirm({ ref: await pendingRef(), ownAccount: true })).status).toBe(200);
+  });
+
+  it("nothing to confirm without a staging", async () => {
+    expect((await confirm({ ref: "abc", ownAccount: true })).status).toBe(409);
+    await seedRevolut();
+    expect((await confirm({ ref: "abc", ownAccount: true })).status).toBe(409);
   });
 });
 
