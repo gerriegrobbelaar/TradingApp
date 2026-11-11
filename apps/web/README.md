@@ -15,7 +15,7 @@ build in Chrome with the API mocked, take the screenshots in `docs/design/screen
 width (no sideways page scroll), axe, console and CSP errors, and the print stylesheet. A screen
 that starts a new request (the ECB rates in Phase 6 added `GET /api/fx/rates` to every signed-in
 screen) must add that request to the `api()` mock of EVERY script. Answers go through
-`scripts/api-mock.ts`: a path no mock knows gets a 404 and is recorded, and every suite fails a
+`scripts/api-mock.ts` (matching and booking endpoints: `scripts/matching-mock.ts`, called from every suite's default branch): a path no mock knows gets a 404 and is recorded, and every suite fails a
 test that hit one ("GET /api/x" in the assertion). Phase 6 shipped with seven failing K3b tests for
 exactly that reason.
 
@@ -28,6 +28,6 @@ PLAYWRIGHT_PATH=/opt/node22/lib/node_modules/playwright/index.mjs \
 ```
 
 Needs Playwright (`PLAYWRIGHT_PATH`, default `playwright`), Chrome (`CHROME_PATH`, default
-`/usr/bin/google-chrome`) and poppler's `pdfinfo`, `pdftoppm`, `pdftotext`. Expect all five files
-(K3b, R2, R3b, Q2, F3) to pass. Set `OUT_DIR` to write the
+`/usr/bin/google-chrome`) and poppler's `pdfinfo`, `pdftoppm`, `pdftotext`. Expect all six files
+(K3b, R2, R3b, Q2, F3, M7d) to pass. Set `OUT_DIR` to write the
 screenshots elsewhere. Commit the regenerated screenshots only for the screens a change touched.

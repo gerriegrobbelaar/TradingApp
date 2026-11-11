@@ -4,9 +4,11 @@ import type {
   BankAccountsResponse,
   BankTransactionDto,
   BankTransactionsResponse,
+  MatchStatsResponse,
 } from "@camelthorn/core";
 import { Card, Segmented, Skeleton } from "@camelthorn/ui";
 import { getBankAccounts, listBankTransactions } from "../api";
+import { getMatchStats } from "../api-matching";
 import { useMe } from "../auth";
 import { useFxRates } from "../fx";
 import { sumInBase, totalsWording } from "../lib/fx";
@@ -24,6 +26,9 @@ import { EmptyState, ErrorNotice } from "../components/EmptyState";
 import { ActiveFilter, FilterBar } from "../components/FilterBar";
 import { FxStaleChip } from "../components/FxAmount";
 import { ConvertedNote } from "../components/FxTotals";
+import { AutoMatchedList } from "../components/matching/AutoMatchedList";
+import { IgnoredList } from "../components/matching/IgnoredList";
+import { ReviewQueue } from "../components/matching/ReviewQueue";
 import { PageHeader } from "../components/PageHeader";
 import {
   DIRECTION_FILTERS,
@@ -58,7 +63,15 @@ const isDay = (v: string | null): v is string =>
   v <= MAX_DAY &&
   formatDate(v) !== NO_VALUE;
 
-const OWN = ["account", "state", "direction", "from", "to"] as const;
+const OWN = ["account", "state", "direction", "from", "to", "tab", "queue"] as const;
+
+/** The views of the Bank screen; the address carries `tab` (none means Transactions). */
+export type BankTab = "transactions" | "review" | "auto" | "ignored";
+const TABS: readonly BankTab[] = ["transactions", "review", "auto", "ignored"];
+const isTab = (v: string | null): v is BankTab =>
+  v !== null && v !== "transactions" && (TABS as readonly string[]).includes(v);
+/** Filters that only belong to the Transactions view. */
+const TX_ONLY = ["state", "direction", "from", "to"] as const;
 
 /** What a connection that is not active means, in words; null when it is active. */
 function connectionProblem(status: string): { title: string; body: string } | null {
@@ -222,6 +235,10 @@ export function Bank() {
   const rawDirection = params.get("direction");
   const rawFrom = params.get("from");
   const rawTo = params.get("to");
+  const rawTab = params.get("tab");
+  const rawQueue = params.get("queue");
+  const tab: BankTab = isTab(rawTab) ? rawTab : "transactions";
+  const queue: "review" | "suggested" = rawQueue === "suggested" ? "suggested" : "review";
   const account = rawAccount !== null && POSITIVE_ID.test(rawAccount) ? rawAccount : "";
   const state: BankStateFilter = isState(rawState) ? rawState : "all";
   const direction: BankDirectionFilter = isDirection(rawDirection) ? rawDirection : "all";
@@ -252,7 +269,9 @@ export function Bank() {
     (rawState !== null && !isState(rawState)) ||
     (rawDirection !== null && !isDirection(rawDirection)) ||
     (rawFrom !== null && from === "") ||
-    (rawTo !== null && to === "");
+    (rawTo !== null && to === "") ||
+    (rawTab !== null && !isTab(rawTab)) ||
+    (rawQueue !== null && rawQueue !== "suggested");
   useEffect(() => {
     if (!invalid) return;
     const patch: Record<string, string | null> = {};
@@ -263,8 +282,10 @@ export function Bank() {
     if (!isDirection(rawDirection)) patch["direction"] = null;
     if (from === "") patch["from"] = null;
     if (to === "") patch["to"] = null;
+    if (!isTab(rawTab)) patch["tab"] = null;
+    if (rawQueue !== "suggested") patch["queue"] = null;
     setParam(patch, "replace");
-  }, [invalid, params, account, rawState, rawDirection, from, to, setParam]);
+  }, [invalid, params, account, rawState, rawDirection, from, to, rawTab, rawQueue, setParam]);
 
   const accounts = useResource<BankAccountsResponse>("bank-accounts", (signal) =>
     getBankAccounts(signal),
@@ -272,6 +293,19 @@ export function Bank() {
   const accountsData = accounts.data;
   const connected = accountsData?.connection != null;
   const available = connected && accountsData?.available === true;
+
+  // Counts on the tabs. A failure only hides the numbers; the tabs still work.
+  const stats = useResource<MatchStatsResponse>(available ? "match-stats" : null, (signal) =>
+    getMatchStats(signal),
+  );
+  const statsData = stats.status === "ready" ? stats.data : null;
+  const reloadStats = stats.reload;
+  const goTab = (next: BankTab) => {
+    const patch: Record<string, string | null> = { tab: next === "transactions" ? null : next };
+    if (next !== "review") patch["queue"] = null;
+    if (next !== "transactions") for (const k of TX_ONLY) patch[k] = null;
+    setParam(patch);
+  };
 
   const rangeBad = from !== "" && to !== "" && from > to;
   const [sheetId, setSheetId] = useState<number | null>(null);
@@ -287,7 +321,7 @@ export function Bank() {
     }),
     [account, state, direction, from, to, q],
   );
-  const ready = available && !invalid && !rangeBad;
+  const ready = available && !invalid && !rangeBad && tab === "transactions";
   const key = ready ? `bank-tx:${JSON.stringify(query)}` : null;
   const list = useCursorList<BankTransactionDto, BankTransactionsResponse>(
     key,
@@ -419,11 +453,66 @@ export function Bank() {
       <PageHeader
         eyebrow="Treasury"
         title="Bank"
-        lede="Revolut balances and transactions. Read-only."
+        lede="Revolut balances and transactions, and matching them to invoices."
         tools={<BankStamp freshness={accountsData?.freshness ?? null} connected={connected} />}
       />
       <Card>{accountsBlock}</Card>
       {available && (
+        <div className="bank-tabs">
+          <Segmented
+            label="Bank view"
+            value={tab}
+            options={[
+              { value: "transactions", label: "Transactions" },
+              {
+                value: "review",
+                label: "To review",
+                ...(statsData ? { count: statsData.unmatched + statsData.suggested } : {}),
+              },
+              {
+                value: "auto",
+                label: "Matched automatically",
+                ...(statsData ? { count: statsData.liveAutoMatches } : {}),
+              },
+              {
+                value: "ignored",
+                label: "Ignored",
+                ...(statsData ? { count: statsData.ignored } : {}),
+              },
+            ]}
+            onChange={goTab}
+          />
+        </div>
+      )}
+      {available && tab !== "transactions" && (
+        <Card className="bank-tx match-tab">
+          <h2 className="h2" id="match-heading">
+            {tab === "review" ? "To review" : tab === "auto" ? "Matched automatically" : "Ignored"}
+          </h2>
+          {tab === "review" && (
+            <ReviewQueue
+              account={account}
+              accountName={accountName}
+              status={queue}
+              onStatus={(v) => setParam({ queue: v === "review" ? null : v })}
+              onClearAccount={() => setParam({ account: null })}
+              onChanged={reloadStats}
+            />
+          )}
+          {tab === "auto" && (
+            <AutoMatchedList autoEnabled={statsData?.autoEnabled ?? null} onChanged={reloadStats} />
+          )}
+          {tab === "ignored" && (
+            <IgnoredList
+              account={account}
+              accountName={accountName}
+              onClearAccount={() => setParam({ account: null })}
+              onChanged={reloadStats}
+            />
+          )}
+        </Card>
+      )}
+      {available && tab === "transactions" && (
         <Card className="bank-tx">
           <h2 className="h2" id="tx-heading">
             Transactions

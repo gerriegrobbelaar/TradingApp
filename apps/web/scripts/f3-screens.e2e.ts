@@ -12,6 +12,7 @@ import { extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { answerApi, takeUnmocked, type MockRoute } from "./api-mock";
+import { matchingApi } from "./matching-mock";
 import type { KpiAmountDto } from "@camelthorn/core";
 import { account, accounts, tx, txDetail, txs } from "../src/test-fixtures-bank";
 import {
@@ -209,7 +210,7 @@ function api(pathname: string, scene: Scene): unknown {
     case "/api/bank/transactions/10":
       return txDetail(BANK_TX);
     default:
-      return null;
+      return matchingApi(pathname);
   }
 }
 

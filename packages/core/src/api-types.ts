@@ -960,3 +960,53 @@ export interface MatchStatsResponse {
   /** Active Revolut accounts without an Exact administration mapping. */
   unmappedAccounts: number;
 }
+
+// ---- Booking in Exact (Phase 7, M7c). Fixed shapes shared with the web (M7d). -----------------------
+// GET /api/booking/settings ; PUT /api/booking/settings {enabled, confirm, note?} ;
+// POST /api/booking/verify {note, confirm} ; GET /api/booking/outbox?status=&limit=&cursor= ;
+// POST /api/booking/outbox/:id/resolve {resolution: 'booked_manually'|'retry'|'give_up', note}
+
+export type BookingStatus =
+  | "pending"
+  | "sending"
+  | "sent_unverified"
+  | "verified"
+  | "failed"
+  | "outcome_unknown"
+  | "manual_required"
+  | "waiting_for_bank_line"
+  | "resolved_manually"
+  | "given_up";
+
+export interface BookingOutboxItemDto {
+  id: number;
+  matchId: number;
+  kind: "bank_entry" | "matchset";
+  status: BookingStatus;
+  attempts: number;
+  lastErrorCode: string | null;
+  exactRef: string | null;
+  createdAt: string;
+  updatedAt: string;
+  transactionId: number;
+  amountMinor: number;
+  currency: string;
+  counterpartyName: string | null;
+  itemLabels: string[];
+}
+
+export interface BookingOutboxResponse {
+  items: BookingOutboxItemDto[];
+  nextCursor: string | null;
+  total: number;
+  countsByStatus: Record<BookingStatus, number>;
+}
+
+export interface BookingSettingsResponse {
+  enabled: boolean;
+  verified: { at: string; by: string; note: string; protocolVersion: string } | null;
+  protocolVersion: string;
+  protocolChanged: boolean;
+  createsBankEntries: boolean | null;
+  blockers: string[];
+}

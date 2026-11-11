@@ -69,6 +69,9 @@ const BLOCKS: Record<string, string> = {
   not_top_candidate: "Another candidate scores higher",
 };
 
+/** Every blocked-reason code the engine and explainBlock know (the web labels them all). */
+export const BLOCK_CODES: readonly string[] = Object.freeze(Object.keys(BLOCKS));
+
 export function explainBlock(code: string): string {
   return `${BLOCKS[code] ?? cleanText(code, 40)}, so it goes to review`;
 }

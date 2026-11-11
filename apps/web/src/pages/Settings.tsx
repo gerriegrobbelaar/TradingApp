@@ -13,10 +13,11 @@ import { useSignedIn } from "../auth";
 import { PageHeader } from "../components/PageHeader";
 import { Connections } from "./Connections";
 import { FxRates } from "./FxRates";
+import { MatchingSettings } from "./MatchingSettings";
 import { Schedules } from "./Schedules";
 import { Users } from "./Users";
 
-type Tab = "appearance" | "users" | "connections" | "schedules" | "fx";
+type Tab = "appearance" | "users" | "connections" | "schedules" | "fx" | "matching";
 
 const THEME_OPTIONS: SegmentedOption<ThemeMode>[] = [
   { value: "auto", label: "Auto" },
@@ -64,6 +65,7 @@ export function Settings() {
     { value: "connections", label: "Connections" },
     { value: "schedules", label: "Schedules" },
     { value: "fx", label: "FX rates" },
+    { value: "matching", label: "Matching" },
   ];
   const current = options.find((o) => o.value === tab)?.value;
   if (!current) return <Navigate to="/settings/appearance" replace />;
@@ -73,7 +75,7 @@ export function Settings() {
       <PageHeader
         eyebrow="Settings"
         title="Settings"
-        lede="Appearance, people, connections, schedules and exchange rates."
+        lede="Appearance, people, connections, schedules, exchange rates and bank matching."
       />
       <div className="settings-seg">
         <Segmented
@@ -88,6 +90,7 @@ export function Settings() {
       {current === "connections" && <Connections />}
       {current === "schedules" && <Schedules />}
       {current === "fx" && <FxRates />}
+      {current === "matching" && <MatchingSettings />}
     </>
   );
 }
