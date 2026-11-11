@@ -5,12 +5,23 @@ import { deployConfigProblems } from "../scripts/deploy-config.mjs";
 const ready = `
 name = "camelthorn-finance"
 workers_dev = false
+preview_urls = false
 routes = [{ pattern = "finance.camelthorncapital.com", custom_domain = true }]
 
 [triggers]
 crons = ["* * * * *"]
 
+[observability]
+enabled = true
+head_sampling_rate = 1
+redact_query_string = true
+
+[observability.logs]
+invocation_logs = false
+
 [vars]
+INITIAL_ADMIN_EMAIL = "admin@camelthorncapital.com"
+ALLOWED_HD = "camelthorncapital.com"
 GOOGLE_CLIENT_ID = "123-abc.apps.googleusercontent.com"
 OAUTH_REDIRECT_URI = "https://finance.camelthorncapital.com/api/auth/callback"
 EXACT_CLIENT_ID = "11111111-2222-3333-4444-555555555555"
@@ -18,6 +29,7 @@ EXACT_REDIRECT_URI = "https://finance.camelthorncapital.com/api/connections/exac
 
 [[d1_databases]]
 binding = "DB"
+database_name = "camelthorn-finance"
 database_id = "6f1c2a8e-1b2c-4d5e-8f90-123456789abc"
 
 [[durable_objects.bindings]]
