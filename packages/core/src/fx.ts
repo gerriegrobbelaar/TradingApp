@@ -238,6 +238,45 @@ export function unrealisedDifference(args: {
 }
 
 /**
+ * Direction of Exact's booked rate (`RateFC`), set by an admin after checking one foreign invoice
+ * against Exact (ADR 0038): `base_per_foreign` = division-currency units per 1 unit of the item
+ * currency (USD invoice in a EUR division, 0.92); `foreign_per_base` = item-currency units per
+ * 1 division-currency unit (the ECB way, 1.087).
+ */
+export type RateDirection = "base_per_foreign" | "foreign_per_base";
+export const isRateDirection = (v: unknown): v is RateDirection =>
+  v === "base_per_foreign" || v === "foreign_per_base";
+
+/**
+ * The open amount of an item in the division currency at the item's booked rate, in integer minor
+ * units, rounded once half away from zero (ADR 0035). Null when the rate is not a plain positive
+ * decimal, a currency code is invalid, or the amount is out of range. Same currency in and out
+ * returns the amount unchanged. Used only when the booked division-currency amount is not read
+ * from Exact (ADR 0038, option 3).
+ */
+export function bookedAtRate(args: {
+  openMinor: bigint | number;
+  currency: string;
+  baseCurrency: string;
+  rate: RateString;
+  direction: RateDirection;
+}): bigint | null {
+  const a = toBigint(args.openMinor);
+  if (!a.ok) return null;
+  if (!validCode(args.currency) || !validCode(args.baseCurrency)) return null;
+  if (args.currency === args.baseCurrency) return a.value;
+  const r = parseRate(args.rate);
+  if (!r.ok) return null;
+  const d = parseDecimal(r.rate);
+  if (!d) return null;
+  const sf = currencyScale(args.currency);
+  const sb = currencyScale(args.baseCurrency);
+  return args.direction === "base_per_foreign"
+    ? divRound(a.value * pow10(sb) * d.int, pow10(sf) * pow10(d.scale))
+    : divRound(a.value * pow10(sb) * pow10(d.scale), pow10(sf) * d.int);
+}
+
+/**
  * Gain (positive) or loss (negative) of an unrealised difference, by open-item kind
  * (`open_items.kind`: `invoice` = receivable, `bill` = payable). A receivable whose base value
  * rose is a gain; a payable whose base value rose is a loss. Credit notes need no special case:

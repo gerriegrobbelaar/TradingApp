@@ -4,6 +4,7 @@ import {
   ExactAuthError,
   ExactBudgetExhaustedError,
   ExactRateLimitedError,
+  OPEN_ITEM_LIST_DC_FIELDS,
   OPEN_ITEM_LIST_FIELDS,
   createExactClient,
   fetchCurrentMe,
@@ -810,5 +811,38 @@ describe("xmlUpload", () => {
     await expect(
       createExactClient(scripted([]).transport, base).xmlUpload("A&B", "<x/>"),
     ).rejects.toThrow(RangeError);
+  });
+});
+
+describe("open item list reads with the optional DC fields (ADR 0038, option 1)", () => {
+  const row = (extra: string) =>
+    `{"d":{"results":[{"ID":"00000000-0000-0000-0000-000000000001","AccountId":"00000000-0000-0000-0000-000000000002","Amount":1000.5,"CurrencyCode":"USD"${extra}}]}}`;
+
+  it("requests only the documented fields by default and ignores DC data", async () => {
+    const { transport, calls } = scripted([ok(row(',"AmountDC":920.46,"RateFC":0.92'))]);
+    const r = await createExactClient(transport, base).listReceivablesChunk(null);
+    expect(calls[0]?.query?.["$select"]).toBe(OPEN_ITEM_LIST_FIELDS.join(","));
+    expect(r.items[0]).toMatchObject({ amountDc: null, rate: null });
+  });
+
+  it("adds AmountDC and RateFC to $select on request and maps them exactly", async () => {
+    const { transport, calls } = scripted([ok(row(',"AmountDC":920.46,"RateFC":0.92'))]);
+    const r = await createExactClient(transport, base).listReceivablesChunk(null, {
+      dcFields: true,
+    });
+    expect(calls[0]?.query?.["$select"]).toBe(
+      [...OPEN_ITEM_LIST_FIELDS, ...OPEN_ITEM_LIST_DC_FIELDS].join(","),
+    );
+    expect(r.items[0]).toMatchObject({
+      amount: { minor: 100050, currency: "USD" },
+      amountDc: { minor: 92046, currency: "EUR" },
+      rate: "0.92",
+    });
+  });
+
+  it("keeps null when the fields are requested but the rows do not carry them", async () => {
+    const { transport } = scripted([ok(row(',"AmountDC":null'))]);
+    const r = await createExactClient(transport, base).listPayablesChunk(null, { dcFields: true });
+    expect(r.items[0]).toMatchObject({ kind: "payable", amountDc: null, rate: null });
   });
 });

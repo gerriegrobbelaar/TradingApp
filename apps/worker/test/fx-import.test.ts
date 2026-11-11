@@ -406,7 +406,8 @@ describe("fetch hardening and failure classification", () => {
         { status: 200, headers: { "content-type": "text/csv" } },
       );
     expect(await run()).toMatchObject({ code: "response_too_large" });
-    expect(pulled).toBeLessThanOrEqual(8);
+    // three requests (400, 120 and 30 days, review N2), each cut off after about 6 chunks
+    expect(pulled).toBeLessThanOrEqual(3 * 8);
   });
 
   it("an HTML page is not data: 200 text/html is bad_content_type, csv-typed HTML is bad_response", async () => {
@@ -450,7 +451,7 @@ describe("fetch hardening and failure classification", () => {
     ecb.respond = () => csvResponse("No results found", 404, "text/plain");
     expect(await run()).toMatchObject({ status: "partial", code: "not_yet_published" });
     ecb.respond = () => new Response(null, { status: 204 });
-    expect((await run({ trigger: "manual" })).status).toBe("ok");
+    expect(await run({ trigger: "manual" })).toMatchObject({ status: "partial", code: "no_data" });
   });
 
   it("times out after 15 seconds as a transient failure", async () => {

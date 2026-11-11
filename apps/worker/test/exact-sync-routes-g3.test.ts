@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { addSession, addUser, authed, call, resetDb } from "./helpers";
 import { freshDivision, seedConnection, stubExact, type ExactStub } from "./exact-helpers";
-import { auditRows, db, resetSync } from "./sync-helpers";
+import { addDivision, auditRows, db, resetSync } from "./sync-helpers";
 
 const ADMIN = "gerrie.grobbelaar@camelthorncapital.com";
 const tokens: Record<string, string> = {};
@@ -130,6 +130,9 @@ describe("incremental open items setting (review S4)", () => {
     (await (await authed("/api/sync/settings", tokens[role] as string)).json()) as {
       incrementalOpenItems: boolean;
       priorYearNightlyUntilMonth: number;
+      listDcFields: boolean;
+      rateDirection: string | null;
+      listDcFieldsUnavailableUntil: string | null;
     };
   const put = (role: string, json: unknown) =>
     authed("/api/sync/settings", tokens[role] as string, { method: "PUT", json });
@@ -143,6 +146,9 @@ describe("incremental open items setting (review S4)", () => {
     expect(await get("viewer")).toEqual({
       incrementalOpenItems: false,
       priorYearNightlyUntilMonth: 4,
+      listDcFields: false,
+      rateDirection: null,
+      listDcFieldsUnavailableUntil: null,
     });
     expect((await put("finance", { incrementalOpenItems: true })).status).toBe(403);
     expect((await put("admin", { incrementalOpenItems: "yes" })).status).toBe(400);
@@ -150,12 +156,18 @@ describe("incremental open items setting (review S4)", () => {
     expect(await get("admin")).toEqual({
       incrementalOpenItems: false,
       priorYearNightlyUntilMonth: 4,
+      listDcFields: false,
+      rateDirection: null,
+      listDcFieldsUnavailableUntil: null,
     });
 
     expect((await put("admin", { incrementalOpenItems: true })).status).toBe(200);
     expect(await get("viewer")).toEqual({
       incrementalOpenItems: true,
       priorYearNightlyUntilMonth: 4,
+      listDcFields: false,
+      rateDirection: null,
+      listDcFieldsUnavailableUntil: null,
     });
     await put("admin", { incrementalOpenItems: true }); // unchanged: no second audit row
     expect(await auditRows("settings.exact_incremental_open_items")).toHaveLength(1);
@@ -167,11 +179,181 @@ describe("incremental open items setting (review S4)", () => {
     expect(await get("viewer")).toEqual({
       incrementalOpenItems: false,
       priorYearNightlyUntilMonth: 4,
+      listDcFields: false,
+      rateDirection: null,
+      listDcFieldsUnavailableUntil: null,
     });
+  });
+
+  it("holds the booked-amount switches (B1, ADR 0038): off by default, admin only, validated, audited", async () => {
+    await db
+      .prepare("DELETE FROM settings WHERE key IN ('exact.list_dc_fields', 'exact.rate_direction')")
+      .run();
+    expect(await get("viewer")).toMatchObject({ listDcFields: false, rateDirection: null });
+    expect((await put("finance", { listDcFields: true })).status).toBe(403);
+    expect((await put("finance", { rateDirection: "base_per_foreign" })).status).toBe(403);
+    for (const bad of ["yes", 1, null]) {
+      expect((await put("admin", { listDcFields: bad })).status, String(bad)).toBe(400);
+    }
+    for (const bad of ["up", 1, true, ""]) {
+      expect((await put("admin", { rateDirection: bad })).status, String(bad)).toBe(400);
+    }
+
+    expect(
+      (await put("admin", { listDcFields: true, rateDirection: "foreign_per_base" })).status,
+    ).toBe(200);
+    expect(await get("viewer")).toMatchObject({
+      listDcFields: true,
+      rateDirection: "foreign_per_base",
+    });
+    await put("admin", { listDcFields: true, rateDirection: "foreign_per_base" }); // unchanged
+    expect(await auditRows("settings.exact_list_dc_fields")).toHaveLength(1);
+    expect(await auditRows("settings.exact_rate_direction")).toHaveLength(1);
+    // unset again: audited, and unsetting what is unset audits nothing
+    await put("admin", { rateDirection: null });
+    await put("admin", { rateDirection: null });
+    expect((await get("viewer")).rateDirection).toBeNull();
+    const rows = await auditRows("settings.exact_rate_direction");
+    expect(rows.map((r) => r.after_json)).toEqual([
+      '{"value":"foreign_per_base"}',
+      '{"value":null}',
+    ]);
+    expect(rows[0]?.before_json).toBe('{"value":null}');
+    expect(rows[0]?.actor_email).toBe(ADMIN);
+  });
+
+  it("changing listDcFields forgets a remembered 400 on the lists", async () => {
+    await db.prepare("DELETE FROM settings WHERE key = 'exact.list_dc_fields'").run();
+    const d = await addDivision();
+    await db
+      .prepare(
+        `INSERT INTO sync_state (division_id, entity, unavailable_until)
+         VALUES (?1, 'receivables', '2099-01-01T00:00:00.000Z')`,
+      )
+      .bind(d.id)
+      .run();
+    const mark = () =>
+      db
+        .prepare(
+          "SELECT unavailable_until FROM sync_state WHERE division_id = ?1 AND entity = 'receivables'",
+        )
+        .bind(d.id)
+        .first<{ unavailable_until: string | null }>();
+    await put("admin", { listDcFields: false }); // unchanged (default false): remembered stays
+    expect((await mark())?.unavailable_until).toBe("2099-01-01T00:00:00.000Z");
+    await put("admin", { listDcFields: true });
+    expect((await mark())?.unavailable_until).toBeNull();
   });
 
   it("rejects anonymous callers", async () => {
     expect((await call("/api/sync/settings")).status).toBe(401);
+  });
+
+  it("the booked-amount switches need a fresh sign-in (step-up); the other settings do not", async () => {
+    await db
+      .prepare(
+        "DELETE FROM settings WHERE key IN ('exact.list_dc_fields', 'exact.rate_direction', 'exact.incremental_open_items')",
+      )
+      .run();
+    const adminId = (
+      await db.prepare("SELECT id FROM users WHERE email = ?1").bind(ADMIN).first<{ id: number }>()
+    )?.id as number;
+    const stale = await addSession(adminId, { lastAuthAgoMs: 16 * 60 * 1000 });
+    const putStale = (json: unknown) =>
+      authed("/api/sync/settings", stale, { method: "PUT", json });
+    // audit_log is append-only: compare counts
+    const dirAudits = (await auditRows("settings.exact_rate_direction")).length;
+    const listAudits = (await auditRows("settings.exact_list_dc_fields")).length;
+    for (const body of [
+      { listDcFields: true },
+      { rateDirection: "base_per_foreign" },
+      { rateDirection: null },
+      // mixed with a setting that needs no step-up: refused as a whole, nothing written
+      { incrementalOpenItems: true, rateDirection: "base_per_foreign" },
+    ]) {
+      const res = await putStale(body);
+      expect(res.status, JSON.stringify(body)).toBe(401);
+      expect(await res.json()).toEqual({ error: "step_up_required" });
+    }
+    expect(await get("viewer")).toMatchObject({
+      incrementalOpenItems: false,
+      listDcFields: false,
+      rateDirection: null,
+    });
+    expect(await auditRows("settings.exact_rate_direction")).toHaveLength(dirAudits);
+    expect(await auditRows("settings.exact_list_dc_fields")).toHaveLength(listAudits);
+    // a setting without money effect still works with an older sign-in
+    expect((await putStale({ incrementalOpenItems: true })).status).toBe(200);
+  });
+
+  it("a changed rate direction clears every computed booked amount, and only those", async () => {
+    await db
+      .prepare("DELETE FROM settings WHERE key IN ('exact.list_dc_fields', 'exact.rate_direction')")
+      .run();
+    const d = await addDivision();
+    const item = (id: string, source: string | null) =>
+      db
+        .prepare(
+          `INSERT INTO open_items (division_id, exact_id, kind, currency, stored_minor, open_minor,
+             synced_at, open_dc_minor, dc_currency, dc_source)
+           VALUES (?1, ?2, 'invoice', 'USD', 100000, 100000, '2026-11-11T00:00:00Z', ?3, ?4, ?5)`,
+        )
+        .bind(d.id, id, source === null ? null : 92000, source === null ? null : "EUR", source)
+        .run();
+    await item("a", "sync");
+    await item("b", "list");
+    await item("c", "computed");
+    await item("d", null);
+    const state = async () =>
+      (
+        await db
+          .prepare(
+            "SELECT exact_id, open_dc_minor, dc_currency, dc_source FROM open_items WHERE division_id = ?1 ORDER BY exact_id",
+          )
+          .bind(d.id)
+          .all<{ exact_id: string; open_dc_minor: number | null; dc_source: string | null }>()
+      ).results.map((r) => `${r.exact_id}:${r.open_dc_minor ?? "-"}:${r.dc_source ?? "-"}`);
+
+    // unsetting what is unset changes nothing
+    await put("admin", { rateDirection: null });
+    expect(await state()).toEqual(["a:92000:sync", "b:92000:list", "c:92000:computed", "d:-:-"]);
+    // a new direction: computed amounts go, Exact's stay
+    expect((await put("admin", { rateDirection: "base_per_foreign" })).status).toBe(200);
+    expect(await state()).toEqual(["a:92000:sync", "b:92000:list", "c:-:-", "d:-:-"]);
+    await db
+      .prepare(
+        "UPDATE open_items SET open_dc_minor = 1, dc_currency = 'EUR', dc_source = 'computed' WHERE exact_id = 'c' AND division_id = ?1",
+      )
+      .bind(d.id)
+      .run();
+    // the same direction again: nothing cleared
+    await put("admin", { rateDirection: "base_per_foreign" });
+    expect(await state()).toEqual(["a:92000:sync", "b:92000:list", "c:1:computed", "d:-:-"]);
+    // flipped, and unset: cleared each time
+    await put("admin", { rateDirection: "foreign_per_base" });
+    expect(await state()).toEqual(["a:92000:sync", "b:92000:list", "c:-:-", "d:-:-"]);
+
+    // list fields: switching ON clears nothing, switching OFF clears the list amounts only
+    await put("admin", { listDcFields: true });
+    expect(await state()).toEqual(["a:92000:sync", "b:92000:list", "c:-:-", "d:-:-"]);
+    await put("admin", { listDcFields: true }); // unchanged
+    expect(await state()).toEqual(["a:92000:sync", "b:92000:list", "c:-:-", "d:-:-"]);
+    await put("admin", { listDcFields: false });
+    expect(await state()).toEqual(["a:92000:sync", "b:-:-", "c:-:-", "d:-:-"]);
+  });
+
+  it("shows until when a refused list $select is remembered", async () => {
+    const d = await addDivision();
+    expect((await get("admin")).listDcFieldsUnavailableUntil).toBeNull();
+    await db
+      .prepare(
+        `INSERT INTO sync_state (division_id, entity, unavailable_until)
+         VALUES (?1, 'payables', '2099-01-01T00:00:00.000Z'), (?1, 'gl_budgets', '2099-02-01T00:00:00.000Z')`,
+      )
+      .bind(d.id)
+      .run();
+    // the budgets row is another feature's memory and is not reported here
+    expect((await get("admin")).listDcFieldsUnavailableUntil).toBe("2099-01-01T00:00:00.000Z");
   });
 
   it("holds the prior-year nightly month: default 4, admin only, validated, audited when it changes (review S4)", async () => {
@@ -205,6 +387,9 @@ describe("incremental open items setting (review S4)", () => {
     expect(await get("viewer")).toEqual({
       incrementalOpenItems: true,
       priorYearNightlyUntilMonth: 12,
+      listDcFields: false,
+      rateDirection: null,
+      listDcFieldsUnavailableUntil: null,
     });
     expect(await auditRows("settings.exact_prior_year_nightly_until_month")).toHaveLength(3);
     // a body that is not an object, and an anonymous or CSRF-less write

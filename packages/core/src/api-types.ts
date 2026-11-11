@@ -630,6 +630,11 @@ export interface FxRatesResponse {
    * Optional so older clients' fixtures stay valid; the Worker always sends it.
    */
   lastImportCode?: string | null;
+  /**
+   * Number of unresolved ECB rate conflicts (the ECB shows another value than the one stored for a
+   * date, ADR 0039). Optional so older fixtures stay valid; the Worker always sends it.
+   */
+  unresolvedConflicts?: number;
   /** 'ECB reference rates are for information only…' */
   notice: string;
 }
@@ -639,4 +644,38 @@ export interface FxHistoryResponse {
   currency: string;
   base: "EUR";
   points: { rateDate: string; rate: string }[];
+}
+
+/** A stored ECB rate the ECB later reported differently (GET /api/fx/conflicts, ADR 0039). */
+export interface FxConflictDto {
+  id: number;
+  currency: string;
+  rateDate: string;
+  /** The rate we hold for that date (canonical decimal text). */
+  storedRate: string;
+  /** What the ECB showed when the conflict was seen. */
+  ecbRate: string;
+  firstSeenAt: string;
+  resolved: boolean;
+  resolvedAt: string | null;
+  resolvedBy: string | null;
+  resolution: "kept" | "accepted" | null;
+}
+
+/** GET /api/fx/conflicts (admin, finance): unresolved first; `?resolved=1` adds resolved ones. */
+export interface FxConflictsResponse {
+  unresolvedCount: number;
+  conflicts: FxConflictDto[];
+}
+
+/** POST /api/fx/conflicts/:id/resolve (admin, step-up): `confirm` must be true. */
+export interface FxConflictResolveRequest {
+  resolution: "kept" | "accepted";
+  confirm: true;
+}
+
+/** `alreadyResolved`: the same resolution was applied before; nothing changed this time. */
+export interface FxConflictResolveResponse {
+  conflict: FxConflictDto;
+  alreadyResolved: boolean;
 }

@@ -4,6 +4,8 @@ import {
   convertMinor,
   crossRate,
   formatRateForDisplay,
+  bookedAtRate,
+  isRateDirection,
   parseRate,
   unrealisedDifference,
 } from "./fx";
@@ -395,5 +397,206 @@ describe("formatRateForDisplay", () => {
     expect(formatRateForDisplay("abc")).toBe("abc");
     expect(formatRateForDisplay("1.5", -1)).toBe("1.5");
     expect(formatRateForDisplay("1.5", 1.5)).toBe("1.5");
+  });
+});
+
+describe("bookedAtRate (ADR 0038, option 3)", () => {
+  it("base_per_foreign multiplies, foreign_per_base divides, rounding once half away from zero", () => {
+    // USD 1,000.00 at 0.92 EUR per USD = EUR 920.00
+    expect(
+      bookedAtRate({
+        openMinor: 100000,
+        currency: "USD",
+        baseCurrency: "EUR",
+        rate: "0.92",
+        direction: "base_per_foreign",
+      }),
+    ).toBe(92000n);
+    // USD 1,000.00 at 1.25 USD per EUR = EUR 800.00
+    expect(
+      bookedAtRate({
+        openMinor: 100000,
+        currency: "USD",
+        baseCurrency: "EUR",
+        rate: "1.25",
+        direction: "foreign_per_base",
+      }),
+    ).toBe(80000n);
+    // tie: 0.01 USD * 0.5 = 0.005 EUR -> 0.01 away from zero; negative mirrors
+    const t = (n: number) =>
+      bookedAtRate({
+        openMinor: n,
+        currency: "USD",
+        baseCurrency: "EUR",
+        rate: "0.5",
+        direction: "base_per_foreign",
+      });
+    expect(t(1)).toBe(1n);
+    expect(t(-1)).toBe(-1n);
+    expect(t(3)).toBe(2n);
+  });
+
+  it("respects currency scales (JPY has none)", () => {
+    // JPY 10,000 at 0.0062 EUR per JPY = EUR 62.00
+    expect(
+      bookedAtRate({
+        openMinor: 10000,
+        currency: "JPY",
+        baseCurrency: "EUR",
+        rate: "0.0062",
+        direction: "base_per_foreign",
+      }),
+    ).toBe(6200n);
+    // EUR 62.00 in a JPY division at 161.29 JPY per EUR
+    expect(
+      bookedAtRate({
+        openMinor: 6200,
+        currency: "EUR",
+        baseCurrency: "JPY",
+        rate: "161.29",
+        direction: "base_per_foreign",
+      }),
+    ).toBe(10000n);
+  });
+
+  it("returns null for bad input and the amount for the same currency", () => {
+    const base = {
+      openMinor: 100,
+      currency: "USD",
+      baseCurrency: "EUR",
+      direction: "base_per_foreign" as const,
+    };
+    expect(bookedAtRate({ ...base, rate: "0" })).toBeNull();
+    expect(bookedAtRate({ ...base, rate: "-1" })).toBeNull();
+    expect(bookedAtRate({ ...base, rate: "1e3" })).toBeNull();
+    expect(bookedAtRate({ ...base, rate: "1", currency: "us" })).toBeNull();
+    expect(bookedAtRate({ ...base, rate: "1", openMinor: 1.5 })).toBeNull();
+    expect(bookedAtRate({ ...base, rate: "1", currency: "EUR" })).toBe(100n);
+  });
+
+  it("isRateDirection accepts exactly the two values", () => {
+    expect(isRateDirection("base_per_foreign")).toBe(true);
+    expect(isRateDirection("foreign_per_base")).toBe(true);
+    expect(isRateDirection("x")).toBe(false);
+    expect(isRateDirection(null)).toBe(false);
+  });
+});
+
+describe("bookedAtRate: review of T1 (hand-computed, scales, hostile rates, oracle)", () => {
+  const b = (
+    openMinor: number | bigint,
+    currency: string,
+    baseCurrency: string,
+    rate: string,
+    direction: "base_per_foreign" | "foreign_per_base",
+  ) => bookedAtRate({ openMinor, currency, baseCurrency, rate, direction });
+
+  it("USD 1,234.56 both ways, worked by hand", () => {
+    // 1,234.56 x 0.92 = 1,135.7952 -> EUR 1,135.80
+    expect(b(123456, "USD", "EUR", "0.92", "base_per_foreign")).toBe(113580n);
+    // 1,234.56 / 1.0870 = 1,135.74977... -> EUR 1,135.75
+    expect(b(123456, "USD", "EUR", "1.0870", "foreign_per_base")).toBe(113575n);
+    // trailing zeros and the same rate without them are one value
+    expect(b(123456, "USD", "EUR", "1.087", "foreign_per_base")).toBe(113575n);
+    // credit note: odd in the sign
+    expect(b(-123456, "USD", "EUR", "0.92", "base_per_foreign")).toBe(-113580n);
+    expect(b(-123456, "USD", "EUR", "1.0870", "foreign_per_base")).toBe(-113575n);
+    expect(b(0, "USD", "EUR", "0.92", "base_per_foreign")).toBe(0n);
+  });
+
+  it("JPY (0 decimals) and KWD (3 decimals), worked by hand", () => {
+    // JPY 123,456 x 0.0061 = 753.0816 -> EUR 753.08
+    expect(b(123456, "JPY", "EUR", "0.0061", "base_per_foreign")).toBe(75308n);
+    // JPY 123,456 / 163.25 = 756.23736... -> EUR 756.24
+    expect(b(123456, "JPY", "EUR", "163.25", "foreign_per_base")).toBe(75624n);
+    // KWD 1.234 / 0.3345 = 3.68908... -> EUR 3.69
+    expect(b(1234, "KWD", "EUR", "0.3345", "foreign_per_base")).toBe(369n);
+    // KWD 1.234 x 2.99 = 3.68966 -> EUR 3.69
+    expect(b(1234, "KWD", "EUR", "2.99", "base_per_foreign")).toBe(369n);
+    // EUR 10.00 in a KWD division at 0.3345 KWD per EUR (base_per_foreign from the item's view)
+    // = KWD 3.345 exactly
+    expect(b(1000, "EUR", "KWD", "0.3345", "base_per_foreign")).toBe(3345n);
+    // EUR 10.00 in a JPY division at 163.255 JPY per EUR = 1,632.55 -> JPY 1,633 (half away)
+    expect(b(1000, "EUR", "JPY", "163.255", "base_per_foreign")).toBe(1633n);
+    expect(b(-1000, "EUR", "JPY", "163.255", "base_per_foreign")).toBe(-1633n);
+  });
+
+  it("huge amounts stay exact (BigInt), no float anywhere", () => {
+    // 90,071,992,547,409.91 USD (2^53 - 1 cents) x 0.92 = 82,866,233,143,617.1172 -> .12
+    expect(b(BigInt(Number.MAX_SAFE_INTEGER), "USD", "EUR", "0.92", "base_per_foreign")).toBe(
+      8286623314361712n,
+    );
+    // beyond the supported money range: null, never a wrapped or float-rounded number
+    expect(b(10n ** 30n, "USD", "EUR", "0.5", "base_per_foreign")).toBeNull();
+  });
+
+  it("hostile rate strings give null (parsed by core parseRate only)", () => {
+    for (const rate of [
+      "",
+      " 0.92",
+      "0.92 ",
+      "+0.92",
+      "-0.92",
+      "0",
+      "0.0000",
+      "1e3",
+      "0x10",
+      "Infinity",
+      "NaN",
+      "0.92.1",
+      ".92",
+      "92.",
+      "1,087",
+      "１.0",
+      "1".repeat(5000),
+      "0." + "0".repeat(5000) + "1",
+    ]) {
+      expect(b(100, "USD", "EUR", rate, "base_per_foreign"), JSON.stringify(rate)).toBeNull();
+      expect(b(100, "USD", "EUR", rate, "foreign_per_base"), JSON.stringify(rate)).toBeNull();
+    }
+  });
+
+  it("matches an independent rational oracle on many random cases (one rounding only)", () => {
+    // Oracle: the major-unit amount and the rate as exact fractions, multiplied or divided, then
+    // scaled to minor units and rounded half away from zero ONCE.
+    const scale: Record<string, number> = { USD: 2, EUR: 2, JPY: 0, KWD: 3, GBP: 2 };
+    const roundHalfAway = (num: bigint, den: bigint): bigint => {
+      const neg = num < 0n !== den < 0n;
+      const n = num < 0n ? -num : num;
+      const d = den < 0n ? -den : den;
+      const q = (2n * n + d) / (2n * d);
+      return neg ? -q : q;
+    };
+    let x = 12345;
+    const rnd = () => {
+      x = (Math.imul(x, 1103515245) + 12345) >>> 0;
+      return x;
+    };
+    const codes = Object.keys(scale);
+    for (let i = 0; i < 2000; i++) {
+      const cur = codes[rnd() % codes.length] as string;
+      let base = codes[rnd() % codes.length] as string;
+      if (base === cur) base = cur === "EUR" ? "USD" : "EUR";
+      const amount = BigInt(rnd() % 100_000_000) * (rnd() % 2 === 0 ? 1n : -1n);
+      const intPart = rnd() % 300;
+      const decimals = rnd() % 7;
+      const frac = decimals === 0 ? "" : String(rnd() % 10 ** decimals).padStart(decimals, "0");
+      const rate = decimals === 0 ? String(intPart || 1) : `${intPart}.${frac}`;
+      const [ri, rf = ""] = rate.split(".");
+      const rNum = BigInt((ri as string) + rf);
+      const rDen = 10n ** BigInt(rf.length);
+      if (rNum === 0n) continue;
+      const sf = 10n ** BigInt(scale[cur] as number);
+      const sb = 10n ** BigInt(scale[base] as number);
+      const dir = rnd() % 2 === 0 ? "base_per_foreign" : "foreign_per_base";
+      // amount/sf major units; x rate or / rate; x sb minor units of the base
+      const want =
+        dir === "base_per_foreign"
+          ? roundHalfAway(amount * rNum * sb, sf * rDen)
+          : roundHalfAway(amount * rDen * sb, sf * rNum);
+      expect(b(amount, cur, base, rate, dir), `${amount} ${cur}->${base} ${rate} ${dir}`).toBe(
+        want,
+      );
+    }
   });
 });

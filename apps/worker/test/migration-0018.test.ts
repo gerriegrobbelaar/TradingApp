@@ -48,6 +48,9 @@ describe("migration 0018 on a populated database", () => {
         last_error_code: null,
         newest_rate_date: null,
         rows_inserted: 0,
+        // migration 0021 (ECB history backfill, ADR 0036 addendum)
+        backfill_target: null,
+        backfill_cursor: null,
       },
     ]);
     // A second row is refused (single-row table).
