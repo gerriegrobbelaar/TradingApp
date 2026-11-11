@@ -25,7 +25,6 @@ import {
   type ExactResponse,
   type ExactTransport,
 } from "./transport";
-import { buildXmlEnvelope, parseXmlResponse, type XmlUploadResult } from "./xml";
 
 // ---------------------------------------------------------------------------------------------
 // Options
@@ -579,6 +578,9 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
    *  - 401: fatal ExactAuthError (the gate already refreshed once). 429: ExactRateLimitedError.
    */
   async function send(req: ExactRequest): Promise<ExactResponse> {
+    // The read client is GET-only (ADR 0040): every Exact write goes through createExactWriter,
+    // which carries the writeEnabled guard. A write method must never be added here.
+    if (req.method !== "GET") throw new RangeError("the Exact read client only sends GET");
     for (let attempt = 0; ; attempt++) {
       const res = await transport(req);
       if (res.status >= 200 && res.status < 300) return res;
@@ -1184,26 +1186,6 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
         token,
         opts,
       );
-    },
-
-    /**
-     * XML API skeleton: POST a topic body to XMLUpload.aspx. `topicXml` is already-built XML for
-     * one topic (builders such as MatchSets come later). Never retried (non-GET).
-     */
-    async xmlUpload(topic: string, topicXml: string): Promise<XmlUploadResult> {
-      if (!/^[A-Za-z]+$/.test(topic)) throw new RangeError("invalid XML topic");
-      const res = await send({
-        method: "POST",
-        path: "/docs/XMLUpload.aspx",
-        query: { Topic: topic },
-        headers: { "Content-Type": "text/xml; charset=utf-8" },
-        body: buildXmlEnvelope(topicXml),
-        division: options.division,
-        priority: options.priority,
-        jobId: options.jobId,
-        api: "xml",
-      });
-      return parseXmlResponse(res.body);
     },
   };
 }

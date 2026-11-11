@@ -10,6 +10,7 @@ import {
   fetchCurrentMe,
   odataGuid,
   odataString,
+  parseXmlResponse,
   resolveNextLink,
 } from "../src";
 import * as fx from "./fixtures";
@@ -669,14 +670,14 @@ describe("errors and retries", () => {
     expect(calls).toHaveLength(3);
   });
 
-  it("never retries a non-GET on 5xx", async () => {
-    const sleep = vi.fn(noSleep);
-    const { transport, calls } = scripted([status(500, "boom"), ok(fx.XML_OK)]);
-    await expect(
-      createExactClient(transport, { ...base, sleep }).xmlUpload("MatchSets", "<MatchSets/>"),
-    ).rejects.toMatchObject({ status: 500 });
-    expect(calls).toHaveLength(1);
-    expect(sleep).not.toHaveBeenCalled();
+  it("has no write path at all: the read client sends GET only (ADR 0040)", () => {
+    const client = createExactClient(scripted([]).transport, base) as unknown as Record<
+      string,
+      unknown
+    >;
+    for (const name of ["xmlUpload", "createBankEntry", "submitMatchSet", "post", "put"]) {
+      expect(client[name]).toBeUndefined();
+    }
   });
 
   it("uses a real timer by default (no injected sleep)", async () => {
@@ -775,42 +776,18 @@ describe("errors and retries", () => {
   });
 });
 
-describe("xmlUpload", () => {
-  it("posts the envelope once and parses messages", async () => {
-    const { transport, calls } = scripted([ok(fx.XML_OK)]);
-    const r = await createExactClient(transport, { ...base, priority: "user" }).xmlUpload(
-      "MatchSets",
-      "<MatchSets/>",
-    );
-    expect(r).toEqual({
+describe("parseXmlResponse (the XML answer reader used by the writer)", () => {
+  it("parses messages", () => {
+    expect(parseXmlResponse(fx.XML_OK)).toEqual({
       ok: true,
       messages: [{ severity: "info", description: "Created & matched" }],
     });
-    const c = calls[0];
-    expect(c).toMatchObject({
-      method: "POST",
-      api: "xml",
-      path: "/docs/XMLUpload.aspx",
-      query: { Topic: "MatchSets" },
-      division: fx.DIV,
-      priority: "user",
-      jobId: "job-1",
-    });
-    expect(c?.body).toContain("<eExact");
-    expect(c?.body).toContain("<MatchSets/>");
   });
 
-  it("treats an HTML page with status 200 as an error, never as ok", async () => {
-    const { transport } = scripted([ok("<html><body>Log in</body></html>")]);
-    await expect(
-      createExactClient(transport, base).xmlUpload("MatchSets", "<MatchSets/>"),
-    ).rejects.toMatchObject({ code: "BAD_XML" });
-  });
-
-  it("rejects bad topic names", async () => {
-    await expect(
-      createExactClient(scripted([]).transport, base).xmlUpload("A&B", "<x/>"),
-    ).rejects.toThrow(RangeError);
+  it("treats an HTML page as an error, never as ok", () => {
+    expect(() => parseXmlResponse("<html><body>Log in</body></html>")).toThrow(
+      expect.objectContaining({ code: "BAD_XML" }),
+    );
   });
 });
 

@@ -11,9 +11,11 @@ import { ExactApiError } from "./transport";
 /** Characters XML 1.0 cannot carry at all, even escaped (C0 controls except tab, LF, CR). */
 // eslint-disable-next-line no-control-regex
 const INVALID_XML_CHAR_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/;
+/** An unpaired UTF-16 surrogate: not a character at all, so not encodable in an XML document. */
+const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 export function xmlEscape(text: string): string {
-  if (INVALID_XML_CHAR_RE.test(text))
+  if (INVALID_XML_CHAR_RE.test(text) || LONE_SURROGATE_RE.test(text))
     throw new RangeError("text contains characters XML cannot carry");
   return text
     .replace(/&/g, "&amp;")

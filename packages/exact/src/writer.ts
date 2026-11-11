@@ -1,11 +1,21 @@
 /**
  * The Exact write path for bank matching (ADR 0040). Transport only, no fetch. Separate from the
- * read client on purpose: a reads-only code path cannot write because it never holds a writer, and
- * a writer made without `writeEnabled: true` refuses every write.
+ * read client on purpose: the read client is GET-only, so a reads-only code path cannot write
+ * because it never holds a writer, and a writer without `writeEnabled: true` refuses every write.
  *
- * Writes are NEVER retried here (a retried POST can book twice). If the transport throws or the
- * answer is lost, the outcome is unknown: the caller must run the duplicate probe
- * (`findBankEntryLineByRef`) or read back before deciding anything.
+ * The guard is strict and evaluated twice: `writeEnabled` must be the boolean `true` when the
+ * writer is created AND at the moment of every write call (so flipping the options object to
+ * false later disables it, and flipping it to true later does not enable a writer created
+ * disabled). Only payload objects produced by `buildBankEntryPayload` / `buildMatchSetXml`, for
+ * this writer's division, are sent.
+ *
+ * Writes are NEVER retried here (a retried POST can book twice), and transport errors are
+ * re-thrown untouched. If the transport throws or the answer is lost, the outcome is unknown:
+ * the caller must run the duplicate probe (`findBankEntryLineByRef`) or read back before
+ * deciding anything.
+ *
+ * Callers: the worker's future matching booker is the only allowed caller (source scan in
+ * apps/worker/test/exact-write-guard.test.ts).
  */
 import { odataGuid } from "./client";
 import { type Row, asRow, badData, parseJsonRawNumbers } from "./json";
@@ -20,9 +30,11 @@ import {
   type ExactResponse,
   type ExactTransport,
 } from "./transport";
+import { isBuilt } from "./write-brand";
 import {
   type BankEntryResponse,
   type BuiltBankEntry,
+  type BuiltMatchSet,
   EXACT_WRITE_NAMES,
   type MatchSetResponse,
   type OpenItemLineRow,
@@ -39,8 +51,16 @@ export class ExactWriteDisabledError extends Error {
   }
 }
 
+/** The payload was not built by this package's builders, or was built for another division. */
+export class ExactWritePayloadError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ExactWritePayloadError";
+  }
+}
+
 export interface ExactWriterOptions {
-  /** Must be exactly `true`; anything else (missing, "true", 1) disables every write. */
+  /** Must be exactly `true` (at creation and at call time); anything else disables writes. */
   writeEnabled: boolean;
   division: number;
   jobId: string;
@@ -67,34 +87,40 @@ function errorMessage(body: string): string {
         : typeof m === "object" && m !== null
           ? (m as Row)["value"]
           : undefined;
-    if (typeof v === "string") return sanitizeForMessage(v);
+    if (typeof v === "string") return sanitizeForMessage(v, 200);
   } catch {
     // not JSON
   }
-  return sanitizeForMessage(body, 200);
+  return sanitizeForMessage(body.slice(0, 2000), 200);
 }
 
 export function createExactWriter(transport: ExactTransport, options: ExactWriterOptions) {
-  if (!Number.isSafeInteger(options.division) || options.division < 1)
+  // Snapshot everything but the guard flag, so later mutation cannot redirect a write.
+  const division = options.division;
+  const jobId = options.jobId;
+  const priority = options.priority;
+  if (!Number.isSafeInteger(division) || division < 1)
     throw new RangeError("division must be a positive integer");
-  if (options.jobId === "") throw new RangeError("jobId is required");
-  const enabled = options.writeEnabled === true;
+  if (typeof jobId !== "string" || jobId === "") throw new RangeError("jobId is required");
+  const enabledAtCreation = options.writeEnabled === true;
   const now = options.now ?? Date.now;
 
   function assertWritable(): void {
-    if (!enabled) throw new ExactWriteDisabledError();
+    // Both checks, strict boolean: "true", 1 or an object never enable writes.
+    if (!enabledAtCreation || options.writeEnabled !== true) throw new ExactWriteDisabledError();
   }
 
-  /** One call, no retry of any kind. */
+  function assertPayload(payload: { division: number }): void {
+    if (!isBuilt(payload)) throw new ExactWritePayloadError("payload was not built by the builder");
+    if (payload.division !== division)
+      throw new ExactWritePayloadError("payload was built for another division");
+  }
+
+  /** One call, no retry of any kind; transport errors propagate untouched. */
   async function sendOnce(
     req: Omit<ExactRequest, "division" | "priority" | "jobId">,
   ): Promise<ExactResponse> {
-    const res = await transport({
-      ...req,
-      division: options.division,
-      priority: options.priority,
-      jobId: options.jobId,
-    });
+    const res = await transport({ ...req, division, priority, jobId });
     if (res.status >= 200 && res.status < 300) return res;
     if (res.status === 401)
       throw new ExactAuthError(
@@ -112,42 +138,42 @@ export function createExactWriter(transport: ExactTransport, options: ExactWrite
   }
 
   return {
-    /** POST the built bank entry. The caller probes first; the outcome of a thrown error is unknown. */
+    /**
+     * POST the built bank entry. The caller probes first. A thrown error, or any non-ok result,
+     * leaves the outcome unknown: probe again, never re-post blind.
+     */
     async createBankEntry(payload: BuiltBankEntry): Promise<BankEntryResponse> {
       assertWritable();
+      assertPayload(payload);
       const res = await sendOnce({
         method: "POST",
         path: EXACT_WRITE_NAMES.rest.bankEntryPath,
-        headers: payload.headers,
+        headers: { ...payload.headers },
         body: payload.body,
         api: "rest",
       });
-      return parseBankEntryResponse(res.body);
+      return parseBankEntryResponse(res.body, payload.yourRefs);
     },
 
     /** POST a built MatchSet document. The answer is never proof: read back (ADR 0040). */
-    async submitMatchSet(
-      xml: string,
-      opts: { idempotencyKey?: string } = {},
-    ): Promise<MatchSetResponse> {
+    async submitMatchSet(payload: BuiltMatchSet): Promise<MatchSetResponse> {
       assertWritable();
-      if (/<!DOCTYPE|<!ENTITY/i.test(xml) || !xml.includes(`<${EXACT_WRITE_NAMES.xml.topic}>`))
-        throw new RangeError("not a MatchSets document built by buildMatchSetXml");
-      const headers: Record<string, string> = { "Content-Type": "text/xml; charset=utf-8" };
-      if (opts.idempotencyKey !== undefined)
-        headers[EXACT_WRITE_NAMES.rest.idempotencyHeader] = opts.idempotencyKey;
+      assertPayload(payload);
       const res = await sendOnce({
         method: "POST",
-        path: "/docs/XMLUpload.aspx",
-        query: { Topic: EXACT_WRITE_NAMES.xml.topic },
-        headers,
-        body: xml,
+        path: EXACT_WRITE_NAMES.xml.uploadPath,
+        query: { Topic: payload.topic },
+        headers: { "Content-Type": "text/xml; charset=utf-8" },
+        body: payload.xml,
         api: "xml",
       });
       return parseMatchSetResponse(res.body);
     },
 
-    /** Duplicate probe: existing bank entry lines with this YourRef in this journal. */
+    /**
+     * Duplicate probe: existing bank entry lines with this YourRef in this journal. Any hit
+     * (even one with unreadable fields) means "do not post".
+     */
     async findBankEntryLineByRef(args: {
       journalCode: string;
       yourRef: string;
@@ -169,17 +195,22 @@ export function createExactWriter(transport: ExactTransport, options: ExactWrite
       }));
     },
 
-    /** Read-back: the open amount of the given entries of one relation (max 20 per call). */
+    /**
+     * Read-back: the open amount of the given entries of one relation (max 20 per call).
+     * `fullyPaidOnly` is the second read for lines absent from the first one (ADR 0040).
+     */
     async readOpenItemLines(args: {
       kind: "receivable" | "payable";
       accountId: string;
       entryNumbers: readonly number[];
+      fullyPaidOnly?: boolean;
     }): Promise<OpenItemLineRow[]> {
       if (args.entryNumbers.length === 0 || args.entryNumbers.length > 20)
         throw new RangeError("1 to 20 entry numbers");
       for (const e of args.entryNumbers)
         if (!Number.isSafeInteger(e) || e < 1) throw new RangeError("invalid entry number");
       const numbers = args.entryNumbers.map((e) => `EntryNumber eq ${e}`).join(" or ");
+      const paid = args.fullyPaidOnly === true ? " and IsFullyPaid eq true" : "";
       const res = await sendOnce({
         method: "GET",
         path:
@@ -187,7 +218,7 @@ export function createExactWriter(transport: ExactTransport, options: ExactWrite
             ? EXACT_WRITE_NAMES.rest.receivablesPath
             : EXACT_WRITE_NAMES.rest.payablesPath,
         query: {
-          $filter: `Account eq ${odataGuid(args.accountId)} and (${numbers})`,
+          $filter: `Account eq ${odataGuid(args.accountId)} and (${numbers})${paid}`,
           $select: EXACT_WRITE_NAMES.rest.openItemFields.join(","),
         },
         headers: { Accept: "application/json" },

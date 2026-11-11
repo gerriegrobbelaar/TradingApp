@@ -2,8 +2,18 @@
  * Pure builders and parsers for the two Exact writes of bank matching (ADR 0040): a bank entry
  * (REST) and a MatchSet (XML). No I/O. Every Exact field name, endpoint and requirement here is
  * a recollection: VERIFY WITH CREDENTIALS (ADR 0040 lists them ranked, with how to check).
+ *
+ * Built payloads are frozen and branded (write-brand.ts): the writer sends only objects that
+ * came out of these builders, for the division they were built for.
  */
-import { currencyScale, formatMinor, maskIbans, sha256Hex } from "@camelthorn/core";
+import {
+  currencyScale,
+  formatMinor,
+  hasValidIbanChecksum,
+  maskIban,
+  maskIbans,
+  sha256Hex,
+} from "@camelthorn/core";
 import {
   type Row,
   asRow,
@@ -17,6 +27,7 @@ import {
   trimField,
 } from "./json";
 import { sanitizeForMessage } from "./redact";
+import { brandBuilt } from "./write-brand";
 import {
   type XmlMessage,
   buildXmlEnvelope,
@@ -73,9 +84,9 @@ export const EXACT_WRITE_NAMES = {
       "IsFullyPaid",
       "EntryNumber",
     ],
-    idempotencyHeader: "X-Idempotency-Key",
   },
   xml: {
+    uploadPath: "/docs/XMLUpload.aspx",
     topic: "MatchSets",
     matchSet: "MatchSet",
     glAccount: "GLAccount",
@@ -91,31 +102,76 @@ export const EXACT_WRITE_NAMES = {
   },
 } as const;
 
+/**
+ * Sign convention of bank entry line amounts (ADR 0040 assumption 3, VERIFY): money IN to the bank
+ * account is positive (a receipt), money OUT is negative (a payment), seen from the bank account,
+ * which is how Exact's bank entry screen and statement imports present them. The builder does not
+ * flip signs: `amountMinor` is the bank transaction's own signed amount.
+ */
+export const BANK_ENTRY_SIGN = "money_in_positive" as const;
+
 const HEX64_RE = /^[0-9a-f]{64}$/;
 const CCY_RE = /^[A-Z]{3}$/;
 const CODE_RE = /^[A-Za-z0-9._ -]{1,18}$/;
-const EXT_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
+const EXT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+/** Exact EntryNumber and OurRef are 32-bit integers (verify). */
+const INT32_MAX = 2_147_483_647;
 
 /** Exact descriptions are short; the cap is a guess (verify). */
 export const DESCRIPTION_MAX = 60;
+/** Exact YourRef cap is a guess (verify). Revolut ids are 36 characters. */
+export const YOUR_REF_MAX = 40;
+/** Text from the bank is cut to this before any processing (keeps the IBAN scan cheap). */
+const RAW_TEXT_MAX = 2000;
+/** Larger answers are not what these endpoints return: refused before parsing. */
+export const MAX_WRITE_RESPONSE_CHARS = 1_000_000;
 
 // ---------------------------------------------------------------------------------------------
 // Sanitising text that comes from bank data
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Conservative text for an Exact field: IBAN-like strings masked, accents folded, anything outside
- * `A-Z a-z 0-9 space . , : / ( ) # & + * _ ' -` (control characters included) becomes a space,
- * whitespace collapsed, cut to `max` characters.
+ * Second IBAN pass over the already reduced text: a run of letters/digits joined by `-./_`
+ * ("NL91-ABNA-0417-1643-00") or glued to a word ("toNL91ABNA0417164300") is not seen by
+ * maskIbans. Any 15-34 character window of the compacted run that starts with two letters and
+ * two digits and passes the mod-97 check masks the whole run. Over-masking (about 1 in 97 per
+ * window on long codes) is the safe direction.
+ */
+function maskHiddenIbans(text: string): string {
+  return text.replace(/[A-Za-z0-9]+(?:[-./_][A-Za-z0-9]+)*/g, (run) => {
+    const compact = run.replace(/[-./_]/g, "").toUpperCase();
+    if (compact.length < 15) return run;
+    for (let i = 0; i + 15 <= compact.length; i++) {
+      if (!/^[A-Z]{2}\d{2}/.test(compact.slice(i, i + 4))) continue;
+      for (let len = 15; len <= 34 && i + len <= compact.length; len++) {
+        const candidate = compact.slice(i, i + len);
+        if (hasValidIbanChecksum(candidate)) return maskIban(candidate);
+      }
+    }
+    return run;
+  });
+}
+
+/**
+ * Conservative text for an Exact field: compatibility-normalised (full-width digits become
+ * ASCII), control characters removed, IBAN-like strings masked (spaced, lower case, joined by
+ * punctuation or glued to a word), accents folded, anything outside
+ * `A-Z a-z 0-9 space . , : / ( ) # & + * _ ' -` becomes a space, whitespace collapsed, cut to
+ * `max` characters. The cut runs after masking, so it can never expose a hidden IBAN.
  */
 export function sanitizeBankText(text: string, max = DESCRIPTION_MAX): string {
-  const folded = maskIbans(text)
+  const reduced = text
+    .slice(0, RAW_TEXT_MAX)
+    .normalize("NFKC")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/g, " ")
     .normalize("NFD")
     .replace(/\p{M}+/gu, "")
     .replace(/[^A-Za-z0-9 .,:/()#&+*_'-]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  return folded.slice(0, Math.max(0, max)).trimEnd();
+  const masked = maskHiddenIbans(maskIbans(reduced));
+  return masked.slice(0, Math.max(0, max)).trimEnd();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -127,6 +183,15 @@ function canonicalHash(parts: readonly unknown[]): string {
   return sha256Hex(JSON.stringify(parts));
 }
 
+function assertKeyPart(v: string | number, what: string): string {
+  if (typeof v === "number") {
+    if (!Number.isSafeInteger(v)) throw new RangeError(`${what} must be a safe integer`);
+    return String(v);
+  }
+  if (typeof v !== "string" || v === "") throw new RangeError(`${what} is required`);
+  return v;
+}
+
 export function bankEntryIdempotencyKey(
   connectionId: string | number,
   bankTransactionExternalId: string,
@@ -134,9 +199,9 @@ export function bankEntryIdempotencyKey(
 ): string {
   return canonicalHash([
     "bank-entry/v1",
-    String(connectionId),
-    bankTransactionExternalId,
-    String(legId),
+    assertKeyPart(connectionId, "connectionId"),
+    assertKeyPart(bankTransactionExternalId, "bankTransactionExternalId"),
+    assertKeyPart(legId, "legId"),
   ]);
 }
 
@@ -145,17 +210,41 @@ export interface MatchAllocation {
   amountMinor: number;
 }
 
-/** Order of `itemIds` and `allocations` does not matter; their content does. */
+/**
+ * Order of `itemIds` and `allocations` does not matter; their content does (any amount change
+ * gives a new key). Amounts must be safe integers: NaN and Infinity would both serialise as
+ * `null` and collide.
+ */
 export function matchSetIdempotencyKey(
   txId: string,
   itemIds: readonly string[],
   allocations: readonly MatchAllocation[],
 ): string {
+  assertKeyPart(txId, "txId");
+  for (const id of itemIds) assertKeyPart(id, "itemId");
+  for (const a of allocations) {
+    assertKeyPart(a.itemId, "itemId");
+    if (!Number.isSafeInteger(a.amountMinor))
+      throw new RangeError("amountMinor must be a safe integer");
+  }
   const ids = [...new Set(itemIds)].sort();
   const allocs = allocations
     .map((a) => [a.itemId, a.amountMinor] as const)
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] - b[1]));
   return canonicalHash(["matchset/v1", txId, ids, allocs]);
+}
+
+/**
+ * Deterministic short YourRef for one bank line, for when Exact's YourRef is too short for the
+ * 36-character Revolut id: `CT` + base36 of the first 48 bits of sha-256 of the external id (at
+ * most 12 characters). Depends on the external id only, so the probe can recompute it. A
+ * collision (about n^2 / 2^49) makes the probe see a line that is not ours: the worker then
+ * stops for a manual check, it never books twice.
+ */
+export function bankLineShortRef(bankTransactionExternalId: string): string {
+  if (!EXT_ID_RE.test(bankTransactionExternalId)) throw new RangeError("invalid external id");
+  const hex = canonicalHash(["bank-line-ref/v1", bankTransactionExternalId]).slice(0, 12);
+  return `CT${BigInt(`0x${hex}`).toString(36).toUpperCase()}`;
 }
 
 /** OData string literal for the probe (single quotes doubled, control characters refused). */
@@ -178,8 +267,10 @@ export function exactDuplicateProbeFilter(args: { journalCode: string; yourRef: 
 }
 
 /**
- * Look up an existing bank entry line by its YourRef (the Revolut transaction id) BEFORE posting,
- * so a lost response never produces a second entry. Returns the REST request to send.
+ * Look up an existing bank entry line by its YourRef (the Revolut transaction id, or its short
+ * ref) BEFORE posting, so a lost response never produces a second entry. Uniqueness ACROSS
+ * entries is the worker's job: this probe plus a unique key on the bank transaction in D1. The
+ * builder only rejects a duplicate inside one entry.
  */
 export function findExistingBankEntryQuery(args: {
   journalCode: string;
@@ -199,21 +290,24 @@ export function findExistingBankEntryQuery(args: {
 // ---------------------------------------------------------------------------------------------
 
 export interface BankEntryLineInput {
-  /** Signed minor units; money in positive (sign convention: verify). Never zero. */
+  /** Signed minor units of the bank transaction: money in positive (BANK_ENTRY_SIGN). Never 0. */
   amountMinor: number;
   /** Free text from the bank; sanitised, IBANs masked. */
   description: string;
+  /** At least one of glAccountId / accountId. */
   glAccountId?: string;
   accountId?: string;
   /** Bank reference text; used as the description when `description` is empty. */
   yourRef?: string;
   /** Our reference: Exact OurRef is an integer (the invoice number). */
   ourRef?: number;
-  /** Becomes the line YourRef: the Revolut transaction id. */
+  /** The Revolut transaction id: the line YourRef (or its short ref, see `yourRefMode`). */
   bankTransactionExternalId: string;
 }
 
 export interface BankEntryInput {
+  /** The Exact division the GUIDs belong to; the writer refuses any other division. */
+  division: number;
   journalCode: string;
   /** YYYY-MM-DD */
   entryDate: string;
@@ -228,9 +322,15 @@ export interface BankEntryInput {
   dateFormat?: "iso" | "msdate";
   /** When equal to `currency`, AmountDC is sent too. */
   divisionCurrency?: string;
+  /**
+   * "external_id" (default): YourRef is the external id (at most YOUR_REF_MAX characters).
+   * "short": YourRef is bankLineShortRef(external id), when Exact's field turns out shorter.
+   */
+  yourRefMode?: "external_id" | "short";
 }
 
 export type WriteBuildError =
+  | "invalid_division"
   | "invalid_journal"
   | "invalid_currency"
   | "invalid_date"
@@ -240,28 +340,44 @@ export type WriteBuildError =
   | "no_lines"
   | "zero_amount_line"
   | "invalid_external_id"
+  | "external_id_too_long"
   | "duplicate_external_id"
   | "invalid_guid"
+  | "missing_account"
   | "invalid_ref"
   | "invalid_period"
   | "balance_mismatch";
 
+export interface BuiltBankEntryLine {
+  externalId: string;
+  /** The YourRef actually sent (external id or short ref): probe with this. */
+  yourRef: string;
+  shortRef: string;
+}
+
 export interface BuiltBankEntry {
-  ok: true;
-  body: string;
-  headers: Record<string, string>;
-  idempotencyKey: string;
-  journalCode: string;
-  /** The YourRef of every line, for the duplicate probe and the post-write check. */
-  yourRefs: string[];
+  readonly ok: true;
+  readonly division: number;
+  readonly body: string;
+  readonly headers: Readonly<Record<string, string>>;
+  readonly idempotencyKey: string;
+  readonly journalCode: string;
+  /** The YourRef of every line as sent, for the duplicate probe and the post-write check. */
+  readonly yourRefs: readonly string[];
+  readonly lines: readonly Readonly<BuiltBankEntryLine>[];
 }
 export type BuildBankEntryResult = BuiltBankEntry | { ok: false; error: WriteBuildError };
 
+const DECIMAL_TEXT_RE = /^-?\d+(?:\.\d+)?$/;
+
 /** A number written into JSON exactly as given (no float round trip). */
 class RawNumber {
-  constructor(readonly text: string) {}
+  constructor(readonly text: string) {
+    if (!DECIMAL_TEXT_RE.test(text)) throw new RangeError("not a plain decimal");
+  }
 }
 
+/** JSON writer; every string and key goes through JSON.stringify (no hand-made escaping). */
 function toJson(v: unknown): string {
   if (v instanceof RawNumber) return v.text;
   if (Array.isArray(v)) return `[${v.map(toJson).join(",")}]`;
@@ -271,6 +387,7 @@ function toJson(v: unknown): string {
       .map(([k, x]) => `${JSON.stringify(k)}:${toJson(x)}`)
       .join(",")}}`;
   }
+  if (typeof v === "number") throw new RangeError("numbers must be RawNumber");
   return JSON.stringify(v);
 }
 
@@ -280,14 +397,21 @@ function validDate(d: string): boolean {
   return !Number.isNaN(t.getTime()) && t.toISOString().slice(0, 10) === d;
 }
 
+function validDivision(d: number): boolean {
+  return Number.isSafeInteger(d) && d >= 1;
+}
+
 export function buildBankEntryPayload(input: BankEntryInput): BuildBankEntryResult {
   const fail = (error: WriteBuildError): { ok: false; error: WriteBuildError } => ({
     ok: false,
     error,
   });
   const n = EXACT_WRITE_NAMES.rest;
+  if (!validDivision(input.division)) return fail("invalid_division");
   if (!CODE_RE.test(input.journalCode)) return fail("invalid_journal");
   if (!CCY_RE.test(input.currency)) return fail("invalid_currency");
+  if (input.divisionCurrency !== undefined && !CCY_RE.test(input.divisionCurrency))
+    return fail("invalid_currency");
   if (!validDate(input.entryDate)) return fail("invalid_date");
   if (!HEX64_RE.test(input.idempotencyKey)) return fail("invalid_idempotency_key");
   if (
@@ -295,19 +419,26 @@ export function buildBankEntryPayload(input: BankEntryInput): BuildBankEntryResu
     !Number.isSafeInteger(input.closingBalanceMinor)
   )
     return fail("invalid_balance");
-  for (const p of [input.financialYear, input.financialPeriod]) {
-    if (p !== undefined && (!Number.isSafeInteger(p) || p < 0 || p > 9999))
-      return fail("invalid_period");
-  }
+  if (
+    input.financialYear !== undefined &&
+    (!Number.isSafeInteger(input.financialYear) ||
+      input.financialYear < 1900 ||
+      input.financialYear > 9999)
+  )
+    return fail("invalid_period");
+  if (
+    input.financialPeriod !== undefined &&
+    (!Number.isSafeInteger(input.financialPeriod) ||
+      input.financialPeriod < 1 ||
+      input.financialPeriod > 99)
+  )
+    return fail("invalid_period");
   if (input.lines.length === 0) return fail("no_lines");
-  let scale: number;
-  try {
-    scale = currencyScale(input.currency);
-  } catch {
-    return fail("invalid_currency");
-  }
+  const scale = currencyScale(input.currency); // CCY_RE checked above: cannot throw
+  const short = input.yourRefMode === "short";
 
-  let sum = 0;
+  // Sums in BigInt: exact for any number of safe-integer lines.
+  let sum = 0n;
   const seen = new Set<string>();
   const marker = ` #${input.idempotencyKey.slice(0, 8)}`;
   const date =
@@ -316,19 +447,29 @@ export function buildBankEntryPayload(input: BankEntryInput): BuildBankEntryResu
       : input.entryDate;
   const withDc = input.divisionCurrency === input.currency;
   const lines: Record<string, unknown>[] = [];
+  const builtLines: Readonly<BuiltBankEntryLine>[] = [];
   for (const l of input.lines) {
     if (!Number.isSafeInteger(l.amountMinor)) return fail("invalid_amount");
     if (l.amountMinor === 0) return fail("zero_amount_line");
-    if (!EXT_ID_RE.test(l.bankTransactionExternalId)) return fail("invalid_external_id");
-    if (seen.has(l.bankTransactionExternalId)) return fail("duplicate_external_id");
-    seen.add(l.bankTransactionExternalId);
+    const ext = l.bankTransactionExternalId;
+    if (typeof ext !== "string" || !EXT_ID_RE.test(ext)) return fail("invalid_external_id");
+    if (!short && ext.length > YOUR_REF_MAX) return fail("external_id_too_long");
+    // Exact's OData string comparison is very likely case-insensitive: compare that way too.
+    if (seen.has(ext.toLowerCase())) return fail("duplicate_external_id");
+    seen.add(ext.toLowerCase());
+    if (l.glAccountId === undefined && l.accountId === undefined) return fail("missing_account");
     for (const g of [l.glAccountId, l.accountId]) {
       if (g !== undefined && !isGuid(g)) return fail("invalid_guid");
     }
-    if (l.ourRef !== undefined && (!Number.isSafeInteger(l.ourRef) || l.ourRef < 0))
+    if (
+      l.ourRef !== undefined &&
+      (!Number.isSafeInteger(l.ourRef) || l.ourRef < 0 || l.ourRef > INT32_MAX)
+    )
       return fail("invalid_ref");
-    sum += l.amountMinor;
-    if (!Number.isSafeInteger(sum)) return fail("invalid_amount");
+    sum += BigInt(l.amountMinor);
+    const shortRef = bankLineShortRef(ext);
+    const yourRef = short ? shortRef : ext;
+    builtLines.push(Object.freeze({ externalId: ext, yourRef, shortRef }));
     const text =
       sanitizeBankText(l.description) || sanitizeBankText(l.yourRef ?? "") || "Bank line";
     const amount = new RawNumber(formatMinor(l.amountMinor, scale));
@@ -340,10 +481,10 @@ export function buildBankEntryPayload(input: BankEntryInput): BuildBankEntryResu
       [n.line.date]: date,
       [n.line.description]: sanitizeBankText(text, DESCRIPTION_MAX - marker.length) + marker,
       [n.line.ourRef]: l.ourRef === undefined ? undefined : new RawNumber(String(l.ourRef)),
-      [n.line.yourRef]: l.bankTransactionExternalId,
+      [n.line.yourRef]: yourRef,
     });
   }
-  if (input.closingBalanceMinor - input.openingBalanceMinor !== sum)
+  if (BigInt(input.closingBalanceMinor) - BigInt(input.openingBalanceMinor) !== sum)
     return fail("balance_mismatch");
 
   const body = toJson({
@@ -359,18 +500,18 @@ export function buildBankEntryPayload(input: BankEntryInput): BuildBankEntryResu
     [n.entry.closing]: new RawNumber(formatMinor(input.closingBalanceMinor, scale)),
     [n.entry.lines]: lines,
   });
-  return {
+  return brandBuilt<BuiltBankEntry>({
     ok: true,
+    division: input.division,
     body,
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      [n.idempotencyHeader]: input.idempotencyKey,
-    },
+    // No idempotency header: ExactGate allows only content-type/accept/prefer/if-* headers, and
+    // Exact has no idempotency support we know of. The key is stored by the worker instead.
+    headers: Object.freeze({ "Content-Type": "application/json", Accept: "application/json" }),
     idempotencyKey: input.idempotencyKey,
     journalCode: input.journalCode,
-    yourRefs: input.lines.map((l) => l.bankTransactionExternalId),
-  };
+    yourRefs: Object.freeze(builtLines.map((l) => l.yourRef)),
+    lines: Object.freeze(builtLines),
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -381,11 +522,15 @@ export interface MatchLineInput {
   /** Exactly one of entryNumber or transactionLineId. */
   entryNumber?: number;
   transactionLineId?: string;
+  /** Currency of the item; must equal the set's currency (a MatchSet never mixes currencies). */
+  currency: string;
   /** Signed minor units in `currency`: invoice positive, payment negative (or the reverse). */
   amountMinor: number;
 }
 
 export interface MatchSetInput {
+  /** The Exact division the lines belong to; the writer refuses any other division. */
+  division: number;
   glAccountCode: string;
   /** Relation (account) code. */
   relationCode: string;
@@ -395,9 +540,11 @@ export interface MatchSetInput {
 }
 
 export type MatchSetBuildError =
+  | "invalid_division"
   | "invalid_gl_account"
   | "invalid_relation"
   | "invalid_currency"
+  | "mixed_currency"
   | "too_few_lines"
   | "invalid_line"
   | "duplicate_line"
@@ -405,54 +552,62 @@ export type MatchSetBuildError =
   | "partial_match_not_supported_v1"
   | "invalid_reference";
 
-export type BuildMatchSetResult =
-  { ok: true; xml: string; topic: string } | { ok: false; error: MatchSetBuildError };
+export interface BuiltMatchSet {
+  readonly ok: true;
+  readonly division: number;
+  readonly xml: string;
+  readonly topic: string;
+}
 
+export type BuildMatchSetResult = BuiltMatchSet | { ok: false; error: MatchSetBuildError };
+
+/**
+ * A full-match MatchSet document. Lines are sorted by their identity so the output is
+ * byte-identical under any input order. Note: the same Exact line given once by entry number and
+ * once by transaction line id cannot be detected here (different identifiers); callers use one
+ * identifier kind per item.
+ */
 export function buildMatchSetXml(input: MatchSetInput): BuildMatchSetResult {
   const fail = (error: MatchSetBuildError): { ok: false; error: MatchSetBuildError } => ({
     ok: false,
     error,
   });
   const x = EXACT_WRITE_NAMES.xml;
+  if (!validDivision(input.division)) return fail("invalid_division");
   if (!CODE_RE.test(input.glAccountCode.trim())) return fail("invalid_gl_account");
   if (!CODE_RE.test(input.relationCode.trim())) return fail("invalid_relation");
   if (!CCY_RE.test(input.currency)) return fail("invalid_currency");
   if (input.lines.length < 2) return fail("too_few_lines");
-  let scale: number;
-  try {
-    scale = currencyScale(input.currency);
-  } catch {
-    return fail("invalid_currency");
-  }
+  const scale = currencyScale(input.currency); // CCY_RE checked above: cannot throw
   const reference = sanitizeBankText(input.reference);
   if (reference === "") return fail("invalid_reference");
 
   const seen = new Set<string>();
-  let sum = 0;
-  const rows: { key: string; xml: string; amount: number }[] = [];
+  let sum = 0n;
+  const rows: { key: string; xml: string }[] = [];
   for (const l of input.lines) {
+    if (l.currency !== input.currency) return fail("mixed_currency");
     const entryNumber = l.entryNumber;
     const lineId = l.transactionLineId;
     if ((entryNumber === undefined) === (lineId === undefined)) return fail("invalid_line");
     let key: string;
     let ref: string;
     if (entryNumber !== undefined) {
-      if (!Number.isSafeInteger(entryNumber) || entryNumber < 1) return fail("invalid_line");
-      key = `e:${String(entryNumber).padStart(12, "0")}`;
+      if (!Number.isSafeInteger(entryNumber) || entryNumber < 1 || entryNumber > INT32_MAX)
+        return fail("invalid_line");
+      key = `e:${String(entryNumber).padStart(10, "0")}`;
       ref = xmlTextElement(x.entryNumber, String(entryNumber));
     } else {
-      if (lineId === undefined || !isGuid(lineId)) return fail("invalid_line");
+      if (typeof lineId !== "string" || !isGuid(lineId)) return fail("invalid_line");
       key = `t:${lineId.toLowerCase()}`;
       ref = xmlTextElement(x.transactionLineId, lineId.toLowerCase());
     }
     if (seen.has(key)) return fail("duplicate_line");
     seen.add(key);
     if (!Number.isSafeInteger(l.amountMinor) || l.amountMinor === 0) return fail("invalid_amount");
-    sum += l.amountMinor;
-    if (!Number.isSafeInteger(sum)) return fail("invalid_amount");
+    sum += BigInt(l.amountMinor);
     rows.push({
       key,
-      amount: l.amountMinor,
       xml: xmlElement(
         x.line,
         {},
@@ -461,8 +616,9 @@ export function buildMatchSetXml(input: MatchSetInput): BuildMatchSetResult {
     });
   }
   // v1: full matches only. A part payment needs Exact's remainder handling (ADR 0040).
-  if (sum !== 0) return fail("partial_match_not_supported_v1");
-  rows.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : a.amount - b.amount));
+  if (sum !== 0n) return fail("partial_match_not_supported_v1");
+  // Keys are unique (checked above), so this order is total and input-order independent.
+  rows.sort((a, b) => (a.key < b.key ? -1 : 1));
 
   const set = xmlElement(
     x.matchSet,
@@ -473,7 +629,12 @@ export function buildMatchSetXml(input: MatchSetInput): BuildMatchSetResult {
       xmlTextElement(x.description, reference) +
       xmlElement(x.lines, {}, rows.map((r) => r.xml).join("")),
   );
-  return { ok: true, xml: buildXmlEnvelope(xmlElement(x.topic, {}, set)), topic: x.topic };
+  return brandBuilt<BuiltMatchSet>({
+    ok: true,
+    division: input.division,
+    xml: buildXmlEnvelope(xmlElement(x.topic, {}, set)),
+    topic: x.topic,
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -488,16 +649,35 @@ export type BankEntryResponse =
       status: string | null;
       lineYourRefs: string[];
     }
-  | { ok: false; error: "bad_response" | "exact_error" | "missing_entry_id" };
+  | {
+      ok: false;
+      error: "bad_response" | "exact_error" | "missing_entry_id" | "line_mismatch";
+      /**
+       * Always true: this parser only sees 2xx answers, so Exact may have booked the entry.
+       * The worker must run the duplicate probe; it must never re-post on this result.
+       */
+      outcomeUnknown: true;
+    };
 
-/** Parse the JSON answer of the bank entry POST. Never throws; anything unclear is a failure. */
-export function parseBankEntryResponse(json: string): BankEntryResponse {
+/**
+ * Parse the JSON answer of the bank entry POST. Never throws; anything unclear is a failure.
+ * When `expectedYourRefs` is given and the answer lists its lines, the line references must be
+ * exactly the ones sent.
+ */
+export function parseBankEntryResponse(
+  json: string,
+  expectedYourRefs?: readonly string[],
+): BankEntryResponse {
+  const fail = (error: "bad_response" | "exact_error" | "missing_entry_id" | "line_mismatch") =>
+    ({ ok: false, error, outcomeUnknown: true }) as const;
+  if (typeof json !== "string" || json.length > MAX_WRITE_RESPONSE_CHARS)
+    return fail("bad_response");
   try {
     const root = asRow(parseJsonRawNumbers(json));
-    if (root["error"] !== undefined) return { ok: false, error: "exact_error" };
+    if (root["error"] !== undefined) return fail("exact_error");
     const d = asRow(root["d"]);
     const id = strField(d, "EntryID");
-    if (id === null || !isGuid(id)) return { ok: false, error: "missing_entry_id" };
+    if (id === null || !isGuid(id)) return fail("missing_entry_id");
     const lines = d["BankEntryLines"];
     const results = Array.isArray(lines)
       ? lines
@@ -511,6 +691,12 @@ export function parseBankEntryResponse(json: string): BankEntryResponse {
         if (y !== null) refs.push(y);
       }
     }
+    if (expectedYourRefs !== undefined && Array.isArray(results)) {
+      const want = [...expectedYourRefs].map((s) => s.toLowerCase()).sort();
+      const got = refs.map((s) => s.toLowerCase()).sort();
+      if (want.length !== got.length || want.some((w, i) => w !== got[i]))
+        return fail("line_mismatch");
+    }
     const st = d["Status"];
     return {
       ok: true,
@@ -520,27 +706,36 @@ export function parseBankEntryResponse(json: string): BankEntryResponse {
       lineYourRefs: refs,
     };
   } catch {
-    return { ok: false, error: "bad_response" };
+    return fail("bad_response");
   }
 }
 
 export interface MatchSetResponse {
   /**
-   * Exact answered with a clearly positive message and no warning, error or fatal one. This is NOT
-   * proof of a match: the message type codes are unverified (ADR 0014 item 13). Always read back.
+   * Exact answered with at least one positive message and no warning, error, fatal or unknown
+   * one. This is NOT proof of a match: the message type codes are unverified (ADR 0014 item 13).
+   * Always read back.
    */
   accepted: boolean;
   readBackRequired: true;
   error?: "bad_xml" | "no_success_message" | "exact_reported_problem";
+  /** Descriptions are redacted (IBANs masked) and capped. */
   messages: XmlMessage[];
 }
 
 export function parseMatchSetResponse(xml: string): MatchSetResponse {
+  const bad: MatchSetResponse = {
+    accepted: false,
+    readBackRequired: true,
+    error: "bad_xml",
+    messages: [],
+  };
+  if (typeof xml !== "string" || xml.length > MAX_WRITE_RESPONSE_CHARS) return bad;
   let parsed;
   try {
     parsed = parseXmlResponse(xml);
   } catch {
-    return { accepted: false, readBackRequired: true, error: "bad_xml", messages: [] };
+    return bad;
   }
   const messages = parsed.messages.map((m) => ({
     severity: m.severity,
@@ -570,38 +765,100 @@ export interface ExpectedMatchLine {
   entryNumber?: number;
   transactionLineId?: string;
   currency: string;
+  /** The open amount of this item BEFORE the MatchSet, as read for building it. */
+  openBeforeMinor: number;
 }
 
-export type ReadBackProblem = "missing" | "ambiguous" | "still_open" | "currency_mismatch";
+export type ReadBackLineState =
+  | "closed"
+  | "open_unchanged"
+  | "missing"
+  | "missing_needs_second_query"
+  | "ambiguous"
+  | "currency_mismatch"
+  | "contradictory"
+  | "unexpected_open_amount"
+  | "no_identifier";
 
 export type ReadBackVerdict =
-  { verified: true } | { verified: false; problems: { index: number; reason: ReadBackProblem }[] };
+  | { outcome: "verified" }
+  | { outcome: "not_applied" }
+  | {
+      outcome: "inconclusive";
+      /** Per expected line (index into `expected`); "partially_applied" at index -1. */
+      problems: {
+        index: number;
+        reason: Exclude<ReadBackLineState, "closed"> | "partially_applied" | "nothing_expected";
+      }[];
+    };
+
+function findRows(rows: readonly OpenItemLineRow[], e: ExpectedMatchLine): OpenItemLineRow[] {
+  if (e.transactionLineId !== undefined) {
+    const id = e.transactionLineId.toLowerCase();
+    return rows.filter((r) => r.id.toLowerCase() === id);
+  }
+  return rows.filter((r) => r.entryNumber === e.entryNumber);
+}
+
+function rowState(row: OpenItemLineRow, e: ExpectedMatchLine): ReadBackLineState {
+  if (row.currency !== e.currency) return "currency_mismatch";
+  if (row.openAmountMinor === 0) return row.isFullyPaid ? "closed" : "contradictory";
+  if (row.isFullyPaid) return "contradictory";
+  return row.openAmountMinor === e.openBeforeMinor ? "open_unchanged" : "unexpected_open_amount";
+}
+
+function lineState(
+  e: ExpectedMatchLine,
+  primary: readonly OpenItemLineRow[],
+  fullyPaid: readonly OpenItemLineRow[] | undefined,
+): ReadBackLineState {
+  if (e.transactionLineId === undefined && e.entryNumber === undefined) return "no_identifier";
+  const found = findRows(primary, e);
+  if (found.length > 1) return "ambiguous";
+  const row = found[0];
+  if (row !== undefined) return rowState(row, e);
+  // Absent from the first read: a fully matched item may drop out of the list, or the read may
+  // have been too narrow. Never decide from absence alone: ask the second read.
+  if (fullyPaid === undefined) return "missing_needs_second_query";
+  const paid = findRows(fullyPaid, e);
+  if (paid.length > 1) return "ambiguous";
+  const p = paid[0];
+  if (p === undefined) return "missing";
+  const s = rowState(p, e);
+  // The second read asked for fully paid rows only: anything but "closed" there is a contradiction.
+  return s === "closed" || s === "currency_mismatch" ? s : "contradictory";
+}
 
 /**
- * True only when EVERY expected line is found exactly once and has nothing open. A missing row is
- * a failure, not a match (a list may drop fully paid items or the read may have been too narrow).
- * `isFullyPaid` alone is not trusted: the open amount must be zero too.
+ * Was the MatchSet applied? Three outcomes, `inconclusive` the fallback for anything not proven:
+ *  - verified:     every expected line is found exactly once (in `primary`, or, when absent
+ *                  there, in `fullyPaid`) with open amount 0 AND flagged fully paid.
+ *  - not_applied:  every expected line is found exactly once in `primary`, still open with exactly
+ *                  its amount from before the MatchSet. Only then may the worker consider a new
+ *                  attempt (with the SAME idempotency key).
+ *  - inconclusive: anything else (missing, duplicate rows, currency or flag contradictions, open
+ *                  amounts that moved, a mix of closed and open lines). Needs a manual check.
+ * `primary` is the plain read-back (`readOpenItemLines`); `fullyPaid` is the second read for the
+ * absent lines (`readOpenItemLines({ fullyPaidOnly: true })`). Without it an absent line is
+ * `missing_needs_second_query`, never a success and never a failure.
  */
 export function verifyMatchSetApplied(
-  rows: readonly OpenItemLineRow[],
+  primary: readonly OpenItemLineRow[],
   expected: readonly ExpectedMatchLine[],
+  fullyPaid?: readonly OpenItemLineRow[],
 ): ReadBackVerdict {
   if (expected.length === 0)
-    return { verified: false, problems: [{ index: -1, reason: "missing" }] };
-  const problems: { index: number; reason: ReadBackProblem }[] = [];
-  expected.forEach((e, index) => {
-    const found = rows.filter((r) =>
-      e.transactionLineId !== undefined
-        ? r.id.toLowerCase() === e.transactionLineId.toLowerCase()
-        : e.entryNumber !== undefined && r.entryNumber === e.entryNumber,
-    );
-    const row = found[0];
-    if (row === undefined) problems.push({ index, reason: "missing" });
-    else if (found.length > 1) problems.push({ index, reason: "ambiguous" });
-    else if (row.currency !== e.currency) problems.push({ index, reason: "currency_mismatch" });
-    else if (row.openAmountMinor !== 0) problems.push({ index, reason: "still_open" });
+    return { outcome: "inconclusive", problems: [{ index: -1, reason: "nothing_expected" }] };
+  const states = expected.map((e) => lineState(e, primary, fullyPaid));
+  if (states.every((s) => s === "closed")) return { outcome: "verified" };
+  if (states.every((s) => s === "open_unchanged")) return { outcome: "not_applied" };
+  const problems: Extract<ReadBackVerdict, { outcome: "inconclusive" }>["problems"] = [];
+  states.forEach((s, index) => {
+    if (s !== "closed" && s !== "open_unchanged") problems.push({ index, reason: s });
   });
-  return problems.length === 0 ? { verified: true } : { verified: false, problems };
+  if (states.includes("closed") && states.includes("open_unchanged"))
+    problems.push({ index: -1, reason: "partially_applied" });
+  return { outcome: "inconclusive", problems };
 }
 
 /** Map a cashflow read-back row. Throws ExactApiError BAD_SHAPE on unusable data. */
