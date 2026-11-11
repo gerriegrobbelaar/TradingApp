@@ -8,13 +8,19 @@
 #   - [triggers] crons = ["* * * * *"]: the scheduler tick, once a minute (do not change it);
 #   - the ExactGate Durable Object binding with migration tag v1 (sqlite), and the JobLock binding
 #     (per-job no-overlap lease, ADR 0021) with migration tag v2; never reuse or edit a deployed tag;
-#   - the JOBS_QUEUE producer, the consumer and its dead_letter_queue. Create both queues first:
-#     camelthorn-jobs and camelthorn-jobs-dlq (Queues have no EU jurisdiction; messages carry ids only).
+#   - the JOBS_QUEUE producer, the consumer and its dead_letter_queue. Create both queues first, in
+#     the EU: `wrangler queues create camelthorn-jobs --jurisdiction eu` and the same for
+#     camelthorn-jobs-dlq (ADR 0028). The producer/consumer tables have no jurisdiction field in
+#     wrangler 4.160's schema; they name the queue only (UNVERIFIED that this resolves a
+#     jurisdiction queue, first-deploy checklist in docs/DEPLOY.md).
+#   - [env.staging], a complete second set of resources (own Worker name, D1 database, queues,
+#     Durable Objects), for running the first-live checks away from production (ADR 0029). The
+#     guard refuses a staging that shares anything with production.
 # Durable Objects are always created in the EU jurisdiction by code (ADR 0018); D1 is created with
 # --jurisdiction eu and that cannot be changed later.
-# Deploy with `pnpm --filter @camelthorn/worker run deploy`, which runs
-# scripts/check-deploy-config.mjs and refuses while any placeholder is left. The ordered runbook,
-# including queue creation, secrets and first-deploy checks, is docs/DEPLOY.md.
+# Deploy with `pnpm --filter @camelthorn/worker run deploy` (staging: `run deploy:staging`), which
+# runs scripts/check-deploy-config.mjs and refuses while any placeholder is left. The ordered
+# runbook, including queue creation, secrets and first-deploy checks, is docs/DEPLOY.md.
 name = "camelthorn-finance"
 main = "src/index.ts"
 compatibility_date = "2026-08-01"
@@ -37,10 +43,26 @@ preview_urls = false
 [triggers]
 crons = ["* * * * *"]
 
+# Logs (review S7). Request URLs carry customer names (`?q=` search) and the OAuth `code`, so:
+#   - redact_query_string removes query strings from URLs in logs and traces;
+#   - invocation_logs = false turns off the automatic per-request log line. The application's own
+#     console output (reason codes only, never tokens or IBANs) is still kept.
+# Whether Cloudflare redacts everything this way is UNVERIFIED until checked in the dashboard
+# (docs/DEPLOY.md, Log hygiene). The deploy guard refuses invocation logs at sampling above 0.05.
 [observability]
 enabled = true
-# Sampling: 1 = keep every request log. Lower this (for example 0.1) if log volume or cost grows.
 head_sampling_rate = 1
+redact_query_string = true
+
+[observability.logs]
+invocation_logs = false
+
+# CPU time per invocation (milliseconds). 30000 is Cloudflare's default; it is written out so a
+# change is a reviewed diff. A full Exact pass is bounded by the 1,000-subrequest and 60-call/minute
+# limits and runs in resumable chunks, so 30 s of CPU is ample; raise it (maximum 300000) only if a
+# live run shows CPU-limit errors (docs/DEPLOY.md, step 10 item 11).
+[limits]
+cpu_ms = 30000
 
 [assets]
 directory = "../web/dist"
@@ -97,9 +119,9 @@ class_name = "JobLock"
 tag = "v2"
 new_sqlite_classes = ["JobLock"]
 
-# Job runs. Create both queues once before the first deploy (docs/DEPLOY.md):
-#   wrangler queues create camelthorn-jobs
-#   wrangler queues create camelthorn-jobs-dlq
+# Job runs. Create both queues once before the first deploy, in the EU (docs/DEPLOY.md, ADR 0028):
+#   wrangler queues create camelthorn-jobs --jurisdiction eu
+#   wrangler queues create camelthorn-jobs-dlq --jurisdiction eu
 [[queues.producers]]
 binding = "JOBS_QUEUE"
 queue = "camelthorn-jobs"
@@ -114,3 +136,89 @@ max_batch_timeout = 1
 max_retries = 3
 retry_delay = 60
 dead_letter_queue = "camelthorn-jobs-dlq"
+
+# ---------------------------------------------------------------------------------------------
+# Staging (ADR 0029): `wrangler deploy --env staging` (via `pnpm run deploy:staging`, which runs the
+# guard first). Environments do not inherit bindings, so everything is written out again. Nothing
+# is shared with production: own Worker, D1 database, queues and Durable Object namespaces (a
+# Durable Object namespace belongs to its Worker, so a separate Worker name means separate state).
+# Fill the placeholders with a TEST Exact division and, preferably, a Google client with its own
+# redirect URI. Secrets are per Worker: repeat `secret put` with `--env staging`.
+# ---------------------------------------------------------------------------------------------
+[env.staging]
+name = "camelthorn-finance-staging"
+workers_dev = false
+preview_urls = false
+# PLACEHOLDER. Uncomment and set the staging hostname (not the production one):
+# routes = [{ pattern = "staging.example.com", custom_domain = true }]
+
+[env.staging.triggers]
+crons = ["* * * * *"]
+
+[env.staging.observability]
+enabled = true
+head_sampling_rate = 1
+redact_query_string = true
+
+[env.staging.observability.logs]
+invocation_logs = false
+
+[env.staging.limits]
+cpu_ms = 30000
+
+[env.staging.assets]
+directory = "../web/dist"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+binding = "ASSETS"
+
+[env.staging.vars]
+INITIAL_ADMIN_EMAIL = "gerrie.grobbelaar@camelthorncapital.com"
+ALLOWED_HD = "camelthorncapital.com"
+# PLACEHOLDER. Google OAuth client ID (the production client works if it has the staging redirect URI).
+GOOGLE_CLIENT_ID = ""
+# PLACEHOLDER (staging.example.com). Must differ from production and be registered on the Google client.
+OAUTH_REDIRECT_URI = "https://staging.example.com/api/auth/callback"
+# PLACEHOLDER. Exact app client ID (the same app registration may be used with an extra redirect URI).
+EXACT_CLIENT_ID = ""
+# PLACEHOLDER (staging.example.com). Same origin as the staging OAUTH_REDIRECT_URI.
+EXACT_REDIRECT_URI = "https://staging.example.com/api/connections/exact/callback"
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "camelthorn-finance-staging"
+# PLACEHOLDER (all zeros). Create it separately, never reuse the production id:
+#   wrangler d1 create camelthorn-finance-staging --jurisdiction eu
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[env.staging.durable_objects.bindings]]
+name = "EXACT_GATE"
+class_name = "ExactGate"
+
+[[env.staging.durable_objects.bindings]]
+name = "JOB_LOCK"
+class_name = "JobLock"
+
+[[env.staging.migrations]]
+tag = "v1"
+new_sqlite_classes = ["ExactGate"]
+
+[[env.staging.migrations]]
+tag = "v2"
+new_sqlite_classes = ["JobLock"]
+
+# Create both in the EU first:
+#   wrangler queues create camelthorn-jobs-staging --jurisdiction eu
+#   wrangler queues create camelthorn-jobs-staging-dlq --jurisdiction eu
+[[env.staging.queues.producers]]
+binding = "JOBS_QUEUE"
+queue = "camelthorn-jobs-staging"
+
+[[env.staging.queues.consumers]]
+queue = "camelthorn-jobs-staging"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 3
+retry_delay = 60
+dead_letter_queue = "camelthorn-jobs-staging-dlq"

@@ -7,6 +7,8 @@ on:
   push:
     branches: [main, "claude/**", "build/**"]
   pull_request:
+  # Manual run; the only trigger of the optional `screens` job below.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -39,6 +41,42 @@ jobs:
       # Validates config, assets and bundle without publishing or needing Cloudflare credentials.
       # It does not run the placeholder guard (scripts/check-deploy-config.mjs); `pnpm run deploy`
       # does, so committed placeholders cannot be deployed by that path.
-      - run: pnpm --filter @camelthorn/worker exec wrangler deploy --dry-run
+      # Production (top level, --env="") and staging ([env.staging]) are both checked.
+      - run: pnpm --filter @camelthorn/worker exec wrangler deploy --dry-run --env=""
         env:
           WRANGLER_SEND_METRICS: "false"
+      - run: pnpm --filter @camelthorn/worker exec wrangler deploy --dry-run --env staging
+        env:
+          WRANGLER_SEND_METRICS: "false"
+
+  # Optional browser checks of the reporting screens (review N8). Not a required check: it only
+  # runs when started by hand (Actions, CI, Run workflow) and a failure never blocks a merge. It
+  # installs Playwright outside the repo, uses the runner's Google Chrome and poppler, and uploads
+  # the screenshots as an artifact. UNVERIFIED on GitHub's runners until its first run.
+  screens:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: sudo apt-get update && sudo apt-get install -y poppler-utils
+      - run: npm install --prefix "$RUNNER_TEMP/pw" playwright
+      - run: pnpm --filter @camelthorn/web build
+      - run: pnpm --filter @camelthorn/web exec vitest run --config scripts/vitest.screens.config.ts
+        env:
+          PLAYWRIGHT_PATH: ${{ runner.temp }}/pw/node_modules/playwright/index.mjs
+          CHROME_PATH: /usr/bin/google-chrome
+          OUT_DIR: ${{ runner.temp }}/screens
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screens
+          path: ${{ runner.temp }}/screens
+          if-no-files-found: ignore

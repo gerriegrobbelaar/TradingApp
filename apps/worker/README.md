@@ -47,7 +47,10 @@ If any is missing, `/api/connections/exact/start` and `/callback` answer
 | `camelthorn-jobs-dlq`            | dead-letter queue                 | Runs that could not be started after 3 retries. Nothing consumes it; see docs/DEPLOY.md. |
 | `JOB_LOCK` (`JobLock`, tag `v2`) | Durable Object, EU                | One no-overlap lease per job name.                                                       |
 
-Create both queues before the first deploy. The Exact sync jobs are off after install; switch them
+Create both queues before the first deploy, in the EU (`wrangler queues create <name> --jurisdiction
+eu`, ADR 0028). `wrangler.toml` also has an `[env.staging]` block with its own Worker, database,
+queues and objects: `pnpm run check:deploy:staging` and `pnpm run deploy:staging` (ADR 0029,
+docs/DEPLOY.md "Staging first"). The Exact sync jobs are off after install; switch them
 on in Settings, Schedules after the first-live-connection checks pass (docs/DEPLOY.md step 10).
 
 ## Auth API

@@ -1,14 +1,154 @@
 // Pure check of wrangler.toml text for committed placeholders. No I/O, so tests can import it.
 
-/** Returns the problems found in a wrangler.toml text; empty means ready to deploy. */
-export function deployConfigProblems(toml) {
-  // Drop comments so commented-out examples never count as configured.
+/**
+ * Returns the text of one environment, comments removed. "production" is the top level with
+ * every [env.*] table dropped; any other name keeps only that environment's tables with the
+ * `env.<name>.` prefix removed, so the same checks read both. Nothing is inherited in this check
+ * on purpose: whatever staging needs must be written inside [env.staging].
+ */
+export function environmentText(toml, env = "production") {
   const lines = toml.split("\n").map((l) => l.replace(/(^|\s)#.*$/, "").trimEnd());
-  const text = lines.join("\n");
-  const value = (key) => {
-    const m = new RegExp(`^\\s*${key}\\s*=\\s*"([^"]*)"`, "m").exec(text);
-    return m ? m[1] : null;
+  const out = [];
+  const prefix = `env.${env}`;
+  let keep = env === "production";
+  for (const line of lines) {
+    const header = /^\s*(\[\[?)\s*([^\]\s]+)\s*(\]\]?)\s*$/.exec(line);
+    if (!header) {
+      if (keep) out.push(line);
+      continue;
+    }
+    const name = header[2] ?? "";
+    if (env === "production") {
+      keep = !/^env(\.|$)/.test(name);
+      if (keep) out.push(line);
+    } else if (name === prefix || name.startsWith(`${prefix}.`)) {
+      keep = true;
+      // [env.staging] itself holds root keys: emit a header that matches no named table.
+      out.push(
+        name === prefix ? "[__root__]" : `${header[1]}${name.slice(prefix.length + 1)}${header[3]}`,
+      );
+    } else {
+      keep = false;
+    }
+  }
+  return out.join("\n");
+}
+
+/** True if the toml defines the named environment at all. */
+export function hasEnvironment(toml, env) {
+  return new RegExp(`^\\s*\\[\\[?\\s*env\\.${env}(\\.|\\s*\\])`, "m").test(toml);
+}
+
+function readValue(text, key) {
+  const m = new RegExp(`^\\s*${key}\\s*=\\s*"([^"]*)"`, "m").exec(text);
+  return m ? (m[1] ?? null) : null;
+}
+
+/** Body of the first [name] (or [[name]]) table, or null. */
+function tableBody(text, name, array = false) {
+  const escaped = name.replace(/\./g, "\\.");
+  const open = array ? `\\[\\[${escaped}\\]\\]` : `\\[${escaped}\\]`;
+  const m = new RegExp(`^${open}[ \\t]*\\n((?:(?!\\[).*\\n?)*)`, "m").exec(text);
+  return m ? (m[1] ?? "") : null;
+}
+
+/** Top-level keys only: the text before the first table, plus the [env.<name>] root keys. */
+function rootBody(text) {
+  const first = text.search(/^\s*\[/m);
+  const head = first < 0 ? text : text.slice(0, first);
+  return head + "\n" + (tableBody(text, "__root__") ?? "");
+}
+
+const isPlaceholderId = (id) => !id || /^[0-]+$/.test(id);
+
+/** Invocation logs at more than 5 % sampling store request URLs (review S7). */
+function observabilityProblems(text) {
+  const obs = tableBody(text, "observability");
+  if (obs === null || !/^\s*enabled\s*=\s*true/m.test(obs)) return [];
+  const logs = tableBody(text, "observability.logs") ?? "";
+  const rate = (body) => {
+    const m = /^\s*head_sampling_rate\s*=\s*([0-9.]+)/m.exec(body);
+    return m ? Number(m[1]) : null;
   };
+  const sampling = rate(logs) ?? rate(obs) ?? 1;
+  const invocationOff = /^\s*invocation_logs\s*=\s*false/m.test(logs);
+  if (!invocationOff && sampling > 0.05) {
+    return [
+      "[observability] keeps invocation logs (request URLs) at sampling above 0.05: set [observability.logs] invocation_logs = false (docs/DEPLOY.md, Log hygiene)",
+    ];
+  }
+  return [];
+}
+
+/** What must differ between production and staging so they can never share state. */
+function isolationProblems(toml) {
+  if (!hasEnvironment(toml, "staging")) return [];
+  const prod = environmentText(toml, "production");
+  const stag = environmentText(toml, "staging");
+  const problems = [];
+  const same = (what, a, b) => {
+    if (a && b && a === b)
+      problems.push(`staging shares ${what} with production (${a}): give it its own`);
+  };
+  same("the Worker name", readValue(rootBody(prod), "name"), readValue(rootBody(stag), "name"));
+  const db = (t) => tableBody(t, "d1_databases", true) ?? "";
+  const prodId = readValue(db(prod), "database_id");
+  if (!isPlaceholderId(prodId))
+    same("the D1 database id", prodId, readValue(db(stag), "database_id"));
+  same(
+    "the D1 database name",
+    readValue(db(prod), "database_name"),
+    readValue(db(stag), "database_name"),
+  );
+  const queues = (t) => {
+    const consumer = tableBody(t, "queues.consumers", true) ?? "";
+    return {
+      producer: readValue(tableBody(t, "queues.producers", true) ?? "", "queue"),
+      consumer: readValue(consumer, "queue"),
+      dlq: readValue(consumer, "dead_letter_queue"),
+    };
+  };
+  const pq = queues(prod);
+  const sq = queues(stag);
+  const prodNames = new Set([pq.producer, pq.consumer, pq.dlq].filter(Boolean));
+  for (const q of new Set([sq.producer, sq.consumer, sq.dlq])) {
+    if (q && prodNames.has(q))
+      problems.push(`staging uses the production queue ${q}: give it its own`);
+  }
+  same(
+    "OAUTH_REDIRECT_URI",
+    readValue(prod, "OAUTH_REDIRECT_URI"),
+    readValue(stag, "OAUTH_REDIRECT_URI"),
+  );
+  same(
+    "EXACT_REDIRECT_URI",
+    readValue(prod, "EXACT_REDIRECT_URI"),
+    readValue(stag, "EXACT_REDIRECT_URI"),
+  );
+  return problems;
+}
+
+/**
+ * Returns the problems found in a wrangler.toml text; empty means ready to deploy.
+ * `env` is "production" (the top level) or the name of an [env.<name>] block, normally "staging".
+ * Isolation between staging and production is checked in both modes.
+ */
+export function deployConfigProblems(toml, env = "production") {
+  if (env !== "production" && !hasEnvironment(toml, env)) {
+    return [`no [env.${env}] section in wrangler.toml`];
+  }
+  const text = environmentText(toml, env);
+  const problems = placeholderProblems(text);
+  if (env !== "production" && !readValue(rootBody(text), "name")) {
+    problems.push(`[env.${env}] has no name of its own (it would deploy over production)`);
+  }
+  problems.push(...observabilityProblems(text));
+  problems.push(...isolationProblems(toml));
+  return problems;
+}
+
+function placeholderProblems(text) {
+  const value = (key) => readValue(text, key);
   const problems = [];
   const dbId = value("database_id");
   if (!dbId || /^[0-]+$/.test(dbId)) {

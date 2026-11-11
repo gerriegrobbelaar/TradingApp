@@ -11,6 +11,12 @@ wrangler 4.160). From `apps/worker` the commands below read `pnpm exec wrangler 
 repo root use `pnpm --filter @camelthorn/worker exec wrangler <command>`. Sign in once with
 `pnpm exec wrangler login`.
 
+**Staging first.** Steps 2 to 10 are written for production. Because nothing here has run against a
+real Cloudflare, Google or Exact account, do them once on the staging environment first (own Worker,
+database, queues and objects; see "Staging first" below) and only then repeat them on production.
+Durable Object jurisdictions do not work in local `wrangler dev`, so staging is the first place the
+Exact connection and the scheduler can run at all.
+
 ## Step 0. What a human must do
 
 Most of these cannot be scripted. Do them first, because later steps need their output (client IDs,
@@ -21,7 +27,7 @@ database id, hostname).
 | 1   | Cloudflare account owner | Put the account on the **Workers paid plan** (the free plan's CPU and cron limits are too small; Queues and Durable Objects need it).                                                                                                                | Cloudflare dashboard, Billing                         | Step 2        |
 | 2   | Cloudflare account owner | Choose the app hostname (for example `finance.<your domain>`) on a zone in the same account. It becomes the `routes` line and the origin of every redirect URI.                                                                                      | Dashboard, DNS / Workers routes                       | Step 4        |
 | 3   | Admin                   | Create the **EU D1 database** (jurisdiction cannot change later). Done by command in step 2.                                                                                                                                                         | Terminal                                              | Step 2        |
-| 4   | Admin                   | Create **two queues**, main and dead-letter. Done by command in step 3.                                                                                                                                                                              | Terminal                                              | Step 3        |
+| 4   | Admin                   | Create **two queues** in the EU, main and dead-letter. Done by command in step 3.                                                                                                                                                                              | Terminal                                              | Step 3        |
 | 5   | Google Cloud admin      | Pick the Google Cloud project that owns the OAuth client (open decision 8 in CLAUDE.md; ADR 0002: only `camelthorncapital.com`). Set the OAuth consent screen to **Internal** (Workspace users only). Create an OAuth client of type Web application. | Google Cloud console, APIs and services, Credentials  | Step 4 and 5  |
 | 6   | Google Cloud admin      | On that client add the authorised redirect URI `https://<app host>/api/auth/callback`. For local work also `http://localhost:5173/api/auth/callback`. Keep the client ID and secret.                                                                  | Same                                                  | Step 4 and 5  |
 | 7   | Exact administrator     | Register the app in the Exact App Center ("Register API keys") with the redirect URI `https://<app host>/api/connections/exact/callback`. Keep the client ID and secret.                                                                             | apps.exactonline.com (Dutch instance: start.exactonline.nl) | Step 4 and 5  |
@@ -84,18 +90,25 @@ tag: a new class or a rename needs a new `[[migrations]]` entry with the next ta
 ## Step 3. Create the queues
 
 Job runs travel through a Cloudflare Queue. Create the queue and its dead-letter queue once, before
-the first deploy; the names must match `wrangler.toml`:
+the first deploy, **in the EU**; the names must match `wrangler.toml`:
 
 ```sh
-pnpm exec wrangler queues create camelthorn-jobs
-pnpm exec wrangler queues create camelthorn-jobs-dlq
+pnpm exec wrangler queues create camelthorn-jobs --jurisdiction eu
+pnpm exec wrangler queues create camelthorn-jobs-dlq --jurisdiction eu
 pnpm exec wrangler queues list
 ```
+
+`--jurisdiction` (choices `eu`, `us`, `fedramp`) is in `wrangler queues create --help` of wrangler
+4.160. Assume it cannot be changed afterwards (ADR 0028). `[[queues.producers]]` and
+`[[queues.consumers]]` have no jurisdiction field in wrangler's schema and need nothing extra: they
+name the queue only. **Unverified:** that a Worker bound by name reaches a queue created with a
+jurisdiction. This is on the first-deploy checklist: if `wrangler deploy` (step 7) or the Run now in
+step 9 cannot find the queue, stop and record the error in ADR 0028.
 
 The Worker is both producer (binding `JOBS_QUEUE`, used by the cron tick and "Run now") and consumer
 (`queue()`), configured under `[[queues.producers]]` and `[[queues.consumers]]`: one run per
 invocation (`max_batch_size = 1`), 3 retries 60 s apart, then the dead-letter queue
-`camelthorn-jobs-dlq`. Queues have no EU jurisdiction; messages carry only ids (`runId`, `jobId`).
+`camelthorn-jobs-dlq`. Messages carry only ids (`runId`, `jobId`), never customer data.
 Nothing consumes the dead-letter queue; see "Inspecting the dead-letter queue".
 
 ## Step 4. Fill in `wrangler.toml`
@@ -116,8 +129,12 @@ left:
 | `JOBS_QUEUE` producer, consumer, `dead_letter_queue` | leave as is (names from step 3)                                                                        | producer, consumer or dead-letter queue missing                 |
 
 `INITIAL_ADMIN_EMAIL` and `ALLOWED_HD` are not guarded: check them by eye. `workers_dev` and
-`preview_urls` stay `false`. `[observability]` is on with `head_sampling_rate = 1` (see "Log
-hygiene").
+`preview_urls` stay `false`. `[observability]` keeps application logs but turns off invocation logs
+and redacts query strings; the guard refuses invocation logs at sampling above 0.05 (see "Log
+hygiene"). `[limits] cpu_ms = 30000` is the CPU time allowed per invocation (Cloudflare's default,
+written out; step 10 item 11 says when to raise it).
+
+Staging has its own copy of every row of this table inside `[env.staging]` (see "Staging first").
 
 The cron `* * * * *` is the scheduler tick: every minute the Worker works out from each job's own
 schedule (Settings, Schedules; Europe/Amsterdam, daylight saving aware) which jobs are due and puts
@@ -135,8 +152,19 @@ are in it).
 
 ## Step 5. Set the secrets
 
-Secrets live only in Workers secrets. If the Worker does not exist yet, `wrangler secret put` offers
-to create it; accept.
+Secrets live only in Workers secrets. The Worker does not exist yet before the first deploy (step
+7), and `wrangler secret put` on a missing Worker asks "There doesn't seem to be a Worker called
+... Do you want to create a new Worker with that name and add secrets to it?" Answer yes **once**:
+run the first `secret put` below by hand (interactive prompt) and accept; the later ones then find
+the Worker. The placeholder Worker it creates has no code until step 7.
+
+Alternative that avoids the prompt per secret: put all four values in a JSON file kept **outside**
+the repo and outside any synced folder (for example `~/secrets/camelthorn.json`, mode 600, content
+`{"GOOGLE_CLIENT_SECRET":"...","SESSION_SECRET":"...","EXACT_CLIENT_SECRET":"...","TOKEN_ENC_KEY":"..."}`)
+and run `pnpm exec wrangler secret bulk ~/secrets/camelthorn.json` (`wrangler secret bulk --help`:
+JSON or `.env` file, up to 100 secrets, a `null` value deletes; with no file it reads stdin). Delete
+the file afterwards. Whether bulk also offers to create a missing Worker is **unverified**; if it
+errors, do the first secret with `secret put` as below.
 
 ```sh
 pnpm exec wrangler secret put GOOGLE_CLIENT_SECRET
@@ -160,8 +188,8 @@ Never commit or log it.
 pnpm exec wrangler d1 migrations apply camelthorn-finance --remote
 ```
 
-This applies `apps/worker/migrations/0001_auth.sql` through the latest file (`0008_scheduler.sql` at
-the time of writing) in order. Verify:
+This applies **all migrations in `apps/worker/migrations`** in order (the file count grows with each
+phase, so do not rely on a number written here). Verify:
 
 ```sh
 pnpm exec wrangler d1 migrations list camelthorn-finance --remote
@@ -181,11 +209,12 @@ pnpm --filter @camelthorn/web build
 pnpm --filter @camelthorn/worker run deploy
 ```
 
-`run deploy` runs the placeholder check, then `wrangler deploy`. Do not call `wrangler deploy`
-directly: it skips the check. `wrangler deploy --dry-run` (also run in CI) checks bundle and config
-without publishing and does not check placeholders. A dry run on this repo needs `apps/web/dist` to
-exist (build first) and lists the bindings `EXACT_GATE`, `JOB_LOCK`, `JOBS_QUEUE`, `DB`, `ASSETS` and
-the variables.
+`run deploy` runs the placeholder check, then `wrangler deploy --env=""` (the empty environment
+names the top level explicitly; without it wrangler warns that several environments are defined).
+Do not call `wrangler deploy` directly: it skips the check. `wrangler deploy --dry-run --env=""`
+(and `--env staging`, both run in CI) checks bundle and config without publishing and does not check
+placeholders. A dry run on this repo needs `apps/web/dist` to exist (build first) and lists the
+bindings `EXACT_GATE`, `JOB_LOCK`, `JOBS_QUEUE`, `DB`, `ASSETS` and the variables.
 
 After the first deploy, `https://camelthorn-finance.<account>.workers.dev` must not answer
 (`workers_dev` is off).
@@ -247,6 +276,12 @@ scheduler itself is checked with a harmless manual run.
       dashboard.
 - [ ] ADR 0021 "verify on first deploy": queue and dead-letter queue exist; no warning within 2
       minutes; Run now ends as above; `JobLock` objects under the EU jurisdiction.
+- [ ] ADR 0028 (unverified): the queues were created with `--jurisdiction eu`, and the Worker
+      (producer and consumer, bound by name only) works with them. Check the dashboard, Queues, for
+      the jurisdiction if `wrangler queues info` does not print it.
+- [ ] Logs (ADR 0029, unverified): after a few requests with a query string (for example
+      `/api/open-items?q=test`) open Workers Logs and confirm no stored URL contains `?q=` or an OAuth
+      `code`, and that no per-request invocation line is kept.
 
 ## Step 10. Connect Exact and run the first-live-connection checklist
 
@@ -285,7 +320,11 @@ sync panel on the test division.
    one stored before: expected, review them with the accountant. An IBAN with a wrong check digit
    (`hasValidIbanChecksum`) is stored and flagged like any other.
 8. **`ReceivablesList` / `PayablesList`.** `ID` versus `HID`, what `Amount` means and in which
-   currency, page size (60?), dates and their time zone (ADR 0014 items 3, 9).
+   currency, page size (60?), dates and their time zone (ADR 0014 items 3, 9). Also: the **sign**
+   of payables (are bills positive and credit notes negative, as for receivables? the app reads
+   credit notes as negative on both sides) and the **spelling of the key field**: Exact resources
+   differ between `ID` and `Id` (`$select` is case-sensitive about names), so a 400 on the lists
+   may just be this.
 9. **`/sync/Cashflow/*`.** Do the endpoints exist (the payables one may be `Payments` or
    `PaymentTerms`), their fields, whether paid rows come back, and **whether an item has the same
    `ID` in the list and in the sync endpoint**. Until that is confirmed, leave Settings,
@@ -301,8 +340,14 @@ sync panel on the test division.
 11. **Subrequest limit and D1 batches.** Which per-invocation subrequest limit the account has
     (we assume 1,000, `SUBREQUEST_LIMIT`), and whether one `db.batch` of up to 100 statements
     counts as one subrequest (we count it as one). Run a full pass on the largest division and
-    read the Worker's subrequest count from the invocation logs (ADR 0017 verify 8). The queue
-    runner's own heartbeats and finish writes are not in that meter (review S7).
+    read the Worker's subrequest count from the invocation logs (ADR 0017 verify 8; invocation
+    logs are off in `wrangler.toml`, so for this check switch them on temporarily on **staging**
+    only, or use `wrangler tail`, which does not need them). The queue runner's own heartbeats and
+    finish writes are not in that meter (review S7). Also check the **CPU limit**: Workers allow
+    30 s of CPU per invocation by default and `[limits] cpu_ms = 30000` in `wrangler.toml` states
+    it. A full pass is bounded by calls, not CPU, but JSON parsing of a large division is the
+    likeliest thing to hit it: look for "exceeded CPU" errors in the dashboard (or `wrangler tail`)
+    and raise `cpu_ms` (maximum 300000) with a note in ADR 0029 only if you see one.
 12. **Logs.** `pnpm exec wrangler tail` during a sync and a connect: no tokens, no IBANs, no
     response bodies.
 13. **Reconnect to another account.** On a throwaway deployment, connect, then connect with a
@@ -316,8 +361,29 @@ sync panel on the test division.
 14. **Before Phase 7 (matching):** XML upload with bearer auth, the `_Division_` parameter, the
     message type codes, and that a MatchSet can be read back (ADR 0014 item 13).
 15. **Ledger and reports (before relying on the balance sheet and profit and loss; ADR 0024).**
-    Run a full sync on the test division (Run now on `exact.full_sync`, or "Sync now" in full mode)
-    until the cycle completes, then check, in this order:
+    Run a full sync on the test division until the cycle completes, then check, in this order.
+    Two ways exist (ADR 0023): **Run now** on `exact.full_sync` in Settings, Schedules (every
+    administration with sync on; reads IBANs; budget per job), or the **Full sync** button in
+    Settings, Connections, Data sync (one administration; the other button there is "Sync now",
+    the incremental one). The **manual button path never reads IBANs**, so item 7 needs Run now.
+    Each press of "Full sync" is a slice of up to 60 Exact calls and 20 s: press it again (after the
+    one-minute wait the card shows) until it reports the cycle complete. There is no button for
+    `restart`. When this list says "a full sync with restart", send the request yourself, as an
+    admin or finance user, with your session cookie from the browser (developer tools, Application,
+    Cookies, `__Host-session`):
+
+    ```sh
+    curl -sS -X POST "https://<app host>/api/divisions/<division id>/sync" \
+      -H "Cookie: __Host-session=<value>" \
+      -H "X-Requested-With: fetch" -H "Content-Type: application/json" \
+      -d '{"mode":"full","restart":true}'
+    ```
+
+    (`X-Requested-With` is the CSRF header; the division id is the one shown in `GET
+    /api/divisions`.) `restart` is accepted in full mode only. Repeat the call without `restart`
+    until `GET /api/sync/status` (or the Data sync card) shows the cycle complete. The exact
+    response fields are not recorded here (**unverified**); read them on first use. Treat the cookie like a password and sign out
+    afterwards.
     - `financial/GLAccounts`, `financial/ReportingBalance` and `budget/Budgets` answer to the
       `$select` lists in `packages/exact/src/client.ts` (`GL_ACCOUNT_FIELDS`,
       `REPORTING_BALANCE_FIELDS`, `BUDGET_FIELDS`). A 400 names a wrong field. For balances it
@@ -390,6 +456,77 @@ sync panel on the test division.
       safe), and `submittedAt` / `ageDays` can be one day off around midnight. Record it.
     - `$skiptoken` paging with this filter and order, the page size (60?), and that `Document`
       holds a GUID when a PDF is attached.
+
+## Staging first
+
+`wrangler.toml` has a complete `[env.staging]` block (ADR 0029): Worker `camelthorn-finance-staging`,
+its own D1 database `camelthorn-finance-staging`, queues `camelthorn-jobs-staging` and
+`camelthorn-jobs-staging-dlq`, its own `ExactGate` and `JobLock` objects (a Durable Object namespace
+belongs to its Worker), its own variables and cron. Nothing is shared with production, and the
+deploy guard refuses a staging that reuses the production Worker name, D1 id or name, a queue or a
+redirect URI.
+
+Procedure: do steps 0 to 7 for staging, then 8 to 10 on staging **before** touching production.
+
+1. Step 0: pick a staging hostname (for example `staging.<your domain>`). Either create a second
+   Google OAuth client for it, or reuse the production client and add the staging redirect URI
+   `https://<staging host>/api/auth/callback` to it. Same for the Exact app registration: add
+   `https://<staging host>/api/connections/exact/callback` (or register a second app). Staging
+   connects to a **test Exact division**, not the real administration.
+2. Step 2 and 3 with staging names, queues in the EU:
+
+   ```sh
+   pnpm exec wrangler d1 create camelthorn-finance-staging --jurisdiction eu
+   pnpm exec wrangler queues create camelthorn-jobs-staging --jurisdiction eu
+   pnpm exec wrangler queues create camelthorn-jobs-staging-dlq --jurisdiction eu
+   ```
+
+3. Step 4: fill the staging `database_id`, `GOOGLE_CLIENT_ID`, `OAUTH_REDIRECT_URI`,
+   `EXACT_CLIENT_ID`, `EXACT_REDIRECT_URI` and `routes` inside `[env.staging]`, then
+   `pnpm run check:deploy:staging` (from `apps/worker`).
+4. Step 5: every secret again for the staging Worker, with a **different** `TOKEN_ENC_KEY`:
+   `pnpm exec wrangler secret put GOOGLE_CLIENT_SECRET --env staging` and so on.
+5. Step 6: `pnpm exec wrangler d1 migrations apply camelthorn-finance-staging --remote --env
+   staging`.
+6. Step 7: `pnpm --filter @camelthorn/web build`, then `pnpm --filter @camelthorn/worker run
+   deploy:staging` (guard first, then `wrangler deploy --env staging`).
+7. Steps 8, 9 and 10 against the staging hostname, with `--env staging` and the staging database
+   name in every `wrangler` command. Record the answers to the step 10 checklist in the ADRs it
+   names.
+8. Only when step 10 and the "First sync procedure" below pass on staging, repeat steps 2 to 9 for
+   production with production names.
+
+What differs on staging: Worker name, hostname, D1 database, queues, objects, secrets and
+`TOKEN_ENC_KEY`, the Exact division (test data) and, if you made one, the Google client. What must
+not differ: the code and `wrangler.toml` structure, which is why staging is deployed from the same
+commit as production. Staging has its own copy of every job: jobs are off after install there too.
+
+Where things can run: Durable Object jurisdictions (`ExactGate`, `JobLock`) are not implemented in
+workerd, so they can be exercised **only on staging or production**, never in local `wrangler dev`
+or with `--remote` aimed at production. Unit tests stub the call.
+
+## First sync procedure
+
+Proposed by the Phase 4 final review. Follow it on staging, then on production.
+
+1. Finish step 10 items 1 to 9 on the test division (staging) with the Exact jobs still **off**.
+2. In daytime (so someone can watch and the day's budget is not at risk), press **Run now** on
+   `exact.full_sync` in Settings, Schedules. Expect several runs for a big division (the pass
+   resumes; ADR 0021). Watch `wrangler tail --env staging` for status codes: no 400, 403 or 429
+   other than expected.
+3. Compare with Exact itself: counts and totals of open receivables and payables against Exact's
+   debtors and creditors ageing; the balance sheet for the last closed month against Exact's trial
+   balance (step 10 item 15); the HTTP status codes in `sync_state.last_error` for every entity
+   (none left over); `GET /api/approvals/status-codes` against Exact's UI (item 16).
+4. Read `exact_usage` (`wrangler d1 execute <db> --remote --command "SELECT * FROM exact_usage ORDER
+   BY 1 DESC LIMIT 20"`) and the remaining-calls header. A first full cycle costs a few hundred
+   calls; the defaults allow up to 1,960 per administration and day (ADR 0021).
+5. Enable `exact.full_sync` (nightly, 02:00) in Settings, Schedules. Look at the next morning's run.
+6. Then enable the hourly `exact.incremental_sync`. Check one day of hourly runs (2 to 4 calls
+   each) and the daily total in `exact_usage`.
+7. Repeat the whole procedure on production with the real administration, starting again with the
+   jobs off and a daytime Run now.
+
 ---
 
 ## Operations
@@ -432,14 +569,25 @@ each deploy and when Settings, Schedules shows repeated failures.
 
 ### Log hygiene
 
-- Workers Logs (`[observability]`) may store request URLs. The Google and Exact OAuth callbacks put
-  the authorization `code` in the URL. The code is single-use and short-lived, and the app also
-  needs the signed state cookie, so a stored code is low risk, but whether URLs with query strings
-  are kept at `head_sampling_rate = 1` is **unverified**. Recommendation: lower the sampling rate
-  (for example `head_sampling_rate = 0.1`) once the first deploy checks are done, and limit who can
-  read the logs. Application code logs reason codes only, never tokens, keys, full IBANs or email
-  bodies (checklist item 12 verifies this).
-- Queues have no EU jurisdiction. Messages carry ids only (`runId`, `jobId`), never customer data.
+- Request URLs can carry personal data. Endpoints with query strings: the lists and search
+  (`?q=<customer or supplier name>` on invoices, payables, approvals and reports; also `division`,
+  `cursor`, `status` and date filters), and the Google and Exact OAuth callbacks
+  (`/api/auth/callback`, `/api/connections/exact/callback`, which carry the authorization `code`
+  and `state`). Names in the page address of the web app can leak through the `Referer` header
+  (task M2 removes relation names from it).
+- What `wrangler.toml` does about it (ADR 0029): `[observability] redact_query_string = true`
+  (query strings removed from URLs in logs and traces) and `[observability.logs] invocation_logs =
+  false` (no automatic per-request line). Both keys are accepted by wrangler 4.160
+  (`wrangler deploy --dry-run` passes). The deploy guard refuses invocation logs left on at sampling
+  above 0.05. **Unverified:** that Cloudflare really drops query strings and the invocation line;
+  confirm with the step 9 log check on staging. If it does not, treat URLs as logged: lower
+  `head_sampling_rate` to 0.05 or turn `[observability]` off, and limit who can read the dashboard.
+  An OAuth `code` is single-use and short-lived and needs the signed state cookie, so a stored code
+  is low risk. Names in URL **paths** are not redacted by either key; the app keeps them out of paths.
+- Application code logs reason codes only, never tokens, keys, full IBANs or email bodies
+  (checklist item 12 verifies this).
+- Queues are created in the EU (ADR 0028). Messages carry ids only (`runId`, `jobId`), never
+  customer data.
 - `wrangler tail` is for short sessions only.
 
 ### Rotating secrets
@@ -479,9 +627,11 @@ encrypted Exact tokens, IBANs and the audit log: store them as sensitive.
 2. Apply migrations before the code that needs them, and keep each migration compatible with the
    previous release, so `pnpm exec wrangler rollback` (code only; does not touch D1 or Durable
    Object migrations; **unverified** here) stays possible.
-3. If `migrations apply` fails part way, run `migrations list` and read the error. D1 is documented
-   to apply each migration file atomically (**unverified**); check the tables the file touches
-   before re-running.
+3. If `migrations apply` fails part way, run `migrations list` and read the error. Cloudflare
+   documents that a migration file that fails is rolled back as a whole and is not recorded as
+   applied, and `wrangler d1 migrations apply --help` says it prompts first and captures a backup
+   after applying; the help text does not state the rollback itself, so confirm it on the first
+   failure (check the tables the file touches before re-running).
 4. If data is damaged, stop the jobs (above), take an export, then use Time Travel (above) to
    restore to just before the apply.
 
@@ -505,11 +655,28 @@ pnpm --filter @camelthorn/web dev                          # UI on :5173, proxie
   `apps/worker`).
 - Durable Object jurisdiction: plain `wrangler dev` (workerd) does not implement jurisdictions, so
   Exact calls and `JobLock` use fail locally with "Jurisdiction restrictions are not implemented in
-  workerd". To try the Exact connection or the scheduler, use `wrangler dev --remote`. It runs on
-  Cloudflare's network against the **real** D1 and Durable Objects of the account, so use a test
-  deployment or a throwaway database, never production data.
-- Cron Triggers do not fire locally unless wrangler is started with `--test-scheduled`. Queues are
-  simulated locally; the app has not been tried that way (**unverified**).
+  workerd". There is no local way around it (no switch exists, by design, ADR 0018).
+  **Do not use `wrangler dev --remote` for the scheduler or the Exact connection**: it runs against
+  the real D1 and Durable Objects of the account the config points at, which is production unless
+  you deliberately aim it at staging, and the Durable Object classes would run there with the
+  local code. Use staging (below).
+- What does work locally: the unit and integration tests (`pnpm test`; the vitest pool stubs the
+  jurisdiction call); the web app and the API routes that do not touch a Durable Object (sign-in,
+  users, settings, the read screens over data you insert into the local D1) through `wrangler dev`
+  and `pnpm --filter @camelthorn/web dev`. What works only on staging or production: Exact connect
+  and sync, the Exact gate and rate limit, the scheduler (cron tick, `JobLock`, Run now), and the
+  Queue consumer in its real setup. Queues are simulated by workerd locally and Cron Triggers do not
+  fire unless wrangler is started with `--test-scheduled`; the app has not been tried that way
+  (**unverified**), and even then `JobLock` fails locally.
 - Tests: `pnpm typecheck && pnpm lint && pnpm test` from the repo root. Worker tests run in the
   Workers Vitest pool (Miniflare), where the jurisdiction call is stubbed by the setup file. CI
-  also runs `wrangler deploy --dry-run`.
+  also runs `wrangler deploy --dry-run` for production and for `--env staging`.
+- Browser checks of the reporting screens (`apps/web/scripts/k3b-screens.e2e.ts`) are **not** part
+  of `pnpm test`. Run them locally with Playwright, Google Chrome and poppler's `pdfinfo`,
+  `pdftoppm`, `pdftotext` installed: `pnpm --filter @camelthorn/web build`, then
+  `PLAYWRIGHT_PATH=<path to playwright/index.mjs> pnpm --filter @camelthorn/web exec vitest run
+  --config scripts/vitest.screens.config.ts` (`CHROME_PATH` defaults to `/usr/bin/google-chrome`;
+  `OUT_DIR` sets where the screenshots go, default `docs/design/screens`). In CI the same suite is
+  the optional `screens` job of `.github/workflows/ci.yml`: start it by hand (Actions, CI, Run
+  workflow); it never blocks a merge and uploads the screenshots as an artifact (**unverified** on
+  GitHub's runners until its first run).

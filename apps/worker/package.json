@@ -8,7 +8,9 @@
     "test": "vitest run",
     "dev": "wrangler dev",
     "check:deploy": "node scripts/check-deploy-config.mjs",
-    "deploy": "node scripts/check-deploy-config.mjs && wrangler deploy"
+    "check:deploy:staging": "node scripts/check-deploy-config.mjs --env staging",
+    "deploy": "node scripts/check-deploy-config.mjs && wrangler deploy --env=\"\"",
+    "deploy:staging": "node scripts/check-deploy-config.mjs --env staging && wrangler deploy --env staging"
   },
   "dependencies": {
     "@camelthorn/core": "workspace:*",
