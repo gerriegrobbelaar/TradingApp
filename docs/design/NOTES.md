@@ -80,3 +80,5 @@ Decorative colours (orbs, `--in`, `--out`, meter and pace bars) are not checked.
 ## K3a screens
 
 Screenshots of the read-only screens, at 360 and 1280 in light and dark: `docs/design/screens/k3a-{overview,overview-drill,invoices,invoices-sheet,payables,approvals,approvals-empty}-{light,dark}-{360,1280}.png`. No horizontal page scroll at 360 (checked in the browser). Shared pieces for later screens: `apps/web/src/lib/{format,ageing,errors,useResource,useCursorList}` and `apps/web/src/components/{Money,DataTable,FilterBar,FreshnessStamp,DrillSheet,EmptyState,OpenItemSheets}`; decisions in `docs/decisions/0026-read-only-screens-web.md`.
+
+Review K3a: table rows (`.dt-table`) no longer use `--accent-soft` for the selected row: chips inside it fell to 3.5-4.3:1. A selected row is `--hover` plus a 3px `--accent-text` bar on the first cell, and neutral chips in rows and drill lists use `--ink`. Checked in `apps/web/src/contrast.test.ts` (rows) and `packages/ui/src/styles/contrast.test.ts` (chips and notices on cards and sheets).
