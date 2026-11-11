@@ -11,6 +11,7 @@ import {
   BACKFILL_DAYS,
   BACKFILL_MAX_PAGES,
   INITIAL_BACKFILL_DAYS,
+  MISS_GRACE_MS,
   POLL_OVERLAP_MS,
   requestBackfill,
   runRevolutBackfill,
@@ -149,6 +150,20 @@ describe("revolut.sync: accounts and balances", () => {
     expect(detailCalls()).toBe(2);
     await sync();
     expect(detailCalls()).toBe(2);
+  });
+
+  it("handles more accounts than D1's bound-parameter limit", async () => {
+    const many = Array.from({ length: 150 }, (_, i) => ({
+      id: `a${String(i).padStart(3, "0")}-0000-4000-8000-000000000000`,
+      name: `Pocket ${i}`,
+      currency: "EUR",
+      balance: i,
+      state: "active",
+    }));
+    api.accounts = many;
+    expect((await sync()).summary).toMatchObject({ accounts: 150, accountsRetired: 0 });
+    api.accounts = many.slice(1);
+    expect((await sync()).summary).toMatchObject({ accounts: 149, accountsRetired: 1 });
   });
 
   it("retires accounts only after a complete, non-empty read", async () => {
@@ -438,6 +453,39 @@ describe("revolut.backfill", () => {
     expect(await rowsOf("bank_transactions")).toHaveLength(BACKFILL_MAX_PAGES + 5);
     // The count accumulated over both runs.
     expect(second.summary).toMatchObject({ missing: BACKFILL_MAX_PAGES + 5, complete: true });
+  });
+
+  it("a transaction younger than the grace is stored but not counted as missed (webhook race)", async () => {
+    const minutesAgo = (m: number) => new Date(Date.now() - m * 60_000).toISOString();
+    api.transactions = [
+      simpleTx("fresh", { createdAt: minutesAgo(MISS_GRACE_MS / 60_000 - 2) }),
+      simpleTx("old", { createdAt: minutesAgo(MISS_GRACE_MS / 60_000 + 5) }),
+    ];
+    const r = await backfill();
+    expect(r.summary).toMatchObject({ seen: 2, inserted: 2, missing: 1, complete: true });
+    expect(await stateRow("backfill")).toMatchObject({ last_missing: 1 });
+  });
+
+  it("a stopped initial backfill says so, and the next run of the job finishes it", async () => {
+    api.maxCount = 2;
+    api.transactions = Array.from({ length: BACKFILL_MAX_PAGES + 3 }, (_, i) =>
+      tx(`i${i + 1}`, 24 * 40 + i),
+    );
+    await requestBackfill(db, connId, INITIAL_BACKFILL_DAYS);
+    const first = await backfill({ trigger: "manual" });
+    expect(first).toMatchObject({ status: "partial", code: "initial_backfill_incomplete" });
+    expect(first.summary).toMatchObject({ initial: true, complete: false });
+    expect(await stateRow("backfill")).toMatchObject({
+      initial: 1,
+      last_error: "initial_backfill_incomplete",
+    });
+    // The daily slot resumes the same 90-day walk (not a fresh 35-day one) and finishes it.
+    const daily = await backfill();
+    expect(daily).toMatchObject({ status: "ok" });
+    expect(daily.summary).toMatchObject({ initial: true, windowDays: 90, complete: true });
+    expect(await rowsOf("bank_transactions")).toHaveLength(BACKFILL_MAX_PAGES + 3);
+    // and it is still not a data-quality signal
+    expect(await stateRow("backfill")).toMatchObject({ last_missing: null, cursor: null });
   });
 
   it("runs twice with the same result and rows", async () => {

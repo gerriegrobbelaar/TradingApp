@@ -23,7 +23,7 @@ import type { HandlerResult, JobContext } from "../jobs/types";
 import { scheduledForMs } from "../jobs/period";
 import { classifyRevolutError } from "./errors";
 import { CREDENTIALS_REJECTED } from "./gate";
-import { upsertTransaction, type IngestSource } from "./ingest";
+import { normStamp, upsertTransaction, type IngestSource } from "./ingest";
 import { startJobClient } from "./job-client";
 import { loadRevolutConnection, type RevolutConnectionRow } from "./store";
 
@@ -46,6 +46,12 @@ export const BACKFILL_MAX_PAGES = 10;
 export const BACKFILL_DAYS = 35;
 export const INITIAL_BACKFILL_DAYS = 90;
 export const BACKFILL_RETRY_SECONDS = 120;
+/**
+ * A transaction the backfill inserts only counts as `missing` (a missed webhook and poll) when it
+ * was created at Revolut more than this long ago: a younger one may simply not have been
+ * delivered or polled yet, and counting it would race the webhook.
+ */
+export const MISS_GRACE_MS = 10 * 60_000;
 /** Wall time one run may spend; the runner's own limit is 13 minutes. */
 const RUN_MAX_MS = 10 * 60_000;
 
@@ -187,7 +193,10 @@ async function ingestAll(
     into.seen++;
     into.inserted += r.inserted;
     into.updated += r.updated;
-    if (r.missing) into.missing++;
+    const createdMs = Date.parse(normStamp(tx.createdAt) ?? "");
+    if (r.missing && Number.isFinite(createdMs) && createdMs < nowMs - MISS_GRACE_MS) {
+      into.missing++;
+    }
     into.blocked += r.blocked.regress + r.blocked.conflict;
     into.skippedLegs += r.skipped;
   }
@@ -290,15 +299,16 @@ async function syncAccounts(
   );
   // Retire accounts that are gone, but only after a COMPLETE and non-empty read: an empty answer
   // is more likely a fault than every account closing.
+  // The ids travel as ONE JSON bind (json_each): D1 caps bound parameters at 100 per statement.
   if (list.length > 0) {
-    const marks = list.map((_, i) => `?${i + 3}`).join(", ");
     statements.push(
       db
         .prepare(
           `UPDATE bank_accounts SET is_active = 0, updated_at = ?2
-           WHERE connection_id = ?1 AND is_active = 1 AND external_id NOT IN (${marks})`,
+           WHERE connection_id = ?1 AND is_active = 1
+             AND external_id NOT IN (SELECT value FROM json_each(?3))`,
         )
-        .bind(connectionId, nowIso, ...list.map((a) => a.id)),
+        .bind(connectionId, nowIso, JSON.stringify(list.map((a) => a.id))),
     );
   }
   if (statements.length === 0) return { accounts: 0, retired: 0 };
@@ -629,7 +639,13 @@ export async function runRevolutBackfill(ctx: JobContext): Promise<HandlerResult
       status: complete ? "ok" : "partial",
       ...(complete
         ? {}
-        : { code: "walk_incomplete", retry: { delaySeconds: BACKFILL_RETRY_SECONDS } }),
+        : {
+            // The initial 90-day walk is usually a manual run, which the runner never retries: its
+            // own code makes the stop visible in Settings > Schedules, and the stored cursor is
+            // resumed by the next run of the job (the daily slot or another "Run now").
+            code: initial ? "initial_backfill_incomplete" : "walk_incomplete",
+            retry: { delaySeconds: BACKFILL_RETRY_SECONDS },
+          }),
       summary: {},
     };
   } catch (e) {

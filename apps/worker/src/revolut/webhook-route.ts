@@ -3,14 +3,18 @@
  *
  * Public (no cookie), exempt from the CSRF-header rule because every request authenticates itself
  * with an HMAC signature. The order is fixed:
- *   1. size cap (413 before reading, and while reading when there is no Content-Length);
+ *   1. size cap (413 when Content-Length is too large; the body is always read as a counted
+ *      stream and cancelled past the cap, whatever Content-Length says);
  *   2. raw BYTES of the body (never text()), the connection's signing secrets (current, previous);
  *   3. R1 `verifyRevolutWebhook` BEFORE anything parses the body. EVERY failure (no connection,
- *      no secret, missing header, bad timestamp, out of window, bad signature) is the same plain
- *      401: fixed body, fixed headers, no reason. The reason code goes to the log, never the body
- *      or the headers;
- *   4. SHA-256 of the raw body into webhook_events (UNIQUE connection + hash): a duplicate
- *      delivery (Revolut retries) answers 200 without enqueueing again;
+ *      a pending or disabled connection, no secret, a database or decryption error while loading
+ *      them, missing header, bad timestamp, out of window, bad signature) is the same plain 401:
+ *      fixed body, fixed headers, no reason. The reason code goes to the log, never the body or
+ *      the headers. Connections in active, needs_reauth or expired accept signed deliveries;
+ *   4. SHA-256 of the raw body (bytes only, not the timestamp header) into webhook_events (UNIQUE
+ *      connection + hash): Revolut's retry of a delivery re-signs the same body with a new
+ *      timestamp, and is the same event. A duplicate answers 200 without enqueueing again, except
+ *      a row that never reached the queue or sat in it unprocessed (bounded by MAX_REQUEUES);
  *   5. only now parse; store type and transaction id; send ONE queue message with ids only; 200.
  *      If the queue refuses, the row is marked error and the answer is 500, so Revolut retries and
  *      the retry (same body, same hash) re-enqueues.
@@ -32,6 +36,20 @@ import { loadRevolutConnection, loadWebhookSecretSet, retirePreviousWebhookSecre
 export const MAX_BODY_BYTES = MAX_WEBHOOK_BODY_BYTES;
 /** A queued row nobody processed for this long is re-enqueued by a redelivery. */
 export const REQUEUE_AFTER_MS = 5 * 60_000;
+/**
+ * How often repeated deliveries may re-enqueue one row (enqueue_failed, never parsed, or stale
+ * queued). Revolut retries 3 more times; a replay of a captured delivery inside the 5-minute
+ * timestamp window is bounded by this too. Past it the answer is 200 and the poll / backfill
+ * pick the transaction up.
+ */
+export const MAX_REQUEUES = 5;
+/**
+ * Connection states whose correctly signed deliveries are accepted (recorded and enqueued). A
+ * connection that needs re-authorisation keeps its subscription and secrets: the event is
+ * recorded, its processing ends as `error` with the status as code, and the backfill after
+ * re-authorisation recovers the transaction. pending / disabled / none: the uniform 401.
+ */
+const ACCEPTING: readonly string[] = ["active", "needs_reauth", "expired"];
 /** event_type of a row whose body has not been parsed yet. */
 export const UNPARSED = "unparsed";
 /** Same alphabet the gate accepts for /transaction/{id}. */
@@ -52,17 +70,12 @@ function unauthorized(): Response {
 
 const tooLarge = (): Response => json({ error: "payload_too_large" }, 413);
 
-/** The body as bytes, or null when it is larger than the cap (cancelling the stream early). */
+/**
+ * The body as bytes, or null when it is larger than the cap. Always read as a stream with a
+ * running count, whatever Content-Length says (absent, or lying), and cancelled as soon as the
+ * count passes the cap: an oversized body is never buffered whole.
+ */
 async function readBody(request: Request): Promise<ArrayBuffer | null> {
-  const declared = request.headers.get("content-length");
-  if (
-    declared !== null &&
-    /^\d{1,12}$/.test(declared.trim()) &&
-    Number(declared) <= MAX_BODY_BYTES
-  ) {
-    const buf = await request.arrayBuffer();
-    return buf.byteLength > MAX_BODY_BYTES ? null : buf;
-  }
   const reader = request.body?.getReader();
   if (!reader) return new ArrayBuffer(0);
   const chunks: Uint8Array[] = [];
@@ -111,17 +124,13 @@ interface EventRow {
   status: string;
   error_code: string | null;
   event_type: string;
-  received_at: string;
 }
 
 async function webhook(ctx: Ctx): Promise<Response> {
   const { env, request } = ctx;
   const declared = request.headers.get("content-length");
-  if (
-    declared !== null &&
-    /^\d{1,15}$/.test(declared.trim()) &&
-    Number(declared) > MAX_BODY_BYTES
-  ) {
+  // Declared too large: refuse before reading anything (any digit string longer than the cap's).
+  if (declared !== null && /^\d+$/.test(declared.trim()) && Number(declared) > MAX_BODY_BYTES) {
     return tooLarge();
   }
   const body = await readBody(request);
@@ -133,8 +142,15 @@ async function webhook(ctx: Ctx): Promise<Response> {
     return unauthorized();
   };
 
-  const conn = await loadRevolutConnection(env.DB);
-  if (!conn || conn.status !== "active") return reject("no_active_connection");
+  // Everything before the signature check answers the same 401, including a database or
+  // decryption error: an unauthenticated caller must not be able to tell the causes apart.
+  let conn: Awaited<ReturnType<typeof loadRevolutConnection>>;
+  try {
+    conn = await loadRevolutConnection(env.DB);
+  } catch {
+    return reject("connection_unreadable");
+  }
+  if (!conn || !ACCEPTING.includes(conn.status)) return reject("no_accepting_connection");
   let secrets: { current: string | null; previous: string | null };
   try {
     secrets = await loadWebhookSecretSet(env, conn.id);
@@ -197,7 +213,7 @@ async function webhook(ctx: Ctx): Promise<Response> {
     // long time, is queued again; everything else is answered 200 and ignored.
     const row = await db
       .prepare(
-        `SELECT id, status, error_code, event_type, received_at FROM webhook_events
+        `SELECT id, status, error_code, event_type FROM webhook_events
          WHERE connection_id = ?1 AND event_hash = ?2`,
       )
       .bind(conn.id, hash)
@@ -205,30 +221,30 @@ async function webhook(ctx: Ctx): Promise<Response> {
     if (!row) return json({ ok: true });
     rowId = row.id;
     const nowIso = new Date(ctx.nowMs).toISOString();
-    if (row.status === "error" && row.error_code === "enqueue_failed") {
-      const claimed = await db
+    // Each re-enqueue is claimed atomically and counted (MAX_REQUEUES), so concurrent or replayed
+    // deliveries cannot loop a row through the queue.
+    const claim = (condition: string, ...binds: string[]) =>
+      db
         .prepare(
-          `UPDATE webhook_events SET status = 'queued', error_code = NULL, received_at = ?2
-           WHERE id = ?1 AND status = 'error' AND error_code = 'enqueue_failed'`,
+          `UPDATE webhook_events
+           SET status = 'queued', error_code = NULL, received_at = ?2,
+               requeue_count = requeue_count + 1
+           WHERE id = ?1 AND requeue_count < ${MAX_REQUEUES} AND ${condition}`,
         )
-        .bind(row.id, nowIso)
+        .bind(row.id, nowIso, ...binds)
         .run();
-      if (claimed.meta.changes !== 1) return json({ ok: true });
+    let claimed: D1Result | null = null;
+    if (row.status === "error" && row.error_code === "enqueue_failed") {
+      claimed = await claim("status = 'error' AND error_code = 'enqueue_failed'");
     } else if (row.status === "queued" && row.event_type === UNPARSED) {
       // Never parsed (the first delivery died between the insert and the parse): handle again.
+      claimed = await claim(`status = 'queued' AND event_type = '${UNPARSED}'`);
     } else if (row.status === "queued") {
       const cut = new Date(ctx.nowMs - REQUEUE_AFTER_MS).toISOString();
-      const claimed = await db
-        .prepare(
-          `UPDATE webhook_events SET received_at = ?2
-           WHERE id = ?1 AND status = 'queued' AND received_at < ?3`,
-        )
-        .bind(row.id, nowIso, cut)
-        .run();
-      if (claimed.meta.changes !== 1) return json({ ok: true });
-    } else {
-      return json({ ok: true });
+      claimed = await claim("status = 'queued' AND received_at < ?3", cut);
     }
+    // Processed, ignored, error, recently queued, or out of re-enqueues: a no-op.
+    if (claimed === null || claimed.meta.changes !== 1) return json({ ok: true });
   }
 
   // Signature is valid: now (and only now) look inside.

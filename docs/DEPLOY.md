@@ -482,9 +482,15 @@ sync panel on the test division.
 
 ### First-live checklist: Revolut webhook, sync and backfill (task R3a, ADR 0033)
 
+**Sandbox first, via staging** (see "Staging first" below): connect the staging Worker to a Revolut
+**sandbox** business account and run steps 1 to 5 there before production. The production
+connection is only made after staging delivered, verified and processed real sandbox webhooks.
+
 The webhook URL is `<app origin>/api/webhooks/revolut`. It must be **public https** (Revolut calls
 it from the internet; a `wrangler dev` or tunnel URL works for tests, `workers.dev` is off). No
-variable to set: it is derived from `REVOLUT_REDIRECT_URI`. Confirming the connection (Settings,
+variable to set: it is derived from `REVOLUT_REDIRECT_URI`. The route must not sit behind
+Cloudflare Access or any other sign-in (Revolut has no cookie); it authenticates every request by
+its HMAC signature and answers one fixed 401 to everything unsigned. Confirming the connection (Settings,
 Connections) registers the subscription and queues the 90-day backfill; if Connections says the
 webhook is not registered, use "Register webhook" (admin, fresh sign-in).
 
@@ -505,6 +511,12 @@ webhook is not registered, use "Register webhook" (admin, fresh sign-in).
    on ordinary days means webhooks or the poll missed transactions.
 5. Dead letters: events that exhaust their retries end as `webhook_events.status = 'error'`; the
    poll and backfill still pick the transaction up.
+6. The initial 90-day backfill is a manual run (never retried automatically). If its result is
+   `partial` / `initial_backfill_incomplete`, press "Run now" on `revolut.backfill` again (or let
+   the daily slot run once it is switched on) until it ends `ok`: each run resumes the stored cursor.
+7. While the connection is `needs_reauth` / `expired`, signed deliveries are still accepted and
+   recorded (`webhook_events.error_code = 'needs_reauth'`). After re-authorising, "Run now" on
+   `revolut.backfill` recovers those transactions.
 
 ## Staging first
 

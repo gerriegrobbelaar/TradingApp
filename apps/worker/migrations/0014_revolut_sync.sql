@@ -8,7 +8,11 @@
 --        entity 'backfill'      the daily 35-day walk and the one-off 90-day initial backfill
 --  (b) bank_transactions.description: the leg description (a card merchant, a payment note). The
 --      reference and the description are different fields at Revolut.
---  (c) an index for the Bank screen's keyset paging: newest first on (created_at, id).
+--  (c) an index for the Bank screen's keyset paging: per connection, newest first on
+--      (created_at, id) (SQLite scans it backwards for ORDER BY created_at DESC, id DESC).
+--  (d) webhook_events.requeue_count: how often a repeated delivery re-enqueued a row that never
+--      reached (or never left) the queue. Bounded (webhook-route.ts MAX_REQUEUES) so a replayed
+--      delivery cannot re-enqueue the same row forever.
 --
 -- Additive only (no rebuild), so a populated database migrates in place.
 
@@ -46,4 +50,7 @@ CREATE TABLE revolut_sync_state (
 
 ALTER TABLE bank_transactions ADD COLUMN description TEXT;
 
-CREATE INDEX idx_bank_tx_created ON bank_transactions (created_at, id);
+CREATE INDEX idx_bank_tx_created ON bank_transactions (connection_id, created_at, id);
+
+ALTER TABLE webhook_events ADD COLUMN requeue_count INTEGER NOT NULL DEFAULT 0
+  CHECK (requeue_count >= 0);

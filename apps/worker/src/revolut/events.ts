@@ -24,6 +24,7 @@ import { loadRevolutById } from "./store";
 export const EVENT_CALL_BUDGET = 3;
 /** Deliveries of one message: the first plus the queue's max_retries (3). */
 export const EVENT_MAX_ATTEMPTS = 4;
+const TX_ID_RE = /^[A-Za-z0-9_-]{1,100}$/;
 
 export type EventDisposition =
   { kind: "ack"; reason: string } | { kind: "retry"; delaySeconds: number };
@@ -69,8 +70,12 @@ export async function processRevolutEvent(
   };
 
   if (row.external_id === null) return settle("error", "no_transaction_id");
+  // The route validated it already; checked again before it becomes part of a gate path.
+  if (!TX_ID_RE.test(row.external_id)) return settle("error", "bad_transaction_id");
   const conn = await loadRevolutById(db, row.connection_id);
   if (!conn || conn.status === "disabled") return settle("error", "not_connected");
+  // needs_reauth / expired / pending: no usable tokens. The event stays recorded with the status as
+  // its code; the poll and backfill after re-authorisation recover the transaction.
   if (conn.status !== "active") return settle("error", conn.status);
 
   let job;

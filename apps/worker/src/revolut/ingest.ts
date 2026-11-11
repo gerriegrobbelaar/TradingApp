@@ -24,11 +24,36 @@ import type { RevolutLeg, RevolutTransaction } from "@camelthorn/revolut";
 export type IngestSource = "webhook" | "poll" | "backfill";
 
 export class IngestError extends Error {
-  constructor(readonly code: "bad_timestamp" | "bad_amount" | "bad_currency") {
+  constructor(
+    readonly code:
+      | "bad_timestamp"
+      | "bad_amount"
+      | "bad_currency"
+      | "bad_transaction_id"
+      | "bad_leg"
+      | "too_many_legs",
+  ) {
     super(code);
     this.name = "IngestError";
   }
 }
+
+/**
+ * The compare-and-swap lost to concurrent writers on every pass. Not an IngestError: the caller
+ * classifies it as retryable (`internal`), and a retry decides again from a fresh read.
+ */
+export class IngestContendedError extends Error {
+  constructor() {
+    super("ingest contended");
+    this.name = "IngestContendedError";
+  }
+}
+
+/** Legs per transaction we accept: Revolut has 1 (card, transfer) or 2 (exchange, own transfer). */
+export const MAX_LEGS = 20;
+const TX_ID_RE = /^[A-Za-z0-9_-]{1,100}$/;
+const LEG_ID_RE = /^[A-Za-z0-9_-]{0,100}$/;
+const ACCOUNT_ID_RE = /^[A-Za-z0-9_-]{1,100}$/;
 
 export interface IngestResult {
   /** Legs seen in the transaction. */
@@ -50,10 +75,26 @@ export interface IngestResult {
 const MAX_PASSES = 3;
 const iso = (ms: number): string => new Date(ms).toISOString();
 
-/** A Revolut timestamp as UTC ISO with milliseconds, so stored values compare as strings. */
-function normStamp(raw: string | undefined): string | null {
+/**
+ * ISO-8601 instant WITH a zone (Z or an offset); fractions of any precision. A zone-less value is
+ * refused: it would be read in whatever zone the runtime has.
+ */
+const STAMP_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?)(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * A Revolut timestamp as UTC ISO with milliseconds (toISOString), so stored values compare as
+ * strings. Sub-millisecond digits are truncated (not rounded): two updates within the same
+ * millisecond count as equal, and equal is "not older" in the transition table.
+ */
+export function normStamp(raw: string | undefined): string | null {
   if (raw === undefined) return null;
-  const ms = Date.parse(raw);
+  const m = STAMP_RE.exec(raw.trim());
+  if (!m) throw new IngestError("bad_timestamp");
+  const frac = (m[2] ?? "").slice(0, 3).padEnd(3, "0");
+  const zone = m[3] === "Z" ? "Z" : (m[3] as string);
+  const ms = Date.parse(
+    `${m[1] as string}${(m[1] as string).length === 16 ? ":00" : ""}.${frac}${zone}`,
+  );
   if (Number.isNaN(ms)) throw new IngestError("bad_timestamp");
   return iso(ms);
 }
@@ -100,6 +141,9 @@ export async function upsertTransaction(
     skipped: 0,
     missing: false,
   };
+  // Ids go into SQL binds only, but they are also used to build gate paths elsewhere: strict.
+  if (!TX_ID_RE.test(tx.id)) throw new IngestError("bad_transaction_id");
+  if (tx.legs.length > MAX_LEGS) throw new IngestError("too_many_legs");
   const createdAt = normStamp(tx.createdAt);
   if (createdAt === null) throw new IngestError("bad_timestamp");
   const updatedAt = normStamp(tx.updatedAt);
@@ -113,6 +157,10 @@ export async function upsertTransaction(
       result.skipped++;
       continue;
     }
+    if (!LEG_ID_RE.test(leg.legId) || !ACCOUNT_ID_RE.test(leg.accountId)) {
+      throw new IngestError("bad_leg");
+    }
+    if (prepared.some((p) => p.leg.legId === leg.legId)) throw new IngestError("bad_leg");
     if (!Number.isSafeInteger(leg.amountMinor)) throw new IngestError("bad_amount");
     if (!/^[A-Z]{3}$/.test(leg.currency)) throw new IngestError("bad_currency");
     prepared.push({ leg, account: leg.accountId });
@@ -122,6 +170,7 @@ export async function upsertTransaction(
   const insertedLegs = new Set<string>();
   let finalCounts = { updated: 0, unchanged: 0 };
   let blocked = { regress: 0, conflict: 0, unknownIgnored: 0 };
+  let settled = false;
 
   for (let pass = 0; pass < MAX_PASSES; pass++) {
     const stored = (
@@ -292,8 +341,13 @@ export async function upsertTransaction(
       }
     });
     finalCounts = counts;
-    if (!lost) break;
+    if (!lost) {
+      settled = true;
+      break;
+    }
   }
+  // Still losing after MAX_PASSES: the write did not happen. Never report it as done.
+  if (!settled) throw new IngestContendedError();
 
   result.inserted = insertedLegs.size;
   result.updated = finalCounts.updated;

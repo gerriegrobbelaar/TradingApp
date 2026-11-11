@@ -61,6 +61,7 @@ const TX = keysOf<BankTransactionDto>()([
   "description",
   "counterpartyName",
   "counterpartyIbanMasked",
+  "legCount",
 ]);
 const DETAIL = keysOf<BankTransactionDetail>()([
   "id",
@@ -79,6 +80,7 @@ const DETAIL = keysOf<BankTransactionDetail>()([
   "description",
   "counterpartyName",
   "counterpartyIbanMasked",
+  "legCount",
   "legs",
   "firstSeenAt",
   "lastEventAt",
@@ -121,6 +123,14 @@ const get = async <T>(
   const res = await authed(path, tokens[role] as string);
   return { status: res.status, body: (await res.json()) as T, res };
 };
+
+const accountId = async (externalId: string): Promise<number> =>
+  (
+    await db
+      .prepare("SELECT id FROM bank_accounts WHERE external_id = ?1")
+      .bind(externalId)
+      .first<{ id: number }>()
+  )?.id ?? 0;
 
 const ingest = (t: FakeTransaction, source: "webhook" | "poll" | "backfill" = "poll") =>
   upsertTransaction(
@@ -208,6 +218,29 @@ describe("GET /api/bank/accounts", () => {
       basis: ["bank_accounts"],
       stale: true,
     });
+  });
+
+  it("reports the connection in every status, never admin-only fields", async () => {
+    await seedAccounts();
+    for (const status of ["pending", "needs_reauth", "expired", "disabled", "active"]) {
+      await db
+        .prepare(
+          "UPDATE connections SET status = ?1, pending_ref = 'ref-secret', pending_summary = '{}' WHERE id = ?2",
+        )
+        .bind(status, connId)
+        .run();
+      const { body } = await get<BankAccountsResponse>("/api/bank/accounts");
+      expect(body.connection, status).toEqual({
+        id: connId,
+        status,
+        createsBankEntries: false,
+        paymentsMode: "drafts",
+      });
+      expect(body.accounts.length, status).toBe(3);
+      expect(JSON.stringify(body)).not.toContain("ref-secret");
+      const txs = await get<BankTransactionsResponse>("/api/bank/transactions");
+      expect(txs.status, status).toBe(200);
+    }
   });
 
   it("without any connection it is empty and available false", async () => {
@@ -334,6 +367,35 @@ describe("GET /api/bank/transactions", () => {
     expect(text).not.toMatch(/counterparty_iban|counterpartyIban"/);
   });
 
+  it("legCount is every stored leg of the Revolut transaction, whatever the filter", async () => {
+    await seedMany();
+    const all = await get<BankTransactionsResponse>("/api/bank/transactions");
+    for (const t of all.body.items) {
+      expect(t.legCount, t.externalId).toBe(t.externalId === "a6" ? 2 : 1);
+    }
+    // filtered to the USD account: one a6 leg listed, both counted
+    const usd = await get<BankTransactionsResponse>(
+      `/api/bank/transactions?account=${await accountId(ACC_USD)}&direction=in`,
+    );
+    expect(usd.body.items.map((t) => [t.externalId, t.legCount])).toEqual([["a6", 2]]);
+  });
+
+  it("the list query walks the (connection, created_at, id) index without a sort", async () => {
+    const plan = (
+      await db
+        .prepare(
+          `EXPLAIN QUERY PLAN SELECT t.id FROM bank_transactions t
+           WHERE t.connection_id = ?1 ORDER BY t.created_at DESC, t.id DESC LIMIT 51`,
+        )
+        .bind(connId)
+        .all<{ detail: string }>()
+    ).results
+      .map((r) => r.detail)
+      .join("\n");
+    expect(plan).toMatch(/idx_bank_tx_created/);
+    expect(plan).not.toMatch(/USE TEMP B-TREE FOR ORDER BY/);
+  });
+
   it("pages with a keyset cursor: every row once, ties broken by id, stable", async () => {
     await seedMany();
     const seen: number[] = [];
@@ -454,11 +516,16 @@ describe("cursor encoding", () => {
   it("round-trips and rejects anything else", () => {
     const c = { createdAt: "2026-07-10T08:00:00.000Z", id: 42 };
     expect(decodeTxCursor(encodeTxCursor(c))).toEqual(c);
+    // a row migrated by 0013 may carry another ISO form; its cursor must still page
+    const legacy = { createdAt: "2026-07-10T08:00:00Z", id: 7 };
+    expect(decodeTxCursor(encodeTxCursor(legacy))).toEqual(legacy);
     const forge = (v: unknown): string => btoa(JSON.stringify(v)).replace(/=+$/, "");
     for (const bad of [
       "",
       "x",
       forge(["d", "2026-07-10", 1]),
+      forge(["d", "2026-07-10T08:00:00", 1]),
+      forge(["d", "2026-07-10T08:00:00Z' OR 1=1", 1]),
       forge(["a", c.createdAt, 1]),
       forge(["d", c.createdAt, 0]),
       forge(["d", c.createdAt, "1"]),

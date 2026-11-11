@@ -87,11 +87,16 @@ interface TxSqlRow {
   description: string | null;
   counterparty_name: string | null;
   counterparty_iban: string | null;
+  leg_count: number;
 }
 
+// leg_count: every stored leg of the same Revolut transaction, whatever the filter or page (a
+// lookup on the unique (connection_id, external_id, leg_id) index).
 const TX_SELECT = `SELECT t.id, t.external_id, t.leg_id, t.bank_account_id, a.name AS account_name,
   t.type, t.state, t.is_final, t.created_at, t.completed_at, t.amount_minor, t.currency,
-  t.reference, t.description, t.counterparty_name, t.counterparty_iban
+  t.reference, t.description, t.counterparty_name, t.counterparty_iban,
+  (SELECT COUNT(*) FROM bank_transactions l
+    WHERE l.connection_id = t.connection_id AND l.external_id = t.external_id) AS leg_count
   FROM bank_transactions t LEFT JOIN bank_accounts a ON a.id = t.bank_account_id`;
 
 /** A stored state as the API reports it ('created' is pending; anything unexpected is unknown). */
@@ -118,6 +123,7 @@ function toTxDto(r: TxSqlRow): BankTransactionDto {
     description: r.description,
     counterpartyName: r.counterparty_name,
     counterpartyIbanMasked: r.counterparty_iban === null ? null : maskIban(r.counterparty_iban),
+    legCount: r.leg_count,
   };
 }
 
@@ -201,7 +207,9 @@ interface TxCursor {
   id: number;
 }
 
-const ISO_MS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+// Ingest stores created_at as toISOString() (milliseconds, Z); rows migrated by 0013 kept their
+// booked_at text, so the cursor accepts any ISO-8601 instant we may have stored.
+const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:?\d{2})$/;
 
 export function encodeTxCursor(c: TxCursor): string {
   return btoa(JSON.stringify(["d", c.createdAt, c.id]))
@@ -217,7 +225,7 @@ export function decodeTxCursor(raw: string): TxCursor | null {
     const v: unknown = JSON.parse(atob(raw.replace(/-/g, "+").replace(/_/g, "/")));
     if (!Array.isArray(v) || v.length !== 3 || v[0] !== "d") return null;
     const [, createdAt, id] = v as unknown[];
-    if (typeof createdAt !== "string" || !ISO_MS_RE.test(createdAt)) return null;
+    if (typeof createdAt !== "string" || !ISO_RE.test(createdAt)) return null;
     if (Number.isNaN(Date.parse(createdAt))) return null;
     if (typeof id !== "number" || !Number.isSafeInteger(id) || id < 1) return null;
     return { createdAt, id };

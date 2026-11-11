@@ -296,7 +296,12 @@ describe("GET /api/connections/revolut/callback", () => {
 
     const ok = await confirm({ ref: await pendingRef(), ownAccount: true });
     expect(ok.status).toBe(200);
-    expect(await ok.json()).toMatchObject({ ok: true });
+    // exactly these keys: no secret, no subscription id, no summary in the answer
+    expect(await ok.json()).toEqual({
+      ok: true,
+      webhook: "registered",
+      backfill: expect.stringMatching(/^(queued|requested)$/),
+    });
 
     const form = stub.tokenCalls[0];
     expect(form?.get("grant_type")).toBe("authorization_code");

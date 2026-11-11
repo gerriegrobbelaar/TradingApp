@@ -393,6 +393,29 @@ describe("audit log", () => {
     expect(out).toContain("2026-01-01T00:00:00.000Z");
   });
 
+  it("keeps result codes but still redacts authorization codes under their qualified names", () => {
+    const out = maskDeep({
+      code: "rate_limited",
+      failure: "api_500",
+      summary: { code: "walk_incomplete", errorCode: "needs_reauth" },
+      authorization_code: "4/0AX4XfWh-secret-a",
+      authCode: "secret-b",
+      oauth_code: "secret-c",
+      grantCode: "secret-d",
+      code_verifier: "secret-e",
+      codeVerifier: "secret-f",
+      access_token: "secret-g",
+      webhookSigningSecret: "secret-h",
+    }) as Record<string, unknown>;
+    expect(out["code"]).toBe("rate_limited");
+    expect(out["failure"]).toBe("api_500");
+    expect(out["summary"]).toEqual({ code: "walk_incomplete", errorCode: "needs_reauth" });
+    const text = JSON.stringify(out);
+    for (const s of ["a", "b", "c", "d", "e", "f", "g", "h"]) {
+      expect(text).not.toContain(`secret-${s}`);
+    }
+  });
+
   it("rejects an empty actor", async () => {
     await expect(writeAudit(db, { actorEmail: " ", action: "x", entity: "y" })).rejects.toThrow();
   });

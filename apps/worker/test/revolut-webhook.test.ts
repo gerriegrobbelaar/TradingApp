@@ -3,9 +3,12 @@
  */
 import { env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { buildRouter } from "../src/app-router";
+import type { Env } from "../src/env";
 import worker from "../src/index";
 import { handleQueue, parseQueueMessage } from "../src/jobs/runner";
 import { EVENT_MAX_ATTEMPTS } from "../src/revolut/events";
+import { MAX_REQUEUES } from "../src/revolut/webhook-route";
 import { loadWebhookSecretSet, saveWebhookSecret } from "../src/revolut/store";
 import { Router } from "../src/router";
 import { db, resetDb } from "./helpers";
@@ -178,17 +181,19 @@ describe("webhook endpoint: every authentication failure is the same 401", () =>
     expect(queue.sent).toEqual([]);
   });
 
-  it("no connection, an inactive connection, no secret or an empty secret: the same 401", async () => {
+  it("no connection, a pending or disabled connection, no secret or an empty secret: the same 401", async () => {
     const ok = await snapshot(await deliver({ ...valid("tx-1"), signature: "x" }));
     // no secret stored
     await db
       .prepare("UPDATE connections SET webhook_secret_enc = NULL, webhook_secret_prev_enc = NULL")
       .run();
     expect(await snapshot(await deliver(valid("tx-1")))).toEqual(ok);
-    // not active
+    // staged (not confirmed) or disconnected: correctly signed, still refused
     await storeWebhookSecret(connId);
-    await db.prepare("UPDATE connections SET status = 'needs_reauth'").run();
-    expect(await snapshot(await deliver(valid("tx-1")))).toEqual(ok);
+    for (const status of ["pending", "disabled"]) {
+      await db.prepare("UPDATE connections SET status = ?1").bind(status).run();
+      expect(await snapshot(await deliver(valid("tx-1"))), status).toEqual(ok);
+    }
     // an empty secret can never verify (fail closed): storing "" and delivering with an empty key
     await db.prepare("UPDATE connections SET status = 'active'").run();
     await saveWebhookSecret(env, connId, WEBHOOK_ID, "", ADMIN);
@@ -197,6 +202,69 @@ describe("webhook endpoint: every authentication failure is the same 401", () =>
     await resetRevolut();
     expect(await snapshot(await deliver(valid("tx-1")))).toEqual(ok);
     expect(queue.sent).toEqual([]);
+    expect(await events()).toEqual([]);
+  });
+
+  it("a database or decryption error while loading the connection or its secrets is the same 401", async () => {
+    const ok = await snapshot(await deliver({ ...valid("tx-1"), signature: "x" }));
+    const failing = (failOn: (sql: string) => boolean) =>
+      Object.create(envWithQueue(queue), {
+        DB: {
+          value: new Proxy(env.DB, {
+            get(target, prop) {
+              if (prop === "prepare") {
+                return (sql: string) => {
+                  if (failOn(sql)) throw new Error("d1 down");
+                  return target.prepare(sql);
+                };
+              }
+              return Reflect.get(target, prop) as unknown;
+            },
+          }),
+          enumerable: true,
+        },
+      }) as Env;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    // the connection lookup fails
+    const a = await worker.fetch(
+      await deliveryRequest(valid("tx-1")),
+      failing((sql) => sql.includes("FROM connections WHERE kind = 'revolut' ORDER BY id")),
+    );
+    // the secret lookup fails
+    const b = await worker.fetch(
+      await deliveryRequest(valid("tx-1")),
+      failing((sql) => sql.includes("webhook_secret_prev_enc FROM connections")),
+    );
+    // the stored ciphertext does not decrypt (wrong key)
+    const c = await worker.fetch(
+      await deliveryRequest(valid("tx-1")),
+      Object.create(envWithQueue(queue), {
+        TOKEN_ENC_KEY: { value: btoa("k".repeat(32)), enumerable: true },
+        TOKEN_ENC_KEY_PREVIOUS: { value: undefined, enumerable: true },
+      }) as Env,
+    );
+    warn.mockRestore();
+    for (const r of [a, b, c]) expect(await snapshot(r)).toEqual(ok);
+    expect(queue.sent).toEqual([]);
+    expect(await events()).toEqual([]);
+  });
+
+  it("a connection that needs re-authorisation (or expired) still accepts signed deliveries", async () => {
+    for (const [i, status] of (["needs_reauth", "expired"] as const).entries()) {
+      await db.prepare("UPDATE connections SET status = ?1").bind(status).run();
+      const res = await deliver(valid(`tx-r${i}`));
+      expect(res.status, status).toBe(200);
+    }
+    const rows = await events();
+    expect(rows).toMatchObject([
+      { status: "queued", external_id: "tx-r0" },
+      { status: "queued", external_id: "tx-r1" },
+    ]);
+    expect(queue.sent).toHaveLength(2);
+    // still unsigned / wrongly signed: refused
+    expect((await deliver({ ...valid("tx-r9"), signature: `v1=${"0".repeat(64)}` })).status).toBe(
+      401,
+    );
   });
 
   it("logs a reason code only, never the body, the signature or the secret", async () => {
@@ -252,6 +320,70 @@ describe("webhook endpoint: size, queue failures and other requests", () => {
     });
     const res = await worker.fetch(req, envWithQueue(queue));
     expect(res.status).toBe(413);
+  });
+
+  it("a Content-Length that lies (small) does not let an oversized body through", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        const chunk = new Uint8Array(400 * 1024).fill(120);
+        for (let i = 0; i < 4; i++) c.enqueue(chunk);
+        c.close();
+      },
+    });
+    const req = new Request("https://app.test/api/webhooks/revolut", {
+      method: "POST",
+      body: stream,
+      headers: {
+        "content-length": "10",
+        "revolut-signature": "v1=" + "0".repeat(64),
+        "revolut-request-timestamp": String(Date.now()),
+      },
+      // @ts-expect-error duplex is required by the runtime for stream bodies
+      duplex: "half",
+    });
+    const res = await worker.fetch(req, envWithQueue(queue));
+    expect(res.status).toBe(413);
+    // a declared length far beyond any number is refused before reading
+    const huge = await worker.fetch(
+      new Request("https://app.test/api/webhooks/revolut", {
+        method: "POST",
+        body: "{}",
+        headers: { "content-length": "9".repeat(30) },
+      }),
+      envWithQueue(queue),
+    );
+    expect([400, 413]).toContain(huge.status);
+    expect(await events()).toEqual([]);
+  });
+
+  it("Revolut's retry (same body, new timestamp and signature) is the same event", async () => {
+    const d = valid("tx-1");
+    const now = Date.now();
+    expect((await deliver({ ...d, timestampMs: now - 60_000 })).status).toBe(200);
+    expect((await deliver({ ...d, timestampMs: now })).status).toBe(200);
+    expect(await events()).toHaveLength(1);
+    expect(queue.sent).toHaveLength(1);
+    // the hash is over the body bytes only: a different body is a different event
+    expect((await deliver(valid("tx-2"))).status).toBe(200);
+    expect(await events()).toHaveLength(2);
+  });
+
+  it("re-enqueueing one row is bounded, however often a delivery is replayed", async () => {
+    const d = valid("tx-1");
+    await deliver(d);
+    for (let i = 0; i < MAX_REQUEUES + 3; i++) {
+      await db.prepare("UPDATE webhook_events SET received_at = '2000-01-01T00:00:00.000Z'").run();
+      expect((await deliver(d)).status).toBe(200);
+    }
+    expect(queue.sent).toHaveLength(1 + MAX_REQUEUES);
+    expect(await events()).toMatchObject([{ requeue_count: MAX_REQUEUES, status: "queued" }]);
+    // the same bound for a row whose enqueue failed
+    queue.fail = true;
+    const e = valid("tx-2");
+    expect((await deliver(e)).status).toBe(500);
+    for (let i = 0; i < MAX_REQUEUES + 2; i++) await deliver(e);
+    const row = (await events()).find((r) => r["external_id"] === "tx-2");
+    expect(row).toMatchObject({ requeue_count: MAX_REQUEUES });
   });
 
   it("a queue failure is a 500 and marks the row, and the redelivery enqueues", async () => {
@@ -322,34 +454,38 @@ describe("webhook endpoint: size, queue failures and other requests", () => {
     ).not.toThrow();
   });
 
-  it("every route registered by the Worker: only the webhook is csrfExempt", async () => {
-    // The Worker's router is module-private; the registration functions are the source of truth.
-    const { registerRevolutWebhookRoute } = await import("../src/revolut/webhook-route");
-    const { registerRevolutRoutes } = await import("../src/revolut/routes");
-    const { registerAuthRoutes } = await import("../src/auth/routes");
-    const { registerUserRoutes } = await import("../src/auth/users-routes");
-    const { registerExactRoutes } = await import("../src/exact/routes");
-    const { registerSyncRoutes } = await import("../src/exact/sync-routes");
-    const { registerBankRoutes } = await import("../src/read/bank-routes");
-    const { registerReadRoutes } = await import("../src/read/routes");
-    const { registerJobRoutes } = await import("../src/jobs/routes");
-    const router = new Router();
-    for (const reg of [
-      registerAuthRoutes,
-      registerUserRoutes,
-      registerExactRoutes,
-      registerRevolutRoutes,
-      registerRevolutWebhookRoute,
-      registerSyncRoutes,
-      registerBankRoutes,
-      registerReadRoutes,
-      registerJobRoutes,
-    ]) {
-      reg(router);
-    }
-    const exempt = router.describe().filter((r) => r.access.csrfExempt);
+  it("every route registered by the Worker: only the webhook is csrfExempt", () => {
+    // The Worker's own router (src/app-router.ts), not a hand-picked list of registrations.
+    const all = buildRouter().describe();
+    expect(all.length).toBeGreaterThan(40);
+    const exempt = all.filter((r) => r.access.csrfExempt);
     expect(exempt.map((r) => r.pattern)).toEqual(["POST /api/webhooks/revolut"]);
     expect(exempt[0]?.access.public).toBe(true);
+    expect(exempt[0]?.access.roles).toBeUndefined();
+  });
+
+  it("other paths keep the CSRF rule: a public POST elsewhere without the header is 403", async () => {
+    const e = envWithQueue(queue);
+    // a cross-site POST to the sign-out route (public) and to a webhook look-alike path
+    const res = await worker.fetch(
+      new Request("https://app.test/api/auth/logout", {
+        method: "POST",
+        headers: { origin: "https://evil.example" },
+      }),
+      e,
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("answers without cookies or CORS headers", async () => {
+    for (const d of [valid("tx-c1"), { ...valid("tx-c2"), signature: "x" }]) {
+      const req = await deliveryRequest(d);
+      req.headers.set("origin", "https://evil.example");
+      const res = await worker.fetch(req, envWithQueue(queue));
+      expect(res.headers.get("set-cookie")).toBeNull();
+      expect(res.headers.get("access-control-allow-origin")).toBeNull();
+      expect(res.headers.get("cache-control")).toBe("no-store");
+    }
   });
 });
 
@@ -377,6 +513,28 @@ describe("webhook secrets: rotation overlap", () => {
     expect(audit?.n).toBe(1);
     // the old secret no longer verifies
     expect((await deliver({ ...valid("tx-3"), secret: WEBHOOK_SECRET })).status).toBe(401);
+  });
+
+  it("the previous secret can never retire or replace the current one", async () => {
+    const retired = async () =>
+      (
+        await db
+          .prepare(
+            "SELECT COUNT(*) AS n FROM audit_log WHERE action = 'connection.revolut_webhook_prev_secret_retired'",
+          )
+          .first<{ n: number }>()
+      )?.n ?? 0;
+    const before = await retired();
+    await saveWebhookSecret(env, connId, WEBHOOK_ID, "wsk_new_secret_value", ADMIN);
+    // An attacker who holds only the OLD secret: many accepted deliveries, nothing rotates back.
+    for (let i = 0; i < 3; i++) {
+      expect((await deliver({ ...valid(`tx-o${i}`), secret: WEBHOOK_SECRET })).status).toBe(200);
+    }
+    expect(await loadWebhookSecretSet(env, connId)).toEqual({
+      current: "wsk_new_secret_value",
+      previous: WEBHOOK_SECRET,
+    });
+    expect(await retired()).toBe(before);
   });
 });
 

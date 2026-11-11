@@ -40,9 +40,14 @@ const IBAN_RE = /\b[A-Z]{2}\d{2}(?:[A-Z0-9]{11,30}|(?: [A-Z0-9]{4}){2,7}(?: [A-Z
 const JWT_RE = /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*/g;
 const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
 
-/** Keys whose values are never stored. */
+/**
+ * Keys whose values are never stored. An OAuth authorization code is caught by its qualified
+ * names (authorization_code, auth_code, oauth_code, grant_code, code_verifier); a bare `code` is
+ * NOT a secret here: it is the short machine code of every job result and audit row (review R3a),
+ * and redacting it hid the reason of every failed run. No caller audits a raw OAuth `code`.
+ */
 const SECRET_KEY_RE =
-  /(token|secret|password|passwd|private[_-]?key|api[_-]?key|authorization|cookie|signature|assertion|client[_-]?secret|code[_-]?verifier|^code$|body|html)/i;
+  /(token|secret|password|passwd|private[_-]?key|api[_-]?key|authorization|cookie|signature|assertion|client[_-]?secret|code[_-]?verifier|auth[_-]?code|oauth[_-]?code|grant[_-]?code|body|html)/i;
 
 function maskString(value: string): string {
   return value

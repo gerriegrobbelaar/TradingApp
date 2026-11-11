@@ -1,19 +1,9 @@
-import { registerAuthRoutes } from "./auth/routes";
-import { registerUserRoutes } from "./auth/users-routes";
-import { registerExactRoutes } from "./exact/routes";
-import { registerSyncRoutes } from "./exact/sync-routes";
-import { registerRevolutRoutes } from "./revolut/routes";
-import { registerRevolutWebhookRoute } from "./revolut/webhook-route";
-import { registerBankRoutes } from "./read/bank-routes";
-import { registerApprovalsRoutes } from "./read/approvals-routes";
-import { registerLedgerRoutes } from "./read/ledger-routes";
-import { registerReadRoutes } from "./read/routes";
+import { buildRouter } from "./app-router";
 import { ensureSeeded } from "./db/seed";
 import { ensureDefaultJobs } from "./jobs/defaults";
-import { registerJobRoutes } from "./jobs/routes";
 import { handleQueue, tickScheduler } from "./jobs/runner";
 import type { Env } from "./env";
-import { json, Router } from "./router";
+import { json } from "./router";
 
 export type { Env } from "./env";
 export { ExactGate } from "./exact/gate";
@@ -37,18 +27,7 @@ async function seedSafely(env: Env): Promise<void> {
   }
 }
 
-const router = new Router();
-registerAuthRoutes(router);
-registerUserRoutes(router);
-registerExactRoutes(router);
-registerRevolutRoutes(router);
-registerRevolutWebhookRoute(router);
-registerBankRoutes(router);
-registerSyncRoutes(router);
-registerReadRoutes(router);
-registerLedgerRoutes(router);
-registerApprovalsRoutes(router);
-registerJobRoutes(router);
+const router = buildRouter();
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {

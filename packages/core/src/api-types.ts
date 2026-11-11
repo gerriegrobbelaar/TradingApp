@@ -521,9 +521,9 @@ export interface BankTransactionDto {
   /** Masked by the server; never a full IBAN. */
   counterpartyIbanMasked: string | null;
   /**
-   * Optional (to agree with R3a): number of legs stored for `externalId`, whatever the filter or
-   * page. When absent the screen counts the legs it has loaded and says "at least" when the list
-   * is filtered or more pages remain.
+   * Number of legs stored for `externalId`, whatever the filter or page. The worker (R3a) always
+   * sends it; it stays optional so the screen keeps its fallback: when absent it counts the legs
+   * it has loaded and says "at least" when the list is filtered or more pages remain.
    */
   legCount?: number;
 }

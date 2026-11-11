@@ -2,7 +2,8 @@ import { applyD1Migrations, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
 /**
- * Migration 0014 adds revolut_sync_state, bank_transactions.description and a keyset index. It is
+ * Migration 0014 adds revolut_sync_state, bank_transactions.description, a keyset index and
+ * webhook_events.requeue_count. It is
  * additive; this runs it on a database that already holds Revolut rows (0013 applied), as a
  * deployed Phase 5 database would.
  */
@@ -68,6 +69,14 @@ describe("migration 0014 on a populated database", () => {
     expect(
       (await mdb.prepare("SELECT COUNT(*) AS n FROM webhook_events").first<{ n: number }>())?.n,
     ).toBe(1);
+    // the existing event row gets requeue_count 0; negatives are refused
+    expect(
+      await mdb.prepare("SELECT requeue_count, status FROM webhook_events WHERE id = 1").first(),
+    ).toEqual({ requeue_count: 0, status: "processed" });
+    const cols = (
+      await mdb.prepare("PRAGMA index_info('idx_bank_tx_created')").all<{ name: string }>()
+    ).results.map((r) => r.name);
+    expect(cols).toEqual(["connection_id", "created_at", "id"]);
 
     const index = await mdb
       .prepare(
@@ -108,5 +117,6 @@ describe("migration 0014 on a populated database", () => {
     expect(
       await bad("INSERT INTO revolut_sync_state (connection_id, entity) VALUES (999, 'accounts')"),
     ).toBe(true);
+    expect(await bad("UPDATE webhook_events SET requeue_count = -1 WHERE id = 1")).toBe(true);
   });
 });

@@ -4,7 +4,15 @@
  */
 import { mapTransaction, parseJsonRawNumbers } from "@camelthorn/revolut";
 import { beforeEach, describe, expect, it } from "vitest";
-import { IngestError, upsertTransaction, type IngestSource } from "../src/revolut/ingest";
+import { classifyRevolutError } from "../src/revolut/errors";
+import {
+  IngestContendedError,
+  IngestError,
+  MAX_LEGS,
+  normStamp,
+  upsertTransaction,
+  type IngestSource,
+} from "../src/revolut/ingest";
 import { db } from "./helpers";
 import { resetRevolut, seedRevolut } from "./revolut-helpers";
 import {
@@ -190,6 +198,166 @@ describe("idempotency and reconciliation", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]?.["state"]).toBe("completed");
     expect(rows[0]?.["is_final"]).toBe(1);
+  });
+});
+
+describe("compare-and-swap under interleaving (webhook consumer vs poll)", () => {
+  /** A D1 handle whose FIRST batch waits for `between` to finish: a writer that read, then stalls. */
+  const stallingDb = (between: () => Promise<unknown>): D1Database => {
+    let stalled = false;
+    return new Proxy(db, {
+      get(target, prop) {
+        if (prop === "batch") {
+          return async (stmts: D1PreparedStatement[]) => {
+            if (!stalled) {
+              stalled = true;
+              await between();
+            }
+            return target.batch(stmts);
+          };
+        }
+        const v = Reflect.get(target, prop) as unknown;
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+  };
+
+  it("a writer that read 'pending' cannot overwrite a 'completed' written meanwhile", async () => {
+    await ingest(simpleTx("tx-1", { state: "pending", updatedAt: "2026-07-10T08:00:00.000Z" }));
+    // A: a pending refresh (newer timestamp than stored, so it is decided as 'apply').
+    const a = parse(simpleTx("tx-1", { state: "pending", updatedAt: "2026-07-10T08:00:05.000Z" }));
+    // B: the completion, written entirely while A is between its read and its write.
+    const b = simpleTx("tx-1", { state: "completed", updatedAt: "2026-07-10T08:00:09.000Z" });
+    const r = await upsertTransaction(
+      { DB: stallingDb(() => ingest(b, "poll")) },
+      connId,
+      a,
+      "webhook",
+    );
+    expect(await stateOf("tx-1-l1")).toBe("completed");
+    const rows = await txRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.["updated_at"]).toBe("2026-07-10T08:00:09.000Z");
+    // A lost the swap, read again, and its pending is now a refused regression.
+    expect(r.blocked.regress).toBe(1);
+    expect(r.updated).toBe(0);
+  });
+
+  it("two first sightings racing: one insert wins, the other decides again from the stored row", async () => {
+    const a = parse(simpleTx("tx-2", { state: "pending", updatedAt: "2026-07-10T08:00:00.000Z" }));
+    const b = simpleTx("tx-2", { state: "completed", updatedAt: "2026-07-10T08:00:09.000Z" });
+    const r = await upsertTransaction(
+      { DB: stallingDb(() => ingest(b, "poll")) },
+      connId,
+      a,
+      "webhook",
+    );
+    expect(r.inserted).toBe(0);
+    expect(r.missing).toBe(false);
+    expect(await stateOf("tx-2-l1")).toBe("completed");
+    expect((await txRows())[0]?.["source"]).toBe("poll");
+  });
+
+  it("equal updated_at: the same state refreshes, a final state still wins over pending", async () => {
+    const at = "2026-07-10T08:00:00.000Z";
+    await ingest(simpleTx("tx-3", { state: "completed", updatedAt: at, reference: "A" }));
+    await ingest(simpleTx("tx-3", { state: "completed", updatedAt: at, reference: "B" }));
+    expect((await txRows())[0]?.["reference"]).toBe("B");
+    const r = await ingest(simpleTx("tx-3", { state: "pending", updatedAt: at }));
+    expect(r.blocked.regress).toBe(1);
+    expect(await stateOf("tx-3-l1")).toBe("completed");
+  });
+
+  it("losing every pass is an error, never a silent success", async () => {
+    await ingest(simpleTx("tx-4", { state: "pending", updatedAt: "2026-07-10T08:00:00.000Z" }));
+    let n = 0;
+    // Every batch is preceded by another writer moving updated_at, so the swap never matches.
+    const hostile = new Proxy(db, {
+      get(target, prop) {
+        if (prop === "batch") {
+          return async (stmts: D1PreparedStatement[]) => {
+            n++;
+            await target
+              .prepare("UPDATE bank_transactions SET updated_at = ?1 WHERE external_id = 'tx-4'")
+              .bind(`2026-07-10T08:00:0${n}.000Z`)
+              .run();
+            return target.batch(stmts);
+          };
+        }
+        const v = Reflect.get(target, prop) as unknown;
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    const a = parse(simpleTx("tx-4", { state: "pending", updatedAt: "2026-07-10T08:00:59.000Z" }));
+    await expect(upsertTransaction({ DB: hostile }, connId, a, "poll")).rejects.toBeInstanceOf(
+      IngestContendedError,
+    );
+    expect(classifyRevolutError(new IngestContendedError()).retryable).toBe(true);
+  });
+});
+
+describe("timestamps and malformed input", () => {
+  it("normalises Z, offsets and micro/milli/no fractions to UTC milliseconds", () => {
+    expect(normStamp("2026-07-10T08:00:00Z")).toBe("2026-07-10T08:00:00.000Z");
+    expect(normStamp("2026-07-10T08:00:00.1Z")).toBe("2026-07-10T08:00:00.100Z");
+    expect(normStamp("2026-07-10T08:00:00.123456Z")).toBe("2026-07-10T08:00:00.123Z");
+    expect(normStamp("2026-07-10T08:00:00.123999999Z")).toBe("2026-07-10T08:00:00.123Z");
+    expect(normStamp("2026-07-10T10:00:00.5+02:00")).toBe("2026-07-10T08:00:00.500Z");
+    expect(normStamp("2026-07-10T03:30:00-04:30")).toBe("2026-07-10T08:00:00.000Z");
+    expect(normStamp("2026-07-10T08:00Z")).toBe("2026-07-10T08:00:00.000Z");
+    expect(normStamp(undefined)).toBeNull();
+    for (const bad of [
+      "2026-07-10T08:00:00", // no zone: would be read in the runtime's zone
+      "2026-07-10",
+      "2026-07-10 08:00:00Z",
+      "2026-13-10T08:00:00Z",
+      "1720598400000",
+      "",
+    ]) {
+      expect(() => normStamp(bad), bad).toThrow(IngestError);
+    }
+  });
+
+  it("an event with microseconds, then the same instant in an offset, is one unchanged row", async () => {
+    await ingest(simpleTx("tx-5", { updatedAt: "2026-07-10T08:00:00.123456Z" }));
+    const r = await ingest(simpleTx("tx-5", { updatedAt: "2026-07-10T10:00:00.123+02:00" }));
+    expect(r).toMatchObject({ inserted: 0, updated: 0 });
+    expect((await txRows())[0]?.["updated_at"]).toBe("2026-07-10T08:00:00.123Z");
+  });
+
+  it("refuses malformed ids, duplicate legs and absurd leg counts without writing", async () => {
+    const badId = parse(simpleTx("tx-6"));
+    badId.id = "../accounts";
+    await expect(upsertTransaction({ DB: db }, connId, badId, "poll")).rejects.toMatchObject({
+      code: "bad_transaction_id",
+    });
+    const badAccount = parse(simpleTx("tx-7"));
+    (badAccount.legs[0] as { accountId?: string }).accountId = "a/b";
+    await expect(upsertTransaction({ DB: db }, connId, badAccount, "poll")).rejects.toMatchObject({
+      code: "bad_leg",
+    });
+    const dup = parse(simpleTx("tx-8"));
+    dup.legs = [dup.legs[0] as (typeof dup.legs)[number], dup.legs[0] as (typeof dup.legs)[number]];
+    await expect(upsertTransaction({ DB: db }, connId, dup, "poll")).rejects.toMatchObject({
+      code: "bad_leg",
+    });
+    const many = parse(simpleTx("tx-9"));
+    const leg = many.legs[0] as (typeof many.legs)[number];
+    many.legs = Array.from({ length: MAX_LEGS + 1 }, (_, i) => ({ ...leg, legId: `l${i}` }));
+    await expect(upsertTransaction({ DB: db }, connId, many, "poll")).rejects.toMatchObject({
+      code: "too_many_legs",
+    });
+    expect(await txRows()).toEqual([]);
+    expect(await rowsOf("bank_accounts")).toEqual([]);
+  });
+
+  it("a counterparty's account id never becomes one of our accounts", async () => {
+    const t = parse(simpleTx("tx-10"));
+    const leg = t.legs[0] as (typeof t.legs)[number];
+    leg.counterparty = { ...leg.counterparty, accountId: "9f1e2d3c-4b5a-4968-8776-655443322119" };
+    await upsertTransaction({ DB: db }, connId, t, "poll");
+    const accounts = await rowsOf("bank_accounts");
+    expect(accounts.map((a) => a["external_id"])).toEqual([ACC_EUR]);
   });
 });
 
