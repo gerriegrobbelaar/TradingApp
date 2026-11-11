@@ -1,5 +1,5 @@
 import { vi } from "vitest";
-import { render } from "@testing-library/react";
+import { act, render } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { AppShell } from "./App";
 import type { Me, UsersResponse } from "./api";
@@ -85,4 +85,19 @@ export function renderApp(path = "/") {
       <AppShell />
     </MemoryRouter>,
   );
+}
+
+/**
+ * Let pending promises and React effects run for `ms` of FAKE time (no real waiting, so a slow
+ * machine cannot change the outcome; review S1). Real timers are restored afterwards.
+ */
+export async function settle(ms: number): Promise<void> {
+  vi.useFakeTimers();
+  try {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+  } finally {
+    vi.useRealTimers();
+  }
 }

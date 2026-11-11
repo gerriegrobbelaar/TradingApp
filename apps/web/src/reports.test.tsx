@@ -9,7 +9,7 @@ import userEvent from "@testing-library/user-event";
 import { configureAxe } from "vitest-axe";
 import { strFromU8, unzipSync } from "fflate";
 import { addDays, type BalanceSheetResponse, type OpenItemRow } from "@camelthorn/core";
-import { VIEWER, mockFetch, renderApp, type Call } from "./test-utils";
+import { VIEWER, mockFetch, renderApp, settle, type Call } from "./test-utils";
 import { ONE_DIVISION, STALE, TWO_DIVISIONS, listResponse, row } from "./test-fixtures";
 import {
   LEDGER_FRESH,
@@ -707,9 +707,7 @@ describe("Balance sheet", () => {
     expect(sent.has("year")).toBe(false);
     expect(sent.has("period")).toBe(false);
     // dropping them from the address does not load the report again
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 30));
-    });
+    await settle(30);
     expect(callsTo(calls, "/api/reports/balance-sheet")).toHaveLength(1);
   });
 
