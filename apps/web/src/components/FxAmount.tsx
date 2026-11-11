@@ -36,14 +36,39 @@ export function FxStaleChip() {
 }
 
 /**
+ * Placeholder lines while the rates (or the administration currency) are still on their way:
+ * the same line class and count as the lines that will replace them, so the page does not jump
+ * when they arrive (ADR 0037). Hidden from assistive technology; the figure above stays readable.
+ */
+export function FxPendingLines({ lines }: { lines: number }) {
+  return (
+    <>
+      {Array.from({ length: lines }, (_, i) => (
+        <p key={i} className="cap fx-line fx-pending" aria-hidden="true" data-fx-pending="">
+          <span className={i === 0 ? "sk fx-sk" : "sk fx-sk fx-sk-short"} />
+        </p>
+      ))}
+    </>
+  );
+}
+
+/** How many lines FxAmount will show under a figure (for the placeholder while loading). */
+function expectedLines(booked: BookedAmount | undefined, note: boolean): number {
+  return 1 + (note ? 1 : 0) + (booked ? (booked.complete ? 2 : 1) : 0);
+}
+
+/**
  * A foreign-currency figure in the administration's terms (CLAUDE.md 4.5): the original amount,
  * what it is worth at today's ECB rate, and, when Exact's booked amount is known, the unrealised
- * difference. Renders nothing while rates have not loaded, and nothing for an amount that is
- * already in the administration currency.
+ * difference. While rates load it keeps the space of the lines to come; it renders nothing more
+ * for an amount that is already in the administration currency, or when rates could not be read.
  *
  *  - rate missing: "No ECB rate for GBP" (not an error)
  *  - booked unknown: "Booked amount not known yet" (never 0)
  *  - `compact` leaves out the stale chip (a page shows it once)
+ *  - `base`: the currency the booked amount is in (an item's own division currency). The
+ *    conversion goes to that currency, so booked and today's value can never be in different
+ *    currencies, even for a moment while the administration is being switched.
  *
  * Everything shown is an estimate at today's rate, never the rate on the day and never booked.
  */
@@ -51,6 +76,7 @@ export function FxAmount({
   currency,
   minor,
   booked,
+  base: baseProp,
   showOriginal = true,
   compact = false,
   note,
@@ -59,6 +85,7 @@ export function FxAmount({
   currency: string;
   minor: number | bigint;
   booked?: BookedAmount;
+  base?: string;
   /** Show the original amount first (leave off where it is already the big number). */
   showOriginal?: boolean;
   compact?: boolean;
@@ -68,7 +95,8 @@ export function FxAmount({
   count?: number;
 }) {
   const fx = useFxRates();
-  const { table, base } = fx;
+  const table = fx.table;
+  const base = baseProp ?? fx.base;
   if (count !== undefined && count <= 0) return null;
   const original = showOriginal ? (
     <p className="fx-orig">
@@ -76,7 +104,23 @@ export function FxAmount({
     </p>
   ) : null;
   if (currency === base) return original;
-  if (!table) return original;
+  if (!fx.ready || !table) {
+    if (!fx.pending) {
+      if (fx.status !== "error") return original;
+      return (
+        <div className="fx-amount">
+          {original}
+          <p className="cap fx-line fx-missing">No estimate: the ECB rates could not be read</p>
+        </div>
+      );
+    }
+    return (
+      <div className="fx-amount">
+        {original}
+        <FxPendingLines lines={expectedLines(booked, note !== undefined)} />
+      </div>
+    );
+  }
 
   const missing = missingRates(table, currency, base);
   if (missing.length > 0) {
@@ -92,7 +136,11 @@ export function FxAmount({
     return (
       <div className="fx-amount">
         {original}
-        <p className="cap fx-line fx-missing">No ECB rate for {currency}</p>
+        <p className="cap fx-line fx-missing">
+          {today.reason === "missing_rate"
+            ? `No ECB rate for ${currency}`
+            : "No estimate: the amount cannot be converted exactly"}
+        </p>
       </div>
     );
   }
@@ -126,7 +174,13 @@ export function FxAmount({
       {booked && diff && !diff.ok && diff.reason === "booked_unknown" && (
         <p className="cap fx-line">
           Booked amount not known yet
-          {booked.minor > 0 && ` (at least ${formatMoney(booked.minor, base)} booked so far)`}
+          {booked.minor !== 0 &&
+            ` (${formatMoney(booked.minor, base)} booked for the items Exact has an amount for)`}
+        </p>
+      )}
+      {booked && diff && !diff.ok && diff.reason !== "booked_unknown" && (
+        <p className="cap fx-line fx-missing">
+          No difference: the amounts cannot be compared exactly
         </p>
       )}
       {booked && diff && diff.ok && (
@@ -136,8 +190,8 @@ export function FxAmount({
             <span className="num">{signedMoney(diff.differenceMinor, base)}</span>
           </p>
           <p className="cap fx-line">
-            {differenceSentence(booked.kind, minor, diff.differenceMinor, base)}{" "}
-            {diff.differenceMinor === 0n ? "" : `(${resultWord(diff.resultMinor)})`}
+            {differenceSentence(booked.kind, minor, diff.differenceMinor, base)}
+            {diff.differenceMinor === 0n ? "" : ` (${resultWord(diff.resultMinor)})`}
           </p>
         </>
       )}
@@ -148,8 +202,9 @@ export function FxAmount({
 
 /**
  * For the Overview and the ageing reports: the FxAmount lines under a figure once rates are
- * there, the plain "Exact's own amount" line (DcLine) until then, so nothing is lost when the
- * rates cannot be read.
+ * there, the plain "Exact's own amount" line (DcLine) when they cannot be read or the figure is
+ * not in the selected administration's currency, and placeholder lines while they load (so the
+ * card keeps its height).
  */
 export function FxDcLine({
   currency,
@@ -170,7 +225,15 @@ export function FxDcLine({
   kind: "invoice" | "bill";
 }) {
   const fx = useFxRates();
-  if (!fx.table || fx.base !== dcCurrency) {
+  if (currency === dcCurrency || count <= 0) return null;
+  if (fx.pending) {
+    return (
+      <div className="fx-amount">
+        <FxPendingLines lines={expectedLines({ minor: 0, complete: dcComplete, kind }, false)} />
+      </div>
+    );
+  }
+  if (!fx.ready || fx.base !== dcCurrency) {
     return (
       <DcLine
         currency={currency}
@@ -181,11 +244,11 @@ export function FxDcLine({
       />
     );
   }
-  if (currency === dcCurrency || count <= 0) return null;
   return (
     <FxAmount
       currency={currency}
       minor={minor}
+      base={dcCurrency}
       booked={{ minor: dcMinor, complete: dcComplete, kind }}
       showOriginal={false}
       compact
@@ -195,8 +258,16 @@ export function FxDcLine({
 
 /** One compact line under a row's amount: "about € 90,00" for a foreign-currency row. */
 export function FxRowLine({ currency, minor }: { currency: string; minor: number | bigint }) {
-  const { table, base } = useFxRates();
-  if (!table || currency === base) return null;
+  const { table, base, ready, pending } = useFxRates();
+  if (currency === base) return null;
+  if (!ready || !table) {
+    // Keep the row's height while the rates load, so the table does not jump.
+    return pending ? (
+      <span className="cap fx-row fx-pending" aria-hidden="true" data-fx-pending="">
+        <span className="sk fx-sk fx-sk-short" />
+      </span>
+    ) : null;
+  }
   const missing = missingRates(table, currency, base);
   if (missing.length > 0) {
     return <span className="cap fx-row">No ECB rate for {missing.join(" and ")}</span>;

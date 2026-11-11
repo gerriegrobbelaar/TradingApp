@@ -25,6 +25,18 @@ export interface FxState {
   base: string;
   /** True when no administration is selected yet, so `base` is the EUR fall-back. */
   baseAssumed: boolean;
+  /**
+   * Rates AND the administration currency are known, so a converted figure can be shown. While
+   * the administration list is still loading the base is not known: nothing is converted to the
+   * EUR fall-back in the meantime (it would flip to the real currency a moment later).
+   */
+  ready: boolean;
+  /**
+   * Still waiting for the first answer (rates or administrations): screens keep the space the FX
+   * lines will take, so nothing jumps when they arrive. False once ready or after a failed first
+   * read (the screens then fall back to Exact's own amounts).
+   */
+  pending: boolean;
   /** Quiet re-read: the previous values stay on screen until the new ones arrive. */
   refresh: () => Promise<void>;
 }
@@ -35,6 +47,8 @@ const DEFAULT: FxState = {
   table: null,
   base: FALLBACK_BASE,
   baseAssumed: true,
+  ready: false,
+  pending: false,
   refresh: () => Promise.resolve(),
 };
 
@@ -94,17 +108,20 @@ export function FxProvider({ children }: { children: ReactNode }) {
   }, [load]);
 
   const selected = division.selected;
-  const value = useMemo<FxState>(
-    () => ({
+  const divisionLoading = division.status === "loading";
+  const value = useMemo<FxState>(() => {
+    const table = buildRateTable(raw.data);
+    return {
       status: raw.status,
       data: raw.data,
-      table: buildRateTable(raw.data),
+      table,
       base: selected?.currency ?? FALLBACK_BASE,
       baseAssumed: selected === null,
+      ready: table !== null && !divisionLoading,
+      pending: raw.status === "loading" || (table !== null && divisionLoading),
       refresh,
-    }),
-    [raw, selected, refresh],
-  );
+    };
+  }, [raw, selected, divisionLoading, refresh]);
   return <FxContext.Provider value={value}>{children}</FxContext.Provider>;
 }
 

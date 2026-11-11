@@ -161,7 +161,11 @@ function api(pathname: string, scene: Scene): unknown {
     case "/api/divisions":
       return ONE_DIVISION;
     case "/api/fx/rates":
-      return scene === "fx-stale" ? fxStale() : scene === "fx-never" ? fxNever() : fxRates();
+      return scene === "fx-stale"
+        ? { ...fxStale(), lastImportStatus: "error", lastImportCode: "rate_not_published" }
+        : scene === "fx-never"
+          ? fxNever()
+          : fxRates();
     case "/api/fx/history":
       return fxHistory("USD", 5);
     case "/api/jobs":
@@ -279,11 +283,11 @@ async function open(scene: Scene, theme: "light" | "dark", width: number, reduce
   await page.waitForSelector("h1", { timeout: 15_000 });
   switch (scene) {
     case "overview":
-      await page.waitForSelector(".fx-headline", { timeout: 15_000 });
+      await page.waitForSelector(".fx-headline:not([data-fx-pending])", { timeout: 15_000 });
       break;
     case "item-receivable":
     case "item-payable":
-      await page.waitForSelector(".fx-row", { timeout: 15_000 });
+      await page.waitForSelector(".fx-row:not([data-fx-pending])", { timeout: 15_000 });
       await page.click(`button[data-row-primary='${scene === "item-receivable" ? 1 : 3}']`);
       await page.waitForSelector("[role='dialog'] .fx-amount", { timeout: 15_000 });
       break;
@@ -291,7 +295,7 @@ async function open(scene: Scene, theme: "light" | "dark", width: number, reduce
       await page.waitForSelector(".fx-ageing", { timeout: 15_000 });
       break;
     case "bank":
-      await page.waitForSelector(".fx-bank-total", { timeout: 15_000 });
+      await page.waitForSelector(".fx-bank-total:not([data-fx-pending])", { timeout: 15_000 });
       break;
     case "fx-ok":
       await page.waitForSelector(".fx-chart", { timeout: 15_000 });
@@ -303,6 +307,8 @@ async function open(scene: Scene, theme: "light" | "dark", width: number, reduce
       await page.waitForSelector(".empty", { timeout: 15_000 });
       break;
   }
+  // Review F3: no placeholder line may be left once the rates are in.
+  await page.waitForSelector("body:not(:has([data-fx-pending]))", { timeout: 15_000 });
   return { page, seen };
 }
 

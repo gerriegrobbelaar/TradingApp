@@ -108,6 +108,17 @@ export interface ConvertedTotal {
   included: string[];
   /** Currencies left out because the table has no rate for them. */
   excluded: string[];
+  /**
+   * The currencies whose ECB rate is actually missing. Usually the same as `excluded`, but in a
+   * GBP administration without a GBP rate every other currency is left out for want of the GBP
+   * rate, and the note must say so rather than blame USD.
+   */
+  noRate: string[];
+  /**
+   * Currencies left out because an amount could not be used exactly (not a safe integer number of
+   * minor units, or a conversion core refused). Never silently rounded or guessed.
+   */
+  invalid: string[];
   /** Oldest rate date among the converted currencies; null when nothing needed a rate. */
   rateDate: string | null;
   /** True when at least one non-base currency was converted into the total. */
@@ -126,15 +137,25 @@ export function sumInBase(
   parts: readonly { currency: string; minor: number | bigint }[],
 ): ConvertedTotal {
   const perCurrency = new Map<string, bigint>();
+  const bad = new Set<string>();
   for (const p of parts) {
+    // A JSON number that is not a safe integer cannot be an exact amount of minor units: leave the
+    // whole currency out (BigInt() would throw on 1.5 and silently take 2^53 + 1 as 2^53).
+    if (typeof p.minor === "number" && !Number.isSafeInteger(p.minor)) {
+      bad.add(p.currency);
+      continue;
+    }
     perCurrency.set(p.currency, (perCurrency.get(p.currency) ?? 0n) + BigInt(p.minor));
   }
   let total = 0n;
   const included: string[] = [];
   const excluded: string[] = [];
+  const noRate: string[] = [];
+  const invalid: string[] = [...bad];
   const usedForDate: string[] = [];
   let converted = false;
   for (const [currency, minor] of perCurrency) {
+    if (bad.has(currency)) continue;
     if (currency === base) {
       total += minor;
       included.push(currency);
@@ -142,7 +163,14 @@ export function sumInBase(
     }
     const c = toBase(table, minor, currency, base);
     if (!c.ok) {
-      excluded.push(currency);
+      if (c.reason === "missing_rate") {
+        excluded.push(currency);
+        for (const code of missingRates(table, currency, base)) {
+          if (!noRate.includes(code)) noRate.push(code);
+        }
+      } else {
+        invalid.push(currency);
+      }
       continue;
     }
     total += c.minor;
@@ -155,9 +183,29 @@ export function sumInBase(
     totalMinor: total,
     included,
     excluded,
+    noRate,
+    invalid,
     rateDate: rateDateFor(table, usedForDate),
     converted,
   };
+}
+
+/** "Not included: GBP (no ECB rate)", and amounts that could not be used exactly; null if none. */
+export function notIncludedText(t: {
+  excluded: string[];
+  noRate: string[];
+  invalid: string[];
+}): string | null {
+  const parts: string[] = [];
+  if (t.excluded.length > 0) {
+    const same =
+      t.noRate.length === t.excluded.length && t.noRate.every((c) => t.excluded.includes(c));
+    parts.push(
+      `${t.excluded.join(", ")} (no ECB rate${same ? "" : ` for ${t.noRate.join(" and ")}`})`,
+    );
+  }
+  if (t.invalid.length > 0) parts.push(`${t.invalid.join(", ")} (amount not usable)`);
+  return parts.length > 0 ? `Not included: ${parts.join("; ")}` : null;
 }
 
 export interface AgeingFxTotals {
@@ -168,6 +216,10 @@ export interface AgeingFxTotals {
   counts: Record<AgeingBucket | "total", number>;
   /** Currencies without a rate (the same in every cell) and the oldest rate date used. */
   excluded: string[];
+  /** Currencies whose amounts could not be used exactly (see `ConvertedTotal.invalid`). */
+  invalid: string[];
+  /** The currencies whose ECB rate is missing (see `ConvertedTotal.noRate`). */
+  noRate: string[];
   rateDate: string | null;
 }
 
@@ -198,7 +250,23 @@ export function ageingTotalsInBase(
     base,
     currencies.map((c) => ({ currency: c.currency, minor: c.totals.totalMinor })),
   );
-  return { base, cells, counts, excluded: cells.total.excluded, rateDate: cells.total.rateDate };
+  // A currency left out of any bucket is left out of the note too, not only out of the total.
+  const union = (pick: (c: ConvertedTotal) => string[]) => {
+    const out: string[] = [];
+    for (const k of [...AGEING_BUCKETS, "total"] as const) {
+      for (const code of pick(cells[k])) if (!out.includes(code)) out.push(code);
+    }
+    return out.sort();
+  };
+  return {
+    base,
+    cells,
+    counts,
+    excluded: union((c) => c.excluded),
+    invalid: union((c) => c.invalid),
+    noRate: union((c) => c.noRate),
+    rateDate: cells.total.rateDate,
+  };
 }
 
 export type Difference =

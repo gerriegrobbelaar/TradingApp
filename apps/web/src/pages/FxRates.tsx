@@ -27,11 +27,49 @@ const IMPORT_STATUS: Record<string, { text: string; ok: boolean }> = {
   skipped: { text: "skipped (not a working day)", ok: true },
 };
 
-/** "Last import: 10 Nov 2026, 16:15 — OK", or "Never run". */
+/**
+ * Plain words for the codes the import ends with (worker fx/ecb-import.ts, fx/ecb-fetch.ts). The
+ * code itself is shown too, so it can be matched with the run history and the logs.
+ */
+export const IMPORT_CODE_TEXT: Record<string, string> = {
+  rate_not_published: "the ECB had not published today's rates by 17:30",
+  not_yet_published: "today's rates are not published yet",
+  ecb_rate_limited: "the ECB asked us to slow down",
+  ecb_unavailable: "the ECB service was not available",
+  ecb_timeout: "the ECB did not answer in time",
+  ecb_network: "the ECB could not be reached",
+  network: "the ECB could not be reached",
+  bad_response: "the ECB sent data that could not be read",
+  bad_status: "the ECB gave an unexpected answer",
+  bad_content_type: "the ECB sent an unexpected kind of file",
+  response_too_large: "the ECB answer was too large",
+  redirect_refused: "the ECB answer pointed elsewhere and was refused",
+  url_not_allowed: "the request address was refused",
+  too_late: "the run started after 17:30, too late for today",
+  handler_error: "the import stopped with an internal error",
+  aborted: "the import was stopped before it finished",
+  already_current: "today's rates were already stored",
+  non_working_day: "not an ECB working day",
+};
+
+/** A code as stored, shown only when it looks like one (it is rendered as text either way). */
+const CODE_SHAPE = /^[a-z][a-z0-9_]{0,47}$/;
+
+/** "Last import: 10 Nov 2026, 16:15 — failed (rate_not_published): the ECB had not ...". */
 export function lastImportText(resp: FxRatesResponse): string {
   if (!resp.lastImportAt) return "Last import: never run";
   const s = resp.lastImportStatus ? IMPORT_STATUS[resp.lastImportStatus] : undefined;
-  const status = s ? s.text : (resp.lastImportStatus ?? "unknown");
+  let status = s ? s.text : (resp.lastImportStatus ?? "unknown");
+  const code = resp.lastImportCode ?? null;
+  if (code !== null && CODE_SHAPE.test(code) && resp.lastImportStatus !== "ok") {
+    // "skipped (not a working day)" already says it; other states get the code and its words.
+    if (resp.lastImportStatus === "skipped") {
+      if (code !== "non_working_day") status = `skipped (${code})`;
+    } else {
+      const words = IMPORT_CODE_TEXT[code];
+      status = `${status} (${code})${words ? `: ${words}` : ""}`;
+    }
+  }
   return `Last import: ${formatDateTime(resp.lastImportAt)} — ${status}`;
 }
 
@@ -50,10 +88,15 @@ function importFailure(e: unknown): string {
         return "The job queue is not set up on the Worker, so nothing can run yet.";
       default:
         if (e.status === 403) return "You do not have permission to run the import.";
+        if (e.status === 404) return "The ECB import job was not found.";
+        return "The server could not start the import. Try again.";
     }
   }
   return "Could not reach the server. Try again.";
 }
+
+/** After a start, re-read the rates quietly at these delays (the job takes a few seconds). */
+export const IMPORT_REREAD_MS = POLL_AFTER_MS;
 
 function ImportNow() {
   const me = useMe();
@@ -64,10 +107,18 @@ function ImportNow() {
   const [until, setUntil] = useState(0);
   const [now, setNow] = useState(() => Date.now());
   const timers = useRef<number[]>([]);
+  // A second click before React has re-rendered the disabled button must not start a second run.
+  const running = useRef(false);
+  const mounted = useRef(true);
+  const refresh = useRef(fx.refresh);
+  refresh.current = fx.refresh;
   useEffect(() => {
+    mounted.current = true;
     const t = timers.current;
     return () => {
+      mounted.current = false;
       for (const id of t) window.clearTimeout(id);
+      t.length = 0;
     };
   }, []);
   const cooling = until > now;
@@ -80,7 +131,21 @@ function ImportNow() {
   const roles = me.status === "ready" ? me.me.roles : [];
   if (!roles.some((r) => (IMPORT_ROLES as readonly string[]).includes(r))) return null;
 
+  const scheduleRereads = () => {
+    for (const id of timers.current) window.clearTimeout(id);
+    timers.current.length = 0;
+    for (const ms of POLL_AFTER_MS) {
+      timers.current.push(
+        window.setTimeout(() => {
+          if (mounted.current) void refresh.current();
+        }, ms),
+      );
+    }
+  };
+
   const run = async () => {
+    if (running.current || until > Date.now()) return;
+    running.current = true;
     setBusy(true);
     setNeedStepUp(false);
     try {
@@ -91,14 +156,14 @@ function ImportNow() {
         return;
       }
       await runJobNow(job.id);
+      if (!mounted.current) return;
       setUntil(Date.now() + 30_000);
       setNow(Date.now());
       toast.show("Started the ECB import. The rates update here when it finishes.");
       // Re-read quietly while it runs; the values on screen stay until new ones arrive.
-      for (const ms of POLL_AFTER_MS) {
-        timers.current.push(window.setTimeout(() => void fx.refresh(), ms));
-      }
+      scheduleRereads();
     } catch (e) {
+      if (!mounted.current) return;
       if (e instanceof StepUpRequired) {
         setNeedStepUp(true);
         return;
@@ -107,9 +172,12 @@ function ImportNow() {
         setUntil(Date.now() + e.retryAfterSeconds * 1000);
         setNow(Date.now());
       }
+      // Already running: its result will land in the rates, so watch for it as after a start.
+      if (e instanceof ApiError && e.code === "already_running") scheduleRereads();
       toast.show(importFailure(e));
     } finally {
-      setBusy(false);
+      running.current = false;
+      if (mounted.current) setBusy(false);
     }
   };
   return (

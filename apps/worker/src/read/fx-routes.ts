@@ -101,8 +101,14 @@ async function ratesHandler(ctx: Ctx): Promise<Response> {
       ? newestOnDate
       : (await db.prepare(SQL_NEWEST_ON_OR_BEFORE).bind(today).first<{ d: string | null }>())?.d;
   const state = await db
-    .prepare("SELECT last_attempt_at, last_status FROM fx_import_state WHERE id = 1")
-    .first<{ last_attempt_at: string | null; last_status: string | null }>();
+    .prepare(
+      "SELECT last_attempt_at, last_status, last_error_code FROM fx_import_state WHERE id = 1",
+    )
+    .first<{
+      last_attempt_at: string | null;
+      last_status: string | null;
+      last_error_code: string | null;
+    }>();
 
   const body: FxRatesResponse = {
     base: "EUR",
@@ -111,6 +117,7 @@ async function ratesHandler(ctx: Ctx): Promise<Response> {
     ...fxStaleness(newest ?? null, ctx.nowMs),
     lastImportAt: state?.last_attempt_at ?? null,
     lastImportStatus: state?.last_status ?? null,
+    lastImportCode: state?.last_error_code ?? null,
     notice: FX_NOTICE,
   };
   return json(body);

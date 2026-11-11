@@ -774,6 +774,18 @@ describe("Settings, FX rates", () => {
       expect(await screen.findByText("The ECB import job was not found.")).toBeTruthy();
       unmount();
       tab(FIN, fxRates(), { "GET /api/jobs": () => ({ status: 500, body: {} }) });
+      const second = renderApp("/settings/fx");
+      await click();
+      // the server answered: it is not a network problem
+      expect(
+        await screen.findByText("The server could not start the import. Try again."),
+      ).toBeTruthy();
+      second.unmount();
+      tab(FIN, fxRates(), {
+        "GET /api/jobs": () => {
+          throw new TypeError("Failed to fetch");
+        },
+      });
       renderApp("/settings/fx");
       await click();
       expect(await screen.findByText("Could not reach the server. Try again.")).toBeTruthy();

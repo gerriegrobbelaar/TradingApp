@@ -24,6 +24,7 @@ const RATES_KEYS = keysOf<FxRatesResponse>()([
   "workingDaysOld",
   "lastImportAt",
   "lastImportStatus",
+  "lastImportCode",
   "notice",
 ]);
 const RATE_KEYS = keysOf<FxRateDto>()(["currency", "rate", "rateDate", "source"]);
@@ -91,6 +92,7 @@ describe("GET /api/fx/rates", () => {
       workingDaysOld: null,
       lastImportAt: null,
       lastImportStatus: null,
+      lastImportCode: null,
       notice: FX_NOTICE,
     });
     expect(body.notice).toMatch(/^ECB reference rates are for information only\./);
@@ -133,6 +135,23 @@ describe("GET /api/fx/rates", () => {
       workingDaysOld: 1,
       lastImportAt: "2026-11-10T15:20:00.000Z",
       lastImportStatus: "ok",
+      lastImportCode: null,
+    });
+  });
+
+  it("exposes the code of the last import's outcome (task F3)", async () => {
+    await put("USD", "2026-11-10", "1.1");
+    await db
+      .prepare(
+        `UPDATE fx_import_state SET last_attempt_at = '2026-11-10T16:30:00.000Z',
+           last_status = 'error', last_error_code = 'rate_not_published' WHERE id = 1`,
+      )
+      .run();
+    const { body } = await get<FxRatesResponse>("/api/fx/rates");
+    expect(Object.keys(body).sort()).toEqual(RATES_KEYS);
+    expect(body).toMatchObject({
+      lastImportStatus: "error",
+      lastImportCode: "rate_not_published",
     });
   });
 

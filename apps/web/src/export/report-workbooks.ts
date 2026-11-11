@@ -117,7 +117,19 @@ function ageingFxSheet(
     `Currency: ${fx.base}`,
     note,
     "An estimate: each currency is converted once at today's rate, then the results are added.",
-    ...(fx.excluded.length > 0 ? [`Not included (no ECB rate): ${fx.excluded.join(", ")}`] : []),
+    ...(fx.excluded.length > 0
+      ? [
+          `Not included (no ECB rate${
+            fx.noRate.length === fx.excluded.length &&
+            fx.noRate.every((c) => fx.excluded.includes(c))
+              ? ""
+              : ` for ${fx.noRate.join(" and ")}`
+          }): ${fx.excluded.join(", ")}`,
+        ]
+      : []),
+    ...(fx.invalid.length > 0
+      ? [`Not included (amount not usable): ${fx.invalid.join(", ")}`]
+      : []),
   ]);
   const cell = (k: AgeingBucket | "total", style?: { bold?: boolean; total?: boolean }): Cell => {
     const c = fx.cells[k];

@@ -80,4 +80,39 @@ describe("ageing export with the converted total", () => {
     expect(out.sheets.map((s) => s.name)).toEqual(["EUR", "GBP", "USD"]);
     expect(ageingExport(r, CTX, "outstanding", null).sheets).toHaveLength(3);
   });
+
+  it("in a GBP administration without a GBP rate names GBP as the missing rate", () => {
+    const gbpReport = ageingResponse(
+      [
+        {
+          relationId: 1,
+          relationName: "Acme",
+          currency: "GBP",
+          openMinor: 5_000,
+          dueDate: "2026-12-01",
+        },
+        {
+          relationId: 2,
+          relationName: "Beta",
+          currency: "USD",
+          openMinor: 10_000,
+          dueDate: "2026-12-01",
+        },
+      ],
+      "receivable",
+    );
+    const t = buildRateTable(fxRatesNoGbp());
+    const totals = ageingTotalsInBase(t as NonNullable<typeof t>, "GBP", gbpReport.currencies);
+    const out = ageingExport(gbpReport, CTX, "outstanding", totals);
+    const sheet = out.sheets.at(-1) as SheetSpec;
+    expect(sheet.name).toBe("Total in GBP");
+    const flat = table(sheet)
+      .map((x) => x.join("|"))
+      .join("\n");
+    expect(flat).toContain("Not included (no ECB rate for GBP): USD");
+    // only the GBP amount itself is in the total: 50.00, exact text, no float artefacts
+    const row = table(sheet).find((x) => x[0] === "Total in GBP at today's ECB rates") as string[];
+    expect(row[1]).toBe("50.00");
+    expect(row.every((c) => !/e[+-]|NaN|undefined/.test(c))).toBe(true);
+  });
 });

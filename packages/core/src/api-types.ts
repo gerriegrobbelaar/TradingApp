@@ -624,6 +624,12 @@ export interface FxRatesResponse {
   workingDaysOld: number | null;
   lastImportAt: string | null;
   lastImportStatus: string | null;
+  /**
+   * Code of the last import's outcome (fx_import_state.last_error_code), for example
+   * rate_not_published, ecb_rate_limited, bad_response, too_late, ecb_network; null when none.
+   * Optional so older clients' fixtures stay valid; the Worker always sends it.
+   */
+  lastImportCode?: string | null;
   /** 'ECB reference rates are for information only…' */
   notice: string;
 }

@@ -29,6 +29,7 @@ export function fxRates(over: Partial<FxRatesResponse> = {}): FxRatesResponse {
     workingDaysOld: 0,
     lastImportAt: "2026-11-10T15:16:00.000Z",
     lastImportStatus: "ok",
+    lastImportCode: null,
     notice: NOTICE,
     ...over,
   };
@@ -59,6 +60,7 @@ export function fxNever(): FxRatesResponse {
     workingDaysOld: null,
     lastImportAt: null,
     lastImportStatus: null,
+    lastImportCode: null,
   });
 }
 

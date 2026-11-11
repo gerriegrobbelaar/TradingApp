@@ -132,6 +132,7 @@ export function OpenItemDetailView({
             <FxAmount
               currency={item.currency}
               minor={item.openMinor}
+              base={dcCur}
               showOriginal={false}
               booked={{
                 minor: item.dcMinor ?? 0,

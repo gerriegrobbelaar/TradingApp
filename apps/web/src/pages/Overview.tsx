@@ -221,9 +221,27 @@ function FxHeadline({
   list: CurrencyKpisDto[];
   baseCurrency: string;
 }) {
-  const { table, base } = useFxRates();
-  if (!table || base !== baseCurrency || !list.some((k) => k.currency !== base)) return null;
+  const { table, base, ready, pending } = useFxRates();
   const L = LABEL[side];
+  if (pending && list.some((k) => k.currency !== baseCurrency)) {
+    // Keep the block's place while the rates load, so the card does not grow under the reader.
+    return (
+      <section className="fx-headline" aria-hidden="true" data-fx-pending="">
+        <h3 className="h2">{fxTotalTitle(baseCurrency)}</h3>
+        <Skeleton height={14} width="80%" />
+        <ul className="fx-head-list">
+          {HEADLINE_FIGURES.map((f) => (
+            <li key={f}>
+              <span className="fx-head-label">{L[f]}</span> <Skeleton height={14} width="40%" />
+            </li>
+          ))}
+        </ul>
+      </section>
+    );
+  }
+  if (!ready || !table || base !== baseCurrency || !list.some((k) => k.currency !== base)) {
+    return null;
+  }
   return (
     <section
       className="fx-headline"

@@ -15,7 +15,7 @@ import { EmptyState, ErrorNotice } from "../components/EmptyState";
 import { SearchBox } from "../components/FilterBar";
 import { FreshnessStamp } from "../components/FreshnessStamp";
 import { FxDcLine } from "../components/FxAmount";
-import { ConvertedAmount, FxEstimateIntro, fxTotalTitle } from "../components/FxTotals";
+import { AgeingFxTotalsCard } from "../components/FxTotals";
 import { Money } from "../components/Money";
 import { useFxRates } from "../fx";
 import { ageingTotalsInBase } from "../lib/fx";
@@ -30,7 +30,7 @@ import {
   type AgeingSort as SortMode,
 } from "../lib/ageing";
 import { describeLoadError } from "../lib/errors";
-import { NO_VALUE, formatCount, formatDate, formatDayMonth, formatMoney } from "../lib/format";
+import { NO_VALUE, formatCount, formatDate, formatMoney } from "../lib/format";
 import { reportFileBase } from "../lib/report-files";
 import { useResource } from "../lib/useResource";
 import { useSearchText } from "../lib/useSearchText";
@@ -321,68 +321,6 @@ function CurrencySection({
   );
 }
 
-/** The rate-date line under the converted row; also printed. */
-export function fxRateLine(rateDate: string | null): string {
-  return rateDate
-    ? `ECB rates of ${formatDayMonth(rateDate)}; for information only`
-    : "For information only";
-}
-
-/**
- * "Total in € at today's ECB rates": one row under the per-currency tables, a converted total per
- * bucket (each currency converted once, then added). The per-currency tables stay primary.
- */
-function FxTotalsCard({ data }: { data: AgeingReportResponse }) {
-  const { table, base } = useFxRates();
-  if (!table || base !== data.division.currency) return null;
-  const t = ageingTotalsInBase(table, base, data.currencies);
-  if (!t) return null;
-  const title = fxTotalTitle(base);
-  return (
-    <Card aria-labelledby="ageing-fx" className="report-card fx-ageing">
-      <h2 id="ageing-fx" className="h2">
-        {title}
-      </h2>
-      <FxEstimateIntro />
-      <ScrollRegion label={`${title}, per days past due`}>
-        <table className="tbl report-table ageing-table">
-          <caption className="sr-only">
-            {title}: all currencies converted and added, per days past due
-          </caption>
-          <thead>
-            <tr>
-              <th scope="col">Currencies</th>
-              {COLUMNS.map((c) => (
-                <th key={c.key} scope="col" className="r">
-                  {c.label}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            <tr className="totals-row">
-              <th scope="row">{title}</th>
-              {COLUMNS.map((c) => (
-                <td key={c.key} className="r">
-                  {t.counts[c.key] === 0 ? (
-                    <span className="muted">{NO_VALUE}</span>
-                  ) : (
-                    <ConvertedAmount total={t.cells[c.key]} base={base} />
-                  )}
-                </td>
-              ))}
-            </tr>
-          </tbody>
-        </table>
-      </ScrollRegion>
-      <p className="cap fx-rate-line">
-        {fxRateLine(t.rateDate)}
-        {t.excluded.length > 0 && <> · Not included: {t.excluded.join(", ")} (no ECB rate)</>}
-      </p>
-    </Card>
-  );
-}
-
 export function AgeingReport({ kind }: { kind: AgeingKind }) {
   const copy = COPY[kind];
   const { selected, gate } = useDivisionGate();
@@ -445,10 +383,10 @@ export function AgeingReport({ kind }: { kind: AgeingKind }) {
   const fx = useFxRates();
   const fxTotals = useMemo(
     () =>
-      data && fx.table && fx.base === data.division.currency
+      data && fx.ready && fx.table && fx.base === data.division.currency
         ? ageingTotalsInBase(fx.table, fx.base, data.currencies)
         : null,
-    [data, fx.table, fx.base],
+    [data, fx.ready, fx.table, fx.base],
   );
 
   const runExcel = useCallback(async () => {
@@ -566,7 +504,7 @@ export function AgeingReport({ kind }: { kind: AgeingKind }) {
                   onDrill={openDrill}
                 />
               ))}
-              <FxTotalsCard data={data} />
+              <AgeingFxTotalsCard data={data} />
             </>
           )}
         </>

@@ -151,8 +151,17 @@ function WaitingForSync({ admin }: { admin: boolean }) {
  * An estimate under the strip; the per-currency balances stay the real figures.
  */
 function FxBankTotal({ data }: { data: BankAccountsResponse }) {
-  const { table, base, baseAssumed } = useFxRates();
-  if (!table || !data.totalsByCurrency.some((t) => t.currency !== base)) return null;
+  const { table, base, baseAssumed, ready, pending } = useFxRates();
+  if (pending && data.totalsByCurrency.some((t) => t.currency !== base)) {
+    // The two lines to come, so the transactions below do not jump when the rates arrive.
+    return (
+      <div className="fx-bank-total" aria-hidden="true" data-fx-pending="">
+        <Skeleton height={20} width="12em" />
+        <Skeleton height={14} width="20em" />
+      </div>
+    );
+  }
+  if (!ready || !table || !data.totalsByCurrency.some((t) => t.currency !== base)) return null;
   const total = sumInBase(
     table,
     base,
