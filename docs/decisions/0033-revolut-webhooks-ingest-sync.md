@@ -30,6 +30,31 @@ Status: accepted for Phase 5 (task R3a). Items under "Assumptions" are **verify 
   admin "Register webhook" (`replace:true` rotates: create new, keep old secret as previous, delete old subscription).
   Recovery of a lost creation response: `GET /webhooks` (gate allows it only for job id `revolut-webhook-recover`, priority
   user) -> delete our-URL subscriptions -> create. List responses (may hold secrets) are never stored or logged.
+  When a replacement is stored but deleting the OLD subscription failed, that subscription keeps delivering
+  until a delivery verifies with the new secret: both the new and the old secret verify during that time, and
+  after the first delivery signed with the new secret the old secret is retired (no longer valid here). An old
+  subscription that was never deleted at Revolut then still delivers, but its deliveries are rejected (counted
+  as `bad_signature`) until an admin removes it in Revolut.
+
+## Channel health and housekeeping (review S4, N1, N2)
+
+- Header-first: both headers must be present, the timestamp 13 digits and inside the 5-minute window, and the
+  signature header well formed (at most 5 entries, one `v1=<64 hex>`) BEFORE the body is read or D1 is asked
+  anything (same rules as R1's verifier, repeated cheaply). The uniform 401 is unchanged.
+- `connections.last_webhook_verified_at` (stamped at most once a minute), `last_webhook_rejected_at`,
+  `webhook_rejected_total` and the table `webhook_rejections` (per UTC minute and reason from a closed list,
+  else `other`). The route is public, so writes are bounded: one upsert per reason per minute per isolate, the
+  counts in between are carried in memory (a lower bound under a flood; the first rejection of a minute is
+  always written). The rejection log line is sampled (10 per minute per isolate, then one "suppressed" line).
+  `GET /api/connections` returns `revolut.webhook = { registered, lastVerifiedAt, lastRejectedAt,
+  rejectedLast24h, rejectedTotal, secretReadable (admins only) }`; Phase 8's "webhook failures" rule reads these.
+  Disconnecting resets them; registering a new subscription clears `last_webhook_verified_at`.
+- `housekeepWebhookEvents` (scheduler tick, at most every 10 minutes): a `queued` row older than 15 minutes is
+  re-enqueued (same MAX_REQUEUES budget as redeliveries) and then ends as `error` (`requeue_exhausted`,
+  `never_parsed` for a body that was never parsed, `enqueue_failed` when the queue refuses); finished rows are
+  deleted after 30 days (ADR 0011).
+- An `unparsed` row is only taken over by a redelivery when it is older than 60 seconds, so two overlapping
+  deliveries of one body cannot both enqueue it.
 
 ## Ingest transition table (`packages/core/bank-tx.ts`)
 One row per leg, unique (connection, transaction id, leg id); decided in TypeScript, applied as compare-and-swap on
@@ -67,7 +92,7 @@ account row.
 1. Payload `{event, timestamp, data:{id, request_id, state | old_state/new_state}}`; header names `Revolut-Signature`,
    `Revolut-Request-Timestamp` (ms). 2. `TransactionStateChanged` fires for every state change. 3. Retries: 3 more, 10 min
    apart. 4. `GET /webhooks` lists our subscription; a second subscription for one URL is allowed. 5. 60 calls/minute.
-6. `/transactions` honours `from`/`count`; a server that caps below seen+1 rows ends a walk early (R1 limit, see report).
+6. `/transactions` honours `from`/`count`; a server that caps below seen+1 rows ends a walk early (a known limit of the paging cursor; the daily backfill walk is the safety net).
 
 ## Audit and result masking
 `maskDeep` (audit before/after and job results) no longer redacts a bare `code` key: it is the machine code of every

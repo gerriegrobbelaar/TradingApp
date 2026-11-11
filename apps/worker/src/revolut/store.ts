@@ -4,7 +4,7 @@
  * v1 has exactly one Revolut connection (kind 'revolut', name 'revolut'); see ADR 0031.
  */
 import { auditStatement } from "../db/audit";
-import { decryptToken, encryptToken, keyring } from "../crypto/token-crypto";
+import { decryptToken, encryptToken, isEncryptedWith, keyring } from "../crypto/token-crypto";
 import type { ConnectionStatus } from "../exact/store";
 import { isRevolutEnvironment, type RevolutEnvironment } from "./config";
 
@@ -228,16 +228,22 @@ export async function saveWebhookSecret(
   // The previous ciphertext is bound to the "webhook_secret" column; re-encrypt it for "_prev".
   let prevEnc: string | null = null;
   if (current.webhook_secret_enc) {
-    const plain = await decryptToken(
-      keyring(env),
-      current.webhook_secret_enc,
-      aad(connectionId, "webhook_secret"),
-    );
-    prevEnc = await encryptToken(
-      env.TOKEN_ENC_KEY,
-      plain,
-      aad(connectionId, "webhook_secret_prev"),
-    );
+    // A current secret nobody can read any more (its key was dropped) has nothing to keep for the
+    // overlap: it simply goes, so "register again" is the way out of that state (review S3).
+    try {
+      const plain = await decryptToken(
+        keyring(env),
+        current.webhook_secret_enc,
+        aad(connectionId, "webhook_secret"),
+      );
+      prevEnc = await encryptToken(
+        env.TOKEN_ENC_KEY,
+        plain,
+        aad(connectionId, "webhook_secret_prev"),
+      );
+    } catch {
+      prevEnc = null;
+    }
   }
   await env.DB.batch([
     auditStatement(env.DB, {
@@ -249,6 +255,7 @@ export async function saveWebhookSecret(
     }),
     env.DB.prepare(
       `UPDATE connections SET webhook_id = ?2, webhook_secret_enc = ?3, webhook_secret_prev_enc = ?4,
+         last_webhook_verified_at = NULL,
          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
        WHERE id = ?1 AND kind = 'revolut'`,
     ).bind(connectionId, webhookId, enc, prevEnc),
@@ -291,14 +298,21 @@ export async function loadWebhookSecrets(
 export async function loadWebhookSecretSet(
   env: { DB: D1Database; TOKEN_ENC_KEY: string; TOKEN_ENC_KEY_PREVIOUS?: string },
   connectionId: number,
-): Promise<{ current: string | null; previous: string | null }> {
+): Promise<{ current: string | null; previous: string | null; stale: boolean }> {
   const row = await env.DB.prepare(
     `SELECT webhook_secret_enc, webhook_secret_prev_enc FROM connections
      WHERE id = ?1 AND kind = 'revolut'`,
   )
     .bind(connectionId)
     .first<{ webhook_secret_enc: string | null; webhook_secret_prev_enc: string | null }>();
+  // stale: a stored secret is still under another (previous) key; the caller re-encrypts it.
+  const stale =
+    (!!row?.webhook_secret_enc &&
+      !(await isEncryptedWith(env.TOKEN_ENC_KEY, row.webhook_secret_enc))) ||
+    (!!row?.webhook_secret_prev_enc &&
+      !(await isEncryptedWith(env.TOKEN_ENC_KEY, row.webhook_secret_prev_enc)));
   return {
+    stale,
     current: row?.webhook_secret_enc
       ? await decryptToken(
           keyring(env),
@@ -347,4 +361,68 @@ export async function retirePreviousWebhookSecret(
       .bind(connectionId),
   ]);
   return (results[1]?.meta.changes ?? 0) === 1;
+}
+
+/**
+ * Re-encrypts the webhook signing secrets under the CURRENT TOKEN_ENC_KEY (review S3). After a key
+ * rotation (current = B, previous = A) the secrets are still under A until something rewrites
+ * them; dropping A first would leave every delivery unverifiable. Idempotent and best effort:
+ * nothing to do when both are already under the current key. Each write is a compare-and-swap on
+ * the old ciphertext, so a concurrent "register again" is never overwritten. No audit row (the
+ * plaintext does not change). `readable` is false when a stored secret cannot be decrypted with
+ * either key (the admin must register the webhook again); never throws.
+ */
+export async function reencryptWebhookSecrets(
+  env: { DB: D1Database; TOKEN_ENC_KEY: string; TOKEN_ENC_KEY_PREVIOUS?: string },
+  connectionId: number,
+): Promise<{ readable: boolean; reencrypted: number }> {
+  let readable = true;
+  let reencrypted = 0;
+  try {
+    const row = await env.DB.prepare(
+      `SELECT webhook_secret_enc, webhook_secret_prev_enc FROM connections
+       WHERE id = ?1 AND kind = 'revolut'`,
+    )
+      .bind(connectionId)
+      .first<{ webhook_secret_enc: string | null; webhook_secret_prev_enc: string | null }>();
+    if (!row) return { readable, reencrypted };
+    const columns = [
+      { enc: row.webhook_secret_enc, kind: "webhook_secret" as const },
+      { enc: row.webhook_secret_prev_enc, kind: "webhook_secret_prev" as const },
+    ];
+    for (const col of columns) {
+      if (!col.enc) continue;
+      try {
+        if (await isEncryptedWith(env.TOKEN_ENC_KEY, col.enc)) continue;
+        const plain = await decryptToken(keyring(env), col.enc, aad(connectionId, col.kind));
+        const fresh = await encryptToken(env.TOKEN_ENC_KEY, plain, aad(connectionId, col.kind));
+        // Column names come from the closed list above, never from input.
+        const r = await env.DB.prepare(
+          `UPDATE connections SET ${col.kind}_enc = ?3
+           WHERE id = ?1 AND kind = 'revolut' AND ${col.kind}_enc = ?2`,
+        )
+          .bind(connectionId, col.enc, fresh)
+          .run();
+        reencrypted += r.meta.changes;
+      } catch {
+        readable = false;
+      }
+    }
+  } catch {
+    /* D1 hiccup: the next refresh or delivery tries again */
+  }
+  return { readable, reencrypted };
+}
+
+/** Whether every stored webhook secret decrypts with the current or previous key. Never throws. */
+export async function webhookSecretsReadable(
+  env: { DB: D1Database; TOKEN_ENC_KEY: string; TOKEN_ENC_KEY_PREVIOUS?: string },
+  connectionId: number,
+): Promise<boolean> {
+  try {
+    await loadWebhookSecretSet(env, connectionId);
+    return true;
+  } catch {
+    return false;
+  }
 }

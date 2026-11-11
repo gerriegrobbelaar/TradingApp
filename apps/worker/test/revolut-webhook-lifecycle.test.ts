@@ -94,7 +94,7 @@ describe("register webhook", () => {
       url: OUR_URL,
       events: ["TransactionCreated", "TransactionStateChanged"],
     });
-    expect(await loadWebhookSecretSet(env, connId)).toEqual({
+    expect(await loadWebhookSecretSet(env, connId)).toMatchObject({
       current: WEBHOOK_SECRET,
       previous: null,
     });
@@ -288,7 +288,7 @@ describe("replacing the subscription (rotation)", () => {
       "POST /api/2.0/webhooks",
       `DELETE /api/2.0/webhooks/${WEBHOOK_ID}`,
     ]);
-    expect(await loadWebhookSecretSet(env, connId)).toEqual({
+    expect(await loadWebhookSecretSet(env, connId)).toMatchObject({
       current: "wsk_rotated_secret",
       previous: WEBHOOK_SECRET,
     });

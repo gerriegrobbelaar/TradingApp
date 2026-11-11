@@ -348,7 +348,11 @@ describe("webhook endpoint: size, queue failures and other requests", () => {
       new Request("https://app.test/api/webhooks/revolut", {
         method: "POST",
         body: "{}",
-        headers: { "content-length": "9".repeat(30) },
+        headers: {
+          "content-length": "9".repeat(30),
+          "revolut-signature": "v1=" + "0".repeat(64),
+          "revolut-request-timestamp": String(Date.now()),
+        },
       }),
       envWithQueue(queue),
     );
@@ -492,7 +496,7 @@ describe("webhook endpoint: size, queue failures and other requests", () => {
 describe("webhook secrets: rotation overlap", () => {
   it("accepts the previous secret during the overlap and drops it after the first delivery with the new one", async () => {
     await saveWebhookSecret(env, connId, WEBHOOK_ID, "wsk_new_secret_value", ADMIN);
-    expect(await loadWebhookSecretSet(env, connId)).toEqual({
+    expect(await loadWebhookSecretSet(env, connId)).toMatchObject({
       current: "wsk_new_secret_value",
       previous: WEBHOOK_SECRET,
     });
@@ -501,7 +505,7 @@ describe("webhook secrets: rotation overlap", () => {
     expect((await loadWebhookSecretSet(env, connId)).previous).toBe(WEBHOOK_SECRET);
     // signed with the NEW one: accepted, the old one is retired and audited
     expect((await deliver({ ...valid("tx-2"), secret: "wsk_new_secret_value" })).status).toBe(200);
-    expect(await loadWebhookSecretSet(env, connId)).toEqual({
+    expect(await loadWebhookSecretSet(env, connId)).toMatchObject({
       current: "wsk_new_secret_value",
       previous: null,
     });
@@ -530,7 +534,7 @@ describe("webhook secrets: rotation overlap", () => {
     for (let i = 0; i < 3; i++) {
       expect((await deliver({ ...valid(`tx-o${i}`), secret: WEBHOOK_SECRET })).status).toBe(200);
     }
-    expect(await loadWebhookSecretSet(env, connId)).toEqual({
+    expect(await loadWebhookSecretSet(env, connId)).toMatchObject({
       current: "wsk_new_secret_value",
       previous: WEBHOOK_SECRET,
     });

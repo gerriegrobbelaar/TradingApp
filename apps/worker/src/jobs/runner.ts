@@ -35,6 +35,7 @@ import type { Env } from "../env";
 import { getEuObject } from "../eu-object";
 import { isTransientFailure, type SyncDeps } from "../exact/sync";
 import { processRevolutEvent, type EventDeps } from "../revolut/events";
+import { housekeepWebhookEvents } from "../revolut/webhook-housekeeping";
 import { handlerFor } from "./handlers";
 import { HEARTBEAT_MS } from "./overhead";
 import { latenessMs } from "./period";
@@ -179,6 +180,11 @@ export async function tickScheduler(env: Env, nowMs: number = Date.now()): Promi
   } catch (e) {
     console.error("job sweep failed", e instanceof Error ? e.name : "unknown");
   }
+  // Webhook tables: stale queued rows and retention. Idle ticks cost nothing (at most once per 10
+  // minutes per isolate, see revolut/webhook-housekeeping.ts).
+  await housekeepWebhookEvents(env, nowMs).catch((e: unknown) =>
+    console.error("webhook housekeeping failed", e instanceof Error ? e.name : "unknown"),
+  );
   return result;
 }
 

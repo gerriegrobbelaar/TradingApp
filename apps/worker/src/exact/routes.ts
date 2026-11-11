@@ -28,7 +28,12 @@ import { fetchCurrentMe, type CurrentMe } from "@camelthorn/exact";
 import { encryptToken } from "../crypto/token-crypto";
 import { DEFAULT_EXACT_HOST, loadExactConfig, type ExactConfig } from "./config";
 import { loadRevolutConfig } from "../revolut/config";
-import { expireRevolutPending, parsePendingSummary } from "../revolut/store";
+import {
+  expireRevolutPending,
+  parsePendingSummary,
+  webhookSecretsReadable,
+} from "../revolut/store";
+import { rejectedLast24h } from "../revolut/webhook-health";
 import { createCurrentGateTransport } from "./gate-transport";
 import { authorizeUrl, exchangeCode, TokenEndpointError } from "./oauth";
 import { aad, EXACT_CONNECTION_NAME } from "./store";
@@ -123,7 +128,8 @@ export function registerExactRoutes(router: Router): void {
       .prepare(
         `SELECT id, kind, name, status, expires_at, last_error, connected_by, connected_at,
            revolut_environment, creates_bank_entries, payments_mode, bank_entries_decided_at,
-           pending_until, pending_ref, pending_by, pending_summary,
+           pending_until, pending_ref, pending_by, pending_summary, refresh_expires_at,
+           last_webhook_verified_at, last_webhook_rejected_at, webhook_rejected_total,
            (webhook_id IS NOT NULL AND webhook_secret_enc IS NOT NULL) AS webhook_registered
          FROM connections ORDER BY id`,
       )
@@ -144,6 +150,10 @@ export function registerExactRoutes(router: Router): void {
         pending_ref: string | null;
         pending_by: string | null;
         pending_summary: string | null;
+        refresh_expires_at: string | null;
+        last_webhook_verified_at: string | null;
+        last_webhook_rejected_at: string | null;
+        webhook_rejected_total: number;
         webhook_registered: number;
       }>();
     const divs = await db
@@ -161,6 +171,21 @@ export function registerExactRoutes(router: Router): void {
       }>();
     const configured = loadExactConfig(ctx.env, ctx.config.appOrigin).ok;
     const isAdmin = ctx.session?.roles.includes("admin") === true;
+    // Webhook channel health of the Revolut connection (Phase 5 review S3 and S4). The secret check
+    // decrypts, so it is admin only: it answers "can the stored signing secret still be read".
+    const revolutRow = results.find((c) => c.kind === "revolut");
+    const health =
+      revolutRow === undefined
+        ? null
+        : {
+            rejectedLast24h: await rejectedLast24h(db, revolutRow.id, ctx.nowMs),
+            secretReadable:
+              isAdmin && revolutRow.webhook_registered === 1
+                ? await webhookSecretsReadable(ctx.env, revolutRow.id)
+                : isAdmin
+                  ? true
+                  : undefined,
+          };
     return json({
       exactConfigured: configured,
       revolutConfigured: loadRevolutConfig(ctx.env, ctx.config.appOrigin).ok,
@@ -172,6 +197,9 @@ export function registerExactRoutes(router: Router): void {
         lastError: c.last_error,
         connectedBy: c.connected_by,
         connectedAt: c.connected_at,
+        // When the refresh token stops working, if the provider told us (null = unknown). Phase 8's
+        // "expiring connection" rule reads this.
+        refreshExpiresAt: c.refresh_expires_at,
         // Revolut only: the two settings and the environment, never a token or key. `null` for
         // createsBankEntries means the admin has not decided yet.
         ...(c.kind === "revolut"
@@ -183,6 +211,22 @@ export function registerExactRoutes(router: Router): void {
                 paymentsMode: c.payments_mode,
                 // Whether the webhook subscription exists and its secret is stored (no secret, no id).
                 webhookRegistered: c.webhook_registered === 1,
+                webhook:
+                  health === null
+                    ? null
+                    : {
+                        registered: c.webhook_registered === 1,
+                        lastVerifiedAt: c.last_webhook_verified_at,
+                        lastRejectedAt: c.last_webhook_rejected_at,
+                        rejectedLast24h: health.rejectedLast24h,
+                        rejectedTotal: c.webhook_rejected_total,
+                        ...(health.secretReadable !== undefined
+                          ? { secretReadable: health.secretReadable }
+                          : {}),
+                      },
+                ...(health?.secretReadable !== undefined
+                  ? { webhookSecretReadable: health.secretReadable }
+                  : {}),
                 // A staged connection waiting for an admin's confirmation: masked facts only
                 // (account names, currencies, last 4 of IBANs). The ref goes to admins only.
                 pending:

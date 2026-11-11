@@ -238,6 +238,24 @@ export interface RevolutSettings {
   paymentsMode: RevolutPaymentsMode;
   /** A connection staged by the connect callback, waiting for an admin's confirmation. */
   pending?: RevolutPending | null;
+  /** Whether the webhook subscription exists and its signing secret is stored. */
+  webhookRegistered?: boolean;
+  /** Health of the webhook channel; never carries a secret. */
+  webhook?: RevolutWebhookHealth | null;
+  /** Admins only: false when the stored signing secret cannot be decrypted (register again). */
+  webhookSecretReadable?: boolean;
+}
+
+export interface RevolutWebhookHealth {
+  registered: boolean;
+  /** UTC ISO time of the last delivery whose signature verified, or null. */
+  lastVerifiedAt: string | null;
+  lastRejectedAt?: string | null;
+  /** Deliveries refused in the last 24 hours (a lower bound under a flood). */
+  rejectedLast24h: number;
+  rejectedTotal?: number;
+  /** Admins only. */
+  secretReadable?: boolean;
 }
 
 /** Masked facts about a staged Revolut connection: never a full IBAN, a balance or an id. */
@@ -263,6 +281,8 @@ export interface RevolutPending {
 
 export interface ConnectionRow {
   kind: "exact" | "revolut";
+  /** When the refresh token stops working, if the provider said so (null = unknown). */
+  refreshExpiresAt?: string | null;
   revolut?: RevolutSettings;
   name: string;
   status: ConnectionStatus;
@@ -315,6 +335,12 @@ export const confirmRevolut = (body: {
   ownAccount: true;
   replacesAccounts?: boolean;
 }) => request<{ ok: true }>("/api/connections/revolut/confirm", { method: "POST", body });
+/** Registers the webhook subscription; `replace` creates a new one and retires the old one. */
+export const registerRevolutWebhook = (replace: boolean) =>
+  request<{ ok: true; status: string }>("/api/connections/revolut/webhook/register", {
+    method: "POST",
+    body: { replace },
+  });
 export const changeRevolutSettings = (body: {
   createsBankEntries?: boolean;
   paymentsMode?: RevolutPaymentsMode;
