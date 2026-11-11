@@ -95,3 +95,65 @@ describe("the rules these checks assume are in app.css", () => {
     );
   });
 });
+
+// ---- reporting screens (review K3b) -------------------------------------------------------------
+
+const reportsCss = readFileSync(join(__dirname, "reports.css"), "utf8");
+
+/** The colour token each ageing bar segment uses, read from reports.css. */
+function segmentTokens(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const m of reportsCss.matchAll(
+    /\.seg-([a-z0-9_]+)\s*\{\s*background:\s*var\((--[a-z0-9-]+)\);/g,
+  )) {
+    out[m[1] as string] = m[2] as string;
+  }
+  return out;
+}
+
+describe("ageing bars (Mix) and their legend keep 3:1 against the bar track in both themes", () => {
+  const segs = segmentTokens();
+  it("reports.css colours every bucket", () => {
+    expect(Object.keys(segs).sort()).toEqual(
+      ["d1_30", "d31_60", "d61_90", "d90_plus", "no_due_date", "not_due"].sort(),
+    );
+    expect(reportsCss.replace(/\s+/g, " ")).toContain("background: var(--fill);");
+  });
+  for (const [name, t] of SETS) {
+    for (const surface of SURFACES) {
+      for (const [bucket, token] of Object.entries(segs)) {
+        it(`${name}: ${bucket} (${token}) on ${surface} > --fill and on ${surface}`, () => {
+          // the bar's track
+          expect(
+            contrastRatio(tok(t, token), stack(t, [surface, "--fill"])),
+          ).toBeGreaterThanOrEqual(3);
+          // the legend swatch sits on the card itself
+          expect(contrastRatio(tok(t, token), stack(t, [surface]))).toBeGreaterThanOrEqual(3);
+        });
+      }
+    }
+  }
+});
+
+describe("report tables keep 4.5:1 text", () => {
+  for (const [name, t] of SETS) {
+    // the pinned first column at phone width is painted with --bg
+    for (const fg of ["--ink", "--muted", "--accent-text"]) {
+      it(`${name}: ${fg} on the pinned column (--bg)`, () => {
+        expect(contrastRatio(tok(t, fg), tok(t, "--bg"))).toBeGreaterThanOrEqual(4.5);
+      });
+    }
+    for (const surface of SURFACES) {
+      it(`${name}: the 'does not balance' difference row (--warn-text) on ${surface}`, () => {
+        expect(contrastRatio(tok(t, "--warn-text"), stack(t, [surface]))).toBeGreaterThanOrEqual(
+          4.5,
+        );
+      });
+    }
+  }
+  it("the rules these checks assume are in reports.css", () => {
+    const flat = reportsCss.replace(/\s+/g, " ");
+    expect(flat).toMatch(/position: sticky; left: 0; z-index: 1; background: var\(--bg\);/);
+    expect(flat).toContain(".totals-row.diff-bad td { color: var(--warn-text); }");
+  });
+});

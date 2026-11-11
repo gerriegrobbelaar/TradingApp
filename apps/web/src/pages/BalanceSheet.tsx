@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import type {
   BalanceSheetResponse,
@@ -27,8 +27,15 @@ import {
   oldestRead,
 } from "../components/ReportParts";
 import { describeLoadError } from "../lib/errors";
-import { currentAmsterdamYear, formatMoney } from "../lib/format";
+import { currentAmsterdamMonth, currentAmsterdamYear } from "../lib/format";
 import { reportFileBase } from "../lib/report-files";
+import {
+  BS_RESULT_LABEL,
+  balanceSheetHeads,
+  balanceSheetNotes,
+  latestPeriodNote,
+  upToPeriod,
+} from "../lib/report-labels";
 import { useResource } from "../lib/useResource";
 
 const SECTION_TITLE = {
@@ -41,8 +48,10 @@ const SECTION_TITLE = {
 export function BalanceSheet() {
   const { selected, gate } = useDivisionGate();
   const [params, setParams] = useSearchParams();
-  const urlYear = parseYear(params.get("year"));
-  const urlPeriod = parsePeriod(params.get("period"));
+  const rawYear = params.get("year");
+  const rawPeriod = params.get("period");
+  const urlYear = parseYear(rawYear);
+  const urlPeriod = parsePeriod(rawPeriod);
   const setParam = useCallback(
     (patch: Record<string, string | null>) =>
       setParams((prev) => {
@@ -55,6 +64,22 @@ export function BalanceSheet() {
       }),
     [setParams],
   );
+  // An invalid year or period in the address is not sent; drop it from the address too, so the
+  // address always describes what is shown.
+  useEffect(() => {
+    const badYear = rawYear !== null && urlYear === undefined;
+    const badPeriod = rawPeriod !== null && urlPeriod === undefined;
+    if (!badYear && !badPeriod) return;
+    setParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (badYear) next.delete("year");
+        if (badPeriod) next.delete("period");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [rawYear, rawPeriod, urlYear, urlPeriod, setParams]);
 
   const key = selected ? `bs:${selected.id}:${urlYear ?? ""}:${urlPeriod ?? ""}` : null;
   const r = useResource<BalanceSheetResponse>(key, (signal) =>
@@ -66,7 +91,7 @@ export function BalanceSheet() {
   const index = useAccountIndex(selected?.id ?? null);
   const [sheetState, setSheet] = useState<AccountRef | null>(null);
   const sheet = sheetState && selected && sheetState.division === selected.id ? sheetState : null;
-  const openLine = (l: BalanceSheetLine) => {
+  const openLine = (l: BalanceSheetLine, section: BalanceSheetSectionResult["section"]) => {
     if (!selected || !data) return;
     index.ask();
     setSheet({
@@ -75,18 +100,25 @@ export function BalanceSheet() {
       code: l.code,
       name: l.name,
       year: data.year,
+      // the line is periods 0..P; liabilities and equity are shown as credit less debit
+      included: {
+        from: 0,
+        to: data.period,
+        sign: section === "liabilities" || section === "equity" ? -1 : 1,
+        shownMinor: l.current,
+      },
     });
   };
 
   const administration = selected?.name ?? "";
   const cur = data?.division.currency ?? selected?.currency ?? "EUR";
   const year = urlYear ?? data?.year ?? currentAmsterdamYear();
-  const period = urlPeriod ?? data?.period ?? new Date().getMonth() + 1;
+  const period = urlPeriod ?? data?.period ?? currentAmsterdamMonth();
   const hasCompare = rep !== null && rep.compareYear !== null;
   const syncedAt = data
     ? oldestRead([data.freshness.gl_accounts, data.freshness.gl_balances, data.compareFreshness])
     : null;
-  const periodLine = data ? `Period: ${data.year}, up to period ${data.period}` : "";
+  const periodLine = data ? `Period: ${upToPeriod(data.year, data.period)}` : "";
   const fileBase = data
     ? reportFileBase(
         "balance-sheet",
@@ -102,12 +134,11 @@ export function BalanceSheet() {
   }, [data, administration, syncedAt]);
 
   const columns = hasCompare ? 3 : 2;
-  const compareHead =
-    rep && rep.compareYear !== null
-      ? rep.compareBasis === "year_end"
-        ? `Year end ${rep.compareYear}`
-        : `${rep.compareYear}, period ${rep.period}`
-      : "";
+  const heads = data ? balanceSheetHeads(data) : { current: "", compare: null };
+  const notes = data ? balanceSheetNotes(data) : [];
+  const latestNote = data
+    ? latestPeriodNote(data.period, data.latestPeriodWithData, data.status)
+    : null;
 
   const renderSection = (s: BalanceSheetSectionResult, totalLabel: string) => {
     const name = SECTION_TITLE[s.section];
@@ -127,7 +158,7 @@ export function BalanceSheet() {
               <button
                 type="button"
                 className="link row-open"
-                onClick={() => openLine(l)}
+                onClick={() => openLine(l, s.section)}
                 aria-label={`${l.code ? `${l.code} ` : ""}${l.name}, show balances per period`}
               >
                 {l.name}
@@ -161,8 +192,7 @@ export function BalanceSheet() {
     );
   };
 
-  const unbalanced =
-    rep !== null && (rep.difference.current !== 0 || (rep.difference.compare ?? 0) !== 0);
+  const unbalanced = notes.some((n) => n.tone === "alert");
 
   return (
     <div className="report report-portrait" data-report="balance-sheet">
@@ -193,6 +223,7 @@ export function BalanceSheet() {
               periodLabel="Up to period"
               onYear={(y) => setParam({ year: String(y) })}
               onPeriod={(p) => setParam({ period: String(p) })}
+              latest={data?.latestPeriodWithData ?? null}
             />
             <ExportButtons disabled={!rep} pdfFileBase={fileBase} runExcel={runExcel} />
           </div>
@@ -232,50 +263,30 @@ export function BalanceSheet() {
           )}
           {data && rep && (
             <>
-              <div className="report-notices" role="group" aria-label="Checks">
-                {unbalanced && (
-                  <p className="notice warn strong-notice" role="alert">
-                    <b>
-                      Does not balance: difference {formatMoney(rep.difference.current, cur)}
-                      {rep.difference.compare !== null &&
-                        rep.difference.compare !== 0 &&
-                        ` (${rep.compareYear}: ${formatMoney(rep.difference.compare, cur)})`}
-                      .
-                    </b>{" "}
-                    Check opening balances.
-                  </p>
-                )}
-                {!rep.hasOpeningBalances.current && (
-                  <p className="notice warn" role="status">
-                    No opening balances (period 0) are in Exact for {data.year}. Balance sheet lines
-                    may show this year&apos;s movements only.
-                  </p>
-                )}
-                {rep.hasOpeningBalances.compare === false && (
-                  <p className="notice warn" role="status">
-                    No opening balances (period 0) are in Exact for {rep.compareYear}, so the
-                    comparison column may be incomplete.
-                  </p>
-                )}
-                {data.compareMissing && (
-                  <p className="notice warn" role="status">
-                    The balances of {data.compareYear ?? "last year"} have not been read from Exact
-                    yet, so there is no comparison column.
-                  </p>
-                )}
-                {data.splitKeys > 0 && (
-                  <p className="notice warn" role="status">
-                    {data.splitKeys} {data.splitKeys === 1 ? "figure was" : "figures were"} split by
-                    Exact over a field this app does not read, so some balances may be too low.
-                  </p>
-                )}
-              </div>
+              {notes.length > 0 && (
+                <div className="report-notices" role="group" aria-label="Checks">
+                  {notes.map((n) =>
+                    n.tone === "alert" ? (
+                      <p key={n.text} className="notice warn strong-notice" role="alert">
+                        <b>{n.text}</b>
+                      </p>
+                    ) : (
+                      <p key={n.text} className="notice warn" role="status">
+                        {n.text}
+                      </p>
+                    ),
+                  )}
+                </div>
+              )}
               <Card className="report-card" aria-labelledby="bs-title">
                 <div className="row-between">
                   <h2 id="bs-title" className="h2">
-                    {data.year}, up to period {data.period}
+                    {upToPeriod(data.year, data.period)}
                   </h2>
-                  <p className="cap">Amounts in {cur}</p>
+                  <p className="cap">
+                    Amounts in {cur}
+                    {latestNote && <span className="no-print"> · {latestNote}</span>}
+                  </p>
                 </div>
                 <ScrollRegion label="Balance sheet">
                   <table className="tbl report-table bs-table">
@@ -287,11 +298,11 @@ export function BalanceSheet() {
                       <tr>
                         <th scope="col">Account</th>
                         <th scope="col" className="r">
-                          {data.year}, period {data.period}
+                          {heads.current}
                         </th>
                         {hasCompare && (
                           <th scope="col" className="r">
-                            {compareHead}
+                            {heads.compare}
                           </th>
                         )}
                       </tr>
@@ -301,7 +312,7 @@ export function BalanceSheet() {
                       {renderSection(rep.sections.liabilities, "Total liabilities")}
                       {renderSection(rep.sections.equity, "Total equity")}
                       <tr>
-                        <th scope="row">Result for the year so far</th>
+                        <th scope="row">{BS_RESULT_LABEL}</th>
                         <td className="r">
                           <LedgerAmount minor={rep.result.current} currency={cur} />
                         </td>

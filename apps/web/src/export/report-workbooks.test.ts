@@ -166,7 +166,19 @@ describe("balance sheet workbook", () => {
     expect(out.asOfPart).toBe("2026-p02");
     expect(rows[2]?.[0]).toBe("Period: 2026, up to period 2");
     const head = rows.find((r) => r[0] === "Code");
-    expect(head).toEqual(["Code", "Account", "2026, up to period 2", "Year end 2025"]);
+    expect(head).toEqual([
+      "Code",
+      "Account",
+      "2026, up to period 2",
+      "Year end 2025 (all periods)",
+    ]);
+    const same = balanceSheetExport(balanceSheetResponse({}, { compareToYearEnd: false }), CTX);
+    expect(table(same.sheets[0] as SheetSpec).find((r) => r[0] === "Code")).toEqual([
+      "Code",
+      "Account",
+      "2026, up to period 2",
+      "2025, up to period 2",
+    ]);
   });
 
   it("holds the lines, totals and a zero difference for a balanced ledger", () => {
@@ -180,7 +192,7 @@ describe("balance sheet workbook", () => {
       "0.00",
       "0.00",
     ]);
-    expect(rows.flat().some((c) => c.startsWith("Warning"))).toBe(false);
+    expect(rows.flat().some((c) => c.startsWith("Warning") || c.startsWith("Note"))).toBe(false);
   });
 
   it("flags an unbalanced sheet and missing opening balances in the file too", () => {
@@ -198,9 +210,52 @@ describe("balance sheet workbook", () => {
         ],
       },
     );
-    const text = table(balanceSheetExport(bad, CTX).sheets[0] as SheetSpec).flat();
-    expect(text).toContain("Warning: the balance sheet does not balance. Check opening balances.");
-    expect(text).toContain("Warning: no opening balances (period 0) found for 2026.");
+    const sheet = table(balanceSheetExport(bad, CTX).sheets[0] as SheetSpec);
+    const text = sheet.flat().map((c) => c.replace(/[\u00A0\u202F]/g, " "));
+    expect(text).toContain(
+      "Warning: Does not balance: difference € 123,45 in 2026, up to period 2. Check opening balances.",
+    );
+    expect(text).toContain(
+      "Note: No opening balances (period 0) are in Exact for 2026. Balance sheet lines may show this year's movements only.",
+    );
+    // Not buried: every warning is above the table header, right under the header block.
+    const headAt = sheet.findIndex((r) => r[0] === "Code");
+    const warnAt = sheet.findIndex((r) => (r[0] ?? "").startsWith("Warning"));
+    expect(warnAt).toBeGreaterThan(0);
+    expect(warnAt).toBeLessThan(headAt);
+    expect(
+      sheet
+        .slice(headAt)
+        .flat()
+        .some((c) => c.startsWith("Warning")),
+    ).toBe(false);
+  });
+
+  it("says when the comparison year was never read, and shows unclassified with only a comparison figure", () => {
+    const missing = balanceSheetResponse({ compareMissing: true });
+    const flat = table(balanceSheetExport(missing, CTX).sheets[0] as SheetSpec).flat();
+    expect(flat).toContain(
+      "Note: The balances of 2025 have not been read from Exact yet, so there is no comparison column.",
+    );
+    const base = balanceSheetResponse();
+    const rep = base.report;
+    if (!rep) throw new Error("fixture");
+    const onlyCompare = {
+      ...base,
+      report: {
+        ...rep,
+        sections: {
+          ...rep.sections,
+          unclassified: {
+            section: "unclassified" as const,
+            lines: [],
+            total: { current: 0, compare: 4_200 },
+          },
+        },
+      },
+    };
+    const rows = table(balanceSheetExport(onlyCompare, CTX).sheets[0] as SheetSpec);
+    expect(rows.find((r) => r[1] === "Total unclassified")?.slice(2)).toEqual(["0.00", "42.00"]);
   });
 
   it("writes a short note instead of an empty sheet", () => {
@@ -222,11 +277,11 @@ describe("profit and loss workbook", () => {
       "Account",
       "Actual",
       "Budget",
-      "Variance vs budget",
-      "Variance vs budget %",
+      "Variance to budget",
+      "Variance to budget %",
       "Last year (2025)",
-      "Variance vs last year",
-      "Variance vs last year %",
+      "Variance to last year",
+      "Variance to last year %",
     ]);
     const rev = rows.find((r) => r[1] === "Consulting revenue");
     // Actual 11,500.00 vs budget 11,000.00 (+500.00 = +4.5455 %), last year 6,000.00.
@@ -256,15 +311,31 @@ describe("profit and loss workbook", () => {
       "Account",
       "Actual",
       "Last year (2025)",
-      "Variance vs last year",
-      "Variance vs last year %",
+      "Variance to last year",
+      "Variance to last year %",
     ]);
     const rev = rows.find((x) => x[1] === "Consulting revenue") as string[];
     expect(rev[2]).toBe("11500.00");
     expect(rev[3]).toBeUndefined(); // blank, never 0
     const flat = rows.flat();
     expect(flat).toContain("Budget is not available in Exact for this administration.");
-    expect(flat.some((c) => c.includes("has not been synced"))).toBe(true);
+    expect(flat).toContain(
+      "Note: The balances of 2025 have not been read from Exact yet, so the last-year figures are not available.",
+    );
+    // above the table, like the screen
+    const headAt = rows.findIndex((x) => x[0] === "Code");
+    expect(rows.findIndex((x) => (x[0] ?? "").startsWith("Note:"))).toBeLessThan(headAt);
+  });
+
+  it("words the budget note like the screen: none entered versus not available, and several scenarios", () => {
+    const none = profitLossResponse({ budgetsAvailable: true }, { budgets: null });
+    const noneFlat = table(profitLossExport(none, CTX).sheets[0] as SheetSpec).flat();
+    expect(noneFlat).toContain("No budget has been entered in Exact for 2026.");
+    expect(noneFlat).not.toContain("Budget is not available in Exact for this administration.");
+    const many = profitLossResponse({ budgetScenarios: ["a", "b"] });
+    expect(table(profitLossExport(many, CTX).sheets[0] as SheetSpec).flat()).toContain(
+      "Exact holds 2 budget scenarios for 2026; this report uses the first one.",
+    );
   });
 
   function balanceSheetLike() {
@@ -290,5 +361,19 @@ describe("header block and file names", () => {
     expect(slugify("日本語")).toBe("administration");
     expect(slugify("a".repeat(100)).length).toBe(40);
     expect(exportFileName("profit-loss", "A", "x/../y")).toBe("camelthorn-profit-loss-a-x-y.xlsx");
+  });
+});
+
+describe("ageing workbook order", () => {
+  it("follows the screen's sort: largest first by default, or by name with unknown relations last", () => {
+    const r = ageingResponse(ITEMS, "receivable");
+    const names = (sort?: "outstanding" | "name") => {
+      const sheet = ageingExport(r, CTX, sort).sheets.find((s) => s.name === "EUR") as SheetSpec;
+      const rows = table(sheet);
+      const head = rows.findIndex((x) => x[0] === "Customer");
+      return rows.slice(head + 1, -1).map((x) => x[0]);
+    };
+    expect(names()).toEqual(["Acme BV", "Unknown relation", `'=HYPERLINK("http://x")`]);
+    expect(names("name")).toEqual([`'=HYPERLINK("http://x")`, "Acme BV", "Unknown relation"]);
   });
 });

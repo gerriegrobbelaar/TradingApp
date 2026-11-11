@@ -12,7 +12,7 @@ import { logout, nav } from "./api";
 import { AuthProvider, useMe } from "./auth";
 import { DivisionProvider } from "./division";
 import { TopNav } from "./components/TopNav";
-import { PLACEHOLDERS } from "./routes";
+import { PLACEHOLDERS, RENAMED_PATHS } from "./routes";
 import { ToastProvider, useToast } from "./toasts";
 import { ComingSoon, NotFound } from "./pages/Placeholder";
 import { Approvals } from "./pages/Approvals";
@@ -24,6 +24,12 @@ import { Payables } from "./pages/Payables";
 import { ProfitLoss } from "./pages/ProfitLoss";
 import { Settings } from "./pages/Settings";
 import { Checking, SessionError, SignedOut } from "./pages/SignedOut";
+
+/** Sends an old address to its new one, keeping the query (year, period, search). */
+function Renamed({ to }: { to: string }) {
+  const { search } = useLocation();
+  return <Navigate to={{ pathname: to, search }} replace />;
+}
 
 function Footer({ email }: { email: string }) {
   const [busy, setBusy] = useState(false);
@@ -93,6 +99,9 @@ function SignedInShell() {
             <Route path="/reporting/profit-loss" element={<ProfitLoss />} />
             <Route path="/reporting/creditors-ageing" element={<CreditorsAgeing />} />
             <Route path="/reporting/receivables-ageing" element={<ReceivablesAgeing />} />
+            {RENAMED_PATHS.map((r) => (
+              <Route key={r.from} path={r.from} element={<Renamed to={r.to} />} />
+            ))}
             {PLACEHOLDERS.map((p) => (
               <Route key={p.to} path={p.to} element={<ComingSoon path={p.to} title={p.label} />} />
             ))}

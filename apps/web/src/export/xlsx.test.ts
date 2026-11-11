@@ -79,6 +79,13 @@ describe("package", () => {
     expect(Array.from(a)).toEqual(Array.from(b));
   });
 
+  it("still builds when the device clock is outside the zip date range (1980-2099)", () => {
+    for (const at of ["1970-01-01T00:00:00Z", "2150-06-01T00:00:00Z"]) {
+      const bytes = buildXlsx([{ name: "A", rows: [] }], { createdAt: new Date(at) });
+      expect(Object.keys(unzipSync(bytes))).toContain("xl/workbook.xml");
+    }
+  });
+
   it("needs at least one sheet", () => {
     expect(() => buildXlsx([], { createdAt: CREATED })).toThrow(RangeError);
   });
@@ -98,6 +105,23 @@ describe("package", () => {
     ]);
     expect(files["xl/workbook.xml"]).toContain('name="Re- Q1-Q2"');
     expect(files["xl/workbook.xml"]).toContain('name="Re- Q1-Q2 2"');
+  });
+
+  it("refuses the reserved name History and never cuts a character in half", () => {
+    expect(sheetNames(["History", "history"])).toEqual(["History sheet", "history sheet 2"]);
+    const emoji = `${"x".repeat(30)}😀`; // the emoji starts at the 31st UTF-16 unit
+    const [n] = sheetNames([emoji]);
+    expect(n).toBe("x".repeat(30));
+    expect(sheetNames([`a\u0001b\u0000`])).toEqual(["ab"]);
+  });
+
+  it("cuts long text without leaving half a character, and the XML stays well formed", () => {
+    const long = `${"x".repeat(31_998)}😀tail`;
+    const files = open([{ name: "A", rows: [[text(long)]] }]);
+    const v = cells(files).get("A1")?.v ?? "";
+    expect(v.length).toBeLessThanOrEqual(32_000);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(v)).toBe(false);
+    expect(v.endsWith("…")).toBe(true);
   });
 
   it("freezes the header rows and first column, sets widths and print setup", () => {
@@ -159,7 +183,8 @@ describe("money cells", () => {
     const c = cells(files);
     expect(c.get("A1")).toMatchObject({ t: null, v: "9999999999999.99" });
     expect(c.get("B1")).toMatchObject({ t: "inlineStr", v: "90071992547409.93" });
-    expect(c.get("C1")).toMatchObject({ t: "inlineStr", v: "'-1234567890123456789012345678.90" });
+    // Exact digits, no apostrophe: the writer made this text itself, so it cannot be a formula.
+    expect(c.get("C1")).toMatchObject({ t: "inlineStr", v: "-1234567890123456789012345678.90" });
   });
 
   it("rejects an unsafe float and a bad scale", () => {
@@ -217,6 +242,15 @@ describe("text cells", () => {
       "\r=1",
       '=HYPERLINK("http://evil","x")',
       "=cmd|'/C calc'!A0",
+      " =1+1",
+      "\u00A0\u200B=1+1",
+      "\n=1",
+      "\uFEFF@SUM(1)",
+      "\uFF1D1+1",
+      "\uFF0B1",
+      "\uFF0D1",
+      "\uFF20SUM(1)",
+      "\u3000\uFF1DA1",
     ];
     for (const e of evil) expect(safeText(e), e).toBe(`'${e}`);
     const files = open([{ name: "A", rows: [evil.map(text)] }]);
@@ -232,7 +266,18 @@ describe("text cells", () => {
   });
 
   it("leaves harmless text alone, including a leading digit, em dash and parenthesis", () => {
-    for (const ok of ["Acme BV", "1–30 days", "— none", "(credit)", "Total", "A=B", "x-y", ""]) {
+    for (const ok of [
+      "Acme BV",
+      "1–30 days",
+      "— none",
+      "(credit)",
+      "Total",
+      "A=B",
+      "x-y",
+      "",
+      " Acme",
+      "−5 (a Unicode minus is not a formula)",
+    ]) {
       expect(safeText(ok)).toBe(ok);
     }
   });

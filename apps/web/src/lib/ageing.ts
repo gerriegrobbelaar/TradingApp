@@ -1,4 +1,4 @@
-import type { AgeingBucket } from "@camelthorn/core";
+import type { AgeingBucket, AgeingReportRow } from "@camelthorn/core";
 import type { ChipTone } from "@camelthorn/ui";
 
 export const BUCKET_LABEL: Record<AgeingBucket, string> = {
@@ -18,3 +18,26 @@ export const BUCKET_TONE: Record<AgeingBucket, ChipTone> = {
   d90_plus: "warn",
   no_due_date: "neutral",
 };
+
+export type AgeingSort = "outstanding" | "name";
+
+/** Ageing rows in the order the screen (and the Excel file) shows them. Never mutates. */
+export function sortAgeingRows(
+  rows: readonly AgeingReportRow[],
+  mode: AgeingSort,
+): AgeingReportRow[] {
+  const copy = [...rows];
+  const name = (r: AgeingReportRow) => r.relation.name ?? "";
+  if (mode === "name") {
+    copy.sort((a, b) => {
+      // Unknown relations last.
+      if ((a.relation.name === null) !== (b.relation.name === null)) {
+        return a.relation.name === null ? 1 : -1;
+      }
+      return name(a).localeCompare(name(b), "en") || b.totalMinor - a.totalMinor;
+    });
+  } else {
+    copy.sort((a, b) => b.totalMinor - a.totalMinor || name(a).localeCompare(name(b), "en"));
+  }
+  return copy;
+}

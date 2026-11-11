@@ -90,6 +90,21 @@ const defaultPeriod = (year: number, nowMs: number): number => {
   return year === now.year ? now.month : 12;
 };
 
+/**
+ * The period used when the request names none (review K3b): the latest period that holds figures,
+ * but never past the calendar default (the current month, or 12 for another year), so a booking
+ * dated in a later period or a closing period 13 does not move the default. Without any figure in
+ * periods 1 and up, the calendar default.
+ */
+export function defaultReportPeriod(
+  year: number,
+  latestPeriodWithData: number | null,
+  nowMs: number,
+): number {
+  const calendar = defaultPeriod(year, nowMs);
+  return latestPeriodWithData === null ? calendar : Math.min(calendar, latestPeriodWithData);
+}
+
 // ---- state and freshness --------------------------------------------------------------------
 
 interface YearInfo {
@@ -110,6 +125,11 @@ interface LedgerState {
   balances: Map<number, YearInfo>;
   budgetSplitKeys: number;
   currentYear: number;
+  /**
+   * Highest period 1..99 of the requested year with any balance row; null without one or when the
+   * year was never read completely.
+   */
+  latestPeriodWithData: number | null;
 }
 
 function entry(at: string | null, staleAfterHours: number, nowMs: number): LedgerFreshnessEntry {
@@ -134,13 +154,14 @@ async function ledgerState(
 ): Promise<LedgerState> {
   const currentYear = nowParts(nowMs).year;
   const asked = compareYear === null ? [year] : [year, compareYear];
-  const [years, sync, present] = await db.batch<{
+  const [years, sync, present, latest] = await db.batch<{
     entity: string;
     year: number;
     completed_at: string;
     split_keys: number;
     unavailable_until: string | null;
     last_completed_at: string | null;
+    p: number | null;
   }>([
     db
       .prepare(
@@ -160,6 +181,12 @@ async function ledgerState(
          WHERE EXISTS (SELECT 1 FROM gl_balances b WHERE b.division_id = ?1 AND b.year = y.value)`,
       )
       .bind(divisionId, JSON.stringify(asked)),
+    // one index lookup (idx_gl_balances_year)
+    db
+      .prepare(
+        "SELECT MAX(period) AS p FROM gl_balances WHERE division_id = ?1 AND year = ?2 AND period >= 1",
+      )
+      .bind(divisionId, year),
   ]);
   const yearRows = years?.results ?? [];
   const stateRows = sync?.results ?? [];
@@ -199,6 +226,9 @@ async function ledgerState(
     balances,
     budgetSplitKeys: row("gl_budgets", year)?.split_keys ?? 0,
     currentYear,
+    // only for a year read completely: a partial pass may hold a few periods only
+    latestPeriodWithData:
+      row("gl_balances", year) === undefined ? null : (latest?.results[0]?.p ?? null),
   };
 }
 
@@ -299,7 +329,8 @@ async function balanceSheetHandler(ctx: Ctx): Promise<Response> {
   const p = ctx.url.searchParams;
   const now = nowParts(ctx.nowMs);
   const year = yearParam(p.get("year"), "year", now.year);
-  const period = periodParam(p.get("period"), "period", defaultPeriod(year, ctx.nowMs));
+  // validated before any query; the default needs the state (latest period with figures)
+  const askedPeriod = periodParam(p.get("period"), "period", 0);
   const compare = p.get("compare") ?? "yearend";
   if (compare !== "yearend" && compare !== "period" && compare !== "none") {
     throw new BadRequest("bad_compare");
@@ -311,11 +342,16 @@ async function balanceSheetHandler(ctx: Ctx): Promise<Response> {
   const db = ctx.env.DB;
   const state = await ledgerState(db, division.id, year, ctx.nowMs, wantYear);
   const status = yearStatus(state, year);
+  const period =
+    askedPeriod === 0
+      ? defaultReportPeriod(year, state.latestPeriodWithData, ctx.nowMs)
+      : askedPeriod;
   const compareSynced = wantYear !== null && state.balanceYears.has(wantYear);
   const base = {
     division: ref,
     year,
     period,
+    latestPeriodWithData: state.latestPeriodWithData,
     freshness: state.freshness,
     compareFreshness: compareFreshness(state, compareSynced ? wantYear : null, ctx.nowMs),
     budgetsAvailable: state.budgetsAvailable,
@@ -379,7 +415,7 @@ async function profitLossHandler(ctx: Ctx): Promise<Response> {
   const p = ctx.url.searchParams;
   const now = nowParts(ctx.nowMs);
   const year = yearParam(p.get("year"), "year", now.year);
-  const periodTo = periodParam(p.get("periodTo"), "period_to", defaultPeriod(year, ctx.nowMs));
+  const askedPeriodTo = periodParam(p.get("periodTo"), "period_to", 0);
   const rawScenario = p.get("scenario");
   let wanted: string | null = null;
   if (rawScenario !== null) {
@@ -392,12 +428,17 @@ async function profitLossHandler(ctx: Ctx): Promise<Response> {
   const db = ctx.env.DB;
   const state = await ledgerState(db, division.id, year, ctx.nowMs, compareYear);
   const status = yearStatus(state, year);
+  const periodTo =
+    askedPeriodTo === 0
+      ? defaultReportPeriod(year, state.latestPeriodWithData, ctx.nowMs)
+      : askedPeriodTo;
   const compareSynced = state.balanceYears.has(compareYear);
   const useBudgets = state.budgetsAvailable && state.budgetYears.has(year);
   const base = {
     division: ref,
     year,
     periodTo,
+    latestPeriodWithData: state.latestPeriodWithData,
     compareYear,
     freshness: state.freshness,
     compareFreshness: compareFreshness(state, compareSynced ? compareYear : null, ctx.nowMs),

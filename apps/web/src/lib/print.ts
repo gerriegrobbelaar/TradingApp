@@ -14,23 +14,49 @@ interface PrintHost {
   removeEventListener: (type: "afterprint", listener: () => void) => void;
 }
 
+const INPUT_EVENTS = ["pointermove", "pointerdown", "keydown", "wheel", "touchstart"] as const;
+
+/** The restore of a print still open (a second click before afterprint must not stack). */
+let pending: (() => void) | null = null;
+
+/**
+ * Opens the print dialog for `fileBase`. The class and title are restored on `afterprint`, on the
+ * first input on the page after `print()` returned, after two minutes at the latest (engines that
+ * never fire afterprint), and at once when `print()` throws (the error is passed on). A second call while one is open first restores the first, so the title
+ * saved is always the page's own.
+ */
 export function printReport(
   fileBase: string,
   win: PrintHost = window,
   doc: Document = document,
 ): void {
+  pending?.();
   const root = doc.documentElement;
   const previousTitle = doc.title;
   const restore = () => {
     root.classList.remove(PRINTING_CLASS);
     doc.title = previousTitle;
     win.removeEventListener("afterprint", restore);
+    for (const t of INPUT_EVENTS) doc.removeEventListener(t, restore, true);
     clearTimeout(timer);
+    if (pending === restore) pending = null;
   };
+  pending = restore;
   root.classList.add(PRINTING_CLASS);
   doc.title = fileBase;
   win.addEventListener("afterprint", restore);
   // Some browsers never fire afterprint (a cancelled dialog on old engines): do not stay stuck.
   const timer = setTimeout(restore, 120_000);
-  win.print();
+  try {
+    win.print();
+  } catch (e) {
+    restore();
+    throw e;
+  }
+  // print() blocks while the dialog is open in desktop browsers, and the page gets no input
+  // then; some engines (headless Chrome) return without ever firing afterprint. Input on the
+  // page after print() returned means the dialog is gone.
+  if (pending === restore) {
+    for (const t of INPUT_EVENTS) doc.addEventListener(t, restore, true);
+  }
 }

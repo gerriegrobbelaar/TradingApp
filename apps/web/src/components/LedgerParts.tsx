@@ -27,6 +27,7 @@ export function PeriodControls({
   onYear,
   onPeriod,
   disabled,
+  latest,
 }: {
   year: number;
   period: number;
@@ -34,6 +35,8 @@ export function PeriodControls({
   onYear: (y: number) => void;
   onPeriod: (p: number) => void;
   disabled?: boolean;
+  /** The latest period with figures: offered too when it is a closing period (13 to 16). */
+  latest?: number | null;
 }) {
   const now = currentAmsterdamYear();
   const years = new Set<number>();
@@ -42,6 +45,9 @@ export function PeriodControls({
   const periods = new Set<number>();
   for (let p = 1; p <= 12; p++) periods.add(p);
   periods.add(period);
+  if (latest != null && latest >= 1 && latest <= 16) {
+    for (let p = 13; p <= latest; p++) periods.add(p);
+  }
   return (
     <div className="period-controls" role="group" aria-label="Period">
       <label className="field-inline">

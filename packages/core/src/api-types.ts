@@ -274,6 +274,12 @@ export interface BalanceSheetResponse {
   year: number;
   /** Last period included. */
   period: number;
+  /**
+   * Highest period (1 and up) of `year` that holds any ledger figure, null without one or when the
+   * year was never read completely. Without a `period` in the request the report uses this period,
+   * capped at the current month (or 12 for another year) (review K3b).
+   */
+  latestPeriodWithData: number | null;
   /** Null when no comparison was asked for or the compare year was never synced. */
   compareYear: number | null;
   /** True when a comparison was asked for but that year was never synced. */
@@ -295,6 +301,8 @@ export interface ProfitLossResponse {
   status: LedgerReportStatus;
   year: number;
   periodTo: number;
+  /** As on the balance sheet: the default `periodTo` when the request names none. */
+  latestPeriodWithData: number | null;
   /** The year of the last-year column. */
   compareYear: number;
   /** True when that year was never synced: the last-year figures are then null. */

@@ -20,14 +20,17 @@ import { PageHeader } from "../components/PageHeader";
 import { ReportSkeleton, useDivisionGate } from "../components/ReportGate";
 import { ExportButtons, PrintMeta, ScrollRegion } from "../components/ReportParts";
 import { Segmented } from "@camelthorn/ui";
-import { BUCKET_LABEL } from "../lib/ageing";
+import {
+  BUCKET_LABEL,
+  sortAgeingRows as sortRows,
+  type AgeingSort as SortMode,
+} from "../lib/ageing";
 import { describeLoadError } from "../lib/errors";
 import { NO_VALUE, formatCount, formatDate, formatMoney } from "../lib/format";
 import { reportFileBase } from "../lib/report-files";
 import { useResource } from "../lib/useResource";
 
 export type AgeingKind = "receivable" | "payable";
-type SortMode = "outstanding" | "name";
 
 const COPY: Record<
   AgeingKind,
@@ -96,6 +99,21 @@ function AgeingBar({ buckets }: { buckets: Record<AgeingBucket, number> }) {
         <span key={b} className={`seg-${b}`} style={{ flexGrow: shares[b] }} />
       ))}
     </span>
+  );
+}
+
+/** What the Mix colours mean. The bars carry their own text alternative, so this is visual only. */
+function MixLegend() {
+  return (
+    <p className="cap mix-legend no-print" aria-hidden="true">
+      <span>Mix:</span>
+      {AGEING_BUCKETS.map((b) => (
+        <span key={b} className="mix-key">
+          <span className={`swatch seg-${b}`} />
+          {BUCKET_LABEL[b]}
+        </span>
+      ))}
+    </p>
   );
 }
 
@@ -285,32 +303,19 @@ function CurrencySection({
           </tfoot>
         </table>
       </ScrollRegion>
+      <MixLegend />
       {foreign && totals.count > 0 && (
         <p className="cap">
-          {totals.dcComplete ? "" : "At least "}
-          {formatMoney(totals.dcMinor, dcCurrency)} in {dcCurrency} as stored in Exact.
-          {totals.dcComplete ? "" : ` Some items have no amount in ${dcCurrency} yet.`}
+          {totals.dcComplete
+            ? `${formatMoney(totals.dcMinor, dcCurrency)} in ${dcCurrency} as stored in Exact.`
+            : totals.dcMinor === 0
+              ? // "at least € 0,00" says nothing: say what is missing instead
+                `Not every item has an amount in ${dcCurrency} in Exact yet, so there is no ${dcCurrency} total.`
+              : `At least ${formatMoney(totals.dcMinor, dcCurrency)} in ${dcCurrency} as stored in Exact. Some items have no amount in ${dcCurrency} yet.`}
         </p>
       )}
     </Card>
   );
-}
-
-function sortRows(rows: AgeingReportRow[], mode: SortMode): AgeingReportRow[] {
-  const copy = [...rows];
-  const name = (r: AgeingReportRow) => r.relation.name ?? "";
-  if (mode === "name") {
-    copy.sort((a, b) => {
-      // Unknown relations last.
-      if ((a.relation.name === null) !== (b.relation.name === null)) {
-        return a.relation.name === null ? 1 : -1;
-      }
-      return name(a).localeCompare(name(b), "en") || b.totalMinor - a.totalMinor;
-    });
-  } else {
-    copy.sort((a, b) => b.totalMinor - a.totalMinor || name(a).localeCompare(name(b), "en"));
-  }
-  return copy;
 }
 
 export function AgeingReport({ kind }: { kind: AgeingKind }) {
@@ -375,12 +380,13 @@ export function AgeingReport({ kind }: { kind: AgeingKind }) {
   const runExcel = useCallback(async () => {
     if (!data) throw new Error("no data");
     const m = await import("../export/download");
-    return m.exportAgeing(data, {
-      administration,
-      generatedAt: new Date(),
-      syncedAt: data.freshness.lastCompletedAt,
-    });
-  }, [data, administration]);
+    // the file holds every relation (not only those the search shows), in the screen's order
+    return m.exportAgeing(
+      data,
+      { administration, generatedAt: new Date(), syncedAt: data.freshness.lastCompletedAt },
+      sort,
+    );
+  }, [data, administration, sort]);
 
   return (
     <div className="report report-landscape" data-report={copy.slug}>
@@ -425,7 +431,14 @@ export function AgeingReport({ kind }: { kind: AgeingKind }) {
           {data && (
             <PrintMeta
               administration={administration}
-              lines={[asOfText]}
+              lines={[
+                asOfText,
+                ...(needle === ""
+                  ? []
+                  : [
+                      `Search: "${q.trim()}" (${sections.reduce((n, x) => n + x.shown.length, 0)} of ${sections.reduce((n, x) => n + x.rows.length, 0)} rows shown; totals cover all)`,
+                    ]),
+              ]}
               syncedAt={data.freshness.lastCompletedAt}
             />
           )}

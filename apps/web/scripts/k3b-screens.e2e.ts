@@ -7,13 +7,17 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { addDays } from "@camelthorn/core";
+import { strFromU8, unzipSync } from "fflate";
+import { addDays, buildBalanceSheet, type BalanceSheetResponse } from "@camelthorn/core";
 import { ONE_DIVISION, listResponse, row } from "../src/test-fixtures";
 import {
+  CHART,
+  LEDGER,
   accountBalancesResponse,
   ageingResponse,
   balanceSheetResponse,
@@ -35,18 +39,27 @@ const CHROME = process.env["CHROME_PATH"] ?? "/usr/bin/google-chrome";
 const AS_OF = "2026-11-11";
 
 // Minimal structural types for the parts of Playwright used here.
+interface Download {
+  suggestedFilename(): string;
+  path(): Promise<string | null>;
+}
 interface Page {
   goto(url: string): Promise<unknown>;
+  waitForEvent(e: "download", o?: { timeout?: number }): Promise<Download>;
+  waitForFunction(fn: () => boolean, arg?: unknown, o?: { timeout?: number }): Promise<unknown>;
+  title(): Promise<string>;
   route(glob: string, fn: (r: Route) => Promise<void> | void): Promise<void>;
+  on(e: "console", fn: (m: { type(): string; text(): string }) => void): void;
   addInitScript(fn: (arg: string) => void, arg: string): Promise<void>;
   emulateMedia(o: { media?: "print" | "screen"; colorScheme?: "light" | "dark" }): Promise<void>;
   setViewportSize(s: { width: number; height: number }): Promise<void>;
   screenshot(o: { path: string; fullPage?: boolean }): Promise<unknown>;
   pdf(o: { path: string; preferCSSPageSize: boolean; printBackground: boolean }): Promise<unknown>;
-  evaluate<T>(fn: () => T): Promise<T>;
+  evaluate<T>(fn: (() => T) | string): Promise<T>;
   waitForSelector(sel: string, o?: { timeout?: number }): Promise<unknown>;
   getByRole(role: string, o?: { name?: string | RegExp }): Locator;
   keyboard: { press(k: string): Promise<void> };
+  mouse: { move(x: number, y: number): Promise<void> };
   close(): Promise<void>;
 }
 interface Locator {
@@ -60,7 +73,10 @@ interface Route {
   continue(): Promise<void>;
 }
 interface Browser {
-  newPage(o: { viewport: { width: number; height: number } }): Promise<Page>;
+  newPage(o: {
+    viewport: { width: number; height: number };
+    acceptDownloads?: boolean;
+  }): Promise<Page>;
   close(): Promise<void>;
 }
 
@@ -151,6 +167,27 @@ function api(path: string, search: URLSearchParams): unknown {
   }
 }
 
+/** The real response headers of the static assets (public/_headers), CSP included. */
+function assetHeaders(): [string, string][] {
+  const out: [string, string][] = [];
+  for (const line of readFileSync(resolve(here, "../public/_headers"), "utf8").split("\n")) {
+    const m = /^\s+([A-Za-z-]+):\s*(.+)$/.exec(line);
+    if (m) out.push([m[1] as string, (m[2] as string).trim()]);
+  }
+  return out;
+}
+const HEADERS = assetHeaders();
+
+/** axe-core (through vitest-axe, which depends on it), run in the real browser with contrast. */
+const req = createRequire(import.meta.url);
+const AXE = readFileSync(
+  createRequire(req.resolve("vitest-axe")).resolve("axe-core/axe.min.js"),
+  "utf8",
+);
+interface AxeResult {
+  violations: { id: string; impact: string; nodes: { target: string[] }[] }[];
+}
+
 const TYPES: Record<string, string> = {
   ".html": "text/html",
   ".js": "text/javascript",
@@ -169,6 +206,7 @@ beforeAll(async () => {
     if (!file.startsWith(DIST) || !existsSync(file) || url.pathname === "/")
       file = join(DIST, "index.html");
     res.setHeader("content-type", TYPES[extname(file)] ?? "application/octet-stream");
+    for (const [k, v] of HEADERS) res.setHeader(k, v);
     res.end(readFileSync(file));
   });
   await new Promise<void>((ok) => server.listen(0, "127.0.0.1", ok));
@@ -189,15 +227,40 @@ afterAll(async () => {
   server?.close();
 });
 
+/** CSP violations and console errors of a page (the CSP of public/_headers is served). */
+const problems = new WeakMap<Page, string[]>();
+
 async function open(
   path: string,
-  o: { width: number; height?: number; theme: "light" | "dark"; items?: number },
+  o: {
+    width: number;
+    height?: number;
+    theme: "light" | "dark";
+    items?: number;
+    bs?: () => unknown;
+  },
 ) {
-  const page = await browser.newPage({ viewport: { width: o.width, height: o.height ?? 900 } });
-  await page.addInitScript((t) => localStorage.setItem("camelthorn.theme", t), o.theme);
+  const page = await browser.newPage({
+    viewport: { width: o.width, height: o.height ?? 900 },
+    acceptDownloads: true,
+  });
+  const seen: string[] = [];
+  problems.set(page, seen);
+  page.on("console", (m) => {
+    if (m.type() === "error") seen.push(m.text());
+  });
+  await page.addInitScript((t) => {
+    localStorage.setItem("camelthorn.theme", t);
+    document.addEventListener("securitypolicyviolation", (e) =>
+      console.error(`CSP ${e.violatedDirective} ${e.blockedURI}`),
+    );
+  }, o.theme);
   await page.route("**/api/**", async (route) => {
     const url = new URL(route.request().url());
-    const body = api(url.pathname, url.searchParams);
+    const body =
+      o.bs && url.pathname === "/api/reports/balance-sheet"
+        ? o.bs()
+        : api(url.pathname, url.searchParams);
     await route.fulfill({
       status: body === null ? 404 : 200,
       contentType: "application/json",
@@ -207,6 +270,15 @@ async function open(
   await page.goto(`${base}${path}`);
   await page.waitForSelector(".report-table", { timeout: 15_000 });
   return page;
+}
+
+async function expectNoAxe(page: Page) {
+  const axe = await page.evaluate<AxeResult>(
+    `${AXE};axe.run(document, { resultTypes: ["violations"] })`,
+  );
+  expect(
+    axe.violations.map((v) => `${v.id}: ${v.nodes.map((n) => n.target.join(" ")).join(", ")}`),
+  ).toEqual([]);
 }
 
 const REPORTS = [
@@ -234,6 +306,15 @@ describe("screens", () => {
             };
           });
           expect(m.pageOverflow, "page-level horizontal scroll").toBeLessThanOrEqual(0);
+          // axe in the real browser, colour contrast included (page.evaluate is not bound by CSP)
+          const axe = await page.evaluate<AxeResult>(
+            `${AXE};axe.run(document, { resultTypes: ["violations"] })`,
+          );
+          expect(
+            axe.violations.map(
+              (v) => `${v.id}: ${v.nodes.map((n) => n.target.join(" ")).join(", ")}`,
+            ),
+          ).toEqual([]);
           expect(m.regions.length).toBeGreaterThan(0);
           for (const region of m.regions) expect(region.focusable).toBe(true);
           if (width === 360) expect(m.regions.some((x) => x.scrolls)).toBe(true);
@@ -255,6 +336,13 @@ describe("screens", () => {
       .click();
     await a.waitForSelector('[role="dialog"] .drill-list');
     await a.screenshot({ path: join(OUT, "k3b-receivables-ageing-sheet-light-1280.png") });
+    await expectNoAxe(a);
+    // keyboard: Escape closes the sheet and focus goes back to the cell that opened it
+    await a.keyboard.press("Escape");
+    await a.waitForFunction(() => document.querySelector('[role="dialog"]') === null);
+    expect(
+      await a.evaluate(() => (document.activeElement?.textContent ?? "").includes("Relation 001")),
+    ).toBe(true);
     await a.close();
 
     const b = await open("/reporting/balance-sheet", { width: 360, theme: "dark" });
@@ -264,6 +352,7 @@ describe("screens", () => {
       .click();
     await b.waitForSelector('[role="dialog"] .report-scroll');
     await b.screenshot({ path: join(OUT, "k3b-balance-sheet-account-sheet-dark-360.png") });
+    await expectNoAxe(b);
     await b.close();
   });
 });
@@ -404,6 +493,134 @@ describe("print stylesheet", () => {
       file,
       join(OUT, "k3b-print-receivables-ageing-page2"),
     ]);
+    await page.close();
+  });
+});
+
+describe("under the real CSP (public/_headers)", () => {
+  it("serves the CSP of public/_headers", () => {
+    expect(HEADERS.find(([k]) => k === "Content-Security-Policy")?.[1]).toContain(
+      "script-src 'self'",
+    );
+  });
+
+  for (const r of REPORTS) {
+    it(`${r.slug}: Export Excel loads the lazy chunk and downloads a workbook, no CSP violation`, async () => {
+      const page = await open(r.path, { width: 1280, theme: "light" });
+      const waiting = page.waitForEvent("download", { timeout: 15_000 });
+      await page.getByRole("button", { name: "Export Excel" }).click();
+      const d = await waiting;
+      expect(d.suggestedFilename()).toMatch(
+        new RegExp(`^camelthorn-${r.slug}-alpha-bv-[0-9p-]+\\.xlsx$`),
+      );
+      const file = await d.path();
+      expect(file).toBeTruthy();
+      const zip = unzipSync(new Uint8Array(readFileSync(file as string)));
+      expect(Object.keys(zip)).toContain("xl/workbook.xml");
+      const sheet = strFromU8(zip["xl/worksheets/sheet1.xml"] as Uint8Array);
+      expect(sheet).not.toContain("<f>");
+      expect(problems.get(page)).toEqual([]);
+      await page.close();
+    });
+  }
+
+  it("Export PDF: the print class and the title are gone afterwards", async () => {
+    const page = await open("/reporting/balance-sheet", { width: 1280, theme: "dark" });
+    const before = await page.title();
+    await page.getByRole("button", { name: "Export PDF" }).click();
+    // Headless Chrome returns from print() at once and never fires afterprint (a real browser
+    // does): the first input after the dialog ends the print state.
+    await page.mouse.move(10, 10);
+    await page.mouse.move(40, 40);
+    await page.waitForFunction(
+      () => !document.documentElement.classList.contains("printing"),
+      undefined,
+      { timeout: 10_000 },
+    );
+    expect(await page.title()).toBe(before);
+    expect(problems.get(page)).toEqual([]);
+    await page.close();
+  });
+});
+
+describe("print: content", () => {
+  it("balance sheet in portrait with long names and large amounts: nothing clipped, titles and totals once", async () => {
+    const chart = CHART.map((a) => ({
+      ...a,
+      name: `${a.name} — ${"long account description ".repeat(3).trim()}`,
+    }));
+    const big = LEDGER.map((b) => ({ ...b, amountMinor: b.amountMinor * 1_000_000 }));
+    const bs = (): BalanceSheetResponse => ({
+      ...(balanceSheetResponse() as BalanceSheetResponse),
+      report: buildBalanceSheet(chart, big, {
+        year: 2026,
+        period: 2,
+        compareYear: 2025,
+        compareToYearEnd: true,
+      }),
+    });
+    const page = await open("/reporting/balance-sheet", { width: 1280, theme: "dark", bs });
+    await page.emulateMedia({ media: "print", colorScheme: "dark" });
+    await page.setViewportSize({ width: 794, height: 1123 });
+    const m = await page.evaluate(() => {
+      const table = document.querySelector<HTMLElement>(".report-table");
+      const right = table ? table.getBoundingClientRect().right : 0;
+      const cells = [
+        ...document.querySelectorAll<HTMLElement>(".report-table th, .report-table td"),
+      ];
+      return {
+        overflow: document.documentElement.scrollWidth - window.innerWidth,
+        right,
+        vw: window.innerWidth,
+        clipped: cells.filter(
+          (c) => c.getBoundingClientRect().right > right + 1 || c.scrollWidth > c.clientWidth + 1,
+        ).length,
+      };
+    });
+    expect(m.overflow).toBeLessThanOrEqual(0);
+    expect(m.right).toBeLessThanOrEqual(m.vw);
+    expect(m.clipped).toBe(0);
+    const file = join(tmpdir(), "k3b-bs-wide.pdf");
+    await page.pdf({ path: file, preferCSSPageSize: true, printBackground: true });
+    const info = pdfInfo(file);
+    expect(info.width).toBeLessThan(info.height); // portrait
+    const text = execFileSync("pdftotext", ["-layout", file, "-"], { encoding: "utf8" });
+    expect(text).toContain("Balance sheet");
+    expect(text).toContain("Period: 2026, up to period 2");
+    expect(text).toContain("Year end 2025 (all");
+    // the largest figure, every digit (24,000.00 x 1,000,000 = € 24.000.000.000,00)
+    expect(text.replace(/\u00a0/g, " ")).toContain("€ 24.000.000.000,00");
+    expect(text.match(/Total assets/g)).toHaveLength(1);
+    expect(text.match(/Difference/g)).toHaveLength(1);
+    // nothing private beyond the screen: no e-mail address, no IBAN-like text
+    expect(text).not.toMatch(/@|[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}/);
+    await page.close();
+  });
+
+  it("long ageing: the title and as-of date are on the first page, the totals row once", async () => {
+    const page = await browser.newPage({ viewport: { width: 1123, height: 794 } });
+    await page.addInitScript((t) => localStorage.setItem("camelthorn.theme", t), "dark");
+    await page.route("**/api/**", async (route) => {
+      const url = new URL(route.request().url());
+      const body =
+        url.pathname === "/api/reports/ageing"
+          ? ageingResponse(ageingItems(90), "receivable")
+          : api(url.pathname, url.searchParams);
+      await route.fulfill({ contentType: "application/json", body: JSON.stringify(body ?? {}) });
+    });
+    await page.goto(`${base}/reporting/receivables-ageing`);
+    await page.waitForSelector(".report-table");
+    await page.emulateMedia({ media: "print", colorScheme: "dark" });
+    const file = join(tmpdir(), "k3b-long-dark.pdf");
+    await page.pdf({ path: file, preferCSSPageSize: true, printBackground: true });
+    const first = execFileSync("pdftotext", ["-layout", "-f", "1", "-l", "1", file, "-"], {
+      encoding: "utf8",
+    });
+    expect(first).toContain("Receivables age analysis");
+    expect(first).toContain("As of 11 Nov 2026");
+    const all = execFileSync("pdftotext", ["-layout", file, "-"], { encoding: "utf8" });
+    // one totals row per currency table (EUR, USD, JPY), never repeated per page
+    expect(all.split("\n").filter((l) => /^\s*Total\s{2,}\S/.test(l))).toHaveLength(3);
     await page.close();
   });
 });

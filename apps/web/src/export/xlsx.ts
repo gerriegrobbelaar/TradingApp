@@ -66,7 +66,13 @@ const MAX_SAFE_DIGITS = 15; // significant digits Excel keeps in a number
 // eslint-disable-next-line no-control-regex
 const INVALID_XML = /[\u0000-\u0008\u000B\u000C\u000E-\u001F￾￿]/g;
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
-const FORMULA_START = /^[=+\-@\t\r]/;
+/**
+ * Text a spreadsheet (or a CSV saved from it) could read as a formula: = + - @ tab CR LF at the
+ * start, also behind leading white space or invisible characters (some importers trim them), and
+ * the full-width forms ＝ ＋ － ＠ that some locales and IMEs fold to ASCII.
+ */
+const FORMULA_START =
+  /^[\s\u00A0\u1680\u180E\u2000-\u200F\u2028-\u202F\u205F-\u2064\u3000\uFEFF]*[=+\-@\t\r\n\uFF1D\uFF0B\uFF0D\uFF20]/;
 
 /** XML 1.0 text: invalid characters dropped, the five markup characters escaped. */
 export function escapeXml(value: string): string {
@@ -90,6 +96,9 @@ export function safeText(value: string): string {
   return FORMULA_START.test(cut) ? `'${cut}` : cut;
 }
 
+/** Sheet names Excel refuses besides the character rules. */
+const RESERVED_SHEET = new Set(["history"]);
+
 /** A valid, unique sheet name: at most 31 characters, none of \ / ? * [ ] :, not empty. */
 export function sheetNames(wanted: readonly string[]): string[] {
   const used = new Set<string>();
@@ -99,12 +108,14 @@ export function sheetNames(wanted: readonly string[]): string[] {
       .replace(INVALID_XML, "")
       .replace(/^'+|'+$/g, "")
       .trim();
-    if (base === "") base = "Sheet";
-    base = base.slice(0, 31);
+    if (base === "" || RESERVED_SHEET.has(base.toLowerCase()))
+      base = base === "" ? "Sheet" : `${base} sheet`;
+    // a cut through a surrogate pair would leave half a character
+    base = base.slice(0, 31).replace(LONE_SURROGATE, "");
     let name = base;
     for (let n = 2; used.has(name.toLowerCase()); n++) {
       const suffix = ` ${n}`;
-      name = `${base.slice(0, 31 - suffix.length)}${suffix}`;
+      name = `${base.slice(0, 31 - suffix.length).replace(LONE_SURROGATE, "")}${suffix}`;
     }
     used.add(name.toLowerCase());
     return name;
@@ -264,8 +275,10 @@ function significantDigits(decimal: string): number {
     .replace(/^0+(?=\d)/, "").length;
 }
 
-function textCell(ref: string, style: number, text: string): string {
-  return `<c r="${ref}"${style ? ` s="${style}"` : ""} t="inlineStr"><is><t xml:space="preserve">${escapeXml(safeText(text))}</t></is></c>`;
+/** `raw` is for text this writer made itself (exact digits of a number): never prefixed. */
+function textCell(ref: string, style: number, text: string, raw = false): string {
+  const body = raw ? text : safeText(text);
+  return `<c r="${ref}"${style ? ` s="${style}"` : ""} t="inlineStr"><is><t xml:space="preserve">${escapeXml(body)}</t></is></c>`;
 }
 
 function numberCell(ref: string, style: number, decimal: string): string {
@@ -290,6 +303,7 @@ function cellXml(cell: Cell, ref: string, styles: StyleBook): string {
           ref,
           styles.of({ kind: "general" }, { ...cell.style, align: "right" }),
           decimal,
+          true,
         );
       }
       return numberCell(ref, styles.of({ kind: "money", scale: cell.scale }, cell.style), decimal);
@@ -297,7 +311,12 @@ function cellXml(cell: Cell, ref: string, styles: StyleBook): string {
     case "int": {
       const text = BigInt(cell.value).toString();
       if (significantDigits(text) > MAX_SAFE_DIGITS) {
-        return textCell(ref, styles.of({ kind: "general" }, cell.style), text);
+        return textCell(
+          ref,
+          styles.of({ kind: "general" }, { ...cell.style, align: "right" }),
+          text,
+          true,
+        );
       }
       return numberCell(ref, styles.of({ kind: "int" }, cell.style), text);
     }
@@ -357,6 +376,15 @@ function sheetXml(spec: SheetSpec, styles: StyleBook): string {
     `<pageSetup paperSize="9" orientation="${spec.landscape ? "landscape" : "portrait"}" fitToWidth="1" fitToHeight="0"/>` +
     `</worksheet>`
   );
+}
+
+/** Zip entry times can only hold 1980-2099; a device clock outside that must not break the export. */
+const ZIP_MIN = Date.UTC(1980, 0, 2);
+const ZIP_MAX = Date.UTC(2099, 11, 30);
+function zipTime(d: Date): Date {
+  const t = d.getTime();
+  if (!Number.isFinite(t)) return new Date(ZIP_MIN);
+  return new Date(Math.min(ZIP_MAX, Math.max(ZIP_MIN, t)));
 }
 
 const NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
@@ -426,7 +454,7 @@ export function buildXlsx(sheets: readonly SheetSpec[], options: WorkbookOptions
   sheetFiles.forEach((xml, i) => {
     files[`xl/worksheets/sheet${i + 1}.xml`] = strToU8(xml);
   });
-  return zipSync(files, { level: 6, mtime: options.createdAt });
+  return zipSync(files, { level: 6, mtime: zipTime(options.createdAt) });
 }
 
 export const XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";

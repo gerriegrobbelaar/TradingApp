@@ -105,6 +105,8 @@
     z-index: 1;
     background: var(--bg);
     min-width: 112px;
+    /* leave room for the first amount column beside it on a phone */
+    max-width: min(180px, 46vw);
     box-shadow: 1px 0 0 var(--line);
   }
   .app .report-table thead th:first-child {
@@ -214,4 +216,30 @@
 
 .print-only {
   display: none;
+}
+
+/* Account sheet: periods that are not part of the report cell it was opened from. */
+.app .report-table tr.outside th,
+.app .report-table tr.outside td {
+  color: var(--muted);
+}
+
+/* Legend of the Mix bar colours (the bars have text alternatives; this is for sighted readers). */
+.app .mix-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  margin: 8px 0 0;
+}
+.app .mix-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.app .mix-legend .swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
 }

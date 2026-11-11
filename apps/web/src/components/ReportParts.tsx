@@ -128,7 +128,13 @@ export function ExportButtons({
       <Button
         size="sm"
         disabled={disabled}
-        onClick={() => printReport(pdfFileBase)}
+        onClick={() => {
+          try {
+            printReport(pdfFileBase);
+          } catch {
+            toast.show("Could not open the print dialog. Use your browser's print command.");
+          }
+        }}
         aria-describedby="pdf-hint"
       >
         Export PDF

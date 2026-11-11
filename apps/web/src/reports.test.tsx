@@ -375,6 +375,30 @@ describe.each([
     expect(norm(card.textContent)).toContain("Some items have no amount in EUR yet.");
   });
 
+  it("never says 'at least € 0,00' when no item has an amount in the division currency", async () => {
+    mock({
+      "GET /api/reports/ageing": () => ({
+        body: ageing(kind, [
+          {
+            relationId: 9,
+            relationName: "Tokyo KK",
+            currency: "JPY",
+            openMinor: 1_000,
+            dueDate: null,
+            dcMinor: null,
+          },
+        ]),
+      }),
+    });
+    renderApp(path);
+    const jpy = await screen.findByRole("region", { name: `${title} in JPY` });
+    const card = jpy.closest(".card") as HTMLElement;
+    expect(norm(card.textContent)).not.toContain("At least");
+    expect(norm(card.textContent)).toContain(
+      "Not every item has an amount in EUR in Exact yet, so there is no EUR total.",
+    );
+  });
+
   it("aborts the old request when the administration changes and shows only the new data", async () => {
     const calls = mockFetch({
       ...base(TWO_DIVISIONS),
@@ -465,14 +489,14 @@ describe("Balance sheet", () => {
       within(region)
         .getAllByRole("columnheader")
         .map((h) => h.textContent),
-    ).toEqual(["Account", "2026, period 2", "Year end 2025"]);
+    ).toEqual(["Account", "2026, up to period 2", "Year end 2025 (all periods)"]);
     const line = (name: string) =>
       norm(within(region).getByRole("row", { name: new RegExp(name) }).textContent);
     expect(line("Bank ING")).toContain("€ 24.000,00");
     expect(line("Bank ING")).toContain("€ 15.000,00");
     expect(line("Total assets")).toContain("€ 25.000,00");
     expect(line("Total liabilities and equity")).toContain("€ 25.000,00");
-    expect(line("Result for the year so far")).toContain("€ 10.000,00");
+    expect(line("Result for the year to date")).toContain("€ 10.000,00");
     expect(line("Difference")).toContain("€ 0,00");
     expect(screen.queryByText(/Does not balance/)).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
@@ -499,7 +523,7 @@ describe("Balance sheet", () => {
     renderApp("/reporting/balance-sheet");
     const alert = await screen.findByRole("alert");
     expect(norm(alert.textContent)).toBe(
-      "Does not balance: difference € 123,45. Check opening balances.",
+      "Does not balance: difference € 123,45 in 2026, up to period 2. Check opening balances.",
     );
     const region = screen.getByRole("region", { name: "Balance sheet" });
     expect(norm(within(region).getByRole("row", { name: /Difference/ }).textContent)).toContain(
@@ -684,6 +708,36 @@ describe("Balance sheet", () => {
     const sent = params(callsTo(calls, "/api/reports/balance-sheet")[0]);
     expect(sent.has("year")).toBe(false);
     expect(sent.has("period")).toBe(false);
+    // dropping them from the address does not load the report again
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    expect(callsTo(calls, "/api/reports/balance-sheet")).toHaveLength(1);
+  });
+
+  it("defaults to the period the server chose (latest with figures) and says when a later one exists", async () => {
+    mock(() => balanceSheetResponse({ latestPeriodWithData: 5 }));
+    renderApp("/reporting/balance-sheet");
+    await screen.findByRole("region", { name: "Balance sheet" });
+    expect((screen.getByLabelText("Up to period") as HTMLSelectElement).value).toBe("2");
+    expect(screen.getByText(/Exact has figures up to period 5\./)).toBeTruthy();
+  });
+
+  it("says nothing about the latest period when it is the one shown", async () => {
+    mock();
+    renderApp("/reporting/balance-sheet");
+    await screen.findByRole("region", { name: "Balance sheet" });
+    expect(screen.queryByText(/Exact has (no )?figures/)).toBeNull();
+  });
+
+  it("offers closing periods 13 and up when the year has figures in them", async () => {
+    mock(() => balanceSheetResponse({ latestPeriodWithData: 13 }, { year: 2025, period: 12 }));
+    renderApp("/reporting/balance-sheet?year=2025");
+    await screen.findByRole("region", { name: "Balance sheet" });
+    const period = screen.getByLabelText("Up to period") as HTMLSelectElement;
+    expect(period.value).toBe("12");
+    expect([...period.options].map((o) => o.value)).toContain("13");
+    expect(screen.getByText(/Exact has figures up to period 13\./)).toBeTruthy();
   });
 
   it("opens the period rows of an account: chart once, then balances for the year", async () => {
@@ -706,6 +760,10 @@ describe("Balance sheet", () => {
     expect(rows[1]).toContain("0 (opening)");
     expect(rows[1]).toContain("€ 14.000,00");
     expect(rows.at(-1)).toContain("€ 24.000,00");
+    // The periods the cell is made of add up to the cell (review K3b).
+    expect(norm(within(dialog).getByTestId("included-check").textContent)).toBe(
+      "€ 24.000,00: periods 0 to 2 (debit less credit), the figure in the report.",
+    );
     // A second account reuses the chart.
     await user.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
@@ -862,6 +920,34 @@ describe("Profit and loss", () => {
     await within(dialog).findByRole("region", { name: "Periods" });
     expect(callsTo(calls, "/api/ledger/accounts/105/balances")).toHaveLength(1);
     expect(norm(dialog.textContent)).toContain("€ -9.000,00");
+    // Revenue is shown credit less debit: the sheet says so and its periods match the cell.
+    expect(norm(within(dialog).getByTestId("included-check").textContent)).toBe(
+      "€ 11.500,00: periods 1 to 2 (credit less debit), the figure in the report.",
+    );
+  });
+
+  it("marks periods outside the report and says when the periods no longer add up to the cell", async () => {
+    const changed = accountBalancesResponse(105);
+    changed.periods = [
+      ...changed.periods.map((p) => (p.period === 1 ? { ...p, amountMinor: -950_000 } : p)),
+      { period: 3, amountMinor: -1_000, debitMinor: 0, creditMinor: 1_000, rows: 1 },
+    ];
+    mock(profitLossResponse, {
+      "GET /api/ledger/accounts": () => ({ body: chartResponse() }),
+      "GET /api/ledger/accounts/105/balances": () => ({ body: changed }),
+    });
+    const user = userEvent.setup();
+    renderApp("/reporting/profit-loss");
+    const region = await screen.findByRole("region", { name: "Profit and loss" });
+    await user.click(within(region).getByRole("button", { name: /8000 Consulting revenue/ }));
+    const dialog = await screen.findByRole("dialog", { name: "8000 Consulting revenue" });
+    const periods = await within(dialog).findByRole("region", { name: "Periods" });
+    expect(norm(within(periods).getByRole("row", { name: /^3/ }).textContent)).toContain(
+      "not in the report",
+    );
+    expect(norm(within(dialog).getByTestId("included-check").textContent)).toBe(
+      "periods 1 to 2 add up to € 12.000,00 (credit less debit), but the report shows € 11.500,00. The data changed since the report was loaded: reload the report.",
+    );
   });
 
   it("empty and stale states", async () => {
@@ -921,6 +1007,29 @@ describe("Reporting menu", () => {
     expect(screen.queryByText(/not built yet/i)).toBeNull();
     // Treasury and Close are still placeholders.
     expect(hrefs).toContain("/treasury/bank");
+  });
+
+  it("sends the placeholder-era addresses to the renamed pages, keeping the query", async () => {
+    const calls = mockFetch({
+      ...base(),
+      "GET /api/reports/ageing": () => ({ body: ageing() }),
+      "GET /api/reports/profit-loss": () => ({ body: profitLossResponse() }),
+    });
+    const first = renderApp("/reporting/profit-and-loss?year=2026&period=2");
+    expect(await screen.findByRole("heading", { level: 1, name: "Profit and loss" })).toBeTruthy();
+    const sent = params(callsTo(calls, "/api/reports/profit-loss")[0]);
+    expect(sent.get("year")).toBe("2026");
+    expect(sent.get("periodTo")).toBe("2");
+    first.unmount();
+    const second = renderApp("/reporting/creditors-age");
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Creditors age analysis" }),
+    ).toBeTruthy();
+    second.unmount();
+    renderApp("/reporting/receivables-age");
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Receivables age analysis" }),
+    ).toBeTruthy();
   });
 });
 

@@ -189,6 +189,12 @@ export const BUDGETS: LedgerBudget[] = [
   { glAccountExactId: "a-rent", year: 2026, period: 2, amountMinor: 100_000 },
 ];
 
+/** Highest period 1 and up of a year in the given rows, as the API reports it. */
+export function latestPeriod(balances: LedgerBalance[], year: number): number | null {
+  const ps = balances.filter((b) => b.year === year && b.period >= 1).map((b) => b.period);
+  return ps.length === 0 ? null : Math.max(...ps);
+}
+
 export function balanceSheetResponse(
   over: Partial<BalanceSheetResponse> = {},
   opts: {
@@ -196,6 +202,7 @@ export function balanceSheetResponse(
     period?: number;
     accounts?: LedgerAccount[];
     balances?: LedgerBalance[];
+    compareToYearEnd?: boolean;
   } = {},
 ): BalanceSheetResponse {
   const year = opts.year ?? 2026;
@@ -205,13 +212,14 @@ export function balanceSheetResponse(
     status: "ok",
     year,
     period,
+    latestPeriodWithData: latestPeriod(opts.balances ?? LEDGER, year),
     compareYear: year - 1,
     compareMissing: false,
     report: buildBalanceSheet(opts.accounts ?? CHART, opts.balances ?? LEDGER, {
       year,
       period,
       compareYear: year - 1,
-      compareToYearEnd: true,
+      compareToYearEnd: opts.compareToYearEnd ?? true,
     }),
     freshness: LEDGER_FRESH,
     compareFreshness: LEDGER_FRESH.gl_balances,
@@ -233,6 +241,7 @@ export function profitLossResponse(
     status: "ok",
     year: 2026,
     periodTo,
+    latestPeriodWithData: latestPeriod(LEDGER, 2026),
     compareYear: compareYear ?? 2025,
     compareMissing: compareYear === null,
     report: buildProfitAndLoss(CHART, LEDGER, budgets, { year: 2026, periodTo, compareYear }),

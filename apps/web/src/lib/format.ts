@@ -245,3 +245,9 @@ const yearFmt = new Intl.DateTimeFormat("en-GB", { year: "numeric", timeZone: TI
 export function currentAmsterdamYear(now: number = Date.now()): number {
   return Number(yearFmt.format(now));
 }
+
+const monthFmt = new Intl.DateTimeFormat("en-GB", { month: "numeric", timeZone: TIME_ZONE });
+/** The calendar month (1-12) in Amsterdam right now: the server's default period. */
+export function currentAmsterdamMonth(now: number = Date.now()): number {
+  return Number(monthFmt.format(now));
+}

@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import type {
   ProfitLossFigures,
@@ -29,8 +29,15 @@ import {
   oldestRead,
 } from "../components/ReportParts";
 import { describeLoadError } from "../lib/errors";
-import { currentAmsterdamYear } from "../lib/format";
+import { currentAmsterdamMonth, currentAmsterdamYear } from "../lib/format";
 import { reportFileBase } from "../lib/report-files";
+import {
+  PL_SIGN_NOTE,
+  latestPeriodNote,
+  profitLossHeads,
+  profitLossNotes,
+  ytdLine,
+} from "../lib/report-labels";
 import { useResource } from "../lib/useResource";
 
 const SECTION_TITLE = {
@@ -39,13 +46,13 @@ const SECTION_TITLE = {
   unclassified: "Unclassified",
 } as const;
 
-export const BUDGET_UNAVAILABLE = "Budget is not available in Exact for this administration.";
-
 export function ProfitLoss() {
   const { selected, gate } = useDivisionGate();
   const [params, setParams] = useSearchParams();
-  const urlYear = parseYear(params.get("year"));
-  const urlPeriod = parsePeriod(params.get("period"));
+  const rawYear = params.get("year");
+  const rawPeriod = params.get("period");
+  const urlYear = parseYear(rawYear);
+  const urlPeriod = parsePeriod(rawPeriod);
   const setParam = useCallback(
     (patch: Record<string, string | null>) =>
       setParams((prev) => {
@@ -58,6 +65,21 @@ export function ProfitLoss() {
       }),
     [setParams],
   );
+  // An invalid year or period in the address is not sent; drop it from the address too.
+  useEffect(() => {
+    const badYear = rawYear !== null && urlYear === undefined;
+    const badPeriod = rawPeriod !== null && urlPeriod === undefined;
+    if (!badYear && !badPeriod) return;
+    setParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (badYear) next.delete("year");
+        if (badPeriod) next.delete("period");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [rawYear, rawPeriod, urlYear, urlPeriod, setParams]);
 
   const key = selected ? `pl:${selected.id}:${urlYear ?? ""}:${urlPeriod ?? ""}` : null;
   const r = useResource<ProfitLossResponse>(key, (signal) =>
@@ -78,13 +100,15 @@ export function ProfitLoss() {
       code: l.code,
       name: l.name,
       year: data.year,
+      // year to date is periods 1..P, every line credit less debit
+      included: { from: 1, to: data.periodTo, sign: -1, shownMinor: l.actual },
     });
   };
 
   const administration = selected?.name ?? "";
   const cur = data?.division.currency ?? selected?.currency ?? "EUR";
   const year = urlYear ?? data?.year ?? currentAmsterdamYear();
-  const period = urlPeriod ?? data?.periodTo ?? new Date().getMonth() + 1;
+  const period = urlPeriod ?? data?.periodTo ?? currentAmsterdamMonth();
   const withBudget = rep?.budgetsIncluded ?? false;
   const syncedAt = data
     ? oldestRead([
@@ -94,9 +118,12 @@ export function ProfitLoss() {
         withBudget ? data.freshness.gl_budgets : null,
       ])
     : null;
-  const periodLine = data
-    ? `Period: ${data.year}, periods 1 to ${data.periodTo} (year to date)`
-    : "";
+  const periodLine = data ? `Period: ${ytdLine(data.year, data.periodTo)}` : "";
+  const notes = data ? profitLossNotes(data) : [];
+  const heads = data ? profitLossHeads(data) : [];
+  const latestNote = data
+    ? latestPeriodNote(data.periodTo, data.latestPeriodWithData, data.status)
+    : null;
   const fileBase = data
     ? reportFileBase(
         "profit-loss",
@@ -181,14 +208,12 @@ export function ProfitLoss() {
     );
   };
 
-  const lastYearHead = `Last year (${data?.compareYear ?? ""})`;
-
   return (
     <div className="report report-landscape" data-report="profit-loss">
       <PageHeader
         eyebrow={selected?.name ?? "Reporting"}
         title="Profit and loss"
-        lede="Revenue, costs and result for the year so far, against budget and last year. Revenue is positive, costs are negative, and a positive variance is good for the result."
+        lede={`Revenue, costs and result for the year so far, against budget and last year. ${PL_SIGN_NOTE}`}
         tools={
           <LedgerStamps
             balances={data?.freshness.gl_balances ?? null}
@@ -215,6 +240,7 @@ export function ProfitLoss() {
               periodLabel="Year to date up to period"
               onYear={(y) => setParam({ year: String(y) })}
               onPeriod={(p) => setParam({ period: String(p) })}
+              latest={data?.latestPeriodWithData ?? null}
             />
             <ExportButtons disabled={!rep} pdfFileBase={fileBase} runExcel={runExcel} />
           </div>
@@ -253,39 +279,28 @@ export function ProfitLoss() {
           )}
           {data && rep && (
             <>
-              <div className="report-notices" role="group" aria-label="Notes">
-                {!withBudget && (
-                  <p className="notice" role="status">
-                    {data.budgetsAvailable
-                      ? `No budget has been entered in Exact for ${data.year}.`
-                      : BUDGET_UNAVAILABLE}
-                  </p>
-                )}
-                {withBudget && data.budgetScenarios.length > 1 && (
-                  <p className="notice" role="status">
-                    Exact holds {data.budgetScenarios.length} budget scenarios for {data.year}; this
-                    report uses the first one.
-                  </p>
-                )}
-                {data.compareMissing && (
-                  <p className="notice warn" role="status">
-                    The balances of {data.compareYear} have not been read from Exact yet, so the
-                    last-year figures are not available.
-                  </p>
-                )}
-                {data.splitKeys > 0 && (
-                  <p className="notice warn" role="status">
-                    {data.splitKeys} {data.splitKeys === 1 ? "figure was" : "figures were"} split by
-                    Exact over a field this app does not read, so some amounts may be too low.
-                  </p>
-                )}
-              </div>
+              {notes.length > 0 && (
+                <div className="report-notices" role="group" aria-label="Notes">
+                  {notes.map((n) => (
+                    <p
+                      key={n.text}
+                      className={n.tone === "info" ? "notice" : "notice warn"}
+                      role="status"
+                    >
+                      {n.text}
+                    </p>
+                  ))}
+                </div>
+              )}
               <Card className="report-card" aria-labelledby="pl-title">
                 <div className="row-between">
                   <h2 id="pl-title" className="h2">
-                    {data.year}, periods 1 to {data.periodTo}
+                    {ytdLine(data.year, data.periodTo)}
                   </h2>
-                  <p className="cap">Amounts in {cur}</p>
+                  <p className="cap">
+                    Amounts in {cur}
+                    {latestNote && <span className="no-print"> · {latestNote}</span>}
+                  </p>
                 </div>
                 <ScrollRegion label="Profit and loss">
                   <table className="tbl report-table pl-table">
@@ -296,31 +311,11 @@ export function ProfitLoss() {
                     <thead>
                       <tr>
                         <th scope="col">Account</th>
-                        <th scope="col" className="r">
-                          Actual
-                        </th>
-                        {withBudget && (
-                          <>
-                            <th scope="col" className="r">
-                              Budget
-                            </th>
-                            <th scope="col" className="r">
-                              Variance to budget
-                            </th>
-                            <th scope="col" className="r">
-                              Variance to budget %
-                            </th>
-                          </>
-                        )}
-                        <th scope="col" className="r">
-                          {lastYearHead}
-                        </th>
-                        <th scope="col" className="r">
-                          Variance to last year
-                        </th>
-                        <th scope="col" className="r">
-                          Variance to last year %
-                        </th>
+                        {heads.map((h) => (
+                          <th key={h} scope="col" className="r">
+                            {h}
+                          </th>
+                        ))}
                       </tr>
                     </thead>
                     <tbody>

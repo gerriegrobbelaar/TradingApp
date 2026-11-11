@@ -452,6 +452,44 @@ describe("balance sheet", () => {
       `/api/reports/balance-sheet?division=${divA}&year=2025`,
     );
     expect(past.body.period).toBe(12);
+    expect(past.body.latestPeriodWithData).toBe(12);
+    expect(r.body.latestPeriodWithData).toBeNull();
+  });
+
+  it("without a period, defaults to the latest period with figures, capped at the calendar default (review K3b)", async () => {
+    // 2026 holds periods 0..3 only: the default is period 3, not the current month
+    const r = await get<BalanceSheetResponse>(`/api/reports/balance-sheet?division=${divA}`);
+    expect(r.body.year).toBe(now().year);
+    expect(r.body.latestPeriodWithData).toBe(now().year === 2026 ? 3 : null);
+    if (now().year === 2026) {
+      expect(r.body.period).toBe(Math.min(3, now().month));
+      expect(r.body.report?.period).toBe(r.body.period);
+    }
+    // an explicit period is kept, and the latest period is still reported
+    const asked = await get<BalanceSheetResponse>(url("period=1&compare=none"));
+    expect(asked.body.period).toBe(1);
+    expect(asked.body.latestPeriodWithData).toBe(3);
+    // a closing period 13 in another year does not move the default past 12
+    await addBalances(divA, [
+      [1, 2025, 13, 100],
+      [4, 2025, 13, -100],
+    ]);
+    const past = await get<BalanceSheetResponse>(
+      `/api/reports/balance-sheet?division=${divA}&year=2025`,
+    );
+    expect(past.body.latestPeriodWithData).toBe(13);
+    expect(past.body.period).toBe(12);
+    // a year whose read never completed reports no latest period (partial rows are not trusted)
+    await addBalances(divA, [[1, 2024, 4, 100]]);
+    const partial = await get<BalanceSheetResponse>(
+      `/api/reports/balance-sheet?division=${divA}&year=2024&compare=none`,
+    );
+    expect(partial.body.status).toBe("not_synced");
+    expect(partial.body.latestPeriodWithData).toBeNull();
+    expect(partial.body.period).toBe(12);
+    // the period is still validated before anything is read
+    expect((await get(url("period=0"))).status).toBe(400);
+    expect((await get(url("period=17"))).status).toBe(400);
   });
 
   it("keeps an account that Exact stopped returning, and one that is not in the chart", async () => {
@@ -483,6 +521,21 @@ describe("profit and loss", () => {
     [6, 2026, 2, 1000, S1],
     [5, 2026, 1, -999, S2],
   ];
+
+  it("without periodTo, uses the latest period with figures (capped at the calendar default)", async () => {
+    const r = await get<ProfitLossResponse>(`/api/reports/profit-loss?division=${divA}&year=2025`);
+    expect(r.body.latestPeriodWithData).toBe(12);
+    expect(r.body.periodTo).toBe(12);
+    expect(r.body.report?.periodTo).toBe(12);
+    const y = await get<ProfitLossResponse>(`/api/reports/profit-loss?division=${divA}`);
+    if (now().year === 2026) {
+      expect(y.body.latestPeriodWithData).toBe(3);
+      expect(y.body.periodTo).toBe(Math.min(3, now().month));
+    }
+    const asked = await get<ProfitLossResponse>(url());
+    expect(asked.body.periodTo).toBe(2);
+    expect(asked.body.latestPeriodWithData).toBe(3);
+  });
 
   it("returns actual, budget and last year for the periods to date", async () => {
     await addBudgets(divA, budgets);
@@ -882,6 +935,13 @@ describe("review K2", () => {
       2026,
     );
     expect(drill).not.toMatch(/SCAN gl_balances(?! USING)/);
+    const latest = await plan(
+      "SELECT MAX(period) AS p FROM gl_balances WHERE division_id = ?1 AND year = ?2 AND period >= 1",
+      1,
+      2026,
+    );
+    expect(latest).toMatch(/idx_gl_balances_year/);
+    expect(latest).not.toMatch(/SCAN gl_balances(?! USING)/);
     const budgets = await plan(
       "SELECT gl_account_exact_id, SUM(amount_minor) FROM gl_budgets WHERE division_id = ?1 AND year = ?2 AND scenario = ?3 AND period BETWEEN 1 AND ?4 GROUP BY gl_account_exact_id, year, period",
       1,
@@ -926,6 +986,7 @@ const BS_RESPONSE = keysOf<BalanceSheetResponse>()([
   "status",
   "year",
   "period",
+  "latestPeriodWithData",
   "compareYear",
   "compareMissing",
   "report",
@@ -966,6 +1027,7 @@ const PL_RESPONSE = keysOf<ProfitLossResponse>()([
   "status",
   "year",
   "periodTo",
+  "latestPeriodWithData",
   "compareYear",
   "compareMissing",
   "report",

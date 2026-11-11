@@ -67,3 +67,13 @@ export function groupLabel(path: string): string | null {
   }
   return null;
 }
+
+/**
+ * Addresses the reporting menu had while its pages were placeholders (renamed in K3b). A bookmark
+ * of one still opens the report.
+ */
+export const RENAMED_PATHS: readonly { from: string; to: string }[] = [
+  { from: "/reporting/profit-and-loss", to: "/reporting/profit-loss" },
+  { from: "/reporting/creditors-age", to: "/reporting/creditors-ageing" },
+  { from: "/reporting/receivables-age", to: "/reporting/receivables-ageing" },
+];

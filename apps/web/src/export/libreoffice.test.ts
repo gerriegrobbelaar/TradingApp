@@ -11,9 +11,20 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildXlsx, type SheetSpec } from "./xlsx";
+import { buildXlsx, type Cell, type SheetSpec } from "./xlsx";
+import { formatBps, minorToDecimal } from "../lib/format";
 import { ageingExport, balanceSheetExport, profitLossExport } from "./report-workbooks";
 import { ageingResponse, balanceSheetResponse, profitLossResponse } from "../test-fixtures-reports";
+import type { BalanceSheetResponse, ProfitLossResponse } from "@camelthorn/core";
+
+/** What LibreOffice shows for minor units in the #,##0.00 style formats (en-US grouping). */
+function shown(minor: number | bigint, scale: number): string {
+  const d = minorToDecimal(BigInt(minor), scale);
+  const neg = d.startsWith("-");
+  const [int, frac] = (neg ? d.slice(1) : d).split(".");
+  const grouped = (int ?? "").replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return `${neg ? "-" : ""}${grouped}${frac === undefined ? "" : `.${frac}`}`;
+}
 
 function sofficeVersion(): string | null {
   const r = spawnSync("soffice", ["--version"], { encoding: "utf8", timeout: 30_000 });
@@ -174,5 +185,100 @@ describe.skipIf(VERSION === null)(
       ]);
       expect(plRows.find((x) => x[1] === "Result")?.[2]).toBe("10,000.00");
     });
+
+    it("money: exact digits for scales 0, 2 and 3, negatives, tiny and huge values; long ones as text", () => {
+      const m = (minor: bigint | number, scale: number): Cell => ({ kind: "money", minor, scale });
+      const cases: [bigint | number, number, string][] = [
+        [5, 2, "0.05"],
+        [-5, 2, "-0.05"],
+        [100, 2, "1.00"],
+        [0, 2, "0.00"],
+        [-1, 0, "-1"],
+        [123_456, 0, "123,456"],
+        [-5, 3, "-0.005"],
+        [1_234_567, 3, "1,234.567"],
+        [Number.MAX_SAFE_INTEGER, 2, "90071992547409.91"], // 16 digits: exact text
+        // 15 digits: still a number. (LibreOffice 24.2 DISPLAYS 9,999,999,999,999.99 as
+        // 10,000,000,000,000.00 although it stores the exact value; Excel shows it right.)
+        [987_654_321_098_765n, 2, "9,876,543,210,987.65"],
+        [-123_456_789_012_345_678n, 2, "-1234567890123456.78"],
+        [99_999_999_999_999_999n, 0, "99999999999999999"],
+      ];
+      const sheets = convert("money", [
+        { name: "M", rows: cases.map(([minor, scale]) => [m(minor, scale)]) },
+      ]);
+      const rows = sheets["M"] ?? Object.values(sheets)[0] ?? [];
+      cases.forEach(([, , want], i) => expect(rows[i]?.[0], want).toBe(want));
+      // never scientific notation
+      expect(rows.flat().some((c) => /e[+-]?\d/i.test(c))).toBe(false);
+    });
+
+    it("percentages: LibreOffice shows the same one-decimal figure as the screen", () => {
+      const bps = [1234, 1235, -1235, 1245, -1245, 5, 4, -4, 45, -45, 99_995, 0, -10_000, 123_456];
+      const sheets = convert("pct", [
+        { name: "P", rows: bps.map((b) => [{ kind: "bps", bps: b } as Cell]) },
+      ]);
+      const rows = sheets["P"] ?? Object.values(sheets)[0] ?? [];
+      bps.forEach((b, i) => {
+        const screen = formatBps(b).replace(",", ".");
+        expect(rows[i]?.[0], `bps ${b}`).toBe(screen);
+      });
+    });
+
+    it("formula-looking text stays inert text, including after spaces and in full-width forms", () => {
+      const evil = ["=1+1", " =1+1", "+1", "-1+1", "@SUM(1)", "\uFF1D1+1", "\u00A0=2+2"];
+      const sheets = convert("evil", [
+        { name: "E", rows: evil.map((e) => [{ kind: "text", text: e } as Cell]) },
+      ]);
+      const rows = sheets["E"] ?? Object.values(sheets)[0] ?? [];
+      evil.forEach((e, i) => expect(rows[i]?.[0]).toBe(`'${e}`));
+      expect(rows.flat()).not.toContain("2");
+      expect(rows.flat()).not.toContain("4");
+    });
+
+    for (const currency of ["EUR", "JPY", "KWD"] as const) {
+      it(`balance sheet and profit and loss in ${currency}: every figure equals the API value`, () => {
+        const scale = currency === "JPY" ? 0 : currency === "KWD" ? 3 : 2;
+        const div = { ...balanceSheetResponse().division, currency };
+        const bs: BalanceSheetResponse = { ...balanceSheetResponse(), division: div };
+        const rows =
+          Object.values(convert(`bs-${currency}`, balanceSheetExport(bs, CTX).sheets))[0] ?? [];
+        const rep = bs.report;
+        if (!rep) throw new Error("fixture");
+        for (const sec of Object.values(rep.sections)) {
+          for (const l of sec.lines) {
+            const r = rows.find((x) => x[1] === l.name);
+            expect(r?.slice(2), l.name).toEqual([
+              shown(l.current, scale),
+              l.compare === null ? "" : shown(l.compare, scale),
+            ]);
+          }
+        }
+        expect(rows.find((x) => x[1] === "Result for the year to date")?.[2]).toBe(
+          shown(rep.result.current, scale),
+        );
+        const pl: ProfitLossResponse = { ...profitLossResponse(), division: div };
+        const plRows =
+          Object.values(convert(`pl-${currency}`, profitLossExport(pl, CTX).sheets))[0] ?? [];
+        const plRep = pl.report;
+        if (!plRep) throw new Error("fixture");
+        for (const sec of Object.values(plRep.sections)) {
+          for (const l of sec.lines) {
+            const r = plRows.find((x) => x[1] === l.name);
+            expect(r?.slice(2), l.name).toEqual([
+              shown(l.actual, scale),
+              l.budget === null ? "" : shown(l.budget, scale),
+              l.vsBudget.minor === null ? "" : shown(l.vsBudget.minor, scale),
+              formatBps(l.vsBudget.bps).replace(",", ".").replace("—", ""),
+              l.lastYear === null ? "" : shown(l.lastYear, scale),
+              l.vsLastYear.minor === null ? "" : shown(l.vsLastYear.minor, scale),
+              formatBps(l.vsLastYear.bps).replace(",", ".").replace("—", ""),
+            ]);
+          }
+        }
+        // costs are negative in the file as on the screen
+        expect(plRows.find((x) => x[1] === "Rent")?.[2]?.startsWith("-")).toBe(true);
+      });
+    }
   },
 );
