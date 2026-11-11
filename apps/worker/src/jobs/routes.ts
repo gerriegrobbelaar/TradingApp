@@ -5,11 +5,13 @@
  *                               budget, next run and last run, plus whether the Worker's queue and
  *                               cron are set up (`scheduler`)
  *  GET   /api/jobs/:id/runs     any signed-in role: history, newest first (`?limit=`, max 100)
- *  PATCH /api/jobs/:id          admin (no step-up): `{ enabled?, schedule?, exactBudget? }`. The
- *                               schedule is checked by validateSchedule, the budget must be a whole
+ *  PATCH /api/jobs/:id          admin (no step-up): `{ enabled?, schedule?, exactBudget?, rev? }`.
+ *                               The schedule is checked by validateSchedule, the budget must be a whole
  *                               number of 1..MAX_EXACT_BUDGET (and only Exact jobs have one), the
  *                               time zone is always Europe/Amsterdam. The change and its audit row
- *                               are one batch (ADR 0013), guarded by the job's `rev`.
+ *                               are one batch (ADR 0013), guarded by the job's `rev`: the one the
+ *                               client sends (409 conflict when stale) and the one read here.
+ *                               A bad schedule is 400 `schedule_invalid` with a `message`.
  *  POST  /api/jobs/:id/run      admin or finance: "Run now". 202 with the run id; 409 while the job
  *                               is queued or running, 429 within 30 s of the last manual run, 409
  *                               not_implemented for a job whose phase is not built, 503 when the
@@ -109,6 +111,8 @@ async function listJobs(ctx: Ctx): Promise<Response> {
         timezone: j.timezone,
         enabled: j.enabled === 1,
         exactBudget: j.exact_budget,
+        /** Send back with PATCH; a stale one gets 409 conflict. */
+        rev: j.rev,
         nextRunAt: j.enabled === 1 ? j.next_run_at : null,
         running: busy.has(j.id),
         lastRun: lastRun ? runView(lastRun) : null,
@@ -160,12 +164,19 @@ async function patchJob(ctx: Ctx): Promise<Response> {
   if (id === null || !email) return json({ error: "not_found" }, 404);
   const body = await readBody(ctx.request);
   if (!body) return json({ error: "invalid_body" }, 400);
-  const allowed = new Set(["enabled", "schedule", "exactBudget"]);
-  if (Object.keys(body).some((k) => !allowed.has(k)) || Object.keys(body).length === 0) {
+  const allowed = new Set(["enabled", "schedule", "exactBudget", "rev"]);
+  const keys = Object.keys(body);
+  if (keys.some((k) => !allowed.has(k)) || keys.filter((k) => k !== "rev").length === 0) {
+    return json({ error: "invalid_body" }, 400);
+  }
+  if ("rev" in body && body["rev"] !== null && typeof body["rev"] !== "string") {
     return json({ error: "invalid_body" }, 400);
   }
   const job = await loadJob(ctx, id);
   if (!job) return json({ error: "not_found" }, 404);
+  // Optimistic concurrency across requests: the screen sends the rev it was shown, so an edit made
+  // from a stale page never silently overwrites somebody else's newer one.
+  if ("rev" in body && body["rev"] !== job.rev) return json({ error: "conflict" }, 409);
   const def = handlerFor(job.handler);
 
   let enabled = job.enabled === 1;
@@ -177,7 +188,8 @@ async function patchJob(ctx: Ctx): Promise<Response> {
   let scheduleChanged = false;
   if ("schedule" in body) {
     const v = validateSchedule(body["schedule"]);
-    if (!v.ok) return json({ error: v.error }, 400);
+    // A stable code for programs, and the validator's sentence for people.
+    if (!v.ok) return json({ error: "schedule_invalid", message: v.error }, 400);
     schedule = v.schedule;
     scheduleChanged = true;
   }
@@ -203,7 +215,12 @@ async function patchJob(ctx: Ctx): Promise<Response> {
   }
   // A new schedule, or switching a job on, starts counting from now: no catch-up for the past.
   const restart = scheduleChanged || (enabled && job.enabled !== 1);
-  const next = enabled ? nextRun(schedule, ctx.nowMs) : null;
+  // Otherwise the baseline stays, and the next run is the first slot after it (the one the tick
+  // will claim; it may be due right now).
+  const baseline = restart
+    ? ctx.nowMs
+    : Date.parse(job.last_scheduled_at ?? "") || Date.parse(job.created_at) || ctx.nowMs;
+  const next = enabled ? nextRun(schedule, baseline) : null;
   const rev = crypto.randomUUID();
   const now = iso(ctx.nowMs);
   const db = ctx.env.DB;

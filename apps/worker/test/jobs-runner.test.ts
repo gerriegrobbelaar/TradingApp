@@ -5,6 +5,7 @@ import { getEuObject } from "../src/eu-object";
 import {
   MAX_ENQUEUES,
   SWEEP_AFTER_MS,
+  TICK_STAMP_EVERY_MS,
   executeRun,
   handleQueue,
   sweep,
@@ -37,6 +38,8 @@ beforeEach(async () => {
 });
 
 const lockOf = (name: string) => getEuObject(env.JOB_LOCK, `job:${name}`);
+
+type RunViewWithToken = Awaited<ReturnType<typeof runById>> & { runner_token: string | null };
 
 describe("scheduler tick: due detection and double-tick safety", () => {
   it("claims a due job once, enqueues it, and moves the baseline and next run", async () => {
@@ -155,6 +158,71 @@ describe("scheduler tick: due detection and double-tick safety", () => {
       )
       .first<{ at: string }>();
     expect(v?.at).toBe(new Date(T0).toISOString());
+  });
+
+  it("rewrites the tick stamp at most every few minutes, not on every tick", async () => {
+    const e = envWith(new FakeQueue());
+    const at = async () =>
+      (
+        await db
+          .prepare(
+            "SELECT json_extract(value_json, '$.at') AS at FROM settings WHERE key = 'scheduler.last_tick'",
+          )
+          .first<{ at: string }>()
+      )?.at;
+    await tickScheduler(e, T0);
+    await tickScheduler(e, minute(1));
+    await tickScheduler(e, minute(3));
+    expect(await at()).toBe(new Date(T0).toISOString());
+    await tickScheduler(e, T0 + TICK_STAMP_EVERY_MS + 1);
+    expect(await at()).toBe(new Date(T0 + TICK_STAMP_EVERY_MS + 1).toISOString());
+    // A stamp from the future (the clock jumped back) is replaced at once.
+    await tickScheduler(e, T0);
+    expect(await at()).toBe(new Date(T0).toISOString());
+  });
+
+  it("a tick with nothing due reads the enabled jobs once and writes no rows", async () => {
+    await addJob({ name: "idle1", schedule: { kind: "cron", expr: "0 3 * * *" } });
+    await addJob({ name: "idle2", schedule: { kind: "cron", expr: "30 * * * *" } });
+    await tickScheduler(envWith(new FakeQueue()), T0); // stamps the tick
+    const log: { sql: string; changes: number }[] = [];
+    const wrap = (st: D1PreparedStatement, sql: string): D1PreparedStatement =>
+      new Proxy(st, {
+        get(target, prop) {
+          if (prop === "bind") return (...a: unknown[]) => wrap(target.bind(...a), sql);
+          if (prop === "run" || prop === "all")
+            return async () => {
+              const res = await target.all();
+              log.push({ sql, changes: res.meta.changes ?? 0 });
+              return res;
+            };
+          if (prop === "first")
+            return async () => {
+              const res = await target.all();
+              log.push({ sql, changes: res.meta.changes ?? 0 });
+              return res.results[0] ?? null;
+            };
+          return Reflect.get(target, prop) as unknown;
+        },
+      });
+    const counted = new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop === "prepare") return (sql: string) => wrap(target.prepare(sql), sql);
+        if (prop === "batch")
+          return () => {
+            throw new Error("no batch expected on an idle tick");
+          };
+        return Reflect.get(target, prop) as unknown;
+      },
+    });
+    const e = Object.create(envWith(new FakeQueue()), {
+      DB: { value: counted, enumerable: true },
+    }) as typeof env;
+    const r = await tickScheduler(e, minute(1));
+    expect(r.claimed).toEqual([]);
+    // The stamp upsert (0 rows changed), one SELECT of the enabled jobs, one sweep SELECT.
+    expect(log.map((l) => l.sql.trim().split(/\s+/)[0])).toEqual(["INSERT", "SELECT", "SELECT"]);
+    expect(log.reduce((n, l) => n + l.changes, 0)).toBe(0);
   });
 
   it("a queue that refuses the message leaves a queued run for the sweep to re-send", async () => {
@@ -308,6 +376,78 @@ describe("executeRun", () => {
     const r = await runById(run);
     expect(r.status).toBe("running");
     expect(r.result_json).toBeNull();
+  });
+
+  it("a redelivery that finds the run's own executor still holding the lease hands it back (D1 heartbeat lost, executor alive)", async () => {
+    const e = envWith(new FakeQueue());
+    const id = await addJob({ name: "alive", handler: "h" });
+    const run = await addRun(id);
+    let calls = 0;
+    let second: Awaited<ReturnType<typeof executeRun>> | null = null;
+    let during: RunViewWithToken | null = null;
+    const handlers = {
+      h: def(async () => {
+        calls++;
+        if (calls > 1) return ok({ who: "second" });
+        // The D1 heartbeat writes failed: the row looks stale, but the lease is held and fresh.
+        const old = new Date(Date.now() - 10 * 60_000).toISOString();
+        await db
+          .prepare("UPDATE job_runs SET heartbeat_at = ?2, started_at = ?2 WHERE id = ?1")
+          .bind(run, old)
+          .run();
+        const before = (await runById(run)) as RunViewWithToken;
+        second = await executeRun(e, run, { handlers });
+        during = (await runById(run)) as RunViewWithToken;
+        expect(during.runner_token).toBe(before.runner_token);
+        return ok({ who: "first" });
+      }),
+    };
+    expect(await executeRun(e, run, { handlers })).toEqual({ kind: "ack", reason: "ok" });
+    // The redelivery did not run the handler, did not mark the run skipped, and will look again.
+    expect(calls).toBe(1);
+    expect(second).toEqual({ kind: "retry", delaySeconds: 60 });
+    expect((during as RunViewWithToken | null)?.status).toBe("running");
+    const r = await runById(run);
+    expect(r.status).toBe("ok");
+    expect(JSON.parse(r.result_json ?? "{}").summary).toEqual({ who: "first" });
+    expect(await lockOf("alive").peek()).toBeNull();
+  });
+
+  it("lease expired during a long handler: the takeover runs, the old executor is aborted and its later result is discarded", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const e = envWith(new FakeQueue());
+    const id = await addJob({ name: "slow", handler: "h" });
+    const run = await addRun(id);
+    let firstAborted = false;
+    let secondRan = false;
+    let calls = 0;
+    const handlers = {
+      h: def(async (ctx) => {
+        if (++calls === 1) {
+          // The first executor: its lease (50 ms) lapses before its first beat (at 200 ms).
+          return new Promise<HandlerResult>((resolve) => {
+            ctx.signal.addEventListener("abort", () => {
+              firstAborted = true;
+              // It finishes AFTER the takeover finished.
+              void sleep(30).then(() => resolve(ok({ who: "first" })));
+            });
+          });
+        }
+        secondRan = true;
+        return ok({ who: "second" });
+      }),
+    };
+    const first = executeRun(e, run, { handlers, lockTtlMs: 50, heartbeatMs: 200 });
+    await sleep(100);
+    // A redelivery (sweep resend) treats the run as stale and takes it over with a fresh lease.
+    const second = await executeRun(e, run, { handlers, staleMs: 0, lockTtlMs: 5000 });
+    expect(second).toEqual({ kind: "ack", reason: "ok" });
+    expect(secondRan).toBe(true);
+    expect(await first).toEqual({ kind: "ack", reason: "taken_over" });
+    expect(firstAborted).toBe(true);
+    const r = await runById(run);
+    expect(r.status).toBe("ok");
+    expect(JSON.parse(r.result_json ?? "{}").summary).toEqual({ who: "second" });
   });
 
   it("a throwing handler becomes an error run and does not stop other jobs", async () => {
@@ -501,6 +641,49 @@ describe("retry policy", () => {
     });
     expect(q.sent).toHaveLength(1);
     expect(q.sent[0]?.delaySeconds).toBe(120);
+  });
+
+  it("the sweep does not race a delayed retry: it counts from when the message becomes visible", async () => {
+    const q = new FakeQueue();
+    const e = envWith(q);
+    const id = await addJob({ name: "r2b", handler: "h" });
+    const run = await addRun(id);
+    const t = Date.now();
+    await executeRun(e, run, {
+      handlers: {
+        h: def(async () => ({ ...partialRetry(), retry: { delaySeconds: 600 } }), {
+          maxAttempts: 2,
+        }),
+      },
+      now: () => t,
+    });
+    expect(q.sent).toHaveLength(1);
+    q.sent = [];
+    // 5 min + after the retry was queued, but before its 10 min delay ends: no duplicate.
+    expect((await sweep(e, t + SWEEP_AFTER_MS + 60_000)).resent).toBe(0);
+    // 5 min after it should have been delivered and nobody took it: re-sent.
+    expect((await sweep(e, t + 600_000 + SWEEP_AFTER_MS + 1000)).resent).toBe(1);
+  });
+
+  it("bounds a handler's retry delay to the queue's 0..12 h", async () => {
+    const q = new FakeQueue();
+    const e = envWith(q);
+    const id = await addJob({ name: "r2c", handler: "h" });
+    const a = await addRun(id, { scheduledFor: "2026-03-10T10:00:00.000Z" });
+    const b = await addRun(id, { scheduledFor: "2026-03-10T10:01:00.000Z" });
+    for (const [run, delay] of [
+      [a, 10 ** 9],
+      [b, -5],
+    ] as const) {
+      await executeRun(e, run, {
+        handlers: {
+          h: def(async () => ({ ...partialRetry(), retry: { delaySeconds: delay } }), {
+            maxAttempts: 2,
+          }),
+        },
+      });
+    }
+    expect(q.sent.map((m) => m.delaySeconds)).toEqual([12 * 3600, 0]);
   });
 
   it("does not retry errors, manual runs, or jobs with maxAttempts 1", async () => {

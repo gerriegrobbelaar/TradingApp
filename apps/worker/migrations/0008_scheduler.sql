@@ -82,12 +82,20 @@ CREATE TABLE job_runs_0008 (
   UNIQUE (job_id, scheduled_for, attempt)
 );
 
-INSERT INTO job_runs_0008 (job_id, scheduled_for, attempt, status, trigger, requested_by, queued_at,
-                           enqueued_at, started_at, finished_at, result_json, calls_used)
-SELECT j.id, r.started_at, 1, r.status,
+-- Old runs keep their ids. A run left 'running' by the old code has no executor any more: it is
+-- closed as an error (code 'abandoned') so the new sweep never re-sends or "takes over" it. Two old
+-- runs of one job with the same start time get attempts 1, 2, ... so the UNIQUE claim cannot fail.
+INSERT INTO job_runs_0008 (id, job_id, scheduled_for, attempt, status, trigger, requested_by, queued_at,
+                           enqueued_at, started_at, finished_at, result_json, error_code, calls_used)
+SELECT r.id, j.id, r.started_at,
+       ROW_NUMBER() OVER (PARTITION BY r.job_name, r.started_at ORDER BY r.id),
+       CASE r.status WHEN 'running' THEN 'error' ELSE r.status END,
        CASE r.trigger WHEN 'manual' THEN 'manual' ELSE 'schedule' END,
-       COALESCE(r.triggered_by, 'system'), r.started_at, r.started_at, r.started_at, r.finished_at,
-       CASE WHEN r.result_json IS NOT NULL AND json_valid(r.result_json) THEN r.result_json END,
+       COALESCE(r.triggered_by, 'system'), r.started_at, r.started_at, r.started_at,
+       CASE r.status WHEN 'running' THEN COALESCE(r.finished_at, r.started_at) ELSE r.finished_at END,
+       CASE WHEN r.status = 'running' THEN json_object('code', 'abandoned')
+            WHEN r.result_json IS NOT NULL AND json_valid(r.result_json) THEN r.result_json END,
+       CASE r.status WHEN 'running' THEN 'abandoned' END,
        r.calls_used
 FROM job_runs r JOIN jobs_0008 j ON j.name = r.job_name;
 

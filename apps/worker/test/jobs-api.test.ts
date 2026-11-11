@@ -41,6 +41,7 @@ interface JobView {
   scheduleText: string;
   enabled: boolean;
   exactBudget: number;
+  rev: string | null;
   nextRunAt: string | null;
   running: boolean;
   lastRun: { status: string; trigger: string } | null;
@@ -252,23 +253,38 @@ describe("PATCH /api/jobs/:id", () => {
 
   it("rejects a bad cron, a bad schedule shape, a bad time and unknown fields", async () => {
     const id = await jobId("exact.full_sync");
-    const cases: [unknown, string][] = [
-      [{ schedule: { kind: "cron", expr: "not a cron" } }, "cron_invalid"],
-      [{ schedule: { kind: "cron", expr: "61 * * * *" } }, "cron_invalid"],
-      [{ schedule: { kind: "cron", expr: "* * * *" } }, "cron_invalid"],
-      [{ schedule: { kind: "last_working_day", time: "25:00" } }, "time_invalid"],
-      [{ schedule: { kind: "weekly" } }, "schedule_invalid"],
-      [{ schedule: "0 2 * * *" }, "schedule_invalid"],
+    // Schedules: a stable code plus packages/core validateSchedule's own sentence.
+    const cases: [unknown, string, string?][] = [
+      [{ schedule: { kind: "cron", expr: "not a cron" } }, "schedule_invalid", "needs 5 fields"],
+      [
+        { schedule: { kind: "cron", expr: "61 * * * *" } },
+        "schedule_invalid",
+        "Invalid minute field: 61",
+      ],
+      [{ schedule: { kind: "cron", expr: "* * * *" } }, "schedule_invalid", "needs 5 fields"],
+      [{ schedule: { kind: "cron", expr: "0 0 31 2 *" } }, "schedule_invalid", "never fires"],
+      [
+        { schedule: { kind: "cron", expr: "0 9 25 12 *", workingDaysOnly: true } },
+        "schedule_invalid",
+        "never fires within 5 years",
+      ],
+      [{ schedule: { kind: "last_working_day", time: "25:00" } }, "schedule_invalid", "HH:mm"],
+      [{ schedule: { kind: "weekly" } }, "schedule_invalid", "Unknown schedule kind"],
+      [{ schedule: "0 2 * * *" }, "schedule_invalid", "must be an object"],
       [{ enabled: "yes" }, "invalid_enabled"],
       [{ timezone: "UTC" }, "invalid_body"],
       [{}, "invalid_body"],
+      [{ rev: null }, "invalid_body"],
+      [{ enabled: true, rev: 5 }, "invalid_body"],
       [[], "invalid_body"],
     ];
     const n = (await auditRows("job.update")).length;
-    for (const [body, error] of cases) {
+    for (const [body, error, message] of cases) {
       const res = await patch("admin", id, body);
       expect(res.status, JSON.stringify(body)).toBe(400);
-      expect(((await res.json()) as { error: string }).error, JSON.stringify(body)).toBe(error);
+      const out = (await res.json()) as { error: string; message?: string };
+      expect(out.error, JSON.stringify(body)).toBe(error);
+      if (message !== undefined) expect(out.message, JSON.stringify(body)).toContain(message);
     }
     expect(await auditRows("job.update")).toHaveLength(n);
     expect((await patch("admin", 99999, { enabled: true })).status).toBe(404);
@@ -300,6 +316,35 @@ describe("PATCH /api/jobs/:id", () => {
       kind: "last_working_day",
       time: "17:00",
     });
+  });
+
+  it("an edit from a stale page (old rev) is refused with 409 and writes nothing", async () => {
+    const id = await jobId("exact.full_sync");
+    const shown = byName(await list(), "exact.full_sync").rev as string | null;
+    expect((await patch("admin", id, { exactBudget: 150, rev: shown })).status).toBe(200);
+    const fresh = byName(await list(), "exact.full_sync").rev;
+    expect(fresh).not.toBe(shown);
+    const n = (await auditRows("job.update")).length;
+    const stale = await patch("admin", id, { exactBudget: 160, rev: shown });
+    expect(stale.status).toBe(409);
+    expect(((await stale.json()) as { error: string }).error).toBe("conflict");
+    expect(await auditRows("job.update")).toHaveLength(n);
+    expect(byName(await list(), "exact.full_sync").exactBudget).toBe(150);
+    expect((await patch("admin", id, { exactBudget: 160, rev: fresh })).status).toBe(200);
+  });
+
+  it("a budget-only edit keeps the baseline, so a due slot is still claimed and shown as next", async () => {
+    const id = await jobId("exact.incremental_sync");
+    // Baseline two hours ago: the :30 slot after it is in the past and due on the next tick.
+    const base = new Date(Date.now() - 2 * 3_600_000).toISOString();
+    await db.prepare("UPDATE jobs SET last_scheduled_at = ?2 WHERE id = ?1").bind(id, base).run();
+    expect((await patch("admin", id, { exactBudget: 50 })).status).toBe(200);
+    const row = await db
+      .prepare("SELECT last_scheduled_at, next_run_at FROM jobs WHERE id = ?1")
+      .bind(id)
+      .first<{ last_scheduled_at: string; next_run_at: string }>();
+    expect(row?.last_scheduled_at).toBe(base);
+    expect(Date.parse(row?.next_run_at ?? "")).toBeLessThanOrEqual(Date.now());
   });
 
   it("two concurrent edits cannot both win: the loser gets 409 and writes no audit row", async () => {

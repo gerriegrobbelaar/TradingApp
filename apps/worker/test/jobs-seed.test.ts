@@ -155,12 +155,34 @@ describe("migration 0008 on a populated database", () => {
         `INSERT INTO job_runs (job_name, started_at, status, trigger, triggered_by)
          VALUES ('nightly', '2026-01-03T01:00:00Z', 'running', 'manual', 'a@b.test')`,
       ),
+      // Two old runs of one job with the same start time (the UNIQUE claim must not reject them).
+      mdb.prepare(
+        `INSERT INTO job_runs (id, job_name, started_at, finished_at, status, trigger)
+         VALUES (40, 'odd', '2026-01-04T00:00:00Z', '2026-01-04T00:00:01Z', 'ok', 'cron')`,
+      ),
+      mdb.prepare(
+        `INSERT INTO job_runs (id, job_name, started_at, finished_at, status, trigger)
+         VALUES (41, 'odd', '2026-01-04T00:00:00Z', '2026-01-04T00:00:02Z', 'skipped', 'cron')`,
+      ),
       mdb.prepare(
         "INSERT INTO audit_log (actor_email, action, entity) VALUES ('system', 'before.0008', 'test')",
       ),
     ]);
 
+    const triggers = async () =>
+      (
+        await mdb
+          .prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name")
+          .all<{ name: string; sql: string }>()
+      ).results;
+    const triggersBefore = await triggers();
+    expect(triggersBefore.map((t) => t.name)).toEqual(
+      expect.arrayContaining(["audit_log_no_update", "audit_log_no_delete"]),
+    );
+
     await applyD1Migrations(mdb, all);
+    // Every trigger survives unchanged (append-only audit log, open item rules).
+    expect(await triggers()).toEqual(triggersBefore);
 
     const jobRows = (
       await mdb
@@ -192,12 +214,14 @@ describe("migration 0008 on a populated database", () => {
     const runs = (
       await mdb
         .prepare(
-          "SELECT job_id, scheduled_for, attempt, status, trigger, requested_by, calls_used, result_json FROM job_runs ORDER BY id",
+          "SELECT id, job_id, scheduled_for, attempt, status, trigger, requested_by, calls_used, result_json, error_code, finished_at FROM job_runs ORDER BY id",
         )
         .all<Record<string, unknown>>()
     ).results;
+    const oddId = jobRows[1]?.["id"] as number;
     expect(runs).toEqual([
       {
+        id: 1,
         job_id: nightlyId,
         scheduled_for: "2026-01-02T01:00:00Z",
         attempt: 1,
@@ -206,18 +230,58 @@ describe("migration 0008 on a populated database", () => {
         requested_by: "system",
         calls_used: 12,
         result_json: '{"rows":3}',
+        error_code: null,
+        finished_at: "2026-01-02T01:03:00Z",
       },
       {
+        // Left 'running' by the old code: closed, so the new sweep never re-sends it.
+        id: 2,
         job_id: nightlyId,
         scheduled_for: "2026-01-03T01:00:00Z",
         attempt: 1,
-        status: "running",
+        status: "error",
         trigger: "manual",
         requested_by: "a@b.test",
         calls_used: 0,
+        result_json: '{"code":"abandoned"}',
+        error_code: "abandoned",
+        finished_at: "2026-01-03T01:00:00Z",
+      },
+      {
+        id: 40,
+        job_id: oddId,
+        scheduled_for: "2026-01-04T00:00:00Z",
+        attempt: 1,
+        status: "ok",
+        trigger: "schedule",
+        requested_by: "system",
+        calls_used: 0,
         result_json: null,
+        error_code: null,
+        finished_at: "2026-01-04T00:00:01Z",
+      },
+      {
+        id: 41,
+        job_id: oddId,
+        scheduled_for: "2026-01-04T00:00:00Z",
+        attempt: 2,
+        status: "skipped",
+        trigger: "schedule",
+        requested_by: "system",
+        calls_used: 0,
+        result_json: null,
+        error_code: null,
+        finished_at: "2026-01-04T00:00:02Z",
       },
     ]);
+    // New runs continue after the copied ids.
+    const added = await mdb
+      .prepare(
+        "INSERT INTO job_runs (job_id, scheduled_for) VALUES (?1, '2026-02-01T00:00:00Z') RETURNING id",
+      )
+      .bind(nightlyId)
+      .first<{ id: number }>();
+    expect(added?.id).toBeGreaterThan(41);
 
     // Constraints are live on the new tables.
     expect((await mdb.prepare("PRAGMA foreign_key_check").all()).results).toEqual([]);

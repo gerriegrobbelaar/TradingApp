@@ -37,6 +37,7 @@ const job = (over: Partial<JobView> = {}): JobView => ({
   scheduleText: "Every day at 02:00",
   enabled: true,
   exactBudget: 240,
+  rev: "rev-1",
   nextRunAt: new Date(Date.now() + 3_600_000).toISOString(),
   running: false,
   lastRun: run({ id: 10 }),
@@ -146,6 +147,14 @@ describe("Settings, Schedules", () => {
     expect(alerts.map((a) => a.textContent).join(" ")).toContain("has not run yet");
     first.unmount();
 
+    // The Worker stores the stamp at most every 4 minutes: 7 minutes is still fine.
+    const recent = new Date(Date.now() - 7 * 60_000).toISOString();
+    mockFetch({ ...ME_OK(ADMIN), ...list(resp([job()], { lastTickAt: recent })) });
+    const second = renderApp("/settings/schedules");
+    await screen.findByText("Full sync from Exact");
+    expect(screen.queryByRole("alert")).toBeNull();
+    second.unmount();
+
     const old = new Date(Date.now() - 20 * 60_000).toISOString();
     mockFetch({ ...ME_OK(ADMIN), ...list(resp([job()], { lastTickAt: old })) });
     renderApp("/settings/schedules");
@@ -207,9 +216,30 @@ describe("Settings, Schedules", () => {
       await screen.findByText("Full sync from Exact");
       await user.click(screen.getByRole("switch", { name: "Full sync from Exact on" }));
       const patch = calls.find((c) => c.method === "PATCH");
-      expect(patch?.body).toEqual({ enabled: false });
+      expect(patch?.body).toEqual({ enabled: false, rev: "rev-1" });
       expect(patch?.headers["X-Requested-With"]).toBe("camelthorn");
       expect(await screen.findByText("Switched off Full sync from Exact.")).toBeTruthy();
+    });
+
+    it("a switch flipped on a stale page is refused (409) and says so, then reloads", async () => {
+      const calls = mockFetch({
+        ...ME_OK(ADMIN),
+        ...list(JOBS),
+        "PATCH /api/jobs/1": () => ({ status: 409, body: { error: "conflict" } }),
+      });
+      const user = userEvent.setup();
+      renderApp("/settings/schedules");
+      await screen.findByText("Full sync from Exact");
+      const before = calls.filter((c) => c.method === "GET" && c.url === "/api/jobs").length;
+      await user.click(screen.getByRole("switch", { name: "Full sync from Exact on" }));
+      expect(
+        await screen.findByText(
+          "Someone else changed Full sync from Exact first. Check the current values and try again.",
+        ),
+      ).toBeTruthy();
+      expect(calls.filter((c) => c.method === "GET" && c.url === "/api/jobs").length).toBe(
+        before + 1,
+      );
     });
 
     it("Run now starts a run, confirms, and holds the button for the cooldown", async () => {
@@ -352,8 +382,9 @@ describe("Settings, Schedules", () => {
       const input = within(dialog).getByLabelText("Cron expression") as HTMLInputElement;
       await user.clear(input);
       await user.type(input, "61 * * * *");
-      expect(within(dialog).getByRole("alert").textContent).toContain(
-        "not a valid cron expression",
+      // The sentence comes from packages/core validateSchedule.
+      expect(within(dialog).getByRole("alert").textContent).toBe(
+        "This schedule is not valid. Invalid minute field: 61.",
       );
       expect(
         (within(dialog).getByRole("button", { name: "Save schedule" }) as HTMLButtonElement)
@@ -403,6 +434,7 @@ describe("Settings, Schedules", () => {
       await user.click(within(dialog).getByRole("button", { name: "Save schedule" }));
       const patch = calls.find((c) => c.method === "PATCH");
       expect(patch?.body).toEqual({
+        rev: "rev-1",
         schedule: { kind: "cron", expr: "30 3 * * *", workingDaysOnly: true },
         exactBudget: 300,
       });
@@ -414,7 +446,10 @@ describe("Settings, Schedules", () => {
 
     it("rejects a budget above the cap before sending, and shows a server refusal", async () => {
       const { calls, user, dialog } = await openEditor({
-        "PATCH /api/jobs/1": () => ({ status: 400, body: { error: "cron_invalid" } }),
+        "PATCH /api/jobs/1": () => ({
+          status: 400,
+          body: { error: "schedule_invalid", message: "Schedule never fires within 5 years" },
+        }),
       });
       const budget = within(dialog).getByLabelText(/Exact calls per administration/);
       await user.clear(budget);
@@ -428,7 +463,9 @@ describe("Settings, Schedules", () => {
       await user.type(budget, "1000");
       await user.click(within(dialog).getByRole("button", { name: "Save schedule" }));
       expect(calls.filter((c) => c.method === "PATCH")).toHaveLength(1);
-      expect((await within(dialog).findByRole("alert")).textContent).toContain("not valid");
+      expect((await within(dialog).findByRole("alert")).textContent).toBe(
+        "This schedule is not valid. Schedule never fires within 5 years.",
+      );
     });
 
     it("has no budget field for a job that does not use Exact", async () => {

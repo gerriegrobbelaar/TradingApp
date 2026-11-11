@@ -16,7 +16,8 @@ export interface Lease {
   until: number;
 }
 
-export type AcquireResult = { ok: true; until: number } | { ok: false; heldUntil: number };
+export type AcquireResult =
+  { ok: true; until: number } | { ok: false; heldUntil: number; holder: string };
 
 const KEY = "lease";
 /** Longest TTL a caller may ask for; a bug cannot lock a job for ever. */
@@ -29,7 +30,8 @@ export class JobLock extends DurableObject<Env> {
   async acquire(holder: string, ttlMs: number): Promise<AcquireResult> {
     const now = Date.now();
     const cur = await this.ctx.storage.get<Lease>(KEY);
-    if (cur && cur.until > now && cur.holder !== holder) return { ok: false, heldUntil: cur.until };
+    if (cur && cur.until > now && cur.holder !== holder)
+      return { ok: false, heldUntil: cur.until, holder: cur.holder };
     const until = now + clampTtl(ttlMs);
     await this.ctx.storage.put<Lease>(KEY, { holder, until });
     return { ok: true, until };

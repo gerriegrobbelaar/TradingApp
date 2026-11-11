@@ -42,12 +42,15 @@ export class ApiError extends Error {
   readonly code: string;
   /** From a 429 `cooldown` answer: seconds until a new run is allowed. */
   readonly retryAfterSeconds: number | undefined;
-  constructor(status: number, code: string, retryAfterSeconds?: number) {
+  /** A sentence from the server for people (for example why a schedule is not valid). */
+  readonly detail: string | undefined;
+  constructor(status: number, code: string, retryAfterSeconds?: number, detail?: string) {
     super(code);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
     this.retryAfterSeconds = retryAfterSeconds;
+    this.detail = detail;
   }
 }
 
@@ -102,14 +105,21 @@ interface RequestOptions {
   notifyOn401?: boolean;
 }
 
-async function errorInfo(res: Response): Promise<{ code: string; retryAfterSeconds?: number }> {
+async function errorInfo(
+  res: Response,
+): Promise<{ code: string; retryAfterSeconds?: number; detail?: string }> {
   try {
     const v: unknown = await res.json();
     if (v && typeof v === "object" && "error" in v && typeof v.error === "string") {
       const wait = "retryAfterSeconds" in v ? v.retryAfterSeconds : undefined;
-      return typeof wait === "number" && Number.isFinite(wait) && wait > 0
-        ? { code: v.error, retryAfterSeconds: Math.ceil(wait) }
-        : { code: v.error };
+      const msg = "message" in v ? v.message : undefined;
+      return {
+        code: v.error,
+        ...(typeof wait === "number" && Number.isFinite(wait) && wait > 0
+          ? { retryAfterSeconds: Math.ceil(wait) }
+          : {}),
+        ...(typeof msg === "string" && msg.length > 0 ? { detail: msg.slice(0, 300) } : {}),
+      };
     }
   } catch {
     /* no JSON body */
@@ -139,7 +149,7 @@ export async function request<T>(path: string, opts: RequestOptions = {}): Promi
   }
   if (!res.ok) {
     const info = await errorInfo(res);
-    throw new ApiError(res.status, info.code, info.retryAfterSeconds);
+    throw new ApiError(res.status, info.code, info.retryAfterSeconds, info.detail);
   }
   return (await res.json()) as T;
 }
@@ -330,6 +340,8 @@ export interface JobView {
   enabled: boolean;
   /** Exact calls per administration and run (Exact jobs only). */
   exactBudget: number;
+  /** Optimistic concurrency token: send it back with patchJob. */
+  rev: string | null;
   nextRunAt: string | null;
   /** A run is queued or running. */
   running: boolean;
@@ -354,7 +366,7 @@ export const listJobRuns = (id: number, limit = 20) =>
   request<{ jobId: number; runs: JobRunView[] }>(`/api/jobs/${id}/runs?limit=${limit}`);
 export const patchJob = (
   id: number,
-  body: { enabled?: boolean; schedule?: Schedule; exactBudget?: number },
+  body: { enabled?: boolean; schedule?: Schedule; exactBudget?: number; rev?: string | null },
 ) => request<{ id: number; changed: boolean }>(`/api/jobs/${id}`, { method: "PATCH", body });
 export const runJobNow = (id: number) =>
   request<{ runId: number; status: "queued" }>(`/api/jobs/${id}/run`, { method: "POST" });

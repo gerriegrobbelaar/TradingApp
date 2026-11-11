@@ -98,6 +98,7 @@ export interface RunRow {
   started_at: string | null;
   finished_at: string | null;
   heartbeat_at: string | null;
+  runner_token: string | null;
   result_json: string | null;
   error_code: string | null;
   calls_used: number;

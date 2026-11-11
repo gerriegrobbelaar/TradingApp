@@ -61,6 +61,11 @@ export const RESULT_MAX_CHARS = 4000;
 const MAX_DELAY_SECONDS = 12 * 3600;
 export const RUN_RETENTION_DAYS = 90;
 export const LAST_TICK_KEY = "scheduler.last_tick";
+/**
+ * The tick stamp is rewritten at most this often (one D1 write per 4 minutes instead of every
+ * minute). The screen warns when it is older than 10 minutes (apps/web Schedules TICK_STALE_MS).
+ */
+export const TICK_STAMP_EVERY_MS = 4 * 60_000;
 
 /** Test seams and tuning. Production passes nothing. */
 export interface RunnerDeps {
@@ -97,6 +102,10 @@ const lockFor = (env: Pick<Env, "JOB_LOCK">, jobName: string) =>
 // Queue
 // ---------------------------------------------------------------------------------------------
 
+/** A queue delay in whole seconds, 0..12 h (the Queues maximum); NaN counts as 0. */
+export const boundedDelay = (s: number): number =>
+  Number.isFinite(s) ? Math.min(Math.max(Math.trunc(s), 0), MAX_DELAY_SECONDS) : 0;
+
 /** Sends a run to the queue. False (never throws) if the queue is missing or refuses. */
 export async function enqueueRun(
   env: Pick<Env, "JOBS_QUEUE">,
@@ -105,7 +114,7 @@ export async function enqueueRun(
   delaySeconds = 0,
 ): Promise<boolean> {
   try {
-    const delay = Math.min(Math.max(Math.trunc(delaySeconds), 0), MAX_DELAY_SECONDS);
+    const delay = boundedDelay(delaySeconds);
     await env.JOBS_QUEUE.send({ runId, jobId }, delay > 0 ? { delaySeconds: delay } : undefined);
     return true;
   } catch (e) {
@@ -127,13 +136,17 @@ export interface TickResult {
 export async function tickScheduler(env: Env, nowMs: number = Date.now()): Promise<TickResult> {
   const db = env.DB;
   const result: TickResult = { claimed: [], resent: 0, abandoned: 0 };
+  // Rate-limited heartbeat for the screen: the upsert only writes when the stored stamp is older
+  // than TICK_STAMP_EVERY_MS (or in the future, after a clock jump), so most ticks write nothing.
   await db
     .prepare(
       `INSERT INTO settings (key, value_json, updated_by)
        VALUES (?1, json_object('at', ?2), 'system')
-       ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, updated_at = ?2`,
+       ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, updated_at = ?2
+       WHERE COALESCE(json_extract(settings.value_json, '$.at'), '') < ?3
+          OR json_extract(settings.value_json, '$.at') > ?2`,
     )
-    .bind(LAST_TICK_KEY, iso(nowMs))
+    .bind(LAST_TICK_KEY, iso(nowMs), iso(nowMs - TICK_STAMP_EVERY_MS))
     .run()
     .catch(() => undefined);
 
@@ -416,19 +429,37 @@ export async function executeRun(
 
   const lock = lockFor(env, row.job_name);
   const ttl = deps.lockTtlMs ?? LOCK_TTL_MS;
+  /** Gives the row back exactly as it was before our claim (queued, or the previous executor's). */
+  const putBack = () =>
+    db
+      .prepare(
+        `UPDATE job_runs SET status = ?3, runner_token = ?4, started_at = ?5, heartbeat_at = ?6
+         WHERE id = ?1 AND runner_token = ?2 AND status = 'running'`,
+      )
+      .bind(
+        runId,
+        token,
+        row.status,
+        row.runner_token,
+        row.started_at,
+        row.status === "running" ? iso(clock()) : row.heartbeat_at,
+      )
+      .run();
   let got;
   try {
     got = await lock.acquire(token, ttl);
   } catch (e) {
     // The lock object is unreachable: put the run back and let the queue try again.
     console.error("job lock unavailable", e instanceof Error ? e.name : "unknown");
-    await db
-      .prepare(
-        "UPDATE job_runs SET status = 'queued', runner_token = NULL WHERE id = ?1 AND runner_token = ?2",
-      )
-      .bind(runId, token)
-      .run();
+    await putBack();
     return { kind: "retry", delaySeconds: 30 };
+  }
+  if (!got.ok && row.runner_token !== null && got.holder === row.runner_token) {
+    // We took over a run whose D1 heartbeat looked stale, but its executor still holds the lease:
+    // it is alive (only its D1 writes failed). Hand the run back to it and look again later, so
+    // its result is the one recorded and the run is not marked skipped while it is working.
+    await putBack();
+    return { kind: "retry", delaySeconds: BUSY_RETRY_SECONDS };
   }
   if (!got.ok) {
     return finish({
@@ -575,13 +606,22 @@ async function finishRun(
       .prepare(
         `INSERT INTO job_runs (job_id, scheduled_for, attempt, status, trigger, requested_by,
                                queued_at, enqueued_at, claim_token)
-         VALUES (?1, ?2, ?3, 'queued', 'retry', 'system', ?4, ?4, ?5)
+         VALUES (?1, ?2, ?3, 'queued', 'retry', 'system', ?4, ?5, ?6)
          ON CONFLICT (job_id, scheduled_for, attempt) DO NOTHING
          RETURNING id`,
       )
-      .bind(row.job_id, row.scheduled_for, row.attempt + 1, finished, crypto.randomUUID())
+      // enqueued_at is when the delayed message becomes visible, so the sweep (which re-sends runs
+      // untouched for SWEEP_AFTER_MS) does not race the delayed delivery with a duplicate.
+      .bind(
+        row.job_id,
+        row.scheduled_for,
+        row.attempt + 1,
+        finished,
+        iso(nowMs + boundedDelay(retry.delaySeconds) * 1000),
+        crypto.randomUUID(),
+      )
       .first<{ id: number }>();
-    if (ins) await enqueueRun(env, ins.id, row.job_id, retry.delaySeconds);
+    if (ins) await enqueueRun(env, ins.id, row.job_id, boundedDelay(retry.delaySeconds));
   }
   return ack(result.status);
 }

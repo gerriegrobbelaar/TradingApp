@@ -68,7 +68,8 @@ The Worker is both producer (the cron tick and "Run now") and consumer (`queue()
 `wrangler.toml` under `[[queues.producers]]` and `[[queues.consumers]]` (one run per invocation,
 3 retries, then the dead-letter queue). Messages in the dead-letter queue are runs that could not be
 started; the scheduler marks such a run as failed ("Never started") after about 20 minutes, so you
-only need to look there when a job keeps failing that way.
+only need to look there when a job keeps failing that way. A duplicate delivery for a run that is
+still working is also retried a few times and then lands there; that is harmless.
 
 ## 2. Create the Google OAuth client
 
@@ -96,7 +97,8 @@ In `apps/worker/wrangler.toml`:
   aware) which jobs are due and puts them on the queue. Change a schedule in the app, never the cron
   expression. Cron Triggers run on the deployed Worker only, never in `wrangler dev` unless started
   with `--test-scheduled`. Settings, Schedules shows a warning when the queue is missing or the tick
-  has not run for 5 minutes.
+  has not run for 10 minutes (the Worker stores the tick time at most every 4 minutes, to save D1
+  writes).
 
 Check nothing is left over, then commit:
 

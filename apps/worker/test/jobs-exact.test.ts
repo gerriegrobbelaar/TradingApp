@@ -1,3 +1,4 @@
+import { amsterdamParts, nextRun } from "@camelthorn/core";
 import { ExactApiError, ExactBudgetExhaustedError } from "@camelthorn/exact";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CREDENTIALS_REJECTED } from "../src/exact/gate";
@@ -11,6 +12,7 @@ import {
   SCHEDULED_WORST_CASE_CALLS_PER_DAY,
 } from "../src/jobs/exact-handlers";
 import { DEFAULT_JOBS } from "../src/jobs/defaults";
+import { HANDLERS } from "../src/jobs/handlers";
 import { callExact, divisionsOf } from "./job-helpers";
 import { FakeExact, addDivision, db, fakeGate, resetSync } from "./sync-helpers";
 
@@ -365,6 +367,38 @@ describe("Exact budget arithmetic (review G1, updated for jobs)", () => {
     expect(worst).toBeLessThanOrEqual(2000);
     // Exact allows 5,000 a day; at least 10 % of it stays for users and 1,000 for later jobs.
     expect(5000 - worst).toBeGreaterThanOrEqual(500 + 1000);
+  });
+
+  it("derives the worst case from the real schedules: fires per Amsterdam day over two years incl. DST", () => {
+    // Count every fire of each seeded Exact sync job per Amsterdam calendar day, 2026-2027, with
+    // the same nextRun the scheduler uses (H1 DST rule: a wildcard hour fires at every real clock
+    // mark, so the fall-back day has 25 hourly fires; a fixed hour fires once).
+    const maxPerDay = (name: string): number => {
+      const job = DEFAULT_JOBS.find((j) => j.name === name);
+      if (!job) throw new Error(name);
+      const perDay = new Map<string, number>();
+      let t = Date.parse("2025-12-31T23:00:00Z") - 1; // 00:00 Amsterdam, 1 January 2026
+      const end = Date.parse("2027-12-31T23:00:00Z");
+      for (;;) {
+        const n = nextRun(job.schedule, t);
+        if (n === null || n >= end) break;
+        const d = amsterdamParts(n).date;
+        perDay.set(d, (perDay.get(d) ?? 0) + 1);
+        t = n;
+      }
+      return Math.max(...perDay.values());
+    };
+    const fullFires = maxPerDay("exact.full_sync");
+    const incFires = maxPerDay("exact.incremental_sync");
+    expect(fullFires).toBe(1);
+    expect(incFires).toBe(MAX_INCREMENTAL_RUNS_PER_DAY);
+    const attempts = (key: string) => HANDLERS[key]?.maxAttempts ?? 0;
+    const budget = (n: string) => DEFAULT_JOBS.find((j) => j.name === n)?.exactBudget ?? 0;
+    const worst =
+      fullFires * attempts("exact.full_sync") * budget("exact.full_sync") +
+      incFires * attempts("exact.incremental_sync") * budget("exact.incremental_sync");
+    expect(worst).toBe(SCHEDULED_WORST_CASE_CALLS_PER_DAY);
+    expect(worst).toBe(1960);
   });
 
   it("the seeded jobs carry exactly those budgets", () => {

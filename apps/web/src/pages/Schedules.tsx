@@ -24,8 +24,11 @@ import { useSignedIn } from "../auth";
 import { ScheduleEditor, formatAmsterdam, type EditorValue } from "../components/ScheduleEditor";
 import { useToast } from "../toasts";
 
-/** The cron trigger ticks every minute; this long without a tick means it is not running. */
-const TICK_STALE_MS = 5 * 60_000;
+/**
+ * The cron trigger ticks every minute but stores its stamp at most every 4 minutes
+ * (TICK_STAMP_EVERY_MS in the Worker), so only a stamp older than this means it is not running.
+ */
+const TICK_STALE_MS = 10 * 60_000;
 /** How often the list refreshes while a job is running. */
 const POLL_MS = 5000;
 
@@ -126,15 +129,15 @@ function failureText(e: unknown, title: string): string {
       case "queue_not_configured":
         return "The job queue is not set up on the Worker, so nothing can run yet.";
       case "conflict":
-        return `Someone else changed ${title}. Reload and try again.`;
+        return `Someone else changed ${title} first. Check the current values and try again.`;
       case "budget_not_applicable":
         return `${title} does not use Exact calls.`;
       case "invalid_budget":
         return "Enter a whole number of Exact calls within the allowed range.";
-      case "cron_invalid":
-      case "time_invalid":
       case "schedule_invalid":
-        return "This schedule is not valid.";
+        return e.detail !== undefined
+          ? `This schedule is not valid. ${e.detail}.`.replace(/\.\.$/, ".")
+          : "This schedule is not valid.";
       default:
         if (e.status === 403) return "You do not have permission to do that.";
     }
@@ -187,7 +190,7 @@ export function Schedules() {
   async function toggle(job: JobView, enabled: boolean) {
     setBusyId(job.id);
     try {
-      await patchJob(job.id, { enabled });
+      await patchJob(job.id, { enabled, rev: job.rev });
       toast.show(enabled ? `Switched on ${job.title}.` : `Switched off ${job.title}.`);
       await load();
     } catch (e) {
@@ -465,7 +468,7 @@ function History({ job, now, onClose }: { job: JobView; now: number; onClose: ()
       {runs !== null && runs.length === 0 && <p className="lede">This job has not run yet.</p>}
       {runs !== null && runs.length > 0 && (
         <div className="scroll">
-          <table className="tbl">
+          <table className="tbl stacked">
             <caption className="sr-only">Runs of {job.title}</caption>
             <thead>
               <tr>
@@ -483,12 +486,14 @@ function History({ job, now, onClose }: { job: JobView; now: number; onClose: ()
                 return (
                   <tr key={r.id}>
                     <td>
+                      <span className="cell-label">Started</span>
                       <time dateTime={new Date(at).toISOString()}>
                         {stamp.format(new Date(at))}
                       </time>
                       <div className="lede">{formatAgo(now, at)}</div>
                     </td>
                     <td>
+                      <span className="cell-label">Result</span>
                       <Chip tone={chip.tone}>{chip.text}</Chip>
                       {why !== null && r.errorCode !== "not_implemented" && (
                         <div className="lede">{why}</div>
@@ -496,10 +501,12 @@ function History({ job, now, onClose }: { job: JobView; now: number; onClose: ()
                       {r.attempt > 1 && <div className="lede">Attempt {r.attempt}</div>}
                     </td>
                     <td>
+                      <span className="cell-label">Started by</span>
                       {TRIGGER[r.trigger]}
                       {r.trigger === "manual" && <div className="lede">{r.requestedBy}</div>}
                     </td>
                     <td>
+                      <span className="cell-label">Took</span>
                       {duration(r)}
                       {r.callsUsed > 0 && <div className="lede">{r.callsUsed} Exact calls</div>}
                     </td>
@@ -537,6 +544,7 @@ function Edit({
     setError(null);
     try {
       await patchJob(job.id, {
+        rev: job.rev,
         schedule: v.schedule,
         ...(job.usesExact && v.exactBudget !== job.exactBudget
           ? { exactBudget: v.exactBudget }

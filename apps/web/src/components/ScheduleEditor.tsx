@@ -68,13 +68,6 @@ export function scheduleFrom(d: Draft): unknown {
   }
 }
 
-const SCHEDULE_ERRORS: Record<string, string> = {
-  cron_invalid:
-    "This is not a valid cron expression. Use five fields: minute, hour, day of month, month and day of week.",
-  time_invalid: "Enter a time as hours and minutes.",
-  schedule_invalid: "This schedule is not valid.",
-};
-
 const fireTime = new Intl.DateTimeFormat("en-GB", {
   timeZone: "Europe/Amsterdam",
   weekday: "short",
@@ -139,9 +132,8 @@ export function ScheduleEditor({
     : Number.isInteger(budgetNumber) && budgetNumber >= 1 && budgetNumber <= maxBudget
       ? null
       : `Enter a whole number from 1 to ${maxBudget.toLocaleString("en-US")}.`;
-  const scheduleError = parsed.ok
-    ? null
-    : (SCHEDULE_ERRORS[parsed.error] ?? "This schedule is not valid.");
+  // packages/core validateSchedule says what is wrong in a sentence ("Invalid minute field: 61").
+  const scheduleError = parsed.ok ? null : `This schedule is not valid. ${parsed.error}.`;
   const showTime =
     draft.kind === "daily" || draft.kind === "working" || draft.kind === "lastWorking";
   const set = (patch: Partial<Draft>) => setDraft((d) => ({ ...d, ...patch }));
@@ -221,7 +213,7 @@ export function ScheduleEditor({
         <div aria-live="polite">
           <p className="lede">Next runs, Amsterdam time</p>
           {fires.length === 0 ? (
-            <p className="notice warn">This schedule never runs in the next year.</p>
+            <p className="notice warn">This schedule never runs in the next 5 years.</p>
           ) : (
             <ul className="fires">
               {fires.map((t) => (
