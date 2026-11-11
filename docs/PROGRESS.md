@@ -11,7 +11,7 @@ Orchestrator log. Update after every merge and every direct (trivial) edit.
 | 4 | Read-only screens | Done (K1-K4, K3a, K3b; review fixes M1 infra/staging/EU queues, M2 truthfulness + payment-safety gate merged). NOT verified against real Exact. Phase 9 must not enable Pay until the approval mapping is verified live (ADR 0025) |
 | 5 | Revolut connection | Done (R1-R3b, review fixes Q1-Q3 merged). NOT verified against real Revolut. Jobs revolut.sync / revolut.backfill ship DISABLED. Revolut is optional for a first deploy |
 | 6 | ECB FX | Done (F1-F3, review fixes T1 booked amount/rate tables/rate conflicts, T2 error boundaries/wording/stale handling). ecb.fx_import ON by default. Unrealised difference is dormant until the Exact booked-amount source is verified live (ADR 0038, DEPLOY.md item 17). Decision 4 still open |
-| 7 | Matching | In progress: M7a (matching engine in core) and M7e (Exact bank-entry/MatchSet payload builders) first; then worker (suggestions, auto-match with undo, booking outbox) and review-queue UI. Exact writes stay DISABLED by default until verified live |
+| 7 | Matching | Built and merged (M7a engine, M7b worker, M7c gated booking, M7d UI, M7e payload builders); final review done (docs/reviews/phase-7-review.md): B1/B2 in the booking path + S1–S10 being fixed (U1 booking, U2 matching safety, U3 web/docs/tests). Booking and automatic matching are OFF by default; NOT verified against real Exact |
 | 8 | Data quality | Not started. Also owns the `exact.bank_balances` job (ING/Rabobank balances from Exact, needed for the rule 'Exact balance differs from bank balance'; review S12). Its handler is not built; the job stays off |
 | 9 | Payments | Not started |
 | 10 | Reminders and resend emails | Not started |
@@ -56,3 +56,4 @@ Oldest first. Within a day, entries follow the order the work landed.
 Answered: 7 (Workers only), 8 (domain only). Unanswered: 1-6 (needed from Phase 2 onward). Record answers as ADRs in `docs/decisions/`.
 - 2026-11-11: Phase 6 F1, F2, F3 merged with reviewer PASS; Phase 6 final review: docs/reviews/phase-6-review.md. Direct edits: relaxed wall-clock bounds in ecb.adversarial tests; added the ECB section to docs/DEPLOY.md.
 - 2026-11-11: Phase 6 final review + fixes T1/T2 merged; full suite green (ui 252, core 680, exact 162, revolut 151, web 1017, worker 1468). Phase 7 started.
+- 2026-11-11: Phase 7 M7a–M7e merged with reviewer PASS (full suite: ui 257, core 792, exact 258, revolut 151, web 1272, worker 1813). Phase 7 final review found B1/B2 (booking path) and S1–S10; fix tasks U1–U3 started. Defaults chosen: incoming payments from an unknown IBAN go to review; Revolut lines with a fee are refused for booking in v1.
