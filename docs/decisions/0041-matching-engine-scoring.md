@@ -103,3 +103,38 @@ references that are not exact, reverted transactions after a match (Phase 8), ma
 Raise `autoMatchMinGap` or `blockAutoOnRecentIbanChangeDays` to be stricter. Keep `amountToleranceMinor` at 0 unless
 there is a known rounding source; it never makes anything automatic. Change weights only in `scores.ts`, then paste
 `renderScoreTable()` here; keep partial (88) and inexact (cap 90) below 95 so they can never qualify.
+
+## Addendum: phase 7 final review (U2, S3, S4 and the incoming-IBAN policy)
+- **Floors (S3).** CLAUDE.md 4.2 says the next candidate must be "far behind". `validateMatchConfig` now requires
+  `autoMatchMinGap` >= 10 and `blockAutoOnRecentIbanChangeDays` >= 30 (`MIN_AUTO_GAP`, `MIN_RECENT_IBAN_DAYS`). A stored
+  configuration below a floor is invalid: the `bank.match` job fails closed with `matching_config_invalid`, the settings
+  screen shows the problems (`configErrors`), and nothing is repaired silently.
+- **Loosening needs the phrase again (S3).** `isLoosening(prev, next)` (core, pure) is true when automatic matching may do
+  more: lower `autoMatchMinScore`, `autoMatchMinGap` or `blockAutoOnRecentIbanChangeDays`, `autoLedgerPatterns` or
+  `autoIncomingUnknownIban` switched on, a higher `amountToleranceMinor`, a new entry in `autoTxTypes`, an entry removed
+  from `noMatchTxTypes`, `internalAccountTypes` or `ownIbans`, or (while `autoLedgerPatterns` is on) a ledger pattern that
+  was not there before in exactly this form. Every `MatchConfig` field is classified in `MATCH_CONFIG_FIELD_SAFETY`
+  (`auto_safety` or `neutral`; a new field is a type error and a test failure until classified). `suggestMinScore` and
+  `maxCandidates` are neutral: the engine now takes the runner-up for the gap rule from EVERY candidate, shown or not
+  (before, raising `suggestMinScore` could hide a close second and make a match automatic). `PUT /api/matching/config` requires `ENABLE AUTOMATIC MATCHING` for such a change while
+  `matching.auto_enabled` is on and stays on in the same request (a stored invalid config counts as "unknown": any change needs
+  it). Tightening and unrelated changes never need it; with auto off nothing needs it, because switching auto on needs it.
+  The same applies to `POST/PUT /api/matching/patterns` while auto and `autoLedgerPatterns` are both on (new or re-enabled
+  pattern, or a changed match field; renaming, disabling and deleting never need it). The web does not prompt for the phrase
+  on these saves yet: it shows the error, and the admin switches auto off, saves, and switches it on again (follow-up).
+- **Concurrent saves.** The matching settings carry a revision (`matching.rev`, in the GET response as `rev`). Every PUT
+  writes only while the revision is the one it read (one D1 batch, every statement conditional on the new revision), so a
+  loosening checked while auto was off cannot land after a concurrent switch-on (409 `conflict`). A client may send `rev`
+  to get 409 instead of overwriting a change it has not seen. Switching auto off always wins and moves the revision.
+- **Incoming payment from an unknown IBAN (decided default: review).** `MatchConfig.autoIncomingUnknownIban` (default
+  false). When false, an incoming payment matched to a receivable whose counterparty IBAN is missing or not among the
+  customer's known IBANs gets the block `iban_unknown_for_customer`: it is never automatic, but stays a high-scoring review
+  candidate (scores are unchanged; `scores.ts` is still the single source and the table above is unchanged). When true the
+  earlier behaviour applies (the IBAN is only a bonus for rule 1). The mirror image for payables is the older
+  `iban_not_known_for_supplier`. The block applies to every receivable candidate, so a refund paid OUT on a customer credit
+  note to an unknown account is review only too; a customer with no known IBAN at all (new customer) is always review.
+- **Fresh open items (S4).** The worker (not the engine) also requires, per division and per item kind, that the last complete
+  open-items pass (`sync_state` `receivables` / `payables`, `last_completed_at`, which is only set when a pass ended ok) is less
+  than 26 hours old (`OPEN_ITEMS_MAX_AGE_MS`). Otherwise, or when no pass ever completed (Exact sync jobs off), the decision
+  is review only with the skip code `open_items_stale` (counted in the run summary, `skipped_by_reason`); the candidate is
+  still suggested. Exactly 26 hours is stale.

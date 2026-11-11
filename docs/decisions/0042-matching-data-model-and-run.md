@@ -84,3 +84,35 @@ Exact (for example booked and synced after the booking) in the trigger, the asse
 ## What M7c adds
 Done in M7c (ADR 0044): booking outbox, `exact_state` transitions, retry and idempotency keys, and the allocation settlement rule that fixes the double count noted under "Undo window". Reversal stays manual (409 `already_booked_in_exact`, detail `reversal_required_in_exact`).
 Not done here: auto-ignore of internal transfers (they stay unmatched until a person ignores them), FX matches, group UI.
+
+## Addendum: settlement rule v2 (phase 7 final review S5, migration 0025)
+The rule of ADR 0044 ("released once the item was re-read after `booked_at`") trusted that Exact's list read reflects a MatchSet
+as soon as the read starts after booking. If it lags, the item reappears fully open and the same money could be allocated again.
+New rule, ONE predicate (`SETTLEMENT_PREDICATE` in `apps/worker/src/matching/settlement.ts`, copied verbatim into the migration;
+`allocCounts(m, oi, a)` rewrites only its aliases): an allocation of a live match counts, EXCEPT when the match is
+`matched_in_exact`, `booked_at < open_items.synced_at`, the baseline `match_allocations.open_before_minor` is known, AND the item
+is closed or has no balance or `ABS(open_before_minor) - ABS(open_minor)` is at least the SUM of the allocated amounts of every
+booked allocation on the same item that could hide in that decrease: booked no later than this one (`booked_at`, then
+allocation id) with a baseline no higher than this one's (aggregate rule, review U2). Anything else keeps counting: a lagging
+read, a partial decrease, an unknown (NULL) baseline, a balance that rose after the booking (credit note reversed, correction). Nothing is released by a timeout. After 48 hours past
+`booked_at` a still-counting booked allocation is a data-quality signal: `staleSettlements(db, nowIso)` and
+`GET /api/matching/stats` `staleSettlements` (Phase 8 raises the issue; a person reviews it).
+- `open_before_minor` is Exact's signed open balance when the match is created (`applyMatch` writes it in the same batch), and
+  again AT THE CLAIM: trigger `matches_settlement_baseline` (BEFORE UPDATE OF exact_state, not_booked -> anything) refreshes
+  every allocation of the match to the balance of the last read, in the claim statement itself, so no booking path can forget
+  it and a payment booked elsewhere while the match waited cannot later pass for our MatchSet. D1 counts those trigger rows
+  in `meta.changes`, so the claim callers test `changes >= 1` (the UPDATE targets one id). `recordOpenBefore(db, matchId)`
+  stays for an explicit refresh before the claim; after the claim it throws (`match_err:immutable`, trigger
+  `match_allocations_guard_open_before`). Rows that existed at migration time have NULL = unknown until their claim sets it;
+  a match booked before 0025 (only possible on a test division) keeps counting and is reported stale after 48 h.
+- The remaining allocation fields stay immutable (`match_allocations_guard_update` now lists its columns, `id` included).
+- Why the sum: two booked allocations A and B of 100 on an item of 300 (both baselines 300) and one re-read showing 200. One
+  by one, both would be released and 100 could be allocated twice; with the sum A (booked first) is released and B keeps
+  counting, so free = 100, exactly what is free once B shows. Known limit: a payment booked in Exact by someone else between
+  the claim and the re-read looks like our MatchSet (balance evidence cannot tell them apart).
+- **Trigger pinning (N5).** `apps/worker/test/fixtures/trigger-hashes.json` lists every trigger after all migrations with the
+  sha-256 of its whitespace-normalised body; `migrations-all.test.ts` compares the exact list and each hash. Rule: any
+  migration that rebuilds a guarded table must recreate its triggers and update the fixture deliberately with
+  `pnpm --filter @camelthorn/worker run triggers:update`, reviewing the diff.
+- Migration 0025 also lets the outbox immutability trigger accept one change to a finished row: replacing `payload_json` by its
+  redacted form computed from the old payload, every other column unchanged (ADR 0011).

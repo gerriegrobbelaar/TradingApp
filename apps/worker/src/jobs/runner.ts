@@ -36,6 +36,7 @@ import { getEuObject } from "../eu-object";
 import { isTransientFailure, type SyncDeps } from "../exact/sync";
 import { EVENT_MAX_ATTEMPTS, processRevolutEvent, type EventDeps } from "../revolut/events";
 import { HOUSEKEEPING_MINUTE, housekeepWebhookEvents } from "../revolut/webhook-housekeeping";
+import { redactOldOutboxPayloads } from "../matching/housekeeping";
 import { handlerFor } from "./handlers";
 import { HEARTBEAT_MS } from "./overhead";
 import { latenessMs } from "./period";
@@ -188,6 +189,12 @@ export async function tickScheduler(env: Env, nowMs: number = Date.now()): Promi
     await housekeepWebhookEvents(env, nowMs).catch((e: unknown) =>
       console.error("webhook housekeeping failed", e instanceof Error ? e.name : "unknown"),
     );
+    // Booking outbox payloads older than 400 days (ADR 0011): hourly, bounded to 200 rows.
+    if (Math.floor(nowMs / 60_000) % 60 === HOUSEKEEPING_MINUTE) {
+      await redactOldOutboxPayloads(env.DB, nowMs).catch((e: unknown) =>
+        console.error("outbox retention failed", e instanceof Error ? e.name : "unknown"),
+      );
+    }
   }
   return result;
 }

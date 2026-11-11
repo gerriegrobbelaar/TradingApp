@@ -292,6 +292,10 @@ function itemBlocks(ctx: Ctx, infos: Info[]): string[] {
     if (!info.sameCur) out.add("currency_mismatch");
     if (info.ref !== null && info.ref !== "exact") out.add("reference_not_exact");
     if (info.otherRelIban) out.add("iban_belongs_to_other_relation");
+    if (it.kind === "receivable" && !cfg.autoIncomingUnknownIban) {
+      // Money in from an account we do not know for this customer: a person checks it.
+      if (ctx.txIban === null || !info.ibanHit) out.add("iban_unknown_for_customer");
+    }
     if (it.kind === "payable") {
       // Paying out to a supplier: the account must be one we know for that supplier.
       if (ctx.txIban === null || !info.ibanHit) out.add("iban_not_known_for_supplier");
@@ -661,7 +665,10 @@ function matchOne(
 
   all.push(...patternCandidates(ctx));
 
-  const ranked = all.filter((c) => c.score >= cfg.suggestMinScore).sort(compareCandidates);
+  // The runner-up for the gap rule comes from EVERY candidate, not only those shown (review U2):
+  // otherwise raising suggestMinScore would hide a close second and make a match automatic.
+  const everything = [...all].sort(compareCandidates);
+  const ranked = everything.filter((c) => c.score >= cfg.suggestMinScore);
   const top = ranked[0];
   if (!top) return none(tx, "No open item or ledger pattern fits this transaction");
 
@@ -675,7 +682,7 @@ function matchOne(
   // or amount only) carry strictly less evidence and do not count for the gap: a customer paying
   // one of several equal monthly invoices and naming it exactly is not ambiguous.
   const exactTop = top.rule === 1 && top.referenceLevel === "exact";
-  const second = ranked.find((c, i) => i > 0 && !(exactTop && (c.rule === 2 || c.rule === 3)));
+  const second = everything.find((c) => c !== top && !(exactTop && (c.rule === 2 || c.rule === 3)));
   ranked.forEach((c, i) => {
     const b = new Set(c.blockedReasons);
     const covered = new Set(c.allocations.map((a) => a.itemId));

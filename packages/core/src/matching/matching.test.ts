@@ -62,7 +62,8 @@ function item(over: Partial<MatchItem> = {}): MatchItem {
   };
 }
 
-const cfg = DEFAULT_MATCH_CONFIG;
+// Legacy behaviour for the older tests; the default policy has its own tests below.
+const cfg: MatchConfig = { ...DEFAULT_MATCH_CONFIG, autoIncomingUnknownIban: true };
 
 describe("normaliseReference", () => {
   it("uppercases and strips punctuation", () => {
@@ -635,7 +636,7 @@ describe("auto-match block conditions", () => {
     expect(
       matchTransaction(good(), [item({ relationIbanAddedAt: "2026-05-01" })], cfg).decision,
     ).toBe("auto");
-    const tight = { ...cfg, blockAutoOnRecentIbanChangeDays: 5 };
+    const tight = { ...cfg, blockAutoOnRecentIbanChangeDays: 30 };
     expect(
       matchTransaction(t, [item({ ...base, relationIbanAddedAt: "2026-04-01" })], tight).decision,
     ).toBe("auto");

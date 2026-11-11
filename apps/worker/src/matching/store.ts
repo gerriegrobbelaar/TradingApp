@@ -9,6 +9,7 @@
  * racing (two job runs, the job against a person) end with exactly one match.
  */
 import { auditStatement, LAST_INSERT_ID } from "../db/audit";
+import { allocCounts } from "./settlement";
 
 export const MATCH_ENGINE_VERSION = "m7-1";
 
@@ -142,9 +143,10 @@ export async function applyMatch(db: D1Database, m: ApplyMatchInput): Promise<Ap
     ...m.allocations.map((a) =>
       db
         .prepare(
-          `INSERT INTO match_allocations (match_id, open_item_id, allocated_minor, currency, remaining_minor_after)
+          `INSERT INTO match_allocations (match_id, open_item_id, allocated_minor, currency, remaining_minor_after,
+                                        open_before_minor)
            VALUES ((SELECT id FROM matches WHERE bank_transaction_id = ?1 AND undone_at IS NULL),
-                   ?2, ?3, ?4, ?5)`,
+                   ?2, ?3, ?4, ?5, (SELECT oi.open_minor FROM open_items oi WHERE oi.id = ?2))`,
         )
         .bind(m.txId, a.openItemId, a.allocatedMinor, m.currency, a.remainingAfter),
     ),
@@ -404,17 +406,8 @@ export function suggestionStatements(
   ];
 }
 
-/**
- * SQL predicate (ADR 0044): the allocations of match `m` still count against the open balance of
- * item `oi`. A live match counts, EXCEPT a match booked in Exact (`matched_in_exact`) once the item
- * was re-read from Exact AFTER the booking (`synced_at > booked_at`): from then on Exact's own
- * open_minor already reflects the payment, so counting it again would be a double count. The sync
- * takes its `synced_at` stamp BEFORE it reads, so `synced_at > booked_at` means the read started
- * after the MatchSet was verified. Until then the allocation keeps counting, so there is no window
- * in which the item can be allocated twice. Same text as the trigger in migration 0023.
- */
-export const allocCounts = (m: string, oi: string): string =>
-  `${m}.undone_at IS NULL AND NOT (${m}.exact_state = 'matched_in_exact' AND ${m}.booked_at IS NOT NULL AND ${m}.booked_at < ${oi}.synced_at)`;
+// The settlement predicate lives in ONE place (settlement.ts, ADR 0042 addendum).
+export { allocCounts } from "./settlement";
 
 export type ReviewReason = "over_allocated" | "item_closed" | "tx_state_conflict" | "tx_changed";
 
@@ -449,7 +442,7 @@ export async function flagMatchesForReview(db: D1Database, nowIso: string): Prom
                          WHERE a.match_id = matches.id
                            AND (SELECT SUM(a2.allocated_minor) FROM match_allocations a2
                                   JOIN matches m2 ON m2.id = a2.match_id
-                                 WHERE a2.open_item_id = a.open_item_id AND ${allocCounts("m2", "oi")})
+                                 WHERE a2.open_item_id = a.open_item_id AND ${allocCounts("m2", "oi", "a2")})
                                > ABS(oi.open_minor)) THEN 'over_allocated'
          END)
        WHERE undone_at IS NULL AND exact_state = 'not_booked' AND review_reason IS NULL
@@ -461,7 +454,7 @@ export async function flagMatchesForReview(db: D1Database, nowIso: string): Prom
                             AND (oi.status <> 'open' OR oi.open_minor = 0
                                  OR (SELECT SUM(a2.allocated_minor) FROM match_allocations a2
                                        JOIN matches m2 ON m2.id = a2.match_id
-                                      WHERE a2.open_item_id = a.open_item_id AND ${allocCounts("m2", "oi")})
+                                      WHERE a2.open_item_id = a.open_item_id AND ${allocCounts("m2", "oi", "a2")})
                                     > ABS(oi.open_minor))))`,
     )
     .bind(nowIso)
@@ -480,7 +473,9 @@ export async function claimMatchForBooking(
   nextState: string,
 ): Promise<boolean> {
   const out = await claimStatement(db, matchId, nextState).run();
-  return (out.meta.changes ?? 0) === 1;
+  // `>= 1`: D1 also counts the allocation rows the claim trigger refreshes (the settlement baseline,
+  // migration 0025); the UPDATE targets one id, so any change means this caller won.
+  return (out.meta.changes ?? 0) >= 1;
 }
 
 /**

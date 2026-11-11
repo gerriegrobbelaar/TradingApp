@@ -27,7 +27,8 @@ import {
   type MatchTx,
 } from "./index";
 
-const cfg = DEFAULT_MATCH_CONFIG;
+// Legacy behaviour for the older tests; the default policy has its own tests below.
+const cfg: MatchConfig = { ...DEFAULT_MATCH_CONFIG, autoIncomingUnknownIban: true };
 
 // ---------------------------------------------------------------- seeded generators
 
@@ -1047,6 +1048,9 @@ describe("config validation and regex safety", () => {
       { autoMatchMinScore: Number.NaN },
       { autoMatchMinScore: 97.5 },
       { autoMatchMinGap: 0 },
+      { autoMatchMinGap: 9 },
+      { blockAutoOnRecentIbanChangeDays: 29 },
+      { blockAutoOnRecentIbanChangeDays: 0 },
       { autoMatchMinGap: -1 },
       { suggestMinScore: 0 },
       { suggestMinScore: 99, autoMatchMinScore: 95 },
