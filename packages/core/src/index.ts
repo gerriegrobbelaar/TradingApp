@@ -20,3 +20,5 @@ export * from "./bank-tx";
 export * from "./decimal";
 export * from "./fx";
 export * from "./ecb";
+
+export * from "./matching";
