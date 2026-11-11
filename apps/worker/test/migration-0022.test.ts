@@ -104,6 +104,8 @@ describe("migration 0022 on a populated database", () => {
       Object.fromEntries(Object.entries(r).filter(([k]) => k !== "match_status"));
     expect(txAfter.map(strip).map(noStatus)).toEqual(txBefore.map(noStatus));
     // The converted data passes the consistency check once the first run has flagged what changed.
+    // The review flags use columns of the later migration (0023, booked_at): apply the rest first.
+    await applyD1Migrations(mdb, all);
     await flagMatchesForReview(mdb, "2026-07-04T00:00:00.000Z");
     expect(await checkMatchingInvariants(mdb)).toEqual([]);
     expect(

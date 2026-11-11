@@ -75,6 +75,8 @@ export const EXACT_WRITE_NAMES = {
       "Description",
       "AmountFC",
     ],
+    /** Fields of the latest-entry read that gives the next entry's opening balance (A12, VERIFY). */
+    bankEntryBalanceFields: ["EntryNumber", "JournalCode", "ClosingBalanceFC", "Currency"],
     openItemFields: [
       "ID",
       "Account",
@@ -283,6 +285,69 @@ export function findExistingBankEntryQuery(args: {
       $select: EXACT_WRITE_NAMES.rest.lineProbeFields.join(","),
     },
   };
+}
+
+/**
+ * Probe for a bank line that ANOTHER system created (Revolut's own Exact feed, ADR 0040 / M7c): the
+ * journal, the exact signed amount and a date window. Several hits are ambiguous (the booker stops
+ * for a person). VERIFY (A13): that `Date` is filterable with `datetime'..'` and that the feed
+ * leaves the line in the journal we mapped.
+ */
+export function findBankLineByAmountQuery(args: {
+  journalCode: string;
+  amountMinor: number;
+  currency: string;
+  /** YYYY-MM-DD, inclusive. */
+  dateFrom: string;
+  dateTo: string;
+}): BankEntryProbe {
+  if (!CODE_RE.test(args.journalCode)) throw new RangeError("invalid journal code");
+  if (!CCY_RE.test(args.currency)) throw new RangeError("invalid currency");
+  if (!Number.isSafeInteger(args.amountMinor) || args.amountMinor === 0)
+    throw new RangeError("invalid amount");
+  if (!validDate(args.dateFrom) || !validDate(args.dateTo) || args.dateFrom > args.dateTo)
+    throw new RangeError("invalid date window");
+  const amount = formatMinor(args.amountMinor, currencyScale(args.currency));
+  return {
+    path: EXACT_WRITE_NAMES.rest.bankEntryLinePath,
+    query: {
+      $filter:
+        `JournalCode eq ${odataLiteral(args.journalCode)} and AmountFC eq ${amount}` +
+        ` and Date ge datetime'${args.dateFrom}T00:00:00' and Date le datetime'${args.dateTo}T23:59:59'`,
+      $select: EXACT_WRITE_NAMES.rest.lineProbeFields.join(","),
+      $top: "5",
+    },
+  };
+}
+
+/** The latest bank entry of a journal: its closing balance is the next entry's opening balance. */
+export function latestBankEntryQuery(journalCode: string): BankEntryProbe {
+  if (!CODE_RE.test(journalCode)) throw new RangeError("invalid journal code");
+  return {
+    path: EXACT_WRITE_NAMES.rest.bankEntryPath,
+    query: {
+      $filter: `JournalCode eq ${odataLiteral(journalCode)}`,
+      $select: EXACT_WRITE_NAMES.rest.bankEntryBalanceFields.join(","),
+      $orderby: "EntryNumber desc",
+      $top: "1",
+    },
+  };
+}
+
+/**
+ * Closing balance of the latest entry (minor units), or null when it cannot be determined: no
+ * entry, a currency other than `currency`, an unreadable amount. Never guesses zero.
+ */
+export function parseLatestClosingBalance(rows: readonly Row[], currency: string): number | null {
+  if (rows.length !== 1) return null;
+  const r = rows[0] as Row;
+  try {
+    const ccy = trimField(r, "Currency")?.toUpperCase();
+    if (ccy !== currency) return null;
+    return minorField(r, "ClosingBalanceFC", currency);
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -877,3 +942,84 @@ export function mapOpenItemLineRow(r: Row): OpenItemLineRow {
     isFullyPaid: boolField(r, "IsFullyPaid"),
   };
 }
+
+// ---------------------------------------------------------------------------------------------
+// Booking protocol version (M7c)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Descriptions of the builder rules that the sample outputs below cannot show on their own. Change
+ * a string (or anything in EXACT_WRITE_NAMES, BANK_ENTRY_SIGN or a builder) and
+ * BOOKING_PROTOCOL_VERSION changes, which invalidates the stored "write path verified" mark: an
+ * admin must verify again on a test division (ADR 0043).
+ */
+export const WRITE_BUILDER_RULES = {
+  bankEntry: "bank-entry/v1",
+  matchSet: "matchset/v1",
+  matching: "full-match-zero-sum-v1",
+  descriptionMax: DESCRIPTION_MAX,
+  yourRefMax: YOUR_REF_MAX,
+  writer: "writer/v1:no-retry,probe-before-post,xml-text/xml-utf8",
+  readBack: "read-back/v1:verified|not_applied|inconclusive",
+  probe: "probe/v1:yourref+journal,amount+date-window",
+} as const;
+
+function protocolCanonical(): string {
+  // A fixed sample through BOTH builders: any change of field names, number formatting, escaping,
+  // sorting, sanitising or checks shows up in the output and therefore in the version.
+  const g1 = "11111111-2222-3333-4444-555555555555";
+  const g2 = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const key = bankEntryIdempotencyKey("c", "tx-sample", "main");
+  const entry = buildBankEntryPayload({
+    division: 1,
+    journalCode: "90",
+    entryDate: "2026-01-31",
+    currency: "EUR",
+    openingBalanceMinor: 100_000,
+    closingBalanceMinor: 112_345,
+    idempotencyKey: key,
+    financialYear: 2026,
+    financialPeriod: 1,
+    divisionCurrency: "EUR",
+    lines: [
+      {
+        amountMinor: 12_345,
+        description: "Café <&> NL91 ABNA 0417 1643 00 \u0007 x",
+        glAccountId: g1,
+        accountId: g2,
+        ourRef: 2026001,
+        bankTransactionExternalId: "tx-sample",
+      },
+    ],
+  });
+  const set = buildMatchSetXml({
+    division: 1,
+    glAccountCode: "1300",
+    relationCode: "R 1",
+    currency: "EUR",
+    reference: "Match <sample> & more",
+    lines: [
+      { entryNumber: 20, currency: "EUR", amountMinor: 12_345 },
+      { transactionLineId: g1, currency: "EUR", amountMinor: -12_345 },
+    ],
+  });
+  return JSON.stringify([
+    EXACT_WRITE_NAMES,
+    BANK_ENTRY_SIGN,
+    WRITE_BUILDER_RULES,
+    entry.ok ? [entry.body, entry.headers, entry.yourRefs] : entry.error,
+    set.ok ? [set.xml, set.topic] : set.error,
+    bankLineShortRef("tx-sample"),
+  ]);
+}
+
+/**
+ * sha256 of the canonical description of everything that decides what we send to Exact. Computed
+ * from code, so ANY change invalidates a stored verification (same idea as the approval-mapping
+ * hash in packages/core).
+ */
+export function computeBookingProtocolVersion(): string {
+  return sha256Hex(protocolCanonical());
+}
+
+export const BOOKING_PROTOCOL_VERSION: string = computeBookingProtocolVersion();

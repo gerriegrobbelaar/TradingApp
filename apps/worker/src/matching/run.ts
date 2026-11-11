@@ -134,6 +134,7 @@ const SKIP_BY_CODE: Record<MatchErrCode, string> = {
   tx_frozen: "lost_race",
   status_mismatch: "lost_race",
   has_live_matches: "other",
+  bad_transition: "other",
 };
 
 /**

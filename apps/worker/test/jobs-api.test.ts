@@ -103,6 +103,7 @@ describe("GET /api/jobs", () => {
       "reminders.send",
       "exact.full_sync",
       "exact.incremental_sync",
+      "exact.book_matches",
       "fx.revaluation",
     ]);
     const full = byName(body, "exact.full_sync");

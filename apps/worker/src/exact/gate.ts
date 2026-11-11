@@ -21,6 +21,7 @@ import {
   ExactAuthError,
   ExactBudgetExhaustedError,
   ExactRateLimitedError,
+  ExactWriteAuthRetryRefused,
   JOB_ID_RE,
   parseRateLimitHeaders,
   retryAfterFromHeaders,
@@ -33,6 +34,7 @@ import { loadExactConfig } from "./config";
 import { getExactGate } from "./gate-transport";
 import { refreshTokens, TokenEndpointError } from "./oauth";
 import { buildUrl, validateRequest } from "./request";
+import { allowedReadShape, isWrite, refuseWrite } from "./write-policy";
 import {
   aad,
   loadConnectionById,
@@ -267,6 +269,9 @@ export class ExactGate extends DurableObject<Env> {
 
   async request(req: ExactRequest): Promise<ExactResponse> {
     validateRequest(req);
+    // Defence in depth (ADR 0043): the gate refuses every write except the two booking writes, and
+    // those only while the fail-closed switch and the verification mark say so, read from D1 NOW.
+    await this.assertMethodAllowed(req);
     if (!(await this.claimRole(`division:${req.division}`))) {
       throw new ExactApiError(400, "wrong gate for division", "division_mismatch");
     }
@@ -284,6 +289,16 @@ export class ExactGate extends DurableObject<Env> {
       this.queue.push({ req, enqueuedAt: this.now(), retried: false, resolve, reject });
       void this.pump();
     });
+  }
+
+  private async assertMethodAllowed(req: ExactRequest): Promise<void> {
+    if (!isWrite(req)) {
+      if (!allowedReadShape(req))
+        throw new ExactApiError(403, "exact request refused", "write_not_allowed");
+      return;
+    }
+    const refusal = await refuseWrite(this.env.DB, req);
+    if (refusal !== null) throw new ExactApiError(403, "exact write refused", refusal);
   }
 
   /** Starts (or restarts) a job run with its own call budget. */
@@ -1029,7 +1044,11 @@ export class ExactGate extends DurableObject<Env> {
     }
     if (row.status !== "active" && !verifying) throw new ExactAuthError("needs_reauth");
     const url = buildUrl(row.region_host, req);
+    // A write may have waited in the queue: the switch is read again right before the call.
+    if (isWrite(req)) await this.assertMethodAllowed(req);
     const token = await this.accessTokenFor(row);
+    // ...and once more after the (possibly slow) token step, immediately before the network call.
+    if (isWrite(req)) await this.assertMethodAllowed(req);
 
     const headers: Record<string, string> = {};
     for (const [k, v] of Object.entries(req.headers ?? {})) headers[k.toLowerCase()] = v;
@@ -1061,6 +1080,14 @@ export class ExactGate extends DurableObject<Env> {
       const retryMs = this.blockFor429(outHeaders, this.now());
       await this.persist();
       throw new ExactRateLimitedError(retryMs);
+    }
+    if (res.status === 401 && isWrite(req)) {
+      // A POST is NEVER re-sent by the gate. Heal the token for the caller's next (read) call, then
+      // report the typed refusal: the outcome is treated as unknown and the booker re-probes first.
+      await getExactGate(this.env, `exact-token:${row.id}`)
+        .refreshAccessToken(row.id, row.expires_at ?? undefined)
+        .catch(() => undefined);
+      throw new ExactWriteAuthRetryRefused();
     }
     if (res.status === 401) {
       if (item.retried) {

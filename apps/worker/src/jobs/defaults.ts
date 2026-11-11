@@ -13,9 +13,10 @@
  */
 import { nextRun, type Schedule } from "@camelthorn/core";
 import { auditStatement } from "../db/audit";
+import { MAX_CALLS_PER_RUN as BOOKING_CALL_BUDGET } from "../booking/executor";
 import { FULL_SYNC_BUDGET, INCREMENTAL_SYNC_BUDGET } from "./exact-handlers";
 
-export const DEFAULT_JOBS_VERSION = 3;
+export const DEFAULT_JOBS_VERSION = 4;
 const MARKER = "seed.default_jobs";
 
 export interface DefaultJob {
@@ -110,6 +111,17 @@ export const DEFAULT_JOBS: readonly DefaultJob[] = [
     enabled: false,
     disabledReason: AWAITING_LIVE_VERIFICATION,
     exactBudget: INCREMENTAL_SYNC_BUDGET,
+  },
+  {
+    name: "exact.book_matches",
+    handler: "exact.book_matches",
+    // Writes to Exact (ADR 0043). Disabled until the first live checks on a TEST division are done
+    // (docs/DEPLOY.md step 10); the handler ALSO does nothing unless the fail-closed booking switch,
+    // the verification mark and the connections say so. 30 Exact calls per run.
+    schedule: { kind: "cron", expr: "*/5 * * * *" },
+    enabled: false,
+    disabledReason: AWAITING_LIVE_VERIFICATION,
+    exactBudget: BOOKING_CALL_BUDGET,
   },
   {
     name: "fx.revaluation",

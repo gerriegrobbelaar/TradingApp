@@ -389,6 +389,7 @@ export async function resetSync(): Promise<void> {
     db.prepare("DELETE FROM gl_budgets"),
     db.prepare("DELETE FROM gl_accounts"),
     db.prepare("DELETE FROM gl_sync_years"),
+    db.prepare("DELETE FROM exact_write_outbox"),
     db.prepare("DELETE FROM match_allocations"),
     db.prepare("DELETE FROM matches"),
     db.prepare("DELETE FROM bank_account_exact_map"),

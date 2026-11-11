@@ -28,6 +28,7 @@ export const ERR_CODES = [
   "tx_frozen",
   "status_mismatch",
   "has_live_matches",
+  "bad_transition",
 ] as const;
 
 export type MatchErrCode = (typeof ERR_CODES)[number];
@@ -171,7 +172,7 @@ export type UndoResult =
   | { kind: "undone" }
   | { kind: "not_found" }
   | { kind: "already_undone" }
-  | { kind: "already_booked_in_exact" };
+  | { kind: "already_booked_in_exact"; exactState: string };
 
 /**
  * Undo while Exact has not booked the match (`exact_state = 'not_booked'`): the match becomes
@@ -198,7 +199,9 @@ export async function undoMatch(
     }>();
   if (!m) return { kind: "not_found" };
   if (m.undone_at !== null) return { kind: "already_undone" };
-  if (m.exact_state !== "not_booked") return { kind: "already_booked_in_exact" };
+  if (m.exact_state !== "not_booked") {
+    return { kind: "already_booked_in_exact", exactState: m.exact_state };
+  }
   const live =
     "EXISTS (SELECT 1 FROM matches WHERE id = ?7 AND undone_at IS NULL AND exact_state = 'not_booked')";
   const done = `EXISTS (SELECT 1 FROM matches WHERE id = ?1 AND undone_at = ?2 AND undone_by = ?3)`;
@@ -238,7 +241,7 @@ export async function undoMatch(
     .bind(matchId)
     .first<{ exact_state: string; undone_at: string | null }>();
   if (now?.undone_at != null) return { kind: "already_undone" };
-  return { kind: "already_booked_in_exact" };
+  return { kind: "already_booked_in_exact", exactState: now?.exact_state ?? "booking" };
 }
 
 export type IgnoreReason = "internal_transfer" | "not_ours" | "other";
@@ -401,6 +404,18 @@ export function suggestionStatements(
   ];
 }
 
+/**
+ * SQL predicate (ADR 0043): the allocations of match `m` still count against the open balance of
+ * item `oi`. A live match counts, EXCEPT a match booked in Exact (`matched_in_exact`) once the item
+ * was re-read from Exact AFTER the booking (`synced_at > booked_at`): from then on Exact's own
+ * open_minor already reflects the payment, so counting it again would be a double count. The sync
+ * takes its `synced_at` stamp BEFORE it reads, so `synced_at > booked_at` means the read started
+ * after the MatchSet was verified. Until then the allocation keeps counting, so there is no window
+ * in which the item can be allocated twice. Same text as the trigger in migration 0023.
+ */
+export const allocCounts = (m: string, oi: string): string =>
+  `${m}.undone_at IS NULL AND NOT (${m}.exact_state = 'matched_in_exact' AND ${m}.booked_at IS NOT NULL AND ${m}.booked_at < ${oi}.synced_at)`;
+
 export type ReviewReason = "over_allocated" | "item_closed" | "tx_state_conflict" | "tx_changed";
 
 /**
@@ -434,7 +449,7 @@ export async function flagMatchesForReview(db: D1Database, nowIso: string): Prom
                          WHERE a.match_id = matches.id
                            AND (SELECT SUM(a2.allocated_minor) FROM match_allocations a2
                                   JOIN matches m2 ON m2.id = a2.match_id
-                                 WHERE a2.open_item_id = a.open_item_id AND m2.undone_at IS NULL)
+                                 WHERE a2.open_item_id = a.open_item_id AND ${allocCounts("m2", "oi")})
                                > ABS(oi.open_minor)) THEN 'over_allocated'
          END)
        WHERE undone_at IS NULL AND exact_state = 'not_booked' AND review_reason IS NULL
@@ -446,7 +461,7 @@ export async function flagMatchesForReview(db: D1Database, nowIso: string): Prom
                             AND (oi.status <> 'open' OR oi.open_minor = 0
                                  OR (SELECT SUM(a2.allocated_minor) FROM match_allocations a2
                                        JOIN matches m2 ON m2.id = a2.match_id
-                                      WHERE a2.open_item_id = a.open_item_id AND m2.undone_at IS NULL)
+                                      WHERE a2.open_item_id = a.open_item_id AND ${allocCounts("m2", "oi")})
                                     > ABS(oi.open_minor))))`,
     )
     .bind(nowIso)
@@ -464,15 +479,28 @@ export async function claimMatchForBooking(
   matchId: number,
   nextState: string,
 ): Promise<boolean> {
+  const out = await claimStatement(db, matchId, nextState).run();
+  return (out.meta.changes ?? 0) === 1;
+}
+
+/**
+ * The claim as a prepared statement (`note` = machine code for matches.exact_note, or null). The
+ * SAME conditional UPDATE serves `claimMatchForBooking` and the booking outbox (booking/outbox.ts
+ * `claimAndEnqueue` adds the outbox row, the idempotency key and the audit row to the batch).
+ */
+export function claimStatement(
+  db: D1Database,
+  matchId: number,
+  nextState: string,
+  note: string | null = null,
+): D1PreparedStatement {
   if (!/^[a-z_]{1,32}$/.test(nextState) || nextState === "not_booked") {
     throw new RangeError("bad exact_state");
   }
-  const out = await db
+  return db
     .prepare(
-      `UPDATE matches SET exact_state = ?2
+      `UPDATE matches SET exact_state = ?2, exact_note = ?3
        WHERE id = ?1 AND undone_at IS NULL AND exact_state = 'not_booked' AND review_reason IS NULL`,
     )
-    .bind(matchId, nextState)
-    .run();
-  return (out.meta.changes ?? 0) === 1;
+    .bind(matchId, nextState, note);
 }

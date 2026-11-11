@@ -86,6 +86,11 @@ export interface ExactJobLoad {
   budget: number;
   /** Runs per slot including retries (the handler's maxAttempts). */
   maxAttempts: number;
+  /**
+   * A handler that enforces its own daily call cap (the booking job spends calls only when there is
+   * work, and stops at the cap): its projection is the smaller of that cap and fires x budget x attempts.
+   */
+  dailyCap?: number;
 }
 
 /** Worst case Exact calls per administration and Amsterdam day: fires x budget x attempts, summed. */
@@ -93,7 +98,8 @@ export function projectedExactCalls(jobs: readonly ExactJobLoad[]): number {
   let total = 0;
   for (const j of jobs) {
     const a = analyseSchedule(j.schedule);
-    total += (a?.maxFiresPerDay ?? 0) * j.budget * j.maxAttempts;
+    const worst = (a?.maxFiresPerDay ?? 0) * j.budget * j.maxAttempts;
+    total += j.dailyCap === undefined ? worst : Math.min(j.dailyCap, worst);
   }
   return total;
 }

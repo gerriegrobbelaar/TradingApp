@@ -72,8 +72,11 @@ const input = (
 const count = async (sql: string): Promise<number> =>
   (await db.prepare(sql).first<{ n: number }>())?.n ?? 0;
 
-async function consistent(): Promise<void> {
-  expect(await checkMatchingInvariants(db)).toEqual([]);
+/** `synthetic`: invariant codes a test that claims a match WITHOUT the outbox (store.claimMatchForBooking) expects. */
+async function consistent(synthetic: string[] = []): Promise<void> {
+  expect((await checkMatchingInvariants(db)).filter((v) => !synthetic.includes(v.code))).toEqual(
+    [],
+  );
 }
 
 /** A perfect receivable payment (rule 1 + IBAN) that the engine decides automatically. */
@@ -466,7 +469,7 @@ describe("data that changes after matching (needs review)", () => {
       .bind(inv)
       .run();
     expect(await flagMatchesForReview(db, "2026-07-15T00:00:00Z")).toBe(0);
-    await consistent();
+    await consistent(["claimed_without_outbox"]);
   });
 });
 
@@ -548,7 +551,7 @@ describe("races (interleavings)", () => {
       else expect(undo.kind).toBe("already_booked_in_exact");
       // An undo audit row exists exactly when the undo won.
       expect((await auditRows("match.undo", id)).length).toBe(claim ? 0 : 1);
-      await consistent();
+      await consistent(["claimed_without_outbox"]);
     }
     await expect(claimMatchForBooking(db, 1, "not_booked")).rejects.toThrow(RangeError);
   });

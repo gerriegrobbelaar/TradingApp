@@ -842,7 +842,10 @@ describe("undo", () => {
     expect(
       (await send("finance", "POST", "/api/matching/matches/987654/undo", { reason: "ok" })).status,
     ).toBe(404);
-    await db.prepare("UPDATE matches SET exact_state = 'booked' WHERE id = ?1").bind(matchId).run();
+    await db
+      .prepare("UPDATE matches SET exact_state = 'booking' WHERE id = ?1")
+      .bind(matchId)
+      .run();
     const r = await send("admin", "POST", `/api/matching/matches/${matchId}/undo`, {
       reason: "too late",
     });

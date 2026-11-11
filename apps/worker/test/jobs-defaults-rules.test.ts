@@ -28,6 +28,9 @@ const loadOf = (name: string): ExactJobLoad => {
     schedule: j.schedule,
     budget: j.exactBudget,
     maxAttempts: HANDLERS[j.handler]?.maxAttempts ?? 1,
+    ...(HANDLERS[j.handler]?.dailyExactCallCap !== undefined
+      ? { dailyCap: HANDLERS[j.handler]?.dailyExactCallCap as number }
+      : {}),
   };
 };
 
@@ -65,11 +68,12 @@ describe("default jobs against the schedule rules and the Exact budget cap", () 
     expect(fires("30 * * * *") * 40 + fires("0 2 * * *") * 240 * FULL_SYNC_MAX_ATTEMPTS).toBe(1960);
   });
 
-  it("all default Exact jobs switched on together stay under the cap (about 2,560)", () => {
+  it("all default Exact jobs switched on together stay under the cap (about 2,960)", () => {
     const all = projectedExactCalls(
       DEFAULT_JOBS.filter((j) => HANDLERS[j.handler]?.usesExact).map((j) => loadOf(j.name)),
     );
-    expect(all).toBe(2560);
+    // 1,960 (sync) + 600 (earlier jobs) + 400 (booking daily cap, ADR 0043)
+    expect(all).toBe(2960);
     expect(all).toBeLessThanOrEqual(MAX_PROJECTED_EXACT_CALLS_PER_DAY);
   });
 });

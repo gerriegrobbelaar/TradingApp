@@ -14,8 +14,9 @@
  * the caller must run the duplicate probe (`findBankEntryLineByRef`) or read back before
  * deciding anything.
  *
- * Callers: the worker's future matching booker is the only allowed caller (source scan in
- * apps/worker/test/exact-write-guard.test.ts).
+ * Callers: the worker's booking executor (apps/worker/src/booking/executor.ts, ADR 0043) is the
+ * only allowed caller (source scan in apps/worker/test/exact-write-guard.test.ts). The ExactGate
+ * refuses every other write, and these two only while the fail-closed booking switch is on.
  */
 import { odataGuid } from "./client";
 import { type Row, asRow, badData, parseJsonRawNumbers } from "./json";
@@ -38,9 +39,12 @@ import {
   EXACT_WRITE_NAMES,
   type MatchSetResponse,
   type OpenItemLineRow,
+  findBankLineByAmountQuery,
   findExistingBankEntryQuery,
+  latestBankEntryQuery,
   mapOpenItemLineRow,
   parseBankEntryResponse,
+  parseLatestClosingBalance,
   parseMatchSetResponse,
 } from "./write-payloads";
 
@@ -193,6 +197,53 @@ export function createExactWriter(transport: ExactTransport, options: ExactWrite
         yourRef: str(r, "YourRef"),
         amountFc: str(r, "AmountFC"),
       }));
+    },
+
+    /**
+     * Bank line created by another system (Revolut's own Exact feed): same journal, exact signed
+     * amount, date window. Zero hits = not there (yet); one = the line; several = ambiguous.
+     */
+    async findBankLineByAmount(args: {
+      journalCode: string;
+      amountMinor: number;
+      currency: string;
+      dateFrom: string;
+      dateTo: string;
+    }): Promise<BankEntryLineHit[]> {
+      const q = findBankLineByAmountQuery(args);
+      const res = await sendOnce({
+        method: "GET",
+        path: q.path,
+        query: q.query,
+        headers: { Accept: "application/json" },
+        api: "rest",
+      });
+      return resultRows(res.body).rows.map((r) => ({
+        id: str(r, "ID"),
+        entryId: str(r, "EntryID"),
+        entryNumber: num(r, "EntryNumber"),
+        yourRef: str(r, "YourRef"),
+        amountFc: str(r, "AmountFC"),
+      }));
+    },
+
+    /**
+     * Closing balance of the latest bank entry of a journal (the next entry's opening balance), in
+     * minor units, or null when it cannot be determined (no entry, other currency, unreadable).
+     */
+    async readLatestClosingBalance(args: {
+      journalCode: string;
+      currency: string;
+    }): Promise<number | null> {
+      const q = latestBankEntryQuery(args.journalCode);
+      const res = await sendOnce({
+        method: "GET",
+        path: q.path,
+        query: q.query,
+        headers: { Accept: "application/json" },
+        api: "rest",
+      });
+      return parseLatestClosingBalance(resultRows(res.body).rows, args.currency);
     },
 
     /**

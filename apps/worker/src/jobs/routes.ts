@@ -271,6 +271,7 @@ async function patchJob(ctx: Ctx): Promise<Response> {
           schedule: sch,
           budget: mine ? budget : other.exact_budget,
           maxAttempts: od.maxAttempts,
+          ...(od.dailyExactCallCap !== undefined ? { dailyCap: od.dailyExactCallCap } : {}),
         });
       }
       return out;

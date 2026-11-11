@@ -9,6 +9,7 @@
  * has nothing left to offer (`hasLiveMatch`).
  */
 import { amsterdamParts, normalizeIban, type MatchItem, type MatchTx } from "@camelthorn/core";
+import { allocCounts } from "./store";
 
 export const TX_WINDOW_DAYS = 120;
 export const TX_CAP_PER_RUN = 500;
@@ -201,7 +202,7 @@ export async function assembleItems(db: D1Database, divisionId: number): Promise
                 r.iban AS rel_iban, r.iban_added_at, r.iban_changed_at,
                 COALESCE((SELECT SUM(a.allocated_minor) FROM match_allocations a
                             JOIN matches m ON m.id = a.match_id
-                           WHERE a.open_item_id = oi.id AND m.undone_at IS NULL), 0) AS allocated
+                           WHERE a.open_item_id = oi.id AND ${allocCounts("m", "oi")}), 0) AS allocated
          FROM open_items oi
            LEFT JOIN relations r ON r.division_id = oi.division_id AND r.exact_id = oi.relation_id
          WHERE oi.division_id = ?1 AND oi.status = 'open' AND oi.open_minor <> 0

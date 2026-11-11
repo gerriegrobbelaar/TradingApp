@@ -86,6 +86,7 @@ export async function resetRevolut(): Promise<void> {
     db.prepare("DELETE FROM revolut_quarantine"),
     db.prepare("DELETE FROM revolut_counterparties"),
     db.prepare("DELETE FROM match_suggestions"),
+    db.prepare("DELETE FROM exact_write_outbox"),
     db.prepare("DELETE FROM match_allocations"),
     db.prepare("DELETE FROM matches"),
     db.prepare("DELETE FROM bank_account_exact_map"),

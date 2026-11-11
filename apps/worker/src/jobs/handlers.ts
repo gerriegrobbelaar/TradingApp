@@ -9,6 +9,7 @@ import {
   recordEcbTooLate,
   runEcbImport,
 } from "../fx/ecb-import";
+import { DAILY_BOOKING_CALL_CAP, runBookMatches } from "../booking/executor";
 import { runMatching } from "../matching/run";
 import { loadRevolutConfig } from "../revolut/config";
 import { runRevolutBackfill, runRevolutSync } from "../revolut/sync";
@@ -160,6 +161,22 @@ export const HANDLERS: Record<string, HandlerDef> = {
     scheduleRules: { minIntervalMinutes: 15 },
     maxLatenessMs: 45 * MIN,
     run: (ctx) => runExactSync("incremental", ctx),
+  },
+  "exact.book_matches": {
+    title: "Book matches in Exact",
+    description:
+      "Writes confirmed bank matches to Exact: a bank entry (unless Revolut's own Exact feed creates the line) and then a MatchSet, each verified by reading Exact back. Does nothing until an admin has verified the write path on a test division and switched booking on (Settings). Never posts twice: an unclear answer waits for an admin.",
+    usesExact: true,
+    dailyExactCallCap: DAILY_BOOKING_CALL_CAP,
+    phase: null,
+    // The next slot is the retry.
+    maxAttempts: 1,
+    // Writes to the system of record: admins only, with a fresh sign-in.
+    runRoles: ["admin"],
+    stepUp: true,
+    scheduleRules: { minIntervalMinutes: 5 },
+    maxLatenessMs: 30 * MIN,
+    run: runBookMatches,
   },
   "fx.revaluation": {
     title: "FX revaluation (draft journal)",

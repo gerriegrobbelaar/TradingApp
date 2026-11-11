@@ -1,0 +1,816 @@
+/**
+ * The booking executor (task M7c, ADR 0043) against a state-holding fake of Exact: the happy paths
+ * (this app creates the bank entries, and Revolut's feed does), idempotency, lost answers, rejected
+ * posts, read-back outcomes, manual cases, the fail-closed switch, leases and races.
+ */
+import { beforeEach, describe, expect, it } from "vitest";
+import { ExactApiError } from "@camelthorn/exact";
+import { checkMatchingInvariants } from "../src/matching/invariants";
+import { transition } from "../src/booking/outbox";
+import { claimMatchForBooking, undoMatch } from "../src/matching/store";
+import { FakeExact } from "./booking-fake-exact";
+import {
+  bookingWorld,
+  countingDb,
+  db,
+  matchRow,
+  NOW,
+  outbox,
+  runBooking,
+  seedBookable,
+  seedLedger,
+  setBooking,
+  type BookingWorld,
+} from "./booking-helpers";
+import { auditRows } from "./sync-helpers";
+
+let w: BookingWorld;
+let fake: FakeExact;
+
+beforeEach(async () => {
+  fake = new FakeExact();
+  fake.closing.set("90", 100_000);
+  w = await bookingWorld({ creates: true });
+});
+
+const statuses = async (matchId: number): Promise<[string, string][]> =>
+  (await outbox(matchId)).map((r) => [r.kind, r.status]);
+
+describe("happy path, this app creates the bank entries", () => {
+  it("a receivable match: probe, bank entry, MatchSet, read-back, booked", async () => {
+    const s = await seedBookable(w, fake);
+    const r = await runBooking(fake);
+    expect(r.status).toBe("ok");
+    expect(await statuses(s.matchId)).toEqual([
+      ["bank_entry", "verified"],
+      ["matchset", "verified"],
+    ]);
+    const m = await matchRow(s.matchId);
+    expect(m.exact_state).toBe("matched_in_exact");
+    expect(m.booked_at).toBe(new Date(NOW).toISOString());
+    // Exactly one bank entry and one MatchSet were created, in the right order.
+    expect(fake.entries).toHaveLength(1);
+    expect(fake.matchSets).toHaveLength(1);
+    const bank = fake.entries[0];
+    expect(bank?.opening).toBe(100_000);
+    expect(fake.closing.get("90")).toBe(100_000 + 12_345);
+    const posts = fake.posts().map((p) => p.api);
+    expect(posts).toEqual(["rest", "xml"]);
+    expect(fake.matchSets[0]?.lines.map((l) => l.amountMinor).sort((a, b) => a - b)).toEqual([
+      -12_345, 12_345,
+    ]);
+    expect(fake.items[0]?.paid).toBe(true);
+    // The write calls carry the booking job id at job priority.
+    for (const p of fake.posts()) {
+      expect([p.jobId, p.priority]).toEqual(["exact-booking", "job"]);
+    }
+    expect(await checkMatchingInvariants(db)).toEqual([]);
+    // Result: counts and codes only.
+    expect(r.summary).toMatchObject({ claimed: 2, verified: 1 });
+  });
+
+  it("a bill paid out: the bank line is positive in the MatchSet, the bill negative", async () => {
+    const s = await seedBookable(w, fake, { kind: "bill", amountMinor: 5_000 });
+    await runBooking(fake);
+    expect((await matchRow(s.matchId)).exact_state).toBe("matched_in_exact");
+    expect(fake.entries[0]).toBeDefined();
+    const amounts = fake.matchSets[0]?.lines.map((l) => l.amountMinor).sort((a, b) => a - b);
+    expect(amounts).toEqual([-5_000, 5_000]);
+  });
+
+  it("a ledger match books a bank entry line only, no MatchSet", async () => {
+    const s = await seedLedger(w, { amountMinor: -250 });
+    await runBooking(fake);
+    expect(await statuses(s.matchId)).toEqual([["bank_entry", "verified"]]);
+    expect((await matchRow(s.matchId)).exact_state).toBe("matched_in_exact");
+    expect(fake.posts().map((p) => p.api)).toEqual(["rest"]);
+    expect(fake.matchSets).toHaveLength(0);
+    expect(fake.lines[0]?.amountMinor).toBe(-250);
+  });
+
+  it("the second run finds nothing to do: exactly one POST of each kind in total", async () => {
+    await seedBookable(w, fake);
+    await runBooking(fake);
+    const before = fake.calls.length;
+    const again = await runBooking(fake);
+    expect(again.status).toBe("ok");
+    expect(fake.calls.length).toBe(before);
+    expect(fake.posts("bank_entry")).toHaveLength(1);
+    expect(fake.posts("matchset")).toHaveLength(1);
+  });
+
+  it("a probe that finds the line already in Exact reuses it (no second bank entry)", async () => {
+    const s = await seedBookable(w, fake);
+    fake.addFeedLine({ journal: "90", amountMinor: 12_345, yourRef: s.txExternalId });
+    await runBooking(fake);
+    expect(fake.posts("bank_entry")).toHaveLength(0);
+    expect(fake.posts("matchset")).toHaveLength(1);
+    expect((await matchRow(s.matchId)).exact_state).toBe("matched_in_exact");
+  });
+
+  it("books at most one bank entry per journal in flight and keeps the balance chain", async () => {
+    const a = await seedBookable(w, fake, { amountMinor: 1_000 });
+    const b = await seedBookable(w, fake, { amountMinor: 2_000 });
+    await runBooking(fake);
+    expect(fake.entries.map((e) => e.opening)).toEqual([100_000, 101_000]);
+    expect(fake.closing.get("90")).toBe(103_000);
+    expect((await matchRow(a.matchId)).exact_state).toBe("matched_in_exact");
+    expect((await matchRow(b.matchId)).exact_state).toBe("matched_in_exact");
+  });
+
+  it("does not book a match younger than the undo window, nor a flagged one", async () => {
+    const young = await seedBookable(w, fake, { createdAt: new Date(NOW - 60_000).toISOString() });
+    const flagged = await seedBookable(w, fake);
+    await db
+      .prepare(
+        "UPDATE matches SET review_reason = 'item_closed', review_flagged_at = '2026-07-15T09:00:00.000Z' WHERE id = ?1",
+      )
+      .bind(flagged.matchId)
+      .run();
+    await runBooking(fake);
+    expect(fake.calls).toHaveLength(0);
+    expect((await matchRow(young.matchId)).exact_state).toBe("not_booked");
+    expect((await matchRow(flagged.matchId)).exact_state).toBe("not_booked");
+  });
+});
+
+describe("happy path, Revolut's own Exact feed creates the bank line", () => {
+  beforeEach(async () => {
+    w = await bookingWorld({ creates: false });
+  });
+
+  it("never creates a bank entry: it finds the line and matches it", async () => {
+    const s = await seedBookable(w, fake);
+    fake.addFeedLine({ journal: "90", amountMinor: 12_345, yourRef: null });
+    const r = await runBooking(fake);
+    expect(r.status).toBe("ok");
+    expect(fake.posts("bank_entry")).toHaveLength(0);
+    expect(fake.posts("matchset")).toHaveLength(1);
+    expect(await statuses(s.matchId)).toEqual([["matchset", "verified"]]);
+    expect((await matchRow(s.matchId)).exact_state).toBe("matched_in_exact");
+  });
+
+  it("no line yet: waiting_for_bank_line, retried every run, manual after 48 hours", async () => {
+    const s = await seedBookable(w, fake);
+    const r1 = await runBooking(fake);
+    expect(r1.status).toBe("ok");
+    expect(await statuses(s.matchId)).toEqual([["matchset", "waiting_for_bank_line"]]);
+    expect((await matchRow(s.matchId)).exact_state).toBe("booking");
+    expect(fake.posts()).toHaveLength(0);
+    // The line shows up: the next run books it.
+    fake.addFeedLine({ journal: "90", amountMinor: 12_345 });
+    await runBooking(fake, { now: NOW + 10 * 60_000 });
+    expect(await statuses(s.matchId)).toEqual([["matchset", "verified"]]);
+  });
+
+  it("gives up waiting after 48 hours: manual_required bank_line_not_found", async () => {
+    const s = await seedBookable(w, fake);
+    await runBooking(fake);
+    await runBooking(fake, { now: NOW + 49 * 3600_000 });
+    expect(await statuses(s.matchId)).toEqual([["matchset", "manual_required"]]);
+    expect((await outbox(s.matchId))[0]?.last_error_code).toBe("bank_line_not_found");
+    expect((await matchRow(s.matchId)).exact_state).toBe("manual_required");
+  });
+
+  it("two identical payments and one line in Exact: ambiguous, a person decides", async () => {
+    const a = await seedBookable(w, fake, { amountMinor: 7_700 });
+    await seedBookable(w, fake, { amountMinor: 7_700 });
+    fake.addFeedLine({ journal: "90", amountMinor: 7_700 });
+    await runBooking(fake);
+    expect((await outbox(a.matchId))[0]?.last_error_code).toBe("bank_line_ambiguous");
+    expect((await matchRow(a.matchId)).exact_state).toBe("manual_required");
+    expect(fake.posts()).toHaveLength(0);
+  });
+
+  it("a ledger match is manual when the feed owns the bank line", async () => {
+    const s = await seedLedger(w);
+    await runBooking(fake);
+    expect((await outbox(s.matchId))[0]).toMatchObject({
+      kind: "bank_entry",
+      status: "manual_required",
+      last_error_code: "ledger_booking_with_feed_manual",
+    });
+    expect(fake.posts()).toHaveLength(0);
+  });
+});
+
+describe("a lost answer and an unclear outcome", () => {
+  it("lost after the POST: outcome_unknown, the next run does NOT re-post, admin retry probes and finds it", async () => {
+    const s = await seedBookable(w, fake);
+    fake.modes.bank_entry = ["lost"];
+    const r = await runBooking(fake);
+    expect(r.status).toBe("partial");
+    expect(r.code).toBe("attention_needed");
+    expect(await statuses(s.matchId)).toEqual([["bank_entry", "outcome_unknown"]]);
+    expect((await matchRow(s.matchId)).exact_state).toBe("outcome_unknown");
+    expect(fake.entries).toHaveLength(1); // the fake did create it
+    // The next run leaves it alone.
+    await runBooking(fake, { now: NOW + 10 * 60_000 });
+    expect(fake.posts("bank_entry")).toHaveLength(1);
+    expect((await outbox(s.matchId))[0]?.status).toBe("outcome_unknown");
+    // An admin retry (needs_probe) lets the next run probe first: it finds the line, no duplicate.
+    await db
+      .prepare(
+        `UPDATE exact_write_outbox SET status = 'pending', needs_probe = 1 WHERE match_id = ?1 AND kind = 'bank_entry'`,
+      )
+      .bind(s.matchId)
+      .run();
+    await db
+      .prepare("UPDATE matches SET exact_state = 'booking' WHERE id = ?1")
+      .bind(s.matchId)
+      .run();
+    await runBooking(fake, { now: NOW + 20 * 60_000 });
+    expect(fake.entries).toHaveLength(1);
+    expect(fake.posts("bank_entry")).toHaveLength(1);
+    expect(await statuses(s.matchId)).toEqual([
+      ["bank_entry", "verified"],
+      ["matchset", "verified"],
+    ]);
+  });
+
+  it("a timeout where nothing was created is also outcome_unknown (never an automatic re-POST)", async () => {
+    const s = await seedBookable(w, fake);
+    fake.modes.bank_entry = ["timeout_not_performed"];
+    await runBooking(fake);
+    expect((await outbox(s.matchId))[0]?.status).toBe("outcome_unknown");
+    await runBooking(fake, { now: NOW + 10 * 60_000 });
+    await runBooking(fake, { now: NOW + 20 * 60_000 });
+    expect(fake.posts("bank_entry")).toHaveLength(1);
+    expect(fake.entries).toHaveLength(0);
+  });
+
+  it("a 500 is outcome_unknown, and it blocks the next entry of that journal", async () => {
+    const a = await seedBookable(w, fake);
+    fake.modes.bank_entry = ["http500"];
+    await runBooking(fake);
+    expect((await outbox(a.matchId))[0]).toMatchObject({
+      status: "outcome_unknown",
+      last_error_code: "exact_http_500",
+    });
+    // The opening balance of the next entry depends on this one: the journal waits for a person.
+    const b = await seedBookable(w, fake, { amountMinor: 900 });
+    const r = await runBooking(fake, { now: NOW + 60_000 });
+    expect(r.summary).toMatchObject({ deferred: 1 });
+    expect((await matchRow(b.matchId)).exact_state).toBe("not_booked");
+    expect(fake.posts("bank_entry")).toHaveLength(1);
+  });
+
+  it("an unreadable 200 is outcome_unknown (something may have been booked)", async () => {
+    const s = await seedBookable(w, fake);
+    fake.modes.bank_entry = ["html"];
+    await runBooking(fake);
+    expect((await outbox(s.matchId))[0]).toMatchObject({
+      status: "outcome_unknown",
+      last_error_code: "bank_entry_bad_response",
+    });
+    expect(fake.entries).toHaveLength(1);
+  });
+
+  it("a 401 after the token refresh is outcome_unknown, never re-sent", async () => {
+    const s = await seedBookable(w, fake);
+    fake.modes.bank_entry = ["auth401"];
+    await runBooking(fake);
+    expect((await outbox(s.matchId))[0]).toMatchObject({
+      status: "outcome_unknown",
+      last_error_code: "auth_retry_refused",
+    });
+    expect(fake.posts("bank_entry")).toHaveLength(1);
+  });
+
+  it("accepted but not visible yet: sent_unverified, never a second POST, verified once it shows", async () => {
+    const s = await seedBookable(w, fake);
+    fake.hideLines = true;
+    await runBooking(fake);
+    expect(await statuses(s.matchId)).toEqual([["bank_entry", "sent_unverified"]]);
+    expect((await outbox(s.matchId))[0]?.exact_ref).not.toBeNull();
+    await runBooking(fake, { now: NOW + 10 * 60_000 });
+    expect(fake.posts("bank_entry")).toHaveLength(1);
+    expect((await outbox(s.matchId))[0]?.status).toBe("sent_unverified");
+    fake.hideLines = false;
+    await runBooking(fake, { now: NOW + 20 * 60_000 });
+    expect(fake.posts("bank_entry")).toHaveLength(1);
+    expect(await statuses(s.matchId)).toEqual([
+      ["bank_entry", "verified"],
+      ["matchset", "verified"],
+    ]);
+  });
+
+  it("still not visible after hours: outcome_unknown (a person looks), never a re-POST", async () => {
+    const s = await seedBookable(w, fake);
+    fake.hideLines = true;
+    await runBooking(fake);
+    await runBooking(fake, { now: NOW + 7 * 3600_000 });
+    expect((await outbox(s.matchId))[0]).toMatchObject({
+      status: "outcome_unknown",
+      last_error_code: "not_visible_after_post",
+    });
+    expect(fake.posts("bank_entry")).toHaveLength(1);
+  });
+
+  it("a 429 on the POST goes back to pending with needs_probe (nothing was created)", async () => {
+    const s = await seedBookable(w, fake);
+    fake.modes.bank_entry = ["rate_limited"];
+    await runBooking(fake);
+    expect((await outbox(s.matchId))[0]).toMatchObject({
+      status: "pending",
+      needs_probe: 1,
+      last_error_code: "rate_limited",
+    });
+    await runBooking(fake, { now: NOW + 30 * 60_000 });
+    expect(fake.entries).toHaveLength(1);
+    expect(fake.posts("bank_entry")).toHaveLength(2); // the first was refused with 429
+  });
+
+  it("an executor that died mid-POST (stale sending) becomes outcome_unknown, not a re-POST", async () => {
+    const s = await seedBookable(w, fake);
+    fake.modes.bank_entry = ["lost"];
+    await runBooking(fake);
+    await db
+      .prepare(
+        `UPDATE exact_write_outbox SET status = 'sending', lease_expires_at = '2026-07-15T09:00:00.000Z',
+           claimed_at = '2026-07-15T08:50:00.000Z' WHERE match_id = ?1`,
+      )
+      .bind(s.matchId)
+      .run();
+    await db
+      .prepare("UPDATE matches SET exact_state = 'booking' WHERE id = ?1")
+      .bind(s.matchId)
+      .run();
+    await runBooking(fake);
+    expect((await outbox(s.matchId))[0]).toMatchObject({
+      status: "outcome_unknown",
+      last_error_code: "stale_sending",
+    });
+    expect(fake.posts("bank_entry")).toHaveLength(1);
+  });
+});
+
+describe("rejections", () => {
+  it("a 400 is failed, with no retry loop (only an admin can retry it)", async () => {
+    const s = await seedBookable(w, fake);
+    fake.modes.bank_entry = ["reject400"];
+    const r = await runBooking(fake);
+    expect(r.status).toBe("partial");
+    expect((await outbox(s.matchId))[0]).toMatchObject({
+      status: "failed",
+      last_error_code: "exact_rejected_400",
+    });
+    expect((await matchRow(s.matchId)).exact_state).toBe("booking_failed");
+    for (let i = 1; i <= 4; i++) await runBooking(fake, { now: NOW + i * 3 * 3600_000 });
+    expect(fake.posts("bank_entry")).toHaveLength(1);
+  });
+});
+
+describe("the MatchSet and its read-back", () => {
+  it("answered success but not applied: failed, retried after the backoff with the same payload", async () => {
+    const s = await seedBookable(w, fake);
+    fake.modes.matchset = ["ok_unapplied"];
+    const r = await runBooking(fake);
+    expect(r.status).toBe("partial");
+    expect(await statuses(s.matchId)).toEqual([
+      ["bank_entry", "verified"],
+      ["matchset", "failed"],
+    ]);
+    expect((await matchRow(s.matchId)).exact_state).toBe("booking_failed");
+    const first = fake.posts("matchset")[0]?.body;
+    // Not yet due: nothing happens.
+    await runBooking(fake, { now: NOW + 60_000 });
+    expect(fake.posts("matchset")).toHaveLength(1);
+    // After the backoff the same document is posted again and now applies.
+    await runBooking(fake, { now: NOW + 10 * 60_000 });
+    expect(fake.posts("matchset")).toHaveLength(2);
+    expect(fake.posts("matchset")[1]?.body).toBe(first);
+    expect(await statuses(s.matchId)).toEqual([
+      ["bank_entry", "verified"],
+      ["matchset", "verified"],
+    ]);
+    expect(fake.entries).toHaveLength(1);
+  });
+
+  it("gives up retrying after three attempts", async () => {
+    const s = await seedBookable(w, fake);
+    fake.modes.matchset = ["ok_unapplied", "ok_unapplied", "ok_unapplied"];
+    await runBooking(fake);
+    await runBooking(fake, { now: NOW + 10 * 60_000 });
+    await runBooking(fake, { now: NOW + 60 * 60_000 });
+    expect(fake.posts("matchset")).toHaveLength(3);
+    const row = (await outbox(s.matchId)).find((r) => r.kind === "matchset");
+    expect(row).toMatchObject({ status: "failed", attempts: 3 });
+    await runBooking(fake, { now: NOW + 10 * 3600_000 });
+    expect(fake.posts("matchset")).toHaveLength(3);
+  });
+
+  it("a read-back that cannot be judged (item vanished) is outcome_unknown, never a success", async () => {
+    const s = await seedBookable(w, fake);
+    // Exact answers success, and afterwards the item row is found by neither read.
+    const original = fake.transport;
+    fake.transport = async (req) => {
+      const res = await original(req);
+      if (req.method === "POST" && req.api === "xml") fake.items.length = 0;
+      return res;
+    };
+    await runBooking(fake);
+    expect((await outbox(s.matchId)).find((r) => r.kind === "matchset")).toMatchObject({
+      status: "outcome_unknown",
+      last_error_code: "readback_inconclusive",
+    });
+    expect((await matchRow(s.matchId)).exact_state).toBe("outcome_unknown");
+  });
+
+  it("the items are already matched in Exact (for example by the bank feed): no POST, verified", async () => {
+    const s = await seedBookable(w, fake);
+    fake.items[0]!.paid = true;
+    await runBooking(fake);
+    expect(fake.posts("matchset")).toHaveLength(0);
+    expect((await matchRow(s.matchId)).exact_state).toBe("matched_in_exact");
+  });
+
+  it("an item whose open amount moved is not touched: manual_required readback_inconclusive", async () => {
+    const s = await seedBookable(w, fake);
+    fake.items[0]!.openMinor = 5_000;
+    await runBooking(fake);
+    expect(fake.posts("matchset")).toHaveLength(0);
+    expect((await outbox(s.matchId)).find((r) => r.kind === "matchset")).toMatchObject({
+      status: "manual_required",
+      last_error_code: "readback_inconclusive",
+    });
+    expect((await matchRow(s.matchId)).exact_state).toBe("manual_required");
+  });
+});
+
+describe("what a person must do by hand in v1", () => {
+  const codeOf = async (matchId: number): Promise<string | null> =>
+    (await outbox(matchId))[0]?.last_error_code ?? null;
+
+  it("a part payment: manual_required part_payment_not_supported_v1, nothing sent", async () => {
+    const s = await seedBookable(w, fake, {
+      amountMinor: 5_000,
+      openMinor: 12_000,
+      allocMinor: 5_000,
+    });
+    await runBooking(fake);
+    expect(await codeOf(s.matchId)).toBe("part_payment_not_supported_v1");
+    expect((await matchRow(s.matchId)).exact_state).toBe("manual_required");
+    expect(fake.calls).toHaveLength(0);
+    expect(await checkMatchingInvariants(db)).toEqual([]);
+  });
+
+  it("a surplus (more money than the invoice): the builder's partial_match code", async () => {
+    const s = await seedBookable(w, fake, {
+      amountMinor: 15_000,
+      openMinor: 12_000,
+      allocMinor: 12_000,
+    });
+    await runBooking(fake);
+    expect(await codeOf(s.matchId)).toBe("partial_match_not_supported_v1");
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it("a foreign currency match is manual (fx_not_supported_v1)", async () => {
+    await db
+      .prepare("UPDATE divisions SET base_currency = 'USD' WHERE id = ?1")
+      .bind(w.divisionId)
+      .run();
+    const s = await seedBookable(w, fake);
+    await runBooking(fake);
+    expect(await codeOf(s.matchId)).toBe("fx_not_supported_v1");
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it.each([
+    ["no control account", "control_account_unknown"],
+    ["no entry number", "item_entry_number_unknown"],
+    ["no relation code", "relation_code_unknown"],
+  ])("%s: manual_required %s", async (what, code) => {
+    let seed: () => ReturnType<typeof seedBookable>;
+    if (what === "no control account") {
+      await db.prepare("UPDATE bank_account_exact_map SET receivable_gl_account_code = NULL").run();
+      seed = () => seedBookable(w, fake);
+    } else if (what === "no entry number") {
+      seed = () => seedBookable(w, fake, { entryNumber: null });
+    } else {
+      seed = () =>
+        seedBookable(w, fake, {
+          relation: { guid: "b0000000-0000-4000-8000-000000000001", code: null },
+        });
+    }
+    const s = await seed();
+    await runBooking(fake);
+    expect(await codeOf(s.matchId)).toBe(code);
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it("a ledger account Exact does not know: manual_required ledger_account_unknown", async () => {
+    const s = await seedLedger(w, { withGl: false });
+    await runBooking(fake);
+    expect(await codeOf(s.matchId)).toBe("ledger_account_unknown");
+  });
+
+  it("an unknown bank balance (no entry in the journal): manual_required bank_balance_unknown", async () => {
+    fake.closing.clear();
+    const s = await seedBookable(w, fake);
+    await runBooking(fake);
+    expect(await codeOf(s.matchId)).toBe("bank_balance_unknown");
+    expect(fake.posts()).toHaveLength(0);
+  });
+
+  it("a failed read of the balance defers the match without claiming it", async () => {
+    const s = await seedBookable(w, fake);
+    fake.failReads = new ExactApiError(503, "down", "gate_unavailable");
+    const r = await runBooking(fake);
+    expect(r.status).toBe("ok");
+    expect((await matchRow(s.matchId)).exact_state).toBe("not_booked");
+    expect(await outbox()).toHaveLength(0);
+    fake.failReads = null;
+    await runBooking(fake, { now: NOW + 600_000 });
+    expect((await matchRow(s.matchId)).exact_state).toBe("matched_in_exact");
+  });
+});
+
+describe("fail closed", () => {
+  it("does nothing, and says why, while booking is off or not verified", async () => {
+    const s = await seedBookable(w, fake);
+    await setBooking(false);
+    const r1 = await runBooking(fake);
+    expect([r1.status, r1.code]).toEqual(["skipped", "booking_disabled"]);
+    await setBooking(true, false);
+    const r2 = await runBooking(fake);
+    expect([r2.status, r2.code]).toEqual(["skipped", "booking_disabled"]);
+    expect(fake.calls).toHaveLength(0);
+    expect((await matchRow(s.matchId)).exact_state).toBe("not_booked");
+  });
+
+  it("the switch turned off mid-run: no further POST, rows stay pending, nothing is lost", async () => {
+    const a = await seedBookable(w, fake, { amountMinor: 1_000 });
+    // After the first probe the admin switches booking off.
+    const original = fake.transport;
+    let disabled = false;
+    fake.transport = async (req) => {
+      const res = await original(req);
+      if (
+        !disabled &&
+        req.method === "GET" &&
+        req.path === "/financialtransaction/BankEntryLines"
+      ) {
+        disabled = true;
+        await db
+          .prepare("UPDATE settings SET value_json = 'false' WHERE key = 'exact.booking_enabled'")
+          .run();
+      }
+      return res;
+    };
+    const r = await runBooking(fake);
+    expect(r.status).toBe("partial");
+    expect(r.code).toBe("writes_disabled");
+    expect(fake.posts()).toHaveLength(0);
+    expect((await outbox(a.matchId))[0]).toMatchObject({ status: "pending", attempts: 0 });
+    // Switched on again: it carries on where it stopped.
+    await setBooking(true);
+    fake.transport = original;
+    await runBooking(fake, { now: NOW + 600_000 });
+    expect((await matchRow(a.matchId)).exact_state).toBe("matched_in_exact");
+  });
+
+  it("a protocol version change invalidates the verification: the run is skipped", async () => {
+    await seedBookable(w, fake);
+    await setBooking(true, "f".repeat(64));
+    const r = await runBooking(fake);
+    expect([r.status, r.code]).toEqual(["skipped", "booking_disabled"]);
+    expect(r.summary).toMatchObject({ blockers: ["protocol_changed"] });
+  });
+
+  it("the daily call cap stops the job", async () => {
+    const s = await seedBookable(w, fake);
+    await db.batch([
+      db.prepare("DELETE FROM job_runs"),
+      db.prepare("DELETE FROM jobs WHERE id = 1 OR name = 'exact.book_matches'"),
+      db.prepare(
+        `INSERT INTO jobs (id, name, handler, schedule_json, enabled, exact_budget)
+         VALUES (1, 'exact.book_matches', 'exact.book_matches', '{"kind":"cron","expr":"*/5 * * * *"}', 0, 30)`,
+      ),
+      db.prepare(
+        `INSERT INTO job_runs (job_id, scheduled_for, attempt, status, trigger, requested_by, queued_at,
+           enqueued_at, started_at, calls_used)
+         VALUES (1, '2026-07-15T08:00:00.000Z', 1, 'ok', 'schedule', 'system', '2026-07-15T08:00:00.000Z',
+           '2026-07-15T08:00:00.000Z', '2026-07-15T08:00:00.000Z', 400)`,
+      ),
+    ]);
+    const r = await runBooking(fake);
+    expect([r.status, r.code]).toEqual(["skipped", "daily_cap_reached"]);
+    expect(fake.calls).toHaveLength(0);
+    expect((await matchRow(s.matchId)).exact_state).toBe("not_booked");
+    await db.batch([
+      db.prepare("DELETE FROM job_runs"),
+      db.prepare("DELETE FROM jobs WHERE id = 1"),
+    ]);
+  });
+
+  it("the call budget per run is respected", async () => {
+    await seedBookable(w, fake);
+    const r = await runBooking(fake, { budget: 2 });
+    expect(r.status).toBe("partial");
+    expect(r.callsUsed).toBeLessThanOrEqual(2);
+    expect(fake.calls.length).toBeLessThanOrEqual(2);
+    expect(fake.posts()).toHaveLength(0);
+  });
+});
+
+describe("races", () => {
+  it("undo versus the booking claim: exactly one wins, in either order", async () => {
+    for (let i = 0; i < 4; i++) {
+      w = await bookingWorld({ creates: true });
+      fake = new FakeExact();
+      fake.closing.set("90", 100_000);
+      const s = await seedBookable(w, fake);
+      const [undo, run] = await Promise.all(
+        i % 2 === 0
+          ? [
+              undoMatch(db, s.matchId, "fin@x", "race", new Date(NOW).toISOString()),
+              runBooking(fake),
+            ]
+          : [
+              runBooking(fake),
+              undoMatch(db, s.matchId, "fin@x", "race", new Date(NOW).toISOString()),
+            ],
+      ).then(
+        (r) => (i % 2 === 0 ? r : [r[1], r[0]]) as [Awaited<ReturnType<typeof undoMatch>>, unknown],
+      );
+      void run;
+      const m = await matchRow(s.matchId);
+      const undone = await db
+        .prepare("SELECT undone_at FROM matches WHERE id = ?1")
+        .bind(s.matchId)
+        .first<{ undone_at: string | null }>();
+      if ((undo as { kind: string }).kind === "undone") {
+        expect(undone?.undone_at).not.toBeNull();
+        expect(m.exact_state).toBe("not_booked");
+        expect(await outbox(s.matchId)).toEqual([]);
+        expect(fake.posts()).toHaveLength(0);
+      } else {
+        expect(undone?.undone_at).toBeNull();
+        expect(m.exact_state).not.toBe("not_booked");
+      }
+      expect(await checkMatchingInvariants(db)).toEqual([]);
+    }
+  });
+
+  it("two executor runs at once: one of them owns each row (lease), one POST of each kind", async () => {
+    await seedBookable(w, fake);
+    const [a, b] = await Promise.all([runBooking(fake), runBooking(fake)]);
+    expect([a.status, b.status].every((s) => s === "ok" || s === "partial")).toBe(true);
+    expect(fake.posts("bank_entry")).toHaveLength(1);
+    expect(fake.posts("matchset")).toHaveLength(1);
+    expect(fake.entries).toHaveLength(1);
+    expect(await checkMatchingInvariants(db)).toEqual([]);
+  });
+
+  it("a claim cannot be taken twice", async () => {
+    const s = await seedBookable(w, fake);
+    expect(await claimMatchForBooking(db, s.matchId, "booking")).toBe(true);
+    expect(await claimMatchForBooking(db, s.matchId, "booking")).toBe(false);
+  });
+});
+
+describe("transitions are atomic", () => {
+  it("a transition from the wrong state changes nothing: no row update, no audit row, no match move", async () => {
+    const s = await seedBookable(w, fake);
+    fake.modes.bank_entry = ["lost"];
+    await runBooking(fake);
+    const row = (await outbox(s.matchId))[0];
+    const before = await db.prepare("SELECT COUNT(*) AS n FROM audit_log").first<{ n: number }>();
+    const ok = await transition(db, {
+      rowId: row?.id ?? 0,
+      matchId: s.matchId,
+      from: ["pending"], // it is outcome_unknown
+      to: "verified",
+      token: null,
+      nowIso: new Date(NOW).toISOString(),
+      match: {
+        from: "outcome_unknown",
+        to: "matched_in_exact",
+        note: null,
+        bookedAt: new Date(NOW).toISOString(),
+      },
+      actor: "system",
+      action: "booking.matched",
+      audit: {},
+    });
+    expect(ok).toBe(false);
+    const after = await db.prepare("SELECT COUNT(*) AS n FROM audit_log").first<{ n: number }>();
+    expect(after?.n).toBe(before?.n);
+    expect((await outbox(s.matchId))[0]?.status).toBe("outcome_unknown");
+    expect((await matchRow(s.matchId)).exact_state).toBe("outcome_unknown");
+  });
+
+  it("a stale lease token cannot write: a zombie executor never overwrites the owner", async () => {
+    const s = await seedBookable(w, fake);
+    fake.modes.bank_entry = ["lost"];
+    await runBooking(fake);
+    const row = (await outbox(s.matchId))[0];
+    await db
+      .prepare(
+        "UPDATE exact_write_outbox SET status = 'pending', claimed_at = 'owner', lease_expires_at = '2099-01-01T00:00:00.000Z' WHERE id = ?1",
+      )
+      .bind(row?.id ?? 0)
+      .run();
+    const ok = await transition(db, {
+      rowId: row?.id ?? 0,
+      matchId: s.matchId,
+      from: ["pending"],
+      to: "failed",
+      token: "zombie",
+      nowIso: new Date(NOW).toISOString(),
+      actor: "system",
+      action: "booking.failed",
+      audit: {},
+    });
+    expect(ok).toBe(false);
+    expect((await outbox(s.matchId))[0]?.status).toBe("pending");
+  });
+});
+
+describe("audit and data hygiene", () => {
+  it("every transition is audited by `system`, atomically with the state change", async () => {
+    const s = await seedBookable(w, fake);
+    await runBooking(fake);
+    const rows = await db
+      .prepare(
+        `SELECT actor_email, action FROM audit_log
+         WHERE action LIKE 'booking.%'
+           AND ((entity = 'match' AND entity_id = ?1)
+             OR (entity = 'exact_write_outbox'
+                 AND entity_id IN (SELECT CAST(id AS TEXT) FROM exact_write_outbox WHERE match_id = ?2)))
+         ORDER BY id`,
+      )
+      .bind(String(s.matchId), s.matchId)
+      .all<{ actor_email: string; action: string }>();
+    const actions = rows.results.map((r) => r.action);
+    expect(actions).toEqual([
+      "booking.claimed",
+      "booking.sending",
+      "booking.sent_unverified",
+      "booking.bank_entry_verified",
+      "booking.sending",
+      "booking.sent_unverified",
+      "booking.matched",
+    ]);
+    expect(rows.results.every((r) => r.actor_email === "system")).toBe(true);
+    // Audit rows carry codes and counts only.
+    const sample = await auditRows("booking.sending");
+    expect(sample.length).toBeGreaterThan(0);
+    for (const a of sample) expect(a.after_json).not.toMatch(/Journal|BankEntryLines|<eExact/);
+  });
+
+  it("no IBAN, token or bank text beyond the sanitised description is stored in the outbox", async () => {
+    const s = await seedBookable(w, fake);
+    await db
+      .prepare(
+        "UPDATE bank_transactions SET reference = 'Invoice 5 pay NL91 ABNA 0417 1643 00 thanks', counterparty_iban = 'NL91ABNA0417164300' WHERE id = ?1",
+      )
+      .bind(s.txId)
+      .run();
+    await runBooking(fake);
+    const rows = await db
+      .prepare("SELECT payload_json FROM exact_write_outbox")
+      .all<{ payload_json: string }>();
+    expect(rows.results.length).toBeGreaterThan(0);
+    for (const r of rows.results) {
+      expect(r.payload_json).not.toMatch(/NL91\s?ABNA\s?0417\s?1643\s?00/i);
+      expect(r.payload_json).not.toMatch(/\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b/);
+      expect(r.payload_json).not.toMatch(/token|secret|bearer/i);
+    }
+    const all = JSON.stringify(fake.calls.map((c) => c.body ?? ""));
+    expect(all).not.toMatch(/NL91ABNA0417164300/);
+  });
+
+  it("the job result holds counts and codes only", async () => {
+    await seedBookable(w, fake);
+    const r = await runBooking(fake);
+    for (const [k, v] of Object.entries(r.summary)) {
+      expect(typeof v === "number" || Array.isArray(v), k).toBe(true);
+    }
+    expect(JSON.stringify(r).length).toBeLessThan(500);
+  });
+
+  it("D1 operations grow linearly with the matches, with a fixed cost per match", async () => {
+    await seedBookable(w, fake);
+    const one = countingDb();
+    await runBooking(fake, { db: one.db });
+    const perMatch = one.ops();
+    expect(perMatch).toBeLessThan(60);
+    // Four more matches (and plenty of unrelated rows) cost four times as much, not more.
+    w = await bookingWorld({ creates: true });
+    fake = new FakeExact();
+    fake.closing.set("90", 100_000);
+    for (let i = 0; i < 4; i++) await seedBookable(w, fake, { amountMinor: 1_000 + i });
+    const four = countingDb();
+    await runBooking(fake, { db: four.db });
+    expect(four.ops()).toBeLessThan(4 * perMatch + 15);
+  });
+
+  it("the Exact calls per match are bounded as well (budget 30 per run)", async () => {
+    await seedBookable(w, fake);
+    const r = await runBooking(fake);
+    expect(r.callsUsed).toBeLessThanOrEqual(12);
+  });
+});

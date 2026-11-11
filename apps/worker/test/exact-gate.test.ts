@@ -647,18 +647,14 @@ describe("request building", () => {
     const div = freshDivision();
     await go(div, {
       api: "xml",
-      method: "POST",
-      path: "/docs/XMLUpload.aspx",
-      query: { Topic: "MatchSets" },
-      body: "<eExact/>",
-      headers: { "Content-Type": "text/xml" },
+      method: "GET",
+      path: "/docs/XMLDownload.aspx",
+      query: { Topic: "GLAccounts" },
     });
     const x = stub.apiCalls[1];
-    expect(x?.url.pathname).toBe("/docs/XMLUpload.aspx");
+    expect(x?.url.pathname).toBe("/docs/XMLDownload.aspx");
     expect(x?.url.searchParams.get("_Division_")).toBe(String(div));
-    expect(x?.url.searchParams.get("Topic")).toBe("MatchSets");
-    expect(x?.body).toBe("<eExact/>");
-    expect(x?.headers["content-type"]).toBe("text/xml");
+    expect(x?.url.searchParams.get("Topic")).toBe("GLAccounts");
     expect(x?.headers.accept).toBeUndefined();
   });
 

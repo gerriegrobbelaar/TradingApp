@@ -48,6 +48,7 @@ async function seedDomain(): Promise<void> {
 async function clearDomain(): Promise<void> {
   await db.batch([
     db.prepare("DELETE FROM payments"),
+    db.prepare("DELETE FROM exact_write_outbox"),
     db.prepare("DELETE FROM match_allocations"),
     db.prepare("DELETE FROM matches"),
     db.prepare("DELETE FROM bank_account_exact_map"),

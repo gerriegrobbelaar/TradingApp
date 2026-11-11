@@ -57,6 +57,17 @@ export class ExactAuthError extends Error {
   }
 }
 
+/**
+ * A WRITE (POST) got a 401. The gate refreshed the token but never re-sends a POST on its own: the
+ * outcome is unknown, so the booker must re-probe (read) before it may post again (M7c, ADR 0043).
+ */
+export class ExactWriteAuthRetryRefused extends Error {
+  constructor(message = "exact write got 401; not re-sent automatically") {
+    super(message);
+    this.name = "ExactWriteAuthRetryRefused";
+  }
+}
+
 /** Invalid request or an unexpected failure talking to Exact. */
 export class ExactApiError extends Error {
   readonly status: number;

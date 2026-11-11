@@ -892,6 +892,9 @@ export interface MatchAccountMapDto {
   divisionName: string | null;
   journalCode: string | null;
   bankGlAccountCode: string | null;
+  /** Control accounts the MatchSet names (M7c); null = booking stops with control_account_unknown. */
+  receivableGlAccountCode?: string | null;
+  payableGlAccountCode?: string | null;
   updatedAt: string | null;
   updatedBy: string | null;
 }
@@ -908,6 +911,9 @@ export interface MatchAccountMapRequest {
   divisionId: number | null;
   journalCode?: string;
   bankGlAccountCode?: string;
+  /** Optional (M7c): ledger accounts of the debtors and creditors control accounts. */
+  receivableGlAccountCode?: string | null;
+  payableGlAccountCode?: string | null;
 }
 
 export interface MatchPatternDto {
@@ -959,4 +965,76 @@ export interface MatchStatsResponse {
   autoEnabled: boolean;
   /** Active Revolut accounts without an Exact administration mapping. */
   unmappedAccounts: number;
+}
+
+// ---- Booking to Exact (Phase 7, M7c, ADR 0043) ----------------------------------------------------
+
+export type BookingStatus =
+  | "pending"
+  | "sending"
+  | "sent_unverified"
+  | "verified"
+  | "failed"
+  | "outcome_unknown"
+  | "manual_required"
+  | "waiting_for_bank_line"
+  | "resolved_manually"
+  | "given_up";
+
+export interface BookingOutboxItemDto {
+  id: number;
+  matchId: number;
+  kind: "bank_entry" | "matchset";
+  status: BookingStatus;
+  attempts: number;
+  lastErrorCode: string | null;
+  exactRef: string | null;
+  createdAt: string;
+  updatedAt: string;
+  transactionId: number;
+  amountMinor: number;
+  currency: string;
+  counterpartyName: string | null;
+  itemLabels: string[];
+}
+
+/** GET /api/booking/outbox?status=&limit=&cursor= (any signed-in role) */
+export interface BookingOutboxResponse {
+  items: BookingOutboxItemDto[];
+  nextCursor: string | null;
+  total: number;
+  countsByStatus: Record<BookingStatus, number>;
+}
+
+/** GET /api/booking/settings (any signed-in role). PUT /api/booking/settings returns the same. */
+export interface BookingSettingsResponse {
+  enabled: boolean;
+  verified: { at: string; by: string; note: string; protocolVersion: string } | null;
+  protocolVersion: string;
+  protocolChanged: boolean;
+  createsBankEntries: boolean | null;
+  /** Codes why booking cannot run now: not_verified, protocol_changed, bank_entries_undecided, no_exact_connection, writes_disabled. */
+  blockers: string[];
+}
+
+/** PUT /api/booking/settings (admin; enabling needs a fresh sign-in and the typed phrase ENABLE EXACT BOOKING). */
+export interface BookingSettingsRequest {
+  enabled: boolean;
+  confirm: string;
+  note?: string;
+}
+
+/** POST /api/booking/verify (admin, step-up): confirm = I VERIFIED THE EXACT WRITE PATH ON A TEST DIVISION. */
+export interface BookingVerifyRequest {
+  note: string;
+  confirm: string;
+}
+
+/** POST /api/booking/outbox/:id/resolve (admin, step-up) */
+export interface BookingResolveRequest {
+  resolution: "booked_manually" | "retry" | "give_up";
+  note: string;
+}
+export interface BookingResolveResponse {
+  item: BookingOutboxItemDto;
 }

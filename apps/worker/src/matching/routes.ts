@@ -60,6 +60,7 @@ import {
 } from "./config";
 import { loadMatches, loadSuggestions, safeText, toTxDto, TX_SELECT, type TxSqlRow } from "./dto";
 import {
+  allocCounts,
   applyMatch,
   ignoreTransaction,
   matchErrorCode,
@@ -84,6 +85,8 @@ class ApiError extends Error {
   constructor(
     readonly code: string,
     readonly status: 400 | 404 | 409 | 422 = 400,
+    /** A second fixed code that says more (for example reversal_required_in_exact). */
+    readonly detail?: string,
   ) {
     super(code);
   }
@@ -98,7 +101,12 @@ const safely =
     try {
       return await guarded(fn)(ctx);
     } catch (err) {
-      if (err instanceof ApiError) return json({ error: err.code }, err.status);
+      if (err instanceof ApiError) {
+        return json(
+          err.detail === undefined ? { error: err.code } : { error: err.code, detail: err.detail },
+          err.status,
+        );
+      }
       throw err;
     }
   };
@@ -392,6 +400,7 @@ const ERR_TO_API: Record<MatchErrCode, [string, 409 | 422]> = {
   tx_frozen: ["already_matched", 409],
   status_mismatch: ["already_matched", 409],
   has_live_matches: ["has_live_matches", 409],
+  bad_transition: ["already_booked_in_exact", 409],
 };
 
 interface ManualTxRow {
@@ -499,7 +508,7 @@ async function createMatchHandler(ctx: Ctx): Promise<Response> {
                      AND r.exact_id = oi.relation_id) AS rel_id,
                   COALESCE((SELECT SUM(a.allocated_minor) FROM match_allocations a
                               JOIN matches m ON m.id = a.match_id
-                             WHERE a.open_item_id = oi.id AND m.undone_at IS NULL), 0) AS allocated
+                             WHERE a.open_item_id = oi.id AND ${allocCounts("m", "oi")}), 0) AS allocated
            FROM open_items oi WHERE oi.id IN (${marks})`,
         )
         .bind(...wanted.map((w) => w.id))
@@ -603,7 +612,13 @@ async function undoHandler(ctx: Ctx): Promise<Response> {
     case "already_undone":
       throw new ApiError("already_undone", 409);
     case "already_booked_in_exact":
-      throw new ApiError("already_booked_in_exact", 409);
+      throw new ApiError(
+        "already_booked_in_exact",
+        409,
+        res.exactState === "matched_in_exact"
+          ? "reversal_required_in_exact"
+          : "booking_in_progress",
+      );
     case "undone": {
       const match = (await loadMatches(ctx.env.DB, [id])).get(id) as MatchDto;
       const out: MatchUndoResponse = { match };
@@ -786,6 +801,8 @@ interface MapSqlRow {
   division_name: string | null;
   journal_code: string | null;
   bank_gl_account_code: string | null;
+  receivable_gl_account_code: string | null;
+  payable_gl_account_code: string | null;
   updated_at: string | null;
   updated_by: string | null;
 }
@@ -807,7 +824,8 @@ async function accountMapResponse(db: D1Database): Promise<MatchAccountMapRespon
     await db
       .prepare(
         `SELECT ba.id, ba.name, ba.iban, ba.currency, m.division_id, d.name AS division_name,
-                m.journal_code, m.bank_gl_account_code, m.updated_at, m.updated_by
+                m.journal_code, m.bank_gl_account_code, m.receivable_gl_account_code,
+                m.payable_gl_account_code, m.updated_at, m.updated_by
          FROM bank_accounts ba
            JOIN connections c ON c.id = ba.connection_id AND c.kind = 'revolut'
            LEFT JOIN bank_account_exact_map m ON m.bank_account_id = ba.id
@@ -826,6 +844,8 @@ async function accountMapResponse(db: D1Database): Promise<MatchAccountMapRespon
     divisionName: safeText(r.division_name, 120),
     journalCode: r.journal_code,
     bankGlAccountCode: r.bank_gl_account_code,
+    receivableGlAccountCode: r.receivable_gl_account_code,
+    payableGlAccountCode: r.payable_gl_account_code,
     updatedAt: r.updated_at,
     updatedBy: r.updated_by,
   }));
@@ -844,6 +864,8 @@ async function putMapHandler(ctx: Ctx): Promise<Response> {
     "divisionId",
     "journalCode",
     "bankGlAccountCode",
+    "receivableGlAccountCode",
+    "payableGlAccountCode",
   ]);
   const accountId = b["bankAccountId"];
   if (typeof accountId !== "number" || !Number.isSafeInteger(accountId) || accountId < 1) {
@@ -916,7 +938,23 @@ async function putMapHandler(ctx: Ctx): Promise<Response> {
   if (before && before.division_id !== divisionId && (await liveFor())) {
     throw new ApiError("has_live_matches", 409);
   }
-  const after = { division_id: divisionId, journal_code: journal, bank_gl_account_code: gl };
+  // Control accounts (M7c): optional; absent keeps the stored value, null clears it.
+  const control = (key: string): { provided: 0 | 1; value: string | null } => {
+    if (!(key in b)) return { provided: 0, value: null };
+    const v = b[key];
+    if (v === null) return { provided: 1, value: null };
+    if (typeof v !== "string" || !LEDGER_CODE.test(v)) throw new ApiError("bad_gl_account");
+    return { provided: 1, value: v };
+  };
+  const receivable = control("receivableGlAccountCode");
+  const payable = control("payableGlAccountCode");
+  const after = {
+    division_id: divisionId,
+    journal_code: journal,
+    bank_gl_account_code: gl,
+    ...(receivable.provided === 1 ? { receivable_gl_account_code: receivable.value } : {}),
+    ...(payable.provided === 1 ? { payable_gl_account_code: payable.value } : {}),
+  };
   await guardedBatch([
     auditStatement(db, {
       actorEmail: actor,
@@ -930,13 +968,28 @@ async function putMapHandler(ctx: Ctx): Promise<Response> {
       .prepare(
         `INSERT INTO bank_account_exact_map
            (bank_account_id, division_id, journal_code, bank_gl_account_code, created_by, created_at,
-            updated_by, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?5, ?6)
+            updated_by, updated_at, receivable_gl_account_code, payable_gl_account_code)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?5, ?6, ?7, ?9)
          ON CONFLICT (bank_account_id) DO UPDATE SET division_id = excluded.division_id,
            journal_code = excluded.journal_code, bank_gl_account_code = excluded.bank_gl_account_code,
+           receivable_gl_account_code = CASE WHEN ?8 = 1 THEN excluded.receivable_gl_account_code
+                                             ELSE bank_account_exact_map.receivable_gl_account_code END,
+           payable_gl_account_code = CASE WHEN ?10 = 1 THEN excluded.payable_gl_account_code
+                                          ELSE bank_account_exact_map.payable_gl_account_code END,
            updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
       )
-      .bind(accountId, divisionId, journal, gl, actor, nowIso),
+      .bind(
+        accountId,
+        divisionId,
+        journal,
+        gl,
+        actor,
+        nowIso,
+        receivable.value,
+        receivable.provided,
+        payable.value,
+        payable.provided,
+      ),
   ]);
   return json(await accountMapResponse(db));
 }

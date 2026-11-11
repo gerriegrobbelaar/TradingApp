@@ -3,6 +3,7 @@
  * example: the only CSRF-exempt route is the signed Revolut webhook).
  */
 import { registerAuthRoutes } from "./auth/routes";
+import { registerBookingRoutes } from "./booking/routes";
 import { registerUserRoutes } from "./auth/users-routes";
 import { registerExactRoutes } from "./exact/routes";
 import { registerSyncRoutes } from "./exact/sync-routes";
@@ -31,6 +32,7 @@ export function buildRouter(): Router {
   registerFxRoutes(router);
   registerApprovalsRoutes(router);
   registerMatchingRoutes(router);
+  registerBookingRoutes(router);
   registerJobRoutes(router);
   return router;
 }

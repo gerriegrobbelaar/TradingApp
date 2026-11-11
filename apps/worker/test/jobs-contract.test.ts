@@ -15,6 +15,8 @@ import { env } from "cloudflare:test";
 import type { ExactRequest, ExactTransport } from "@camelthorn/exact";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { HANDLERS } from "../src/jobs/handlers";
+import { FakeExact as BookingFakeExact } from "./booking-fake-exact";
+import { bookingWorld, seedBookable } from "./booking-helpers";
 import type { HandlerResult, JobContext } from "../src/jobs/types";
 import { assertCountsAndCodesOnly, MAX_STRING } from "./counts-only";
 import { stubEcb, type FakeEcb } from "./fx-helpers";
@@ -37,6 +39,8 @@ const NOW = Date.parse("2026-07-15T00:00:00Z"); // 02:00 CEST
 /** Tables where a repeated run must not add rows. */
 const DATA_TABLES = [
   // Children first: the delete order below is also the order of the foreign keys.
+  "exact_write_outbox",
+  "exact_write_outbox",
   "match_suggestions",
   "match_allocations",
   "matches",
@@ -80,6 +84,8 @@ interface Effects {
 }
 
 interface Fixture {
+  /** The handler writes to the outside world by design (booking): the first run must write, a second must not. */
+  writes?: true;
   /** The handler works on D1 only: there is no external boundary to observe. */
   internal?: true;
   /** Prepares the database and the fakes; returns the syncDeps-style test seam and the effects log. */
@@ -224,8 +230,26 @@ async function matchingFixture(): Promise<{ syncDeps: JobContext["syncDeps"]; ef
   return { syncDeps: undefined, effects: { calls: [], writes: [] } };
 }
 
+/**
+ * exact.book_matches WRITES to Exact by design (behind the fail-closed switch, which this fixture
+ * turns on): one bank entry and one MatchSet for one match. The contract still holds: the first
+ * run's writes each have their idempotency key claimed first, and the second run repeats nothing.
+ */
+async function bookingFixture(): Promise<{ syncDeps: JobContext["syncDeps"]; effects: Effects }> {
+  const w = await bookingWorld({ creates: true });
+  const fake = new BookingFakeExact();
+  fake.closing.set("90", 100_000);
+  await seedBookable(w, fake, { createdAt: "2026-07-14T08:00:00.000Z" });
+  const effects: Effects = { calls: [], writes: [] };
+  return {
+    syncDeps: { transport: recording(fake.transport, effects), gate: fakeGate(), now: () => NOW },
+    effects,
+  };
+}
+
 /** One entry per implemented handler. */
 const FIXTURES: Record<string, Fixture> = {
+  "exact.book_matches": { setup: bookingFixture, writes: true },
   "exact.full_sync": { setup: exactFixture },
   "exact.incremental_sync": { setup: exactFixture },
   "revolut.sync": { setup: revolutFixture, teardown: () => revolutStub?.restore() },
@@ -240,7 +264,13 @@ function contextFor(
   syncDeps: JobContext["syncDeps"],
 ): JobContext {
   const budget =
-    key === "exact.full_sync" ? 240 : key.startsWith("revolut.") || key === "bank.match" ? 0 : 40;
+    key === "exact.full_sync"
+      ? 240
+      : key === "exact.book_matches"
+        ? 30
+        : key.startsWith("revolut.") || key === "bank.match"
+          ? 0
+          : 40;
   return {
     env,
     job: { id: 1, name: key, handler: key, exactBudget: budget },
@@ -308,7 +338,8 @@ describe("handler contract: every implemented handler", () => {
           const rowsAfterSecond = await counts();
 
           // The sync handlers only read from Exact and write to D1.
-          expect(effects.writes, "external writes").toEqual([]);
+          if (fixture.writes) expect(writes1, "the booking run writes").toBeGreaterThan(0);
+          else expect(effects.writes, "external writes").toEqual([]);
           // Generic rule for handlers that do write: a second run adds no write, and every write
           // had its idempotency key claimed first.
           expect(effects.writes.length - writes1).toBe(0);

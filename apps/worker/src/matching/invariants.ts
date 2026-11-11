@@ -28,13 +28,25 @@ export type InvariantCode =
   /** A live, not booked allocation to a closed item, and the match is not flagged. */
   | "allocation_to_closed_item_unflagged"
   /** Suggestions left on a line that is matched or ignored. */
-  | "suggestions_on_decided_line";
+  | "suggestions_on_decided_line"
+  /** matched_in_exact without booked_at (the settlement rule needs it). */
+  | "booked_without_booked_at"
+  /** A match that was never claimed still has outbox rows. */
+  | "not_booked_with_outbox"
+  /** A claimed live match (booking, bank_entry_created, booking_failed, outcome_unknown) without outbox rows. */
+  | "claimed_without_outbox"
+  /** matched_in_exact with an outbox row that is not finished (verified or resolved by a person). */
+  | "booked_with_open_outbox"
+  /** An outbox row of an undone match. */
+  | "outbox_of_undone_match";
 
 export interface InvariantViolation {
   code: InvariantCode;
   /** Offending row ids (match id, bank transaction id or open item id; see the rule). */
   ids: number[];
 }
+
+import { allocCounts } from "./store";
 
 const SAMPLE = 20;
 
@@ -86,7 +98,7 @@ const RULES: readonly { code: InvariantCode; sql: string }[] = [
     sql: `SELECT oi.id FROM open_items oi
           WHERE (SELECT COALESCE(SUM(a.allocated_minor), 0) FROM match_allocations a
                    JOIN matches m ON m.id = a.match_id
-                  WHERE a.open_item_id = oi.id AND m.undone_at IS NULL) > ABS(oi.open_minor)
+                  WHERE a.open_item_id = oi.id AND ${allocCounts("m", "oi")}) > ABS(oi.open_minor)
             AND EXISTS (SELECT 1 FROM match_allocations a JOIN matches m ON m.id = a.match_id
                         WHERE a.open_item_id = oi.id AND m.undone_at IS NULL
                           AND m.exact_state = 'not_booked' AND m.review_reason IS NULL)`,
@@ -103,6 +115,32 @@ const RULES: readonly { code: InvariantCode; sql: string }[] = [
     sql: `SELECT DISTINCT s.bank_transaction_id AS id FROM match_suggestions s
             JOIN bank_transactions t ON t.id = s.bank_transaction_id
           WHERE t.match_status IN ('matched', 'ignored')`,
+  },
+  {
+    code: "booked_without_booked_at",
+    sql: `SELECT m.id FROM matches m WHERE m.exact_state = 'matched_in_exact' AND m.booked_at IS NULL`,
+  },
+  {
+    code: "not_booked_with_outbox",
+    sql: `SELECT m.id FROM matches m WHERE m.exact_state = 'not_booked'
+            AND EXISTS (SELECT 1 FROM exact_write_outbox o WHERE o.match_id = m.id)`,
+  },
+  {
+    code: "claimed_without_outbox",
+    sql: `SELECT m.id FROM matches m WHERE m.undone_at IS NULL
+            AND m.exact_state IN ('booking', 'bank_entry_created', 'booking_failed', 'outcome_unknown')
+            AND NOT EXISTS (SELECT 1 FROM exact_write_outbox o WHERE o.match_id = m.id)`,
+  },
+  {
+    code: "booked_with_open_outbox",
+    sql: `SELECT m.id FROM matches m WHERE m.exact_state = 'matched_in_exact'
+            AND EXISTS (SELECT 1 FROM exact_write_outbox o WHERE o.match_id = m.id
+                          AND o.status NOT IN ('verified', 'resolved_manually'))`,
+  },
+  {
+    code: "outbox_of_undone_match",
+    sql: `SELECT o.id FROM exact_write_outbox o JOIN matches m ON m.id = o.match_id
+          WHERE m.undone_at IS NOT NULL`,
   },
 ];
 

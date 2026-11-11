@@ -3,8 +3,9 @@ import { describe, expect, it } from "vitest";
 /**
  * Review M7e (ADR 0040): nothing in the worker may write to Exact (the system of record) except
  * through `createExactWriter` from `@camelthorn/exact`, which carries the strict `writeEnabled`
- * guard, and only from an allow-listed module (none yet: the matching booker that wires it in is
- * a later task and must add itself here, WITH the reason, in a reviewed diff).
+ * guard, and only from an allow-listed module: the booking executor (M7c, ADR 0043; the gate's
+ * write policy may name the endpoints to refuse everything else). Any other module that wants the
+ * writer must add itself here, WITH the reason, in a reviewed diff.
  *
  * A source scan of apps/worker/src:
  *  1. the write API names (the writer, its methods, the old `xmlUpload`, the XML upload path and
@@ -23,13 +24,20 @@ const files = (
 ).glob("../src/**/*.ts", { query: "?raw", import: "default", eager: true });
 
 /** Name -> files allowed to mention it, each with the reason. */
+const BOOKER = "../src/booking/executor.ts";
+const BOOKER_WHY =
+  "the booking executor: the one caller of the writer, behind the fail-closed switch, the verification mark, the gate policy and the outbox";
+const POLICY = "../src/exact/write-policy.ts";
+const POLICY_WHY =
+  "the gate policy: it names the two allowed write endpoints to REFUSE everything else (it never builds a request)";
+
 const WRITE_NAMES: Record<string, Record<string, string>> = {
-  createExactWriter: {},
-  ExactWriter: {},
-  createBankEntry: {},
-  submitMatchSet: {},
+  createExactWriter: { [BOOKER]: BOOKER_WHY },
+  ExactWriter: { [BOOKER]: BOOKER_WHY },
+  createBankEntry: { [BOOKER]: BOOKER_WHY },
+  submitMatchSet: { [BOOKER]: BOOKER_WHY },
   xmlUpload: {},
-  EXACT_WRITE_NAMES: {},
+  EXACT_WRITE_NAMES: { [POLICY]: POLICY_WHY },
   BankEntries: {},
   BankEntryLines: {},
   MatchSets: {},
@@ -79,6 +87,37 @@ describe("Exact write guard (source scan)", () => {
       if (inArea && NON_GET.test(src) && !(file in NON_GET_ALLOWED)) offenders.push(file);
     }
     expect(offenders).toEqual([]);
+  });
+
+  it("the gate checks writes at the door and again right before the network call (M7c)", () => {
+    const gate = stripComments(files["../src/exact/gate.ts"] ?? "");
+    expect((gate.match(/assertMethodAllowed\(req\)/g) ?? []).length).toBeGreaterThanOrEqual(3);
+    expect(gate).toContain("refuseWrite(this.env.DB, req)");
+    // A POST that got 401 is never re-queued: the refusal is thrown before the retry path.
+    expect(gate.indexOf("ExactWriteAuthRetryRefused()")).toBeGreaterThan(0);
+    expect(gate.indexOf("throw new ExactWriteAuthRetryRefused()")).toBeLessThan(
+      gate.indexOf("this.queue.unshift(item)"),
+    );
+    expect(gate).toContain('redirect: "manual"');
+  });
+
+  it("only the executor and the gate policy know the booking job id", () => {
+    const users = Object.entries(files)
+      .filter(([, raw]) =>
+        /(?<![A-Za-z0-9_])BOOKING_JOB_ID(?![A-Za-z0-9_])|["'`]exact-booking["'`]/.test(
+          stripComments(raw),
+        ),
+      )
+      .map(([f]) => f)
+      .sort();
+    expect(users).toEqual(["../src/booking/executor.ts", "../src/exact/write-policy.ts"]);
+  });
+
+  it("only the executor module calls the booking writes of the writer", () => {
+    const callers = Object.entries(files)
+      .filter(([, raw]) => /\.(?:createBankEntry|submitMatchSet)\(/.test(stripComments(raw)))
+      .map(([f]) => f);
+    expect(callers).toEqual(["../src/booking/executor.ts"]);
   });
 
   it("the allow-lists hold no stale entries", () => {

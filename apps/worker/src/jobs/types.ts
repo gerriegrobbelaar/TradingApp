@@ -99,6 +99,11 @@ export interface HandlerDef {
   description: string;
   /** Spends Exact calls (the budget field applies). */
   usesExact: boolean;
+  /**
+   * The handler stops by itself once it used this many Exact calls in an Amsterdam day (and only
+   * spends calls when there is work), so the budget projection uses it instead of fires x budget.
+   */
+  dailyExactCallCap?: number;
   /** The phase that builds it, shown while it is `not_implemented`. */
   phase: string | null;
   /** Total attempts including the first; retries only apply to scheduled runs. */
