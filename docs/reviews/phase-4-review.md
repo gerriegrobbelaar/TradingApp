@@ -1,0 +1,25 @@
+# Phase 4 (Read-only screens) final review — condensed
+Reviewed at 76bf73f. Typecheck, lint, 2,221 tests x3 (no flakes), core coverage 99.4%, web build, `wrangler deploy --dry-run`, Playwright screens suite (30/30) and migrations 0001–0011 on a populated DB all pass. 24-case number trace (Exact JSON → parse → D1 → API → formatMoney → xlsx) exact at every hop. **No blocking findings; ready for Phase 5 with conditions.** Nothing has run against real Exact, Cloudflare or Google.
+
+## Should fix
+- S1 Queues CAN be created in the EU (`wrangler queues create --jurisdiction eu`); DEPLOY.md/wrangler.toml header/Phase 3 review wrongly say they cannot. Create both queues with `--jurisdiction eu`, ADR; before first deploy.
+- S2 Approval status mapping (5 → waiting, 50 → approved) is probably wrong (recollection: 5 Rejected, 20 Open, 50 Processed; may instead be PayablesList.ApprovalStatus); no join key between open_items and purchase_entries. Add a verified flag that `isInvoiceApprovedForPayment` requires (false until ADR 0025 records live result), show 'mapping not verified' on Approvals, define the join, add ApprovalStatus/JournalCode to the live checklist.
+- S3 Overview shows 'At least € 0,00 in EUR' for foreign-currency figures by default (open_dc_minor NULL from the list read); share the ageing screen's wording/component; say 'as stored in Exact'.
+- S4 Last year's balances refresh weekly even while the year is still being booked (up to 8 days behind): read year-1 nightly until a configurable month/closed; design the fallback if period-0 rows only exist once the prior year is closed.
+- S5 DEPLOY.md errors: queue jurisdiction; latest migration is 0011; `restart` has no UI (give request or add admin button); item 15 button names; `wrangler dev --remote` and queue consumers; `secret put` before the Worker exists; D1 migration failure rollback is verified; CPU limit; payables sign and Id vs ID.
+- S6 No staging environment; nothing with Durable Objects runs locally (workerd has no jurisdictions): add `[env.staging]`, extend the deploy guard, run runbook steps 8–10 there first.
+- S7 Customer/supplier names in URLs (`?q=`, relationName in page address → Referer) with Workers Logs at sampling 1: turn invocation logs off or confirm URLs aren't stored; drop relationName from the address.
+- S8 A paid invoice can stay open under a fresh 'Updated' stamp (hourly job doesn't read open items; two-strike keeps it one more night; up to 36 h before the warning): show 'possibly paid' for missed_cycles > 0, state the nightly cadence, revisit incremental open items after the live check.
+- S9 'Closed'/'All' views mislead (only items open at some sync since connecting; closed rows show € 0,00): reword 'Closed since first sync' or hide.
+- S10 IBAN read not resumable and sits before approvals/ledger: make resumable or move last.
+- S11 Hazards: `open_items.amount_minor` semantics (add a test forbidding reads outside sync/detail, or rename); `connections.creates_bank_entries` defaults to 1 — Phase 5 must set it explicitly per connection (decision 2).
+
+## Nice to have
+N1 dead code (listAccounts/listReceivables/listPayables/listGlBalances, ExactGate.defaultBudget, open_items.relation_iban); N2 duplicates (cursor encode/decode, passStmt/clip/MAX_CHUNKS, minorToDecimal vs formatMinor, Amsterdam year/month helpers); N3 SOURCE_LABEL.sync wrong; N4 stale job descriptions; N5 stale flag/asOf fixed at page load (refetch on focus); N6 ageing Excel/print lacks 'out of date' line; N7 check bulk/sync endpoints live; N8 CI doesn't run screens suite, noisy expected exceptions, two real 20–30 ms waits; N9 PROGRESS log placement, ADR heading styles, SCHEDULED_MAX_MS name; N10 Overview KPIs only receivables/payables; design canvas never exported to docs/design; N11 SQL sums beyond 2^53.
+
+## Exact budget after Phase 4
+Scheduled worst case unchanged at 1,960/administration/day. Typical night ~229 calls (one attempt, ~4 min); weekly/first night ~319 (two attempts). Hourly run 2–4 calls, max ~15. Manual runs have no daily cap of their own.
+Proposed first sync: staging with a test division, checklist items 1–9; Run now on exact.full_sync in daytime; compare counts/totals/balance sheet/status codes with Exact; read exact_usage; enable full then hourly job; repeat on production.
+
+## Questions for the user (ranked)
+1 first deploy/live checklist timing and a test division (gates trust in Phases 2–4; precede Phase 7); 2 decision 2 (Revolut's own Exact integration on? blocks Phase 7, per-connection setting in Phase 5); 3 decision 1 (Revolut plan: Company? blocks Phase 9); 4 decision 6 (four-eyes limit, approvers, who may pay/lock; is Exact's purchase-invoice approval workflow used?); 5 decision 3 (currencies, FX result account, reversal; Phase 12); 6 decision 4 (ECB rates accepted by the accountant; Phase 12 booking); 7 decision 5 (reminders; Phase 10); 8 financial year = calendar year? when is prior year closed? budgets used?; 9 export design canvas screenshots; 10 rough volumes.
