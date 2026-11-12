@@ -739,3 +739,54 @@ export async function paymentSettlement(db: D1Database, paymentId: number): Prom
     ? "booked"
     : "awaiting_booking";
 }
+
+/**
+ * `paymentSettlement` for many payments in ONE query (F9c review: the list pages read up to 100
+ * payments, or 100 batches of up to 50 items; one lookup per row would be hundreds of queries).
+ * Same rules, same answers (a test compares the two). Ids that are not `paid` are `not_paid`.
+ * D1 allows 100 bound parameters: larger inputs are read in chunks.
+ */
+export async function paymentSettlements(
+  db: D1Database,
+  ids: readonly number[],
+): Promise<Map<number, Settlement>> {
+  const out = new Map<number, Settlement>();
+  for (const id of ids) out.set(id, "not_paid");
+  for (let at = 0; at < ids.length; at += 100) {
+    const chunk = ids.slice(at, at + 100);
+    const marks = chunk.map((_, i) => `?${i + 1}`).join(", ");
+    const rows = await db
+      .prepare(
+        `SELECT p.id AS pid, l.bank_transaction_id AS bt, m.id AS mid, m.exact_state AS state,
+                CASE WHEN m.id IS NULL THEN 0 ELSE EXISTS (
+                  SELECT 1 FROM match_allocations a WHERE a.match_id = m.id AND a.open_item_id = p.open_item_id
+                ) END AS ours
+           FROM payments p
+           LEFT JOIN payment_bank_links l ON l.payment_id = p.id
+           LEFT JOIN matches m ON m.bank_transaction_id = l.bank_transaction_id AND m.undone_at IS NULL
+          WHERE p.id IN (${marks}) AND p.status = 'paid'`,
+      )
+      .bind(...chunk)
+      .all<{
+        pid: number;
+        bt: number | null;
+        mid: number | null;
+        state: string | null;
+        ours: number;
+      }>();
+    const per = new Map<number, typeof rows.results>();
+    for (const r of rows.results) per.set(r.pid, [...(per.get(r.pid) ?? []), r]);
+    for (const [pid, rs] of per) {
+      let s: Settlement;
+      if (rs.every((r) => r.bt === null)) s = "awaiting_bank_line";
+      else if (rs.every((r) => r.mid === null)) s = "awaiting_match";
+      else if (!rs.some((r) => r.ours === 1)) s = "match_other_invoice";
+      else
+        s = rs.some((r) => r.ours === 1 && r.state === "matched_in_exact")
+          ? "booked"
+          : "awaiting_booking";
+      out.set(pid, s);
+    }
+  }
+  return out;
+}

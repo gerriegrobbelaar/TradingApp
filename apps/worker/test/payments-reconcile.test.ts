@@ -16,11 +16,13 @@ import {
   linkPaidPayments,
   loadDraftExpiryDays,
   paymentSettlement,
+  paymentSettlements,
   reconcilePayments,
   DRAFT_EXPIRY_KEY,
 } from "../src/payments/reconcile";
 import { runSubmission, setSubmitterForTests, type SubmitOutcome } from "../src/payments/submit";
 import { runPaymentsReconcile } from "../src/payments/reconcile-job";
+import { readPayment } from "../src/payments/read";
 import {
   db,
   execWorld,
@@ -421,6 +423,13 @@ describe("drafts: approval in the Revolut app, lost answers, expiry", () => {
 });
 
 describe("bank line link and settlement (CLAUDE.md 4.3: bank confirmed AND booked in Exact)", () => {
+  /** F9c review: the bulk read (lists, batch items) and the DTO agree with the single lookup. */
+  async function settled(id: number): Promise<string> {
+    const one = await paymentSettlement(db, id);
+    expect((await paymentSettlements(db, [id])).get(id)).toBe(one);
+    expect((await readPayment(db, id))?.settlement).toBe(one);
+    return one;
+  }
   async function paidPayment(): Promise<{ id: number; rid: string }> {
     const id = await readyPayment(w);
     await toState(id, { kind: "accepted", providerId: "p" });
@@ -446,7 +455,7 @@ describe("bank line link and settlement (CLAUDE.md 4.3: bank confirmed AND booke
 
   it("until the bank line exists the settlement says so; the reconciliation then links it by request_id", async () => {
     const { id, rid } = await paidPayment();
-    expect(await paymentSettlement(db, id)).toBe("awaiting_bank_line");
+    expect(await settled(id)).toBe("awaiting_bank_line");
     const txId = await bankLine(rid);
     expect(await linkPaidPayments(db, new Date().toISOString())).toBe(1);
     expect(
@@ -455,7 +464,7 @@ describe("bank line link and settlement (CLAUDE.md 4.3: bank confirmed AND booke
         .bind(id)
         .first(),
     ).toMatchObject({ bank_transaction_id: txId, via: "request_id" });
-    expect(await paymentSettlement(db, id)).toBe("awaiting_match");
+    expect(await settled(id)).toBe("awaiting_match");
     // idempotent
     expect(await linkPaidPayments(db, new Date().toISOString())).toBe(0);
   });
@@ -530,14 +539,14 @@ describe("bank line link and settlement (CLAUDE.md 4.3: bank confirmed AND booke
       .bind(txId, div)
       .run();
     const matchId = m.meta.last_row_id;
-    expect(await paymentSettlement(db, id)).toBe("match_other_invoice"); // a live match without our allocation is not ours
+    expect(await settled(id)).toBe("match_other_invoice"); // a live match without our allocation is not ours
     await db
       .prepare(
         "INSERT INTO match_allocations (match_id, open_item_id, allocated_minor, currency) VALUES (?1, ?2, 100000, 'EUR')",
       )
       .bind(matchId, item)
       .run();
-    expect(await paymentSettlement(db, id)).toBe("awaiting_booking");
+    expect(await settled(id)).toBe("awaiting_booking");
     await withoutTriggers(
       [
         "matches_guard_exact_state",
@@ -552,7 +561,7 @@ describe("bank line link and settlement (CLAUDE.md 4.3: bank confirmed AND booke
           .run();
       },
     );
-    expect(await paymentSettlement(db, id)).toBe("booked");
+    expect(await settled(id)).toBe("booked");
     // a match for the line that allocates ANOTHER invoice is not ours
     const other = await anotherBill(w);
     await withoutTriggers(["match_allocations_guard_update"], async () => {
@@ -561,13 +570,13 @@ describe("bank line link and settlement (CLAUDE.md 4.3: bank confirmed AND booke
         .bind(matchId, other)
         .run();
     });
-    expect(await paymentSettlement(db, id)).toBe("match_other_invoice");
+    expect(await settled(id)).toBe("match_other_invoice");
   });
 
   it("a payment that is not paid has no settlement; a reversed bank line is raised once", async () => {
     const paid = await paidPayment();
     const id = await readyPayment(w, { itemId: await anotherBill(w) });
-    expect(await paymentSettlement(db, id)).toBe("not_paid");
+    expect(await settled(id)).toBe("not_paid");
     const txId = await bankLine(paid.rid);
     await linkPaidPayments(db, new Date().toISOString());
     await withoutTriggers(["bank_transactions_guard_status"], async () => {

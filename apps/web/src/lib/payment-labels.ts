@@ -433,13 +433,20 @@ export function subjectOf(
         kind: "batch";
         status: string;
         mode: string;
+        itemCount?: number;
         items: readonly { settlement?: string | undefined }[];
       },
 ): StatusSubject {
   return {
     status: dto.status,
     mode: dto.mode,
-    settlement: dto.kind === "payment" ? dto.settlement : batchSettlement(dto.items),
+    settlement:
+      dto.kind === "payment"
+        ? dto.settlement
+        : // Fewer items than the batch holds: we cannot see them all, so it is not booked.
+          typeof dto.itemCount === "number" && dto.itemCount !== dto.items.length
+          ? "unreadable"
+          : batchSettlement(dto.items),
   };
 }
 
@@ -587,6 +594,9 @@ export const ERROR_TEXT: Record<string, string> = {
     "That request was already used for a different payment. Close the sheet and start again.",
   amount_invalid: "The amount is not a valid payment amount.",
   checks_incomplete: "Every verification check must be ticked.",
+  bad_days: "Enter a whole number of days from 1 to 30.",
+  bad_kind: "Choose a payment or a batch.",
+  bad_id: "That request number is not valid.",
   bad_note: "The note is too short or too long.",
   note_required: "Write a reason for turning this down (at least 3 characters).",
   last_four_mismatch: "The last four characters do not match the bank account shown.",

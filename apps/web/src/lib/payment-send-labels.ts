@@ -94,6 +94,22 @@ export const SEND_TEXT: Record<string, string> = {
     "A final check against today's data failed, so it was not sent. Reload the page and look again.",
   iban_binding_broken:
     "The stored bank account no longer matches the one an approver confirmed, so nothing was sent. Do not try again. Ask an administrator.",
+  // F9a (S5): the fingerprint key was rotated since the approval; not a tampered account.
+  iban_key_rotated:
+    "The security key for bank accounts was changed since this was approved, so nothing was sent. Cancel it and request the payment again.",
+  // The pre-check refused without naming a block, or the request changed at the same moment.
+  blocked:
+    "A final check against today's data failed, so it was not sent. Reload the page and look again.",
+  conflict:
+    "Somebody else changed this request at the same moment, so nothing was sent. Reload the page and look at its status.",
+  // The database's own guards on the claim (migration triggers): the claim did not happen.
+  bad_transition:
+    "This request is not in a state that can be sent, so nothing was sent. Reload the page and look at its status.",
+  final:
+    "This request is already finished, so nothing was sent. Reload the page and look at its status.",
+  claim_subject:
+    "This request could not be reserved for sending, so nothing was sent. Reload the page and look at its status.",
+  approval_required: "The approval for this request is missing, so it was not sent.",
   // Earlier attempts and the bank's own lookups (answered as a refusal by the bank side)
   prior_attempt_live: PROVIDER_REJECT_TEXT["prior_attempt_live"] as string,
   prior_attempt_unchecked: PROVIDER_REJECT_TEXT["prior_attempt_unchecked"] as string,
@@ -131,22 +147,43 @@ export function sendRefusalText(code: string): string {
     const b = blockText(code.slice("precheck:".length));
     return `${b.what} Nothing was sent. ${b.todo}`;
   }
-  if (own(ERROR_TEXT, code)) return ERROR_TEXT[code] as string;
+  if (own(ERROR_TEXT, code)) {
+    // A shared sentence (an IBAN or a limit found by the last pre-check): say what it means here.
+    const t = ERROR_TEXT[code] as string;
+    return /nothing (was|is) sent|not sent|nothing can be sent/i.test(t)
+      ? t
+      : `${t} Nothing was sent.`;
+  }
   return SEND_REFUSED_FALLBACK;
 }
 
-/** True when the failure is a refusal the server made BEFORE claiming the request. */
+/** A 403 on the submit route comes from the role check, before the handler runs. */
+export const SEND_FORBIDDEN_TEXT =
+  "Only someone with the finance role can send a payment, so nothing was sent.";
+
+/**
+ * True when the failure is a refusal the server made BEFORE claiming the request: a 409 or 404
+ * with a readable code (the submit route only answers those before its claim), or a 403 of the role
+ * check. An error page whose body we cannot read (`request_failed`) is NOT known to be ours, so it
+ * is "unsure", never "nothing was sent".
+ */
 export function isRefusal(e: unknown): e is ApiError {
-  return e instanceof ApiError && (e.status === 409 || e.status === 404);
+  return (
+    e instanceof ApiError &&
+    (e.status === 409 || e.status === 404 || e.status === 403) &&
+    e.code !== "request_failed" &&
+    e.code !== ""
+  );
 }
+
+/** A refusal after which this request must not be offered again from this screen. */
+export const FINAL_REFUSALS: ReadonlySet<string> = new Set(["already_claimed"]);
 
 /** Words for a failed submit call. A refusal says nothing was sent; anything else does not. */
 export function describeSendError(e: unknown): string {
-  if (e instanceof ApiError && e.status === 403 && !own(SEND_TEXT, e.code)) {
-    return ERROR_TEXT["forbidden"] as string;
-  }
-  if (isRefusal(e)) return sendRefusalText(e.code);
-  return SEND_UNSURE_TEXT;
+  if (!isRefusal(e)) return SEND_UNSURE_TEXT;
+  if (e.status === 403 && !own(SEND_TEXT, e.code)) return SEND_FORBIDDEN_TEXT;
+  return sendRefusalText(e.code);
 }
 
 /** What a handled request (`result`) means, from `result.to` and the mode. Never invents success. */

@@ -7,6 +7,7 @@ import {
   SEND_NEXT_TEXT,
   SEND_RESULT_TEXT,
   SEND_UNSURE_TEXT,
+  FINAL_REFUSALS,
   describeSendError,
   isRefusal,
   rejectedReasonText,
@@ -27,7 +28,7 @@ type RequestDto = PaymentDto | BatchDto;
 export type SendNote =
   | { kind: "result"; text: string; good: boolean; final: true }
   | { kind: "unsure"; text: string; final: true }
-  | { kind: "refused"; text: string; final: false };
+  | { kind: "refused"; text: string; final: boolean };
 
 const MODE_WORDS = { drafts: "Draft in the Revolut app", pay: "One-click pay" } as const;
 
@@ -78,7 +79,10 @@ export function SendPanel({
         batch?: BatchDto;
       };
       const next = v.payment ?? v.batch ?? null;
-      const key = typeof v.result?.to === "string" ? sendResultKey(v.result.to, dto.mode) : null;
+      // The mode the SERVER sent it in (its answer), else the one it showed us: never guessed.
+      const mode =
+        next !== null && (next.mode === "drafts" || next.mode === "pay") ? next.mode : dto.mode;
+      const key = typeof v.result?.to === "string" ? sendResultKey(v.result.to, mode) : null;
       if (key === null) {
         // The server's answer is not one we know how to read: say nothing good, send nothing again.
         onNote({ kind: "unsure", text: SEND_UNSURE_TEXT, final: true });
@@ -100,10 +104,12 @@ export function SendPanel({
       return;
     }
     if (isRefusal(r.error)) {
-      // Refused before anything was claimed: nothing was sent, a later attempt is allowed.
-      used.current = false;
+      // Refused before anything was claimed: nothing was sent from here. A later attempt is
+      // allowed, except when somebody else already holds the request (`already_claimed`).
+      const final = FINAL_REFUSALS.has(r.error.code);
+      if (!final) used.current = false;
       setOpen(false);
-      onNote({ kind: "refused", text: describeSendError(r.error), final: false });
+      onNote({ kind: "refused", text: describeSendError(r.error), final });
       onRefresh();
       return;
     }

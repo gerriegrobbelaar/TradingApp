@@ -153,6 +153,11 @@ export function VerifyControls({
               Tick a check only when you did it on the Revolut sandbox and it passed. All{" "}
               {all.length} must be ticked.
             </p>
+            <p className="cap" data-testid="verify-attest">
+              This is a record that the drills were actually done, not a plan. It is saved with your
+              Google email and the time in the audit log, and switching payments on relies on it. Do
+              not tick a check that was not done.
+            </p>
             <p className="cap" data-testid="verify-progress">
               {ticked.size} of {all.length} ticked.
             </p>
@@ -293,11 +298,13 @@ type Unknown = PaymentDto | BatchDto;
  */
 export function UnknownOutcomesCard() {
   const toast = useToast();
+  const [more, setMore] = useState(false);
   const res = useResource<Unknown[]>("payments-unknown", async (signal) => {
     const [p, b] = await Promise.all([
       listPayments({ status: "outcome_unknown", limit: 50 }, signal),
       listPaymentBatches({ status: "outcome_unknown", limit: 50 }, signal),
     ]);
+    setMore(p.nextCursor !== null || b.nextCursor !== null);
     return [...b.items, ...p.items];
   });
   const [target, setTarget] = useState<Unknown | null>(null);
@@ -354,6 +361,12 @@ export function UnknownOutcomesCard() {
             </li>
           ))}
         </ul>
+      )}
+      {res.status === "ready" && more && (
+        <p className="cap">
+          Only the 50 most recent payments and 50 most recent batches are shown. Resolve these
+          first; the rest appear after.
+        </p>
       )}
       <TypedPhraseSheet
         open={target !== null}

@@ -680,6 +680,11 @@ export function RequestView({
   const mine = sameUser(dto.requestedBy, me.email);
   // What the last Send to bank said; it outlives the panel, which goes when the status moves on.
   const [sendNote, setSendNote] = useState<SendNote | null>(null);
+  // Focus follows the answer: the confirmation that held focus is gone, so the note takes it.
+  const noteRef = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    if (sendNote !== null) noteRef.current?.focus();
+  }, [sendNote]);
   return (
     <div className="pay-view">
       <p className="lede">
@@ -699,6 +704,8 @@ export function RequestView({
           role={sendNote.kind === "result" ? "status" : "alert"}
           className={sendNote.kind === "result" && sendNote.good ? "notice" : "notice warn"}
           data-testid="send-result"
+          tabIndex={-1}
+          ref={noteRef}
         >
           {sendNote.text}
         </p>

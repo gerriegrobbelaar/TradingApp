@@ -434,3 +434,48 @@ describe("only an administrator gets the tools", () => {
     expect(screen.queryByLabelText("Request number")).toBeNull();
   });
 });
+
+describe("review F9c", () => {
+  it("the verification sheet says it is a record of drills actually done, under your name", async () => {
+    page({ "GET /api/settings/payments": () => ({ body: paymentsSettings() }) });
+    const user = userEvent.setup();
+    renderApp("/settings/payments");
+    await user.click(await screen.findByRole("button", { name: "Record the verification" }));
+    const dlg = await screen.findByRole("dialog");
+    const t = norm(within(dlg).getByTestId("verify-attest").textContent);
+    expect(t).toContain("a record that the drills were actually done");
+    expect(t).toContain("audit log");
+    expect(t).toContain("Do not tick a check that was not done.");
+  });
+
+  it("an IBAN put into the sha256 field (or any identifier field) by mistake is masked", async () => {
+    const { maskPaymentsAnswer } = await import("./api-payments");
+    const leaky = {
+      calls: [
+        { sha256: FULL_IBAN, body: "{}" },
+        { sha256: `${FULL_IBAN.toLowerCase()}`, body: "{}" },
+        { sha256: "AB12CD34EF56AB12CD34EF56AB12CD34EF56AB12CD34EF56AB12CD34EF56AB12", body: "{}" },
+      ],
+      payloadHash: `${FULL_IBAN} ${"a".repeat(40)}`,
+      requestId: FULL_IBAN,
+    };
+    const out = JSON.stringify(maskPaymentsAnswer(leaky));
+    expect(out).not.toContain(FULL_IBAN);
+    expect(out.toLowerCase()).not.toContain(FULL_IBAN.toLowerCase());
+    // a real hash is kept byte for byte
+    const h = "ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12";
+    expect(maskPaymentsAnswer({ sha256: h }).sha256).toBe(h);
+  });
+
+  it("more unknown outcomes than one page: the screen says only the first are shown", async () => {
+    const unknown = payment({ status: "outcome_unknown" });
+    page({
+      "GET /api/settings/payments": () => ({ body: ready() }),
+      "GET /api/payments": () => ({ body: { items: [unknown], nextCursor: "11" } }),
+    });
+    renderApp("/settings/payments");
+    expect(
+      await screen.findByText(/Only the 50 most recent payments and 50 most recent batches/),
+    ).toBeTruthy();
+  });
+});

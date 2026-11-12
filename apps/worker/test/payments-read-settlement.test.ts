@@ -112,3 +112,65 @@ describe("PaymentDto.settlement", () => {
     expect(batch?.items.every((i) => i.settlement === "not_paid")).toBe(true);
   });
 });
+
+/** A D1 stand-in that counts statements and can fail the settlement lookup (F9c review). */
+function spyDb(failOn: RegExp | null): { db: D1Database; sql: string[] } {
+  const sql: string[] = [];
+  const wrapped = new Proxy(db, {
+    get(target, prop, receiver) {
+      if (prop === "prepare") {
+        return (q: string) => {
+          sql.push(q);
+          if (failOn !== null && failOn.test(q)) throw new Error("D1_ERROR: simulated");
+          return target.prepare(q);
+        };
+      }
+      const v = Reflect.get(target, prop, receiver) as unknown;
+      return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+    },
+  });
+  return { db: wrapped, sql };
+}
+
+describe("settlement on the list pages (review F9c)", () => {
+  async function paid(itemId?: number): Promise<number> {
+    const id = await readyPayment(w, itemId === undefined ? {} : { itemId });
+    await toState(id, { kind: "accepted", providerId: `p-${id}` });
+    const rid = (await rowOf(id)).request_id;
+    tx.set(rid, completed(rid));
+    await reconcilePayments({ db, nowMs: Date.now(), client: () => Promise.resolve(client) });
+    expect((await rowOf(id)).status).toBe("paid");
+    return id;
+  }
+
+  it("is ONE settlement query for a page of paid payments, not one per row", async () => {
+    const ids = [await paid(), await paid(await anotherBill(w)), await paid(await anotherBill(w))];
+    const spy = spyDb(null);
+    const page = await listPayments(spy.db, {
+      status: "paid",
+      requestedBy: null,
+      limit: 25,
+      cursorId: null,
+    });
+    expect(page.items.map((p) => p.id).sort()).toEqual([...ids].sort());
+    expect(page.items.every((p) => p.settlement === "awaiting_bank_line")).toBe(true);
+    expect(spy.sql.filter((q) => /payment_bank_links/.test(q)).length).toBe(1);
+    // no write on a GET
+    expect(spy.sql.some((q) => /^\s*(INSERT|UPDATE|DELETE)/i.test(q))).toBe(false);
+  });
+
+  it("no lookup at all when nothing on the page is paid", async () => {
+    await readyPayment(w);
+    const spy = spyDb(null);
+    await listPayments(spy.db, { status: "all", requestedBy: null, limit: 25, cursorId: null });
+    expect(spy.sql.filter((q) => /payment_bank_links/.test(q))).toEqual([]);
+  });
+
+  it("a failed lookup is never booked: every paid row reads as awaiting_bank_line, the page still loads", async () => {
+    const id = await paid();
+    const spy = spyDb(/payment_bank_links/);
+    const dto = await readPayment(spy.db, id);
+    expect(dto?.status).toBe("paid");
+    expect(dto?.settlement).toBe("awaiting_bank_line");
+  });
+});

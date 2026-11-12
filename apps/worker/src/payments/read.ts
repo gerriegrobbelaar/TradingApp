@@ -16,7 +16,7 @@ import {
   type PaymentStatus,
 } from "@camelthorn/core";
 import { maskedIbans } from "./iban-store";
-import { paymentSettlement } from "./reconcile";
+import { paymentSettlements } from "./reconcile";
 
 // The DTO types live in core (api-types.ts) so the web shares them; re-exported for the worker's own imports.
 export type { BatchDto, DecisionDto, PaymentDto } from "@camelthorn/core";
@@ -135,25 +135,30 @@ function toPaymentDto(
 
 /**
  * How far each payment is booked (F9c, CLAUDE.md 4.3). Only a bank-paid payment has anything to
- * look up; every other status is `not_paid` without a query. An unreadable answer is NOT "booked":
- * it falls back to `awaiting_bank_line`, which reads as "paid at the bank, booking pending".
+ * look up; every other status is `not_paid`, and when no row is paid no query is made. The paid
+ * rows are looked up together in ONE query (a list page is not N+1). An unreadable answer is NOT
+ * "booked": every paid row falls back to `awaiting_bank_line` ("paid at the bank, booking pending").
+ * Read-only: no write on a GET.
  */
 async function settlements(
   db: D1Database,
   rows: readonly PaymentRowRaw[],
 ): Promise<Map<number, PaymentSettlement>> {
   const out = new Map<number, PaymentSettlement>();
+  const paid: number[] = [];
   for (const r of rows) {
-    if (r.status !== "paid") {
-      out.set(r.id, "not_paid");
-      continue;
-    }
-    try {
-      out.set(r.id, await paymentSettlement(db, r.id));
-    } catch {
-      out.set(r.id, "awaiting_bank_line");
-    }
+    out.set(r.id, "not_paid");
+    if (r.status === "paid") paid.push(r.id);
   }
+  if (paid.length === 0) return out;
+  try {
+    const found = await paymentSettlements(db, paid);
+    for (const id of paid) out.set(id, found.get(id) ?? "awaiting_bank_line");
+  } catch {
+    for (const id of paid) out.set(id, "awaiting_bank_line");
+  }
+  // A row that was `paid` when read but is no longer paid in the lookup is NOT booked either.
+  for (const id of paid) if (out.get(id) === "not_paid") out.set(id, "awaiting_bank_line");
   return out;
 }
 

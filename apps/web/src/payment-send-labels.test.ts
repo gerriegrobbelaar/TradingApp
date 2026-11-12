@@ -355,3 +355,53 @@ describe("the new wording rules", () => {
     }
   });
 });
+
+describe("review F9c: the codes the scan above cannot see", () => {
+  it("the database's own guards on the claim batch (payment_err:<code> in the migrations) are worded", () => {
+    // dbErrorCode() turns a trigger refusal of the claim into a `refused` code; the reachable ones:
+    for (const c of [
+      "bad_transition",
+      "final",
+      "claim_subject",
+      "approval_required",
+      "not_approved",
+    ]) {
+      expect(sendRefusalText(c), c).not.toBe(SEND_REFUSED_FALLBACK);
+    }
+  });
+
+  it("recheckBeforeSubmit answers with a PaymentError code: each says nothing was sent", () => {
+    for (const c of ["blocked", "conflict", "not_found", "iban_missing", "iban_cache_stale"]) {
+      const t = sendRefusalText(c);
+      expect(t, c).not.toBe(SEND_REFUSED_FALLBACK);
+      expect(t.toLowerCase(), c).toMatch(/not sent|nothing was sent|no longer exists/);
+    }
+  });
+
+  it("F9a's pending codes (requester_inactive, iban_key_rotated) are worded already", () => {
+    expect(sendRefusalText("requester_inactive")).toContain("not sent");
+    expect(sendRefusalText("iban_key_rotated")).toContain("nothing was sent");
+  });
+
+  it("a 403 is a refusal; a 409/404 without a readable code is NOT", () => {
+    expect(describeSendError(new ApiError(403, "forbidden"))).toContain("nothing was sent");
+    expect(describeSendError(new ApiError(409, "request_failed"))).toBe(SEND_UNSURE_TEXT);
+    expect(describeSendError(new ApiError(404, "request_failed"))).toBe(SEND_UNSURE_TEXT);
+    expect(describeSendError(new ApiError(429, "rate_limited"))).toBe(SEND_UNSURE_TEXT);
+  });
+
+  it("a batch whose items do not all arrive is never Paid", () => {
+    const booked = payment({ status: "paid", settlement: "booked" });
+    const partial = batch({ status: "paid", itemCount: 3, items: [booked, booked] });
+    expect(displayStatus(subjectOf(partial)).label).toBe("Paid at the bank, booking pending");
+    const whole = batch({ status: "paid", itemCount: 2, items: [booked, booked] });
+    expect(displayStatus(subjectOf(whole)).label).toBe("Paid");
+    // a paid batch with an item the bank did not pay is not booked
+    const mixed = batch({
+      status: "paid",
+      itemCount: 2,
+      items: [booked, payment({ status: "failed", settlement: "not_paid" })],
+    });
+    expect(displayStatus(subjectOf(mixed)).label).not.toBe("Paid");
+  });
+});

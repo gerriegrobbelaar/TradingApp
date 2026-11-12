@@ -97,6 +97,7 @@ describe("who sees Send to bank", () => {
     for (const status of [
       "draft",
       "pending_approval",
+      "submitting",
       "submitted",
       "paid",
       "outcome_unknown",
@@ -334,7 +335,9 @@ describe("refusals and failures", () => {
     ["iban_binding_broken", 409],
     ["counterparty_account_ambiguous", 409],
     ["payments_disabled", 409],
-    ["already_claimed", 409],
+    ["iban_key_rotated", 409],
+    ["blocked", 409],
+    ["bad_transition", 409],
     ["not_ready", 409],
     ["expired", 409],
     ["precheck:invoice_not_approved", 409],
@@ -363,6 +366,103 @@ describe("refusals and failures", () => {
       expect(within(dlg).getByRole("button", { name: "Send to bank" })).toBeTruthy();
     });
   }
+
+  it("already_claimed: somebody else holds it, so the Send button does not come back", async () => {
+    const calls = base(FINANCE, READY(), {
+      "POST /api/payments/11/submit": () => ({ status: 409, body: { error: "already_claimed" } }),
+    });
+    const user = userEvent.setup();
+    renderApp(PATH);
+    const dlg = await openRow(user);
+    await user.click(within(dlg).getByRole("button", { name: "Send to bank" }));
+    await user.click(within(dlg).getByRole("button", { name: "Create the draft in Revolut" }));
+    const alert = await within(dlg).findByRole("alert");
+    expect(alert.textContent).toContain("Someone else is already sending this request");
+    expect(
+      within(dlg).queryByRole("button", { name: /send to bank|create the draft/i }),
+    ).toBeNull();
+    expect(submits(calls)).toHaveLength(1);
+  });
+
+  it("a 409 whose body cannot be read is NOT a refusal: unsure, no Send button", async () => {
+    base(FINANCE, READY(), {
+      "POST /api/payments/11/submit": () => ({ status: 409, body: {} }),
+    });
+    const user = userEvent.setup();
+    renderApp(PATH);
+    const dlg = await openRow(user);
+    await user.click(within(dlg).getByRole("button", { name: "Send to bank" }));
+    await user.click(within(dlg).getByRole("button", { name: "Create the draft in Revolut" }));
+    await within(dlg).findByText(SEND_UNSURE_TEXT);
+    expect(norm(dlg.textContent).toLowerCase()).not.toContain("nothing was sent");
+    expect(
+      within(dlg).queryByRole("button", { name: /send to bank|create the draft/i }),
+    ).toBeNull();
+  });
+
+  it("a 403 of the role check is a refusal with its own sentence", async () => {
+    base(FINANCE, READY(), {
+      "POST /api/payments/11/submit": () => ({ status: 403, body: { error: "forbidden" } }),
+    });
+    const user = userEvent.setup();
+    renderApp(PATH);
+    const dlg = await openRow(user);
+    await user.click(within(dlg).getByRole("button", { name: "Send to bank" }));
+    await user.click(within(dlg).getByRole("button", { name: "Create the draft in Revolut" }));
+    const alert = await within(dlg).findByRole("alert");
+    expect(alert.textContent).toBe(
+      "Only someone with the finance role can send a payment, so nothing was sent.",
+    );
+  });
+
+  it("focus moves to the answer after a refusal and after a result (the confirmation is gone)", async () => {
+    let current = READY();
+    base(FINANCE, current, {
+      "GET /api/payments/11": () => ({ body: { payment: current, events: [] } }),
+      "POST /api/payments/11/submit": () => ({ status: 409, body: { error: "busy" } }),
+    });
+    const user = userEvent.setup();
+    const { unmount } = renderApp(PATH);
+    let dlg = await openRow(user);
+    await user.click(within(dlg).getByRole("button", { name: "Send to bank" }));
+    await user.click(within(dlg).getByRole("button", { name: "Create the draft in Revolut" }));
+    const alert = await within(dlg).findByTestId("send-result");
+    await waitFor(() => expect(document.activeElement).toBe(alert));
+    unmount();
+
+    current = READY();
+    base(FINANCE, current, {
+      "GET /api/payments/11": () => ({ body: { payment: current, events: [] } }),
+      "POST /api/payments/11/submit": () => {
+        current = payment({ ...current, status: "submitted" });
+        return { body: { result: { to: "submitted", code: "accepted" }, payment: current } };
+      },
+    });
+    renderApp(PATH);
+    dlg = await openRow(user);
+    await user.click(within(dlg).getByRole("button", { name: "Send to bank" }));
+    await user.click(within(dlg).getByRole("button", { name: "Create the draft in Revolut" }));
+    const done = await within(dlg).findByTestId("send-result");
+    await waitFor(() => expect(document.activeElement).toBe(done));
+  });
+
+  it("the words after a handled send follow the mode in the SERVER's answer", async () => {
+    let current = READY({ mode: "drafts" });
+    base(FINANCE, current, {
+      "GET /api/payments/11": () => ({ body: { payment: current, events: [] } }),
+      "POST /api/payments/11/submit": () => {
+        current = payment({ ...current, mode: "pay", status: "submitted" });
+        return { body: { result: { to: "submitted", code: "accepted" }, payment: current } };
+      },
+    });
+    const user = userEvent.setup();
+    renderApp(PATH);
+    const dlg = await openRow(user);
+    await user.click(within(dlg).getByRole("button", { name: "Send to bank" }));
+    await user.click(within(dlg).getByRole("button", { name: "Create the draft in Revolut" }));
+    const note = await within(dlg).findByTestId("send-result");
+    expect(note.textContent).toBe(SEND_RESULT_TEXT.submitted_pay);
+  });
 
   it("a refusal code this version does not know gets the fixed sentence, not the server's text", async () => {
     base(FINANCE, READY(), {
