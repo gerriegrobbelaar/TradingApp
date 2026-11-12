@@ -112,7 +112,11 @@ describe("Exact write guard (source scan)", () => {
     expect(gate.indexOf("throw new ExactWriteAuthRetryRefused()")).toBeLessThan(
       gate.indexOf("this.queue.unshift(item)"),
     );
-    expect(gate).toContain('redirect: "manual"');
+    // The one outbound fetch moved into the shared gate core (G9): redirects are never followed
+    // there, and the Exact gate itself no longer calls fetch at all.
+    const core = stripComments(files["../src/gate/core.ts"] ?? "");
+    expect(core).toContain('redirect: "manual"');
+    expect(gate).not.toMatch(/\bfetch\(/);
   });
 
   it("only the executor and the gate policy know the booking job id", () => {
