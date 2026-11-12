@@ -14,13 +14,15 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RevolutGate } from "../src/revolut/gate";
 import { unwrap } from "../src/revolut/wire";
 import { FakeRevolut, gateExecution, SOURCE_ACCOUNT_UUID } from "./payments-fake-revolut";
-import { db, execWorld, type ExecWorld } from "./payments-exec-helpers";
+import { db, execWorld, stageSubmitting, type ExecWorld } from "./payments-exec-helpers";
 import { fakeRevolutClock, revolutGate, rreq } from "./revolut-helpers";
 import { setSwitch, setVerified } from "./payments-helpers";
 
-const RID = "3f2b8c1e-5d4a-4e7b-9a10-0c6d2e8f1a42";
+// The gate compares a payment body with the STORED request (F9a, N7), so every test works on a real
+// `submitting` request staged in beforeEach; RID and leg point at it.
+let RID = "3f2b8c1e-5d4a-4e7b-9a10-0c6d2e8f1a42";
 const CP = "5138f3e7-b2d1-4d16-a8e0-6a7c1f0d9b11";
-const leg = {
+let leg = {
   accountId: SOURCE_ACCOUNT_UUID,
   counterpartyId: CP,
   amountMinor: 100,
@@ -33,6 +35,9 @@ let fake: FakeRevolut;
 beforeEach(async () => {
   w = await execWorld();
   fake = w.fake;
+  const s = await stageSubmitting(w, CP);
+  RID = s.requestId;
+  leg = { ...leg, accountId: s.accountUuid, amountMinor: s.amountMinor };
 });
 afterEach(() => fake.restore());
 
