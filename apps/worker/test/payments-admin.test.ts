@@ -8,8 +8,8 @@ import {
   PAYMENTS_LOOSEN_PHRASE,
   PAYMENTS_VERIFY_CHECKS,
   PAYMENTS_VERIFY_PHRASE,
-  paymentsProtocolVersion,
 } from "@camelthorn/core";
+import { paymentsProtocolVersion } from "../src/payments/protocol-version";
 import { setSubmitterForTests, type PaymentSubmitter } from "../src/payments/submit";
 import { addSession, authed } from "./helpers";
 import {

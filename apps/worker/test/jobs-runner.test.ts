@@ -946,7 +946,7 @@ describe("heartbeat and entry points", () => {
       e,
     );
     const n = await db.prepare("SELECT COUNT(*) AS n FROM jobs").first<{ n: number }>();
-    expect(n?.n).toBe(12);
+    expect(n?.n).toBe(13);
     const tick = await db
       .prepare("SELECT value_json FROM settings WHERE key = 'scheduler.last_tick'")
       .first();

@@ -96,6 +96,9 @@ describe("states only move forward", () => {
       "payments_guard_approved",
       "payments_guard_rejected",
       "payments_guard_submitting",
+      // P9b (migration 0029): outcome_unknown -> rejected needs a lookup that found nothing;
+      // tested on its own in payments-execution.test.ts.
+      "payments_guard_unknown_reject",
     ];
     const statusSql = await triggerSql(STATUS);
     const secondarySql = await triggerSql(SECONDARY);
@@ -129,7 +132,9 @@ describe("states only move forward", () => {
       }
     }
     // the matrix left every trigger in place
-    expect((await triggerSql([...STATUS, ...SECONDARY])).length).toBe(6);
+    expect((await triggerSql([...STATUS, ...SECONDARY])).length).toBe(
+      STATUS.length + SECONDARY.length,
+    );
   });
 });
 

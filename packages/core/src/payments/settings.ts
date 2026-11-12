@@ -18,14 +18,20 @@ export const PAYMENTS_ENABLED_KEY = "payments.enabled";
 export const PAYMENTS_VERIFIED_KEY = "payments.verified";
 
 /**
- * What an admin ticks before the payments switch may go on (ADR 0049; the live checklist is in
- * docs/DEPLOY.md). One list for the worker and the web. Order = order of the checklist.
+ * What an admin ticks before the payments switch may go on (ADR 0049, extended by ADR 0050; the live
+ * runbook is PAYMENTS_VERIFY_RUNBOOK in ./runbook, printed in docs/DEPLOY.md). One list for the
+ * worker and the web. Order = order of the checklist.
  */
 export const PAYMENTS_VERIFY_CHECKS = [
   "revolut_plan_known",
+  "sandbox_counterparty_roundtrip",
   "sandbox_draft_roundtrip",
-  "request_id_idempotent_on_sandbox",
-  "lost_answer_reconciles_by_request_id",
+  "sandbox_pay_roundtrip",
+  "request_id_idempotency_replay",
+  "lost_answer_lookup_drill",
+  "reference_charset_probe",
+  "amount_format_probe",
+  "webhook_state_sequence",
   "four_eyes_approver_accounts_checked",
   "first_iban_verified_out_of_band",
   "approval_mapping_verified_in_exact",
@@ -33,12 +39,25 @@ export const PAYMENTS_VERIFY_CHECKS = [
 ] as const;
 export type PaymentsVerifyCheck = (typeof PAYMENTS_VERIFY_CHECKS)[number];
 
-/** Exactly the required codes: every one, nothing else, no duplicates (order is free). */
+/** Needed only for the `pay` mode (Company plan); in `drafts` mode a mark may leave it out. */
+export const PAYMENTS_PAY_ONLY_CHECK: PaymentsVerifyCheck = "sandbox_pay_roundtrip";
+
+/**
+ * A mark's check list is valid when it holds every required code once and nothing else. The pay-only
+ * check is optional here (a drafts-only installation never ticks it); `verifyCoversMode` decides
+ * whether a mark is enough for a mode.
+ */
 export function sameVerifyChecks(list: readonly unknown[]): boolean {
-  const need: readonly string[] = PAYMENTS_VERIFY_CHECKS;
-  if (list.length !== need.length) return false;
   const seen = new Set<unknown>(list);
-  return seen.size === need.length && need.every((c) => seen.has(c));
+  if (seen.size !== list.length) return false;
+  const all: readonly string[] = PAYMENTS_VERIFY_CHECKS;
+  if (!list.every((c) => typeof c === "string" && all.includes(c))) return false;
+  return all.every((c) => c === PAYMENTS_PAY_ONLY_CHECK || seen.has(c));
+}
+
+/** `pay` needs the direct-payment sandbox round trip as well; `drafts` does not. */
+export function verifyCoversMode(list: readonly unknown[], mode: "drafts" | "pay"): boolean {
+  return sameVerifyChecks(list) && (mode === "drafts" || list.includes(PAYMENTS_PAY_ONLY_CHECK));
 }
 
 const isMinor = (v: unknown): v is number =>

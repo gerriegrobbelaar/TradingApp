@@ -324,6 +324,8 @@ const FIXTURES: Record<string, Fixture> = {
   "dq.checks": { setup: dqFixture, internal: true },
   // No sender is configured in the contract run: the digest records one skipped row and stays stable.
   "dq.digest": { setup: dqFixture, internal: true },
+  // Nothing is in flight in the contract run: the reconciliation makes no call and writes nothing.
+  "payments.reconcile": { setup: dqFixture, internal: true },
   "exact.bank_balances": { setup: bankBalancesFixture },
 };
 

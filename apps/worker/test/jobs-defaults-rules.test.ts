@@ -97,6 +97,7 @@ describe("S6: the Exact sync jobs ship disabled (the public ECB import is the on
     expect(DEFAULT_JOBS.filter((j) => j.enabled).map((j) => j.name)).toEqual([
       "bank.match",
       "ecb.fx_import",
+      "payments.reconcile",
       "dq.checks",
       "dq.digest",
     ]);

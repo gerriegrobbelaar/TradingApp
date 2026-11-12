@@ -214,3 +214,74 @@ export async function storedIbansMatch(
   if (rows.results.length === 0) return false;
   return rows.results.every((r) => ibanFingerprint(r.beneficiary_iban, key) === r.iban_fingerprint);
 }
+
+/** One payment as the submitter needs it: everything to name the payee and the account. */
+export interface SendTarget {
+  requestId: string;
+  paymentId: number;
+  amountMinor: number;
+  currency: string;
+  reference: string;
+  /** The payee name stored with the request (from the verified supplier record). */
+  beneficiaryName: string;
+  /** Full IBAN: in memory for the one call that creates a payee, never returned or logged. */
+  iban: string;
+  ibanFingerprint: string;
+  /** The Revolut account id (uuid) of the source account. */
+  sourceExternalId: string;
+  sourceConnectionId: number;
+}
+
+/**
+ * The ONLY reader of the full IBAN for sending (P9b, ADR 0050). Reads the requests of a payment or
+ * batch, re-computes each keyed fingerprint from the stored IBAN and returns null unless it equals
+ * the fingerprint the payload and the approval are bound to (a request is never sent to an IBAN
+ * other than the verified one). The IBAN comes from this table only, never from request input.
+ */
+export async function readSendTargets(
+  db: D1Database,
+  kind: "payment" | "batch",
+  id: number,
+  key: string | null,
+): Promise<SendTarget[] | null> {
+  if (key === null) return null;
+  const where = kind === "payment" ? "p.id = ?1" : "p.batch_id = ?1";
+  const rows = await db
+    .prepare(
+      `SELECT p.id, p.request_id, p.amount_minor, p.currency, p.reference, p.beneficiary_name,
+              p.beneficiary_iban, p.iban_fingerprint, a.external_id, a.connection_id
+         FROM payments p JOIN bank_accounts a ON a.id = p.bank_account_id
+        WHERE ${where} ORDER BY p.id`,
+    )
+    .bind(id)
+    .all<{
+      id: number;
+      request_id: string;
+      amount_minor: number;
+      currency: string;
+      reference: string;
+      beneficiary_name: string;
+      beneficiary_iban: string;
+      iban_fingerprint: string;
+      external_id: string;
+      connection_id: number;
+    }>();
+  if (rows.results.length === 0) return null;
+  const out: SendTarget[] = [];
+  for (const r of rows.results) {
+    if (ibanFingerprint(r.beneficiary_iban, key) !== r.iban_fingerprint) return null;
+    out.push({
+      requestId: r.request_id,
+      paymentId: r.id,
+      amountMinor: r.amount_minor,
+      currency: r.currency,
+      reference: r.reference,
+      beneficiaryName: r.beneficiary_name,
+      iban: r.beneficiary_iban,
+      ibanFingerprint: r.iban_fingerprint,
+      sourceExternalId: r.external_id,
+      sourceConnectionId: r.connection_id,
+    });
+  }
+  return out;
+}

@@ -12,6 +12,7 @@ import {
 import { DAILY_BOOKING_CALL_CAP, runBookMatches } from "../booking/executor";
 import { runBankBalances } from "../exact/bank-balances";
 import { runDigest } from "../dq/digest";
+import { runPaymentsReconcile } from "../payments/reconcile-job";
 import { runDqChecks } from "../dq/run";
 import { runMatching } from "../matching/run";
 import { loadRevolutConfig } from "../revolut/config";
@@ -145,6 +146,18 @@ export const HANDLERS: Record<string, HandlerDef> = {
           implemented: isImplemented(h),
         }),
       }),
+  },
+  "payments.reconcile": {
+    title: "Payments reconciliation",
+    description:
+      "Resolves payments that were sent to Revolut but are not final: looks each one up by its request id (or its draft), moves it to paid or failed only on a final bank state, and links a paid payment to its bank line. Read-only towards Revolut and idle when nothing is in flight; on by default and harmless while payments are switched off. It never sends or retries a payment.",
+    usesExact: false,
+    phase: null,
+    // The next slot (five minutes later) is the retry.
+    maxAttempts: 1,
+    scheduleRules: { minIntervalMinutes: 5 },
+    maxLatenessMs: 30 * MIN,
+    run: whenRevolutConfigured(runPaymentsReconcile),
   },
   "dq.digest": {
     title: "Data quality digest",

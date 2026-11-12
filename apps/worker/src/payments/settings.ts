@@ -15,15 +15,16 @@
  */
 import {
   isIbanFingerprintKey,
+  verifyCoversMode,
   parsePaymentSettings,
   PAYMENT_SETTINGS_KEY,
   PAYMENTS_ENABLED_KEY,
   PAYMENTS_VERIFIED_KEY,
-  paymentsProtocolVersion,
-  sameVerifyChecks,
   type PaymentSettings,
 } from "@camelthorn/core";
 import { readMappingCheck } from "../read/approvals-routes";
+import { parseVerificationMark, type VerificationMark } from "./gate-flag";
+import { paymentsProtocolVersion } from "./protocol-version";
 
 export { PAYMENT_SETTINGS_KEY, PAYMENTS_ENABLED_KEY, PAYMENTS_VERIFIED_KEY };
 export {
@@ -37,18 +38,13 @@ export type PaymentsBlocker =
   | "protocol_changed"
   | "submitter_unavailable"
   | "approval_mapping_unverified"
+  | "pay_mode_not_verified"
   | "no_revolut_connection"
   | "no_approver"
   | "iban_key_missing"
   | "payments_disabled";
 
-export interface VerificationMark {
-  at: string;
-  by: string;
-  note: string;
-  protocolVersion: string;
-  checks: string[];
-}
+export type { VerificationMark };
 
 export interface PaymentsState {
   enabled: boolean;
@@ -71,34 +67,6 @@ export function ibanKeyOf(env: { PAYMENTS_IBAN_KEY?: string | undefined }): stri
   return isIbanFingerprintKey(k) ? k : null;
 }
 
-function parseVerified(raw: string | undefined): VerificationMark | null {
-  if (raw === undefined) return null;
-  try {
-    const v = JSON.parse(raw) as Record<string, unknown>;
-    const checks = v["checks"];
-    if (
-      typeof v["at"] === "string" &&
-      typeof v["by"] === "string" &&
-      typeof v["note"] === "string" &&
-      typeof v["protocolVersion"] === "string" &&
-      /^[0-9a-f]{64}$/.test(v["protocolVersion"]) &&
-      Array.isArray(checks) &&
-      sameVerifyChecks(checks)
-    ) {
-      return {
-        at: v["at"],
-        by: v["by"],
-        note: v["note"],
-        protocolVersion: v["protocolVersion"],
-        checks: checks as string[],
-      };
-    }
-  } catch {
-    // unreadable: not verified
-  }
-  return null;
-}
-
 export async function loadPaymentsState(
   db: D1Database,
   ibanKey: string | null | undefined,
@@ -118,7 +86,7 @@ export async function loadPaymentsState(
   const byKey = new Map(
     (settings?.results ?? []).map((r) => [String(r["key"]), String(r["value_json"])]),
   );
-  const verified = parseVerified(byKey.get(PAYMENTS_VERIFIED_KEY));
+  const verified = parseVerificationMark(byKey.get(PAYMENTS_VERIFIED_KEY));
   const protocolVersion = paymentsProtocolVersion();
   const rev = revolut?.results?.[0];
   const mode = rev?.["payments_mode"];
@@ -142,6 +110,14 @@ export function paymentsBlockers(s: PaymentsState, submitterAvailable: boolean):
   if (s.verified === null) out.push("not_verified");
   else if (s.protocolChanged) out.push("protocol_changed");
   if (!submitterAvailable) out.push("submitter_unavailable");
+  // The direct-payment mode needs its own sandbox round trip in the mark (checklist item
+  // sandbox_pay_roundtrip); drafts mode does not.
+  if (
+    s.settings.mode === "pay" &&
+    (s.verified === null || !verifyCoversMode(s.verified.checks, "pay"))
+  ) {
+    out.push("pay_mode_not_verified");
+  }
   if (!s.mappingVerified) out.push("approval_mapping_unverified");
   if (!s.revolutActive) out.push("no_revolut_connection");
   if (s.approverCount < 1) out.push("no_approver");

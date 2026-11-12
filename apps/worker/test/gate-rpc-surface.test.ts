@@ -126,7 +126,16 @@ const EXACT_ONLY = [
   "reserve",
   "untilDayReset",
 ];
-const REVOLUT_ONLY = ["checkWebhookTarget", "marginFor"];
+// P9b (ADR 0050): the three payment RPC methods. None returns a token or sends anything: a lease
+// token (a random id, only useful with a payment write that the gate re-checks against D1), the
+// release of it, and whether the gate ever attempted a payment (a yes/no).
+const REVOLUT_ONLY = [
+  "acquirePaymentLease",
+  "checkWebhookTarget",
+  "marginFor",
+  "paymentSendState",
+  "releasePaymentLease",
+];
 
 const sorted = (...lists: string[][]): string[] => [...new Set(lists.flat())].sort();
 

@@ -45,9 +45,10 @@ import {
   type ThrottleContext,
   type TokenResult,
 } from "../gate/core";
+import { paymentWritesOpen } from "../payments/gate-flag";
 import { loadRevolutConfig, revolutWebhookUrl } from "./config";
 import { refreshTokens, TokenEndpointError } from "./oauth";
-import { buildUrl, validateRequest, versionOf } from "./request";
+import { buildUrl, paymentKindOf, validateRequest, versionOf } from "./request";
 import {
   aad,
   environmentOf,
@@ -89,6 +90,23 @@ const DEFAULT_429_WAIT_MS = 60_000;
 const MAX_BLOCK_MS = 3600_000;
 
 type GateRole = `connection:${number}`;
+
+/** How long a payment lease lasts; longer than a queued call can wait plus the fetch timeout. */
+export const PAYMENT_LEASE_MS = 5 * 60_000;
+const LEASE_KEY = "paylease";
+const SEND_PREFIX = "paysend:";
+/** Send-ledger entries older than this are dropped (a payment is reconciled within days). */
+const SEND_LEDGER_TTL_MS = 60 * 24 * 3600_000;
+export const sendLedgerKey = (ref: string): string => `${SEND_PREFIX}${ref}`;
+
+export type PaymentLeaseResult =
+  { ok: true; lease: string; expiresAt: number } | { ok: false; code: string };
+
+interface Lease {
+  token: string;
+  owner: string;
+  expiresAt: number;
+}
 
 /** The job id of the connect callback's account check (the only use of a staged connection). */
 export const CONNECT_JOB_ID = "revolut-connect";
@@ -151,12 +169,14 @@ export class RevolutGate extends GateCore<
     validateRequest(req);
   }
   /**
-   * Revolut's write policy is static and fully decided by `validateRequest` (default deny: an
-   * allow-list of reads and the webhook calls; every payment endpoint is refused). Nothing is
-   * re-read from D1, so there is nothing more to check here.
+   * Revolut's write policy is the static allow-list in `validateRequest` (default deny). Only the
+   * three payment WRITE endpoints add a dynamic condition: the D1 switch, the verification mark
+   * and the payment lease (`#assertPaymentWrite`), re-read here and again before the fetch.
    */
-  protected authorize(): Promise<void> {
-    return Promise.resolve();
+  protected async authorize(req: RevolutRequest): Promise<void> {
+    // P9b (ADR 0050): the one exception to "no policy to read" are the payment WRITES, whose switch
+    // lives in D1 and is read here, at the door, and again right before the network call.
+    if (paymentKindOf(req) === "write") await this.#assertPaymentWrite(req);
   }
   protected async admit(req: RevolutRequest): Promise<void> {
     if (!(await this.claimRole(`connection:${req.connectionId}`))) {
@@ -167,6 +187,103 @@ export class RevolutGate extends GateCore<
     return this.role?.startsWith("connection:")
       ? Number(this.role.slice("connection:".length))
       : null;
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // Payment lease and send ledger (P9b, ADR 0050)
+  // ---------------------------------------------------------------------------------------
+
+  /** In-memory copy of the stored lease; `undefined` = not read from storage yet. */
+  #lease: Lease | null | undefined;
+
+  async #readLease(): Promise<Lease | null> {
+    if (this.#lease === undefined) {
+      const stored = (await this.ctx.storage.get<Lease>(LEASE_KEY)) ?? null;
+      // Another call may have set it while we waited: never overwrite a newer value.
+      if (this.#lease === undefined) this.#lease = stored;
+    }
+    return this.#lease ?? null;
+  }
+
+  /**
+   * The ONE payment mutex per Revolut connection. A submission (pre-checks, daily ceiling, claim,
+   * the calls, the write of the result) runs while it holds the lease, so two submissions can never
+   * both pass the daily ceiling or the balance reservation; a second caller gets `busy` and leaves
+   * its request `ready`. The lease expires on its own (a crashed holder cannot block payments for
+   * ever), and the gate refuses every payment write whose lease is not the current one.
+   * Refused while the payment switch is closed.
+   */
+  async acquirePaymentLease(
+    connectionId: number,
+    owner: string,
+    ttlMs: number = PAYMENT_LEASE_MS,
+  ): Promise<PaymentLeaseResult> {
+    if (!Number.isSafeInteger(connectionId) || connectionId < 1) {
+      return { ok: false, code: "connection" };
+    }
+    if (typeof owner !== "string" || !/^[A-Za-z0-9_.:@-]{1,100}$/.test(owner)) {
+      return { ok: false, code: "owner" };
+    }
+    const ttl = Math.min(PAYMENT_LEASE_MS, Math.max(10_000, Math.floor(Number(ttlMs)) || 0));
+    await this.ensureLoaded();
+    if (!(await this.claimRole(`connection:${connectionId}`))) {
+      return { ok: false, code: "connection_mismatch" };
+    }
+    const flag = await paymentWritesOpen(this.env);
+    if (!flag.open) return { ok: false, code: `payments_${flag.reason}` };
+    const current = await this.#readLease();
+    // No await between this check and the assignment below: check-and-set is atomic.
+    const now = this.now();
+    if (current !== null && current.expiresAt > now) return { ok: false, code: "busy" };
+    const lease: Lease = { token: crypto.randomUUID(), owner, expiresAt: now + ttl };
+    this.#lease = lease;
+    await this.ctx.storage.put(LEASE_KEY, lease);
+    await this.#purgeLedger(now);
+    return { ok: true, lease: lease.token, expiresAt: lease.expiresAt };
+  }
+
+  /** Gives the lease back. True only for the current holder's token. */
+  async releasePaymentLease(token: string): Promise<boolean> {
+    await this.ensureLoaded();
+    const current = await this.#readLease();
+    if (current === null || current.token !== token) return false;
+    this.#lease = null;
+    await this.ctx.storage.delete(LEASE_KEY);
+    return true;
+  }
+
+  /**
+   * Whether this gate ever got as far as calling Revolut for a payment write with this ledger key.
+   * The entry is written BEFORE the fetch, so "never_attempted" is proof that the instruction was
+   * not sent (the caller may then fail the request safely); anything else is "attempted".
+   */
+  async paymentSendState(ref: string): Promise<"never_attempted" | "attempted"> {
+    await this.ensureLoaded();
+    if (typeof ref !== "string" || ref === "") return "attempted";
+    return (await this.ctx.storage.get(sendLedgerKey(ref))) === undefined
+      ? "never_attempted"
+      : "attempted";
+  }
+
+  async #purgeLedger(now: number): Promise<void> {
+    const all = await this.ctx.storage.list<{ at: number }>({ prefix: SEND_PREFIX, limit: 200 });
+    for (const [key, v] of all) {
+      if (typeof v?.at === "number" && now - v.at > SEND_LEDGER_TTL_MS) {
+        await this.ctx.storage.delete(key);
+      }
+    }
+  }
+
+  /** Switch, mark and lease for a payment write. Throws a typed refusal; sends nothing. */
+  async #assertPaymentWrite(req: RevolutRequest): Promise<void> {
+    const flag = await paymentWritesOpen(this.env);
+    if (!flag.open) {
+      throw new RevolutApiError(403, "payments are closed", `payments_${flag.reason}`);
+    }
+    const lease = await this.#readLease();
+    if (lease === null || lease.token !== req.paymentLease || lease.expiresAt <= this.now()) {
+      throw new RevolutApiError(409, "payment lease is not current", "payment_lease");
+    }
   }
 
   /** Snapshot for the UI and data-quality rules. */
@@ -351,6 +468,18 @@ export class RevolutGate extends GateCore<
     const url = buildUrl(environment, req);
     if (req.method === "POST" && req.path === "/webhooks") this.checkWebhookTarget(req.body);
     const token = await this.#accessTokenFor(row);
+
+    if (paymentKindOf(req) === "write") {
+      // Right before the network call: the switch and the lease once more, then the send ledger.
+      // The ledger entry is persisted BEFORE the fetch (so "never attempted" is proof) and a ledger
+      // key can be used ONCE: the gate itself refuses to send the same payment twice.
+      await this.#assertPaymentWrite(req);
+      const key = sendLedgerKey(req.paymentRef as string);
+      if ((await this.ctx.storage.get(key)) !== undefined) {
+        throw new RevolutApiError(409, "payment already attempted", "payment_already_attempted");
+      }
+      await this.ctx.storage.put(key, { at: this.now(), path: req.path });
+    }
 
     const headers: Record<string, string> = {};
     for (const [k, v] of Object.entries(req.headers ?? {})) headers[k.toLowerCase()] = v;
