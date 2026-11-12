@@ -198,11 +198,7 @@ export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
 
   // ---- the payment ---------------------------------------------------------------------------------
 
-  async function payDirect(
-    req: SubmitRequest,
-    t: SendTarget,
-    payee: Payee,
-  ): Promise<SubmitOutcome> {
+  async function payDirect(t: SendTarget, payee: Payee): Promise<SubmitOutcome> {
     const claim = await claimIdempotencyKey(deps.db, t.requestId, "revolut.pay");
     if (claim.status === "duplicate") return unknown();
     try {
@@ -228,7 +224,6 @@ export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
       return { kind: "accepted", providerId: r.transactionId };
     } catch (e) {
       const f: PaymentFailure = classifyPaymentFailure(e, await ledgerOf(t.requestId));
-      void req;
       if (f.kind === "not_executed") return rejected(f.code);
       // Rejected, duplicate or unknown: Revolut may still hold a transaction under this request_id.
       const found = await lookupOurs(t);
@@ -307,7 +302,7 @@ export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
     }
     if (req.mode === "pay") {
       const t = targets[0] as SendTarget;
-      return payDirect(req, t, payees.get(t.ibanFingerprint) as Payee);
+      return payDirect(t, payees.get(t.ibanFingerprint) as Payee);
     }
     return draft(req, targets, payees);
   }

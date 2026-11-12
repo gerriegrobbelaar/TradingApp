@@ -42,6 +42,10 @@ payments are used: without it every payment request, every IBAN verification and
 refused (`iban_key_missing`). Never rotate it casually: a new key changes every fingerprint, so every
 supplier IBAN must be verified again (fail closed, nothing is paid to an unverified IBAN).
 
+Payment execution (ADR 0050) adds the variable `REVOLUT_PAYMENTS_EXECUTION`, which ships `"off"`.
+Payments reach Revolut only when it is exactly `"on"` AND an admin enabled payments after the sandbox
+verification (docs/DEPLOY.md, "Payments execution"). Set it to `"on"` on staging first.
+
 If any is missing, `/api/connections/exact/start` and `/callback` answer
 `500 server_misconfigured`; `GET /api/connections` still works and reports `exactConfigured: false`.
 

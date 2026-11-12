@@ -5,13 +5,14 @@
  * and send, a lost answer, after send before persist, duplicate delivery, lease expiry, and the
  * concurrency tests (two submissions, the daily ceiling).
  */
-import { runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { paymentConfirmPhrase } from "@camelthorn/core";
+import { createRevolutClient, type RevolutClient } from "@camelthorn/revolut";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createRevolutSubmitter } from "../src/payments/revolut-submitter";
 import { markStaleSubmissions, runSubmission, setSubmitterForTests } from "../src/payments/submit";
 import { resolveNotSent, reconcilePayments } from "../src/payments/reconcile";
 import type { RevolutGate } from "../src/revolut/gate";
+import { createRevolutGateTransport } from "../src/revolut/gate-transport";
 import {
   anotherBill,
   db,
@@ -611,10 +612,6 @@ describe("switches: nothing is enabled by default", () => {
 });
 
 // A client for the reconciliation tests: through the real gate, as the job does.
-import { createRevolutClient } from "@camelthorn/revolut";
-import { createRevolutGateTransport } from "../src/revolut/gate-transport";
-import { env } from "cloudflare:test";
-import type { RevolutClient } from "@camelthorn/revolut";
 async function clientFor(): Promise<RevolutClient> {
   return createRevolutClient(createRevolutGateTransport(env, w.revolutConnectionId), {
     connectionId: w.revolutConnectionId,
@@ -623,4 +620,3 @@ async function clientFor(): Promise<RevolutClient> {
     sleep: () => Promise.resolve(),
   });
 }
-void createRevolutSubmitter;
