@@ -80,6 +80,7 @@ interface Harness {
   api: new (...a: never[]) => Error;
   /** Largest block a 429 can impose, and the wait when the 429 carries no hint. */
   maxBlockMs: number;
+  authorityRole(connectionId: number): string;
   defaultBudget: number;
   /** The division gate / connection gate itself (not the token authority). */
   authorityOrGate: DurableObjectStub<ExactGate | RevolutGate>;
@@ -127,6 +128,7 @@ const exactHarness = async (): Promise<Harness> => {
     auth: ExactAuthError,
     api: ExactApiError,
     maxBlockMs: 24 * 3600_000,
+    authorityRole: (id) => `authority:${id}`,
     defaultBudget: 500,
     authorityOrGate: gate as unknown as DurableObjectStub<ExactGate>,
     mismatchCode: "division_mismatch",
@@ -185,6 +187,7 @@ const revolutHarness = async (): Promise<Harness> => {
     auth: RevolutAuthError,
     api: RevolutApiError,
     maxBlockMs: 3600_000,
+    authorityRole: (id) => `connection:${id}`,
     defaultBudget: 200,
     authorityOrGate: gate as unknown as DurableObjectStub<RevolutGate>,
     mismatchCode: "connection_mismatch",
@@ -333,14 +336,20 @@ describe.each(builders)("gate characterization: %s", (_label, build) => {
 
     it("also stops a job whose budget runs out while its calls wait in the queue", async () => {
       await h.gate.startJob("q", 2);
-      const results = await Promise.allSettled(
-        Array.from({ length: 3 }, (_, i) => h.go({ priority: "job", jobId: "q", tag: `q${i}` })),
-      );
-      expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(2);
-      const rejected = results.filter((r) => r.status === "rejected") as PromiseRejectedResult[];
-      expect(rejected).toHaveLength(1);
-      expect(rejected[0]?.reason).toBeInstanceOf(h.budget);
-      expect(h.stub.apiCalls).toHaveLength(2);
+      const release = holdFirst();
+      const first = h.go({ priority: "job", jobId: "q", tag: "q0" });
+      await vi.waitFor(() => expect(h.stub.apiCalls).toHaveLength(1));
+      // Both pass the door (one call used so far); only one can still be dispatched.
+      const rest = [
+        h.go({ priority: "job", jobId: "q", tag: "q1" }),
+        h.go({ priority: "job", jobId: "q", tag: "q2" }),
+      ];
+      await queued(2);
+      release();
+      const results = await Promise.allSettled([first, ...rest]);
+      expect(results.map((r) => r.status)).toEqual(["fulfilled", "fulfilled", "rejected"]);
+      expect((results[2] as PromiseRejectedResult).reason).toBeInstanceOf(h.budget);
+      expect(sortedTags()).toEqual(["q0", "q1"]);
       expect((await h.gate.usage()).used).toBe(2);
     });
 
@@ -455,6 +464,8 @@ describe.each(builders)("gate characterization: %s", (_label, build) => {
       h.stub.api = (_c, n) => (n === 1 ? limited({ "retry-after": "0" }) : h.ok());
       const err = (await h.go().catch((e: unknown) => e)) as { retryAfterMs: number };
       expect(err.retryAfterMs).toBe(1000);
+      // The block itself (not just the error) is at least a second.
+      expect((await h.gate.usage()).blockedUntil).toBe(h.clock.t + 1000);
     });
 
     it("caps an absurd Retry-After at the gate's maximum block", async () => {
@@ -523,6 +534,24 @@ describe.each(builders)("gate characterization: %s", (_label, build) => {
       );
       expect(results.every((r) => r.status === 200)).toBe(true);
       expect(stub.tokenCalls).toHaveLength(1);
+    });
+
+    it("shares one refresh between concurrent callers inside the token authority", async () => {
+      await env.DB.prepare("UPDATE connections SET expires_at = ?1 WHERE id = ?2")
+        .bind(new Date(Date.now() + 1000).toISOString(), h.connectionId)
+        .run();
+      const results = await runInDurableObject(h.authority, async (g) => {
+        const shared = (
+          g as unknown as {
+            refreshShared: (id: number, role: string) => Promise<{ ok: boolean }>;
+          }
+        ).refreshShared.bind(g);
+        return Promise.all(
+          Array.from({ length: 5 }, () => shared(h.connectionId, h.authorityRole(h.connectionId))),
+        );
+      });
+      expect(results.every((r) => r.ok)).toBe(true);
+      expect(h.stub.tokenCalls).toHaveLength(1);
     });
 
     it("answers many parallel 401s on the same stale token with one refresh and retries each once", async () => {
