@@ -225,6 +225,8 @@ describe("B2b/B2c: the limits (watermark, allow-list, per-run cap)", () => {
     expect((await settings()).body.backlogCount).toBe(2);
     await put("admin", { bookingFrom: "2026-07-15T07:30:00.000Z" });
     expect((await settings()).body.backlogCount).toBe(0);
+    // U3: what switching on NOW would leave behind ignores the old watermark (enable resets it).
+    expect((await settings()).body.backlogIfEnabledNow).toBe(2);
   });
 });
 

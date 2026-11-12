@@ -26,9 +26,7 @@ import { EmptyState, ErrorNotice } from "../components/EmptyState";
 import { ActiveFilter, FilterBar } from "../components/FilterBar";
 import { FxStaleChip } from "../components/FxAmount";
 import { ConvertedNote } from "../components/FxTotals";
-import { AutoMatchedList } from "../components/matching/AutoMatchedList";
-import { IgnoredList } from "../components/matching/IgnoredList";
-import { ReviewQueue } from "../components/matching/ReviewQueue";
+import { Lazy, lazyNamed } from "../components/Lazy";
 import { PageHeader } from "../components/PageHeader";
 import {
   DIRECTION_FILTERS,
@@ -43,6 +41,13 @@ import { NO_VALUE, formatCount, formatDate, formatMoney } from "../lib/format";
 import { useCursorList } from "../lib/useCursorList";
 import { useResource } from "../lib/useResource";
 import { useSearchText } from "../lib/useSearchText";
+
+const AutoMatchedList = lazyNamed(
+  () => import("../components/matching/AutoMatchedList"),
+  "AutoMatchedList",
+);
+const IgnoredList = lazyNamed(() => import("../components/matching/IgnoredList"), "IgnoredList");
+const ReviewQueue = lazyNamed(() => import("../components/matching/ReviewQueue"), "ReviewQueue");
 
 const PAGE = 50;
 const POSITIVE_ID = /^[1-9][0-9]{0,15}$/;
@@ -489,27 +494,32 @@ export function Bank() {
           <h2 className="h2" id="match-heading">
             {tab === "review" ? "To review" : tab === "auto" ? "Matched automatically" : "Ignored"}
           </h2>
-          {tab === "review" && (
-            <ReviewQueue
-              account={account}
-              accountName={accountName}
-              status={queue}
-              onStatus={(v) => setParam({ queue: v === "review" ? null : v })}
-              onClearAccount={() => setParam({ account: null })}
-              onChanged={reloadStats}
-            />
-          )}
-          {tab === "auto" && (
-            <AutoMatchedList autoEnabled={statsData?.autoEnabled ?? null} onChanged={reloadStats} />
-          )}
-          {tab === "ignored" && (
-            <IgnoredList
-              account={account}
-              accountName={accountName}
-              onClearAccount={() => setParam({ account: null })}
-              onChanged={reloadStats}
-            />
-          )}
+          <Lazy>
+            {tab === "review" && (
+              <ReviewQueue
+                account={account}
+                accountName={accountName}
+                status={queue}
+                onStatus={(v) => setParam({ queue: v === "review" ? null : v })}
+                onClearAccount={() => setParam({ account: null })}
+                onChanged={reloadStats}
+              />
+            )}
+            {tab === "auto" && (
+              <AutoMatchedList
+                autoEnabled={statsData?.autoEnabled ?? null}
+                onChanged={reloadStats}
+              />
+            )}
+            {tab === "ignored" && (
+              <IgnoredList
+                account={account}
+                accountName={accountName}
+                onClearAccount={() => setParam({ account: null })}
+                onChanged={reloadStats}
+              />
+            )}
+          </Lazy>
         </Card>
       )}
       {available && tab === "transactions" && (

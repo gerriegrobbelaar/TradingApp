@@ -3,7 +3,17 @@ import type { MatchAccountMapDto, MatchAccountMapResponse } from "@camelthorn/co
 import { Button, Card, Chip, Skeleton } from "@camelthorn/ui";
 import { getAccountMap, putAccountMap } from "../../api-matching";
 import { describeLoadError } from "../../lib/errors";
+import {
+  CONTROL_ACCOUNTS_HELP,
+  controlAccountsMissing,
+  openingBalanceErrorText,
+  openingBalanceRequest,
+  openingBalanceText,
+  parseOpeningBalance,
+} from "../../lib/account-map";
+import { blockerText } from "../../lib/matching-labels";
 import { JOURNAL_CODE, LEDGER_CODE } from "../../lib/matching-settings";
+import { formatMoney } from "../../lib/format";
 import { useAction } from "../../lib/useAction";
 import { useResource } from "../../lib/useResource";
 import { useToast } from "../../toasts";
@@ -15,12 +25,18 @@ interface Draft {
   division: string;
   journal: string;
   gl: string;
+  receivable: string;
+  payable: string;
+  opening: string;
 }
 
 const draftOf = (a: MatchAccountMapDto): Draft => ({
   division: a.divisionId === null ? "" : String(a.divisionId),
   journal: a.journalCode ?? "",
   gl: a.bankGlAccountCode ?? "",
+  receivable: a.receivableGlAccountCode ?? "",
+  payable: a.payableGlAccountCode ?? "",
+  opening: openingBalanceText(a.openingBalanceMinor, a.currency),
 });
 
 function Row({
@@ -40,12 +56,25 @@ function Row({
   const saved = draftOf(account);
   const unmapped = account.divisionId === null;
   const changed =
-    draft.division !== saved.division || draft.journal !== saved.journal || draft.gl !== saved.gl;
+    draft.division !== saved.division ||
+    draft.journal !== saved.journal ||
+    draft.gl !== saved.gl ||
+    draft.receivable !== saved.receivable ||
+    draft.payable !== saved.payable ||
+    draft.opening !== saved.opening;
   const removing = draft.division === "" && !unmapped;
   const journalOk = JOURNAL_CODE.test(draft.journal.trim());
   const glOk = LEDGER_CODE.test(draft.gl.trim());
+  // Control accounts are optional to save (booking waits without them) but must be well formed.
+  const receivableOk = draft.receivable.trim() === "" || LEDGER_CODE.test(draft.receivable.trim());
+  const payableOk = draft.payable.trim() === "" || LEDGER_CODE.test(draft.payable.trim());
+  const opening = parseOpeningBalance(draft.opening, account.currency);
   const division = divisions.find((d) => String(d.id) === draft.division);
-  const valid = draft.division === "" ? removing : division !== undefined && journalOk && glOk;
+  const valid =
+    draft.division === ""
+      ? removing
+      : division !== undefined && journalOk && glOk && receivableOk && payableOk && opening.ok;
+  const incomplete = controlAccountsMissing(account);
   const iban = maskIban(account.ibanMasked);
   const id = `map-${account.bankAccountId}`;
 
@@ -60,6 +89,14 @@ function Row({
               divisionId: division.id,
               journalCode: draft.journal.trim(),
               bankGlAccountCode: draft.gl.trim(),
+              receivableGlAccountCode:
+                draft.receivable.trim() === "" ? null : draft.receivable.trim(),
+              payableGlAccountCode: draft.payable.trim() === "" ? null : draft.payable.trim(),
+              // Sent only when edited: absent keeps the stored value (a value the screen could not
+              // show is never cleared by saving another field).
+              ...(draft.opening !== saved.opening
+                ? { openingBalanceMinor: openingBalanceRequest(opening) }
+                : {}),
             },
       ),
     );
@@ -70,7 +107,7 @@ function Row({
   }
 
   return (
-    <li className={`mt-map-row${unmapped ? " mt-unmapped" : ""}`}>
+    <li className={`mt-map-row${unmapped || incomplete ? " mt-unmapped" : ""}`}>
       <div className="mt-map-head">
         <strong>{account.accountName}</strong> <Chip>{account.currency}</Chip>{" "}
         {iban && (
@@ -79,7 +116,18 @@ function Row({
           </span>
         )}
         {unmapped && <Chip tone="warn">Not matched until mapped</Chip>}
+        {incomplete && <Chip tone="warn">Not booked until control accounts are filled in</Chip>}
       </div>
+      {unmapped && (
+        <p className="cap" role="note">
+          {blockerText("journal_unmapped")}
+        </p>
+      )}
+      {incomplete && (
+        <p className="cap" role="note">
+          {blockerText("control_accounts_missing")}
+        </p>
+      )}
       <div className="mt-map-fields">
         <label className="field">
           Administration
@@ -122,7 +170,68 @@ function Row({
             onChange={(e) => setDraft({ ...draft, gl: e.target.value })}
           />
         </label>
+        <label className="field">
+          Debtors control account
+          <input
+            className="input"
+            value={draft.receivable}
+            maxLength={20}
+            disabled={readOnly || draft.division === ""}
+            autoComplete="off"
+            aria-invalid={draft.division !== "" && !receivableOk}
+            aria-describedby={`${id}-ctl-help`}
+            onChange={(e) => setDraft({ ...draft, receivable: e.target.value })}
+          />
+        </label>
+        <label className="field">
+          Creditors control account
+          <input
+            className="input"
+            value={draft.payable}
+            maxLength={20}
+            disabled={readOnly || draft.division === ""}
+            autoComplete="off"
+            aria-invalid={draft.division !== "" && !payableOk}
+            aria-describedby={`${id}-ctl-help`}
+            onChange={(e) => setDraft({ ...draft, payable: e.target.value })}
+          />
+        </label>
+        <label className="field">
+          Opening balance of an empty journal ({account.currency}, optional)
+          <input
+            className="input"
+            inputMode="decimal"
+            value={draft.opening}
+            maxLength={24}
+            disabled={readOnly || draft.division === ""}
+            autoComplete="off"
+            aria-invalid={draft.division !== "" && !opening.ok}
+            aria-describedby={`${id}-ctl-help`}
+            onChange={(e) => setDraft({ ...draft, opening: e.target.value })}
+          />
+        </label>
       </div>
+      {draft.division !== "" && (
+        <p id={`${id}-ctl-help`} className="cap">
+          {CONTROL_ACCOUNTS_HELP}
+        </p>
+      )}
+      {draft.division !== "" && opening.ok && opening.minor !== null && (
+        <p className="cap" id={`${id}-opening-reads`}>
+          Opening balance reads as {formatMoney(opening.minor, account.currency)}. Used only for the
+          first bank entry of a journal that has none in Exact yet.
+        </p>
+      )}
+      {draft.division !== "" && !opening.ok && (
+        <p className="cap bad" role="alert">
+          {openingBalanceErrorText(opening.error, account.currency)}
+        </p>
+      )}
+      {draft.division !== "" && (!receivableOk || !payableOk) && (
+        <p className="cap bad" role="alert">
+          Use the ledger account code: letters, digits, dots or hyphens.
+        </p>
+      )}
       {draft.division !== "" && (!journalOk || !glOk) && (
         <p className="cap bad" role="alert">
           Fill in the journal code (letters, digits, dot, underscore, hyphen) and the bank ledger

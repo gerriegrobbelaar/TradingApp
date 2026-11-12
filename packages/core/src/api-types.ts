@@ -976,6 +976,12 @@ export interface MatchPatternRequest {
   direction?: "in" | "out" | null;
   maxAmountMinor?: number | null;
   enabled?: boolean;
+  /**
+   * U2: the typed phrase (AUTO_MATCH_CONFIRM_PHRASE), needed while automatic matching AND automatic
+   * ledger patterns are on for a new enabled pattern or a change to the match fields of one
+   * (422 `confirmation_required` otherwise).
+   */
+  confirm?: string;
 }
 
 /**
@@ -1020,15 +1026,15 @@ export interface MatchStatsResponse {
   /** Active Revolut accounts without an Exact administration mapping. */
   unmappedAccounts: number;
   /**
-   * Allocations of matches booked in Exact more than 48 hours ago that still count against their
-   * item because Exact has not shown the payment (Phase 8 data-quality signal; never auto-released).
-   */
-  staleSettlements: number;
-  /**
    * Booking health (U1, review S10/N6). Always present from the server; optional here so older
    * fixtures keep compiling. Counts of live matches by booking trouble.
    */
   booking?: MatchBookingHealth;
+  /**
+   * Allocations of matches booked in Exact more than 48 hours ago that still count against their
+   * item because Exact has not shown the payment (Phase 8 data-quality signal; never auto-released).
+   */
+  staleSettlements: number;
 }
 
 /** Counts for Phase 8 and the Matching screen: what needs a person in the booking path. */
@@ -1119,6 +1125,12 @@ export interface BookingSettingsResponse {
    */
   bookingFrom?: string | null;
   backlogCount?: number;
+  /**
+   * U3: live not-booked matches that would stay untouched if booking were switched on NOW (every
+   * enable moves the watermark to now, so this is every live not-booked match). The enable dialog
+   * shows it; `backlogCount` describes the watermark in force.
+   */
+  backlogIfEnabledNow?: number;
   divisions?: number[];
   maxPerRun?: number;
   /**

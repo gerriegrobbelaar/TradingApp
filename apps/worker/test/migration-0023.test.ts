@@ -92,7 +92,6 @@ describe("migration 0023 on a populated database", () => {
     expect(
       (await mdb.prepare("SELECT COUNT(*) AS n FROM exact_write_outbox").first<{ n: number }>())?.n,
     ).toBe(0);
-    expect(await checkMatchingInvariants(mdb)).toEqual([]);
 
     const mapCols = (
       await mdb.prepare("PRAGMA table_info(bank_account_exact_map)").all<{ name: string }>()
@@ -139,5 +138,7 @@ describe("migration 0023 on a populated database", () => {
         .run(),
       // the CHECK of 0023, or (since 0024) the transition guard that fires before it
     ).rejects.toThrow(/CHECK|booking_err:bad_transition/);
+    // Every later migration is already applied above: the migrated data must still be consistent.
+    expect(await checkMatchingInvariants(mdb)).toEqual([]);
   });
 });

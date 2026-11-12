@@ -17,9 +17,13 @@ export function TypedPhraseSheet({
   phrase,
   confirmLabel,
   note,
+  extra,
+  extraReady = true,
+  extraDirty = false,
   onClose,
   onConfirm,
   onDone,
+  onFailed,
 }: {
   open: boolean;
   title: string;
@@ -27,11 +31,23 @@ export function TypedPhraseSheet({
   /** The text that must be typed exactly; omit for a note-and-confirm sheet. */
   phrase?: string;
   confirmLabel: string;
-  /** Ask for a written note; `required` keeps the button disabled while it is empty. */
-  note?: { label: string; required: boolean };
+  /**
+   * Ask for a written note; `required` keeps the button disabled while it is empty, `minLength`
+   * while it is shorter (the server's own bounds, so a short note is caught before sending).
+   */
+  note?: { label: string; required: boolean; minLength?: number; maxLength?: number };
+  /** More inputs shown before the note (tick boxes, pickers); the caller owns their state. */
+  extra?: ReactNode;
+  /** The extra inputs are complete; the confirm button stays disabled until they are. */
+  extraReady?: boolean;
+  /** The extra inputs hold something that closing would lose. */
+  extraDirty?: boolean;
   onClose: () => void;
   onConfirm: (v: { phrase: string; note: string }) => Promise<unknown>;
-  onDone: () => void;
+  /** Called with the server's answer after a successful confirm. */
+  onDone: (value: unknown) => void;
+  /** Called after a refusal (the error is shown here already), e.g. to refresh what is behind. */
+  onFailed?: (error: unknown) => void;
 }) {
   const [typed, setTyped] = useState("");
   const [text, setText] = useState("");
@@ -43,33 +59,43 @@ export function TypedPhraseSheet({
       clear();
     }
   }, [open, clear]);
-  const noteOk = !note || !note.required || text.trim() !== "";
+  const min = note?.minLength ?? 1;
+  const noteOk = !note || (!note.required && text.trim() === "") || text.trim().length >= min;
+  const noteShort = note !== undefined && text.trim() !== "" && text.trim().length < min;
   // Exact, case-sensitive, NOT trimmed (core phraseMatches; the server compares with === too).
-  const ready = (phrase === undefined || phraseMatches(typed, phrase)) && noteOk;
+  const ready = (phrase === undefined || phraseMatches(typed, phrase)) && noteOk && extraReady;
   async function go() {
     const r = await run(() => onConfirm({ phrase: typed, note: text.trim() }));
-    if (r?.ok) onDone();
+    if (r?.ok) onDone(r.value);
+    else if (r && !r.ok) onFailed?.(r.error);
   }
   return (
     <DrillSheet
       open={open}
       title={title}
       onClose={onClose}
-      dirty={!state.busy && (typed !== "" || text.trim() !== "")}
+      dirty={!state.busy && (typed !== "" || text.trim() !== "" || extraDirty)}
     >
       <div className="mt-phrase">
         {intro}
+        {extra}
         {note && (
           <label className="field">
             {note.label}
             <textarea
               className="input mt-note"
               rows={3}
-              maxLength={200}
+              maxLength={note.maxLength ?? 200}
               value={text}
+              aria-describedby={noteShort ? "tps-note-short" : undefined}
               onChange={(e) => setText(e.target.value)}
             />
           </label>
+        )}
+        {noteShort && (
+          <p id="tps-note-short" className="cap">
+            Write at least {min} characters.
+          </p>
         )}
         {phrase !== undefined && (
           <label className="field">

@@ -15,6 +15,7 @@ const all = import.meta.glob(["./**/*.ts", "./**/*.tsx", "!./**/*.test.ts", "!./
 
 const isMatching = (name: string) =>
   name === "./lib/allocation.ts" ||
+  name === "./lib/account-map.ts" ||
   /^\.\/lib\/matching-[\w-]+\.ts$/.test(name) ||
   name.startsWith("./components/matching/") ||
   name === "./api-matching.ts" ||
@@ -41,6 +42,12 @@ const FORBIDDEN: [string, RegExp][] = [
 /** The legitimate uses: [file, pattern, exact count, why]. Anything else, or one more, fails. */
 const ALLOWED: [string, string, number, string][] = [
   ["./lib/allocation.ts", "Number(...)", 1, "a checked safe-integer BigInt as the JSON number"],
+  [
+    "./lib/account-map.ts",
+    "Number(...)",
+    1,
+    "the opening balance: a checked BigInt within 1e13 as the JSON number",
+  ],
   [
     "./lib/matching-settings.ts",
     "Number(...)",

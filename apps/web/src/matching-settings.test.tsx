@@ -9,6 +9,7 @@ import { nav, type Me } from "./api";
 import {
   AUTO_MATCH_CONFIRM_PHRASE,
   BOOKING_ENABLE_PHRASE,
+  BOOKING_VERIFY_CHECKS,
   BOOKING_VERIFY_PHRASE,
 } from "@camelthorn/core";
 import { BLOCKER_FALLBACK } from "./lib/matching-labels";
@@ -186,6 +187,8 @@ describe("account map", () => {
       divisionId: 2,
       journalCode: "RB2",
       bankGlAccountCode: "1220",
+      receivableGlAccountCode: null,
+      payableGlAccountCode: null,
     });
     await waitFor(() => expect(of(calls, "/api/matching/account-map").length).toBeGreaterThan(1));
   });
@@ -282,10 +285,12 @@ describe("thresholds", () => {
         amountToleranceMinor: 0,
         blockAutoOnRecentIbanChangeDays: 90,
         autoLedgerPatterns: false,
+        autoIncomingUnknownIban: false,
         autoTxTypes: ["transfer", "topup", "card_payment"],
         noMatchTxTypes: ["exchange"],
         internalAccountTypes: ["self"],
       },
+      rev: "rev-1",
     });
   });
 
@@ -626,7 +631,9 @@ describe("booking in Exact", () => {
 
   it("Ready: shows who verified it and offers Disable", async () => {
     await open({
-      "GET /api/booking/settings": () => ({ body: booking({ enabled: true, verified }) }),
+      "GET /api/booking/settings": () => ({
+        body: booking({ enabled: true, verified, divisions: [1] }),
+      }),
     });
     const c = card("Booking in Exact");
     expect(await within(c).findByText("Ready")).toBeTruthy();
@@ -649,8 +656,9 @@ describe("booking in Exact", () => {
     const phrase = BOOKING_VERIFY_PHRASE;
     const input = within(dialog).getByLabelText(`Type “${phrase}” to confirm`);
     await user.type(input, phrase);
-    expect((go as HTMLButtonElement).disabled).toBe(true); // note still empty
     await user.type(within(dialog).getByLabelText(/What did you check/), "Test invoice booked");
+    expect((go as HTMLButtonElement).disabled).toBe(true); // the checks are not ticked yet
+    for (const box of within(dialog).getAllByRole("checkbox")) await user.click(box);
     expect((go as HTMLButtonElement).disabled).toBe(false);
     await user.clear(input);
     await user.type(input, phrase.toLowerCase());
@@ -662,17 +670,21 @@ describe("booking in Exact", () => {
     expect(of(calls, "/api/booking/verify", "POST")[0]?.body).toEqual({
       note: "Test invoice booked",
       confirm: phrase,
+      checks: [...BOOKING_VERIFY_CHECKS],
     });
   });
 
   it("enabling needs ENABLE EXACT BOOKING typed exactly; disabling is immediate", async () => {
     const user = userEvent.setup();
     let enabled = false;
+    let divisions: number[] = [];
     const { calls } = await open({
-      "GET /api/booking/settings": () => ({ body: booking({ enabled, verified }) }),
+      "GET /api/booking/settings": () => ({ body: booking({ enabled, verified, divisions }) }),
       "PUT /api/booking/settings": (c) => {
-        enabled = (c.body as { enabled: boolean }).enabled;
-        return { body: booking({ enabled, verified }) };
+        const b = c.body as { enabled?: boolean; divisions?: number[] };
+        if (b.enabled !== undefined) enabled = b.enabled;
+        if (b.divisions !== undefined) divisions = b.divisions;
+        return { body: booking({ enabled, verified, divisions }) };
       },
     });
     const c = card("Booking in Exact");
@@ -681,6 +693,7 @@ describe("booking in Exact", () => {
     const go = within(dialog).getByRole("button", { name: "Enable booking" });
     const input = within(dialog).getByLabelText(`Type “${BOOKING_ENABLE_PHRASE}” to confirm`);
     expect((go as HTMLButtonElement).disabled).toBe(true);
+    await user.click(await within(dialog).findByRole("checkbox", { name: "Camelthorn B.V." }));
     for (const near of [
       BOOKING_ENABLE_PHRASE.slice(0, -1),
       BOOKING_ENABLE_PHRASE.toLowerCase(),
@@ -697,10 +710,10 @@ describe("booking in Exact", () => {
     expect((go as HTMLButtonElement).disabled).toBe(false);
     await user.click(go);
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    expect(of(calls, "/api/booking/settings", "PUT")[0]?.body).toEqual({
-      enabled: true,
-      confirm: BOOKING_ENABLE_PHRASE,
-    });
+    // one call: the switch with the limits along (one server batch); the server sets the watermark
+    expect(of(calls, "/api/booking/settings", "PUT").map((x) => x.body)).toEqual([
+      { enabled: true, confirm: BOOKING_ENABLE_PHRASE, divisions: [1] },
+    ]);
     expect(await within(c).findByText("Ready")).toBeTruthy();
     await user.click(within(c).getByRole("button", { name: "Disable booking" }));
     expect(screen.queryByRole("dialog")).toBeNull();
@@ -720,6 +733,7 @@ describe("booking in Exact", () => {
       await within(card("Booking in Exact")).findByRole("button", { name: "Enable booking…" }),
     );
     const dialog = await screen.findByRole("dialog");
+    await user.click(await within(dialog).findByRole("checkbox", { name: "Camelthorn B.V." }));
     await user.type(within(dialog).getByLabelText(/to confirm/), BOOKING_ENABLE_PHRASE);
     await user.click(within(dialog).getByRole("button", { name: "Enable booking" }));
     expect(

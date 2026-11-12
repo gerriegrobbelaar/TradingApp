@@ -13,17 +13,18 @@ import {
   getBookingSettings,
   putBookingSettings,
   resolveOutboxItem,
-  verifyBookingPath,
 } from "../../api-matching";
 import { magnitude } from "../../lib/allocation";
 import { describeLoadError } from "../../lib/errors";
-import { NO_VALUE, formatDate, formatDateTime, formatMoney } from "../../lib/format";
+import { NO_VALUE, formatCount, formatDate, formatDateTime, formatMoney } from "../../lib/format";
 import {
   BOOKING_STATUS,
   BOOKING_STATUS_ORDER,
   OUTBOX_ACTIONABLE,
   blockerText,
   bookingState,
+  isRunBlocker,
+  verifyCheckLabel,
 } from "../../lib/matching-labels";
 import { maskIbanLike } from "../../lib/mask";
 import { useAction } from "../../lib/useAction";
@@ -32,8 +33,11 @@ import { useResource } from "../../lib/useResource";
 import { useToast } from "../../toasts";
 import { DataTable, LoadMore, type Column } from "../DataTable";
 import { EmptyState, ErrorNotice } from "../EmptyState";
+import { EnableSheet, backlogIfEnabledNow, enableBlockers } from "./EnableSheet";
 import { ErrorLine, StepUpNotice } from "./MatchParts";
+import { PreviewSheet } from "./PreviewSheet";
 import { TypedPhraseSheet } from "./TypedPhraseSheet";
+import { VerifySheet } from "./VerifySheet";
 
 /** The phrases live in core (one source for the worker, the web and the tests). */
 export const VERIFY_PHRASE = BOOKING_VERIFY_PHRASE;
@@ -55,6 +59,12 @@ const CHIP_TEXT: Record<BookingChip, { label: string; tone: "neutral" | "warn" |
   blocked: { label: "Blocked", tone: "warn" },
   ready: { label: "Ready", tone: "ok" },
 };
+
+function modeText(v: boolean | null | undefined): string {
+  if (v === true) return "this app creates the bank entries";
+  if (v === false) return "another integration creates the bank entries";
+  return "not recorded";
+}
 
 function bankEntryLine(v: boolean | null): string {
   if (v === true) return "This app creates the bank entries in Exact, then matches them.";
@@ -295,7 +305,7 @@ export function BookingCard({ isAdmin }: { isAdmin: boolean }) {
   const res = useResource<BookingSettingsResponse>("booking-settings", (s) =>
     getBookingSettings(s),
   );
-  const [sheet, setSheet] = useState<"verify" | "enable" | null>(null);
+  const [sheet, setSheet] = useState<"verify" | "enable" | "preview" | null>(null);
   const { state, run } = useAction();
 
   async function disable() {
@@ -308,6 +318,21 @@ export function BookingCard({ isAdmin }: { isAdmin: boolean }) {
 
   const s = res.data;
   const chip = s ? bookingChip(s) : null;
+  // While booking is off, "switched off" is what the chip already says; the Enable dialog fixes the
+  // allow-list itself. Everything else is listed.
+  const shownBlockers = s
+    ? s.enabled
+      ? s.blockers
+      : s.blockers.filter((b) => b !== "writes_disabled")
+    : [];
+  const enableStop = s ? enableBlockers(s) : [];
+  const canEnable =
+    s !== undefined &&
+    s !== null &&
+    enableStop.length === 0 &&
+    !s.protocolChanged &&
+    s.verified !== null;
+  const notBookedNow = s ? backlogIfEnabledNow(s) : undefined;
   return (
     <Card>
       <div className="row-between">
@@ -338,12 +363,21 @@ export function BookingCard({ isAdmin }: { isAdmin: boolean }) {
               administration before booking.
             </p>
           )}
-          {s.blockers.length > 0 && (
+          {shownBlockers.length > 0 && (
             <div role="note" className="notice warn">
-              <p>Booking is blocked until this is fixed:</p>
+              <p>
+                {s.enabled
+                  ? "Booking is on, but this needs fixing:"
+                  : "Booking cannot be switched on until this is fixed:"}
+              </p>
               <ul>
-                {s.blockers.map((b) => (
-                  <li key={b}>{blockerText(b)}</li>
+                {shownBlockers.map((b) => (
+                  <li key={b}>
+                    {blockerText(b)}
+                    {s.enabled && !isRunBlocker(b)
+                      ? " Matches it affects wait with a “cannot be booked yet” note; the others are still booked."
+                      : ""}
+                  </li>
                 ))}
               </ul>
             </div>
@@ -366,6 +400,29 @@ export function BookingCard({ isAdmin }: { isAdmin: boolean }) {
                 <dd>{maskIbanLike(s.verified.note)}</dd>
               </div>
             )}
+            {s.verified && s.verified.checks !== undefined && (
+              <div className="dl-row">
+                <dt>Checks ticked</dt>
+                <dd>
+                  <ul className="mt-ticked" aria-label="Checks ticked at verification">
+                    {s.verified.checks.map((c) => (
+                      <li key={c}>{verifyCheckLabel(c)}</li>
+                    ))}
+                  </ul>
+                </dd>
+              </div>
+            )}
+            {s.verified && s.verified.createsBankEntries !== undefined && (
+              <div className="dl-row">
+                <dt>Verified for</dt>
+                <dd>
+                  {`Mode: ${modeText(s.verified.createsBankEntries)}`}
+                  {s.verified.createsBankEntries !== s.createsBankEntries
+                    ? ". This differs from the current setting, so verify again."
+                    : ""}
+                </dd>
+              </div>
+            )}
             <div className="dl-row">
               <dt>Current format</dt>
               <dd>{s.protocolVersion}</dd>
@@ -374,6 +431,46 @@ export function BookingCard({ isAdmin }: { isAdmin: boolean }) {
               <dt>Bank entries</dt>
               <dd>{bankEntryLine(s.createsBankEntries)}</dd>
             </div>
+            {s.bookingFrom !== undefined && s.bookingFrom !== null && (
+              <div className="dl-row">
+                <dt>Booked from</dt>
+                <dd>Only matches made after {formatDateTime(s.bookingFrom)} are booked</dd>
+              </div>
+            )}
+            {s.enabled && s.backlogCount !== undefined && s.backlogCount > 0 && (
+              <div className="dl-row">
+                <dt>Not booked</dt>
+                <dd>
+                  {formatCount(s.backlogCount, "existing match", "existing matches")} made before
+                  that will NOT be booked
+                </dd>
+              </div>
+            )}
+            {!s.enabled && notBookedNow !== undefined && notBookedNow > 0 && (
+              <div className="dl-row">
+                <dt>Not booked</dt>
+                <dd>
+                  {formatCount(notBookedNow, "existing match", "existing matches")} would NOT be
+                  booked if booking were switched on now
+                </dd>
+              </div>
+            )}
+            {s.divisions !== undefined && (
+              <div className="dl-row">
+                <dt>Administrations</dt>
+                <dd>
+                  {s.divisions.length === 0
+                    ? "None allowed yet"
+                    : formatCount(s.divisions.length, "administration", "administrations")}
+                </dd>
+              </div>
+            )}
+            {s.maxPerRun !== undefined && (
+              <div className="dl-row">
+                <dt>Matches per run</dt>
+                <dd>{s.maxPerRun}</dd>
+              </div>
+            )}
           </dl>
           {state.needsStepUp && <StepUpNotice />}
           {state.error && <ErrorLine>{state.error}</ErrorLine>}
@@ -385,6 +482,7 @@ export function BookingCard({ isAdmin }: { isAdmin: boolean }) {
           {isAdmin && (
             <div className="stack-row">
               <Button onClick={() => setSheet("verify")}>Verify write path…</Button>
+              <Button onClick={() => setSheet("preview")}>Preview booking…</Button>
               {s.enabled ? (
                 <Button disabled={state.busy} onClick={() => void disable()}>
                   Disable booking
@@ -392,7 +490,8 @@ export function BookingCard({ isAdmin }: { isAdmin: boolean }) {
               ) : (
                 <Button
                   variant="primary"
-                  disabled={s.blockers.length > 0 || s.protocolChanged || s.verified === null}
+                  disabled={!canEnable}
+                  aria-describedby={canEnable ? undefined : "booking-enable-why"}
                   onClick={() => setSheet("enable")}
                 >
                   Enable booking…
@@ -400,62 +499,47 @@ export function BookingCard({ isAdmin }: { isAdmin: boolean }) {
               )}
             </div>
           )}
-          {isAdmin && !s.enabled && s.verified === null && (
-            <p className="cap">
-              Verify the write path first. Booking cannot be enabled before that.
+          {isAdmin && !s.enabled && !canEnable && (
+            <p className="cap" id="booking-enable-why">
+              {s.verified === null
+                ? "Verify the write path first. Booking cannot be enabled before that."
+                : "Enable is available once everything listed above is fixed."}
             </p>
           )}
         </>
       )}
-      <TypedPhraseSheet
-        open={sheet === "verify"}
-        title="Verify the Exact write path"
-        phrase={VERIFY_PHRASE}
-        confirmLabel="Record the verification"
-        note={{ label: "What did you check? (required)", required: true }}
-        intro={
-          <>
-            <p>
-              Do this only after you tried the booking on a test administration in Exact and saw the
-              bank entry and the match come out right. This records that you did, and by whom.
-            </p>
-            <p>Verifying needs a Google sign-in from the last 15 minutes.</p>
-          </>
-        }
-        onClose={() => setSheet(null)}
-        onConfirm={({ phrase, note }) => verifyBookingPath({ note, confirm: phrase })}
-        onDone={() => {
-          setSheet(null);
-          toast.show("Recorded the verification.");
-          res.reload();
-        }}
-      />
-      <TypedPhraseSheet
-        open={sheet === "enable"}
-        title="Enable booking in Exact"
-        phrase={ENABLE_PHRASE}
-        confirmLabel="Enable booking"
-        note={{ label: "Note (optional)", required: false }}
-        intro={
-          <>
-            <p>
-              From now on, matches that are recorded here are booked in Exact automatically after a
-              short delay. Once booked, a match cannot be undone in this app; it must be reversed in
-              Exact.
-            </p>
-            <p>You can switch booking off again at any time. Enabling needs a recent sign-in.</p>
-          </>
-        }
-        onClose={() => setSheet(null)}
-        onConfirm={({ phrase, note }) =>
-          putBookingSettings({ enabled: true, confirm: phrase, ...(note ? { note } : {}) })
-        }
-        onDone={() => {
-          setSheet(null);
-          toast.show("Booking in Exact is on.");
-          res.reload();
-        }}
-      />
+      {isAdmin && (
+        <>
+          <VerifySheet
+            open={sheet === "verify"}
+            settings={s ?? null}
+            onClose={() => setSheet(null)}
+            onDone={() => {
+              setSheet(null);
+              toast.show("Recorded the verification.");
+              res.reload();
+            }}
+          />
+          {s && (
+            <EnableSheet
+              open={sheet === "enable"}
+              settings={s}
+              onClose={() => setSheet(null)}
+              onDone={(after) => {
+                setSheet(null);
+                toast.show(
+                  after.bookingFrom
+                    ? `Booking in Exact is on for matches made from ${formatDateTime(after.bookingFrom)}.`
+                    : "Booking in Exact is on.",
+                );
+                res.reload();
+              }}
+              onStale={res.reload}
+            />
+          )}
+          <PreviewSheet open={sheet === "preview"} onClose={() => setSheet(null)} />
+        </>
+      )}
       <Outbox canResolve={isAdmin} />
     </Card>
   );

@@ -5,6 +5,7 @@
  */
 import type {
   BookingStatus,
+  BookingVerifyCheck,
   MatchBlockedReason,
   MatchIgnoreReason,
   MatchTxDto,
@@ -189,7 +190,8 @@ export const ERROR_TEXT: Record<string, string> = {
   unknown_account: "That bank account does not exist.",
   // 400: a value the server refused
   bad_request: "That request was not valid. Check the values and try again.",
-  bad_note: "The note is missing or too long (up to 200 characters).",
+  bad_note:
+    "The note is missing, too short or too long. A verification note needs 10 to 500 characters, other notes up to 200.",
   bad_reason: "The reason is missing or too long (up to 200 characters).",
   bad_ledger_account: "That ledger account code is not valid.",
   bad_allocations: "The amounts are not valid.",
@@ -205,7 +207,6 @@ export const ERROR_TEXT: Record<string, string> = {
   bad_division: "That administration is not valid.",
   bad_journal_code: "That journal code is not valid.",
   bad_gl_account: "That bank ledger account code is not valid.",
-  bad_opening_balance: "The opening balance must be a whole number of cents.",
   bad_ids: "The invoices could not be checked. Remove one and try again.",
   bad_status: "That filter is not valid.",
   bad_q: "That search is too long or not valid.",
@@ -214,6 +215,34 @@ export const ERROR_TEXT: Record<string, string> = {
   // booking routes (M7c): codes not known here fall back to a calm general sentence
   not_verified: "The Exact write path is not verified yet.",
   blocked: "Booking cannot be switched on until the listed blockers are fixed.",
+  blockers_changed:
+    "Something changed since this dialog opened (a blocker, the verification or the switch). Nothing was switched on. The card is refreshed; check it, then open Enable again.",
+  bank_entries_undecided:
+    "It is not decided yet who creates the bank entries in Exact (Settings, Connections). Decide that first.",
+  checks_incomplete:
+    "Tick every check first. Each one must be done on the test administration before the write path counts as verified.",
+  bad_checks: "Tick every check first. Each one must be done on the test administration.",
+  bad_receivable_gl_account: "That debtors control account code is not valid.",
+  bad_payable_gl_account: "That creditors control account code is not valid.",
+  bad_opening_balance:
+    "That opening balance is not valid. Type digits with at most the currency's decimals and, for an overdrawn journal, one minus sign in front.",
+  bad_resolution: "That choice is not valid. Close the sheet and try again.",
+  booking_from_in_future:
+    "That date and time is too far in the future. Pick a time no later than tomorrow.",
+  changed_meanwhile:
+    "This row changed in the meantime. The booking queue is refreshed; check it again before choosing.",
+  in_flight:
+    "This is being sent to Exact right now. Wait until the run has finished, then check it again.",
+  not_resolvable:
+    "This row can no longer be changed here. The booking queue shows its latest state.",
+  not_retryable:
+    "This row cannot be retried. Check it in Exact and mark it as booked manually or give it up.",
+  step_up_required:
+    "This needs a Google sign-in from the last 15 minutes. Sign in again, then retry.",
+  bad_booking_from: "That date and time is not valid.",
+  bad_divisions: "Pick at least one administration that exists.",
+  bad_max_per_run: "That number of matches per run is not valid.",
+  bad_match_ids: "Pick between one and three matches.",
   // general
   not_found: "That item no longer exists. The list is refreshed.",
   forbidden: "You do not have permission to do this.",
@@ -255,7 +284,8 @@ export function bookingState(
 ): BookingState {
   if (s === null) return "unknown";
   if (!s.enabled) return "off";
-  return s.blockers.length > 0 || s.protocolChanged === true ? "blocked" : "ready";
+  // Only RUN blockers stop booking once it is on; the enable-only ones defer single matches.
+  return s.blockers.some(isRunBlocker) || s.protocolChanged === true ? "blocked" : "ready";
 }
 
 /** Recording a match never moves money; every confirmation says so. */
@@ -332,23 +362,60 @@ export const OUTBOX_ACTIONABLE: readonly BookingStatus[] = [
   "manual_required",
 ];
 
-/** The blocker codes GET /api/booking/settings can return (fixed with M7c). */
+/**
+ * The blocker codes GET /api/booking/settings can return (worker booking/settings.ts
+ * `BookingBlocker`; a test reads the worker source and keeps this list complete).
+ */
 export const BOOKING_BLOCKERS = [
   "not_verified",
   "protocol_changed",
+  "mode_changed",
   "bank_entries_undecided",
   "no_exact_connection",
+  "no_division_allowed",
+  "control_accounts_missing",
+  "journal_unmapped",
   "writes_disabled",
 ] as const;
 export type BookingBlocker = (typeof BOOKING_BLOCKERS)[number];
 
+/**
+ * Blockers that stop a RUN (worker `RUN_BLOCKERS`). The others (control accounts, journal map) only
+ * stop ENABLING: once booking is on, a match that misses them waits on its own with a "cannot be
+ * booked yet" chip and every other match is still booked.
+ */
+export const RUN_BLOCKERS: readonly BookingBlocker[] = [
+  "not_verified",
+  "protocol_changed",
+  "mode_changed",
+  "bank_entries_undecided",
+  "no_exact_connection",
+  "no_division_allowed",
+  "writes_disabled",
+];
+
+/** A blocker that stops every run (unknown codes count as stopping: the cautious reading). */
+export function isRunBlocker(b: string): boolean {
+  return (
+    !Object.prototype.hasOwnProperty.call(BLOCKER_TEXT, b) ||
+    RUN_BLOCKERS.includes(b as BookingBlocker)
+  );
+}
+
 const BLOCKER_TEXT: Record<BookingBlocker, string> = {
   not_verified: "The Exact write path has not been verified on a test administration.",
   protocol_changed: "The Exact write format changed since it was verified. Verify it again.",
+  mode_changed:
+    "Who creates the bank entries changed since you verified. Verify the write path again.",
   bank_entries_undecided:
     "It is not decided who creates the bank entries in Exact (Settings, Connections).",
   no_exact_connection: "Exact is not connected, or the connection needs to be renewed.",
-  writes_disabled: "Writes to Exact are switched off for this installation.",
+  no_division_allowed: "No administration is allowed for booking yet. Pick at least one.",
+  control_accounts_missing:
+    "A bank account has no debtors or creditors control account. Fill them in under Account map below.",
+  journal_unmapped:
+    "A bank account has no Exact journal or bank ledger account. Map it under Account map below.",
+  writes_disabled: "Booking in Exact is switched off.",
 };
 
 /** Never echoes the server's text: an unknown code gets one fixed sentence. */
@@ -358,4 +425,158 @@ export function blockerText(b: string): string {
   return Object.prototype.hasOwnProperty.call(BLOCKER_TEXT, b)
     ? BLOCKER_TEXT[b as BookingBlocker]
     : BLOCKER_FALLBACK;
+}
+
+/**
+ * Why a match cannot be booked yet (`bookingDeferredCode` on a match): the executor leaves it not
+ * booked and tries again later (worker plan.ts DEFER_PLAN_CODES, the fee and mode checks, and
+ * `build_<error>` when a body could not be built). A fixed list here, NOT derived from the worker at
+ * run time: a test scans the worker source so a new code fails until it is added; at run time an
+ * unknown code gets the fallback sentence.
+ */
+export const BOOKING_DEFERRAL_CODES = [
+  "control_account_unknown",
+  "ledger_account_unknown",
+  "relation_code_unknown",
+  "relation_unknown",
+  "item_entry_number_unknown",
+  "bank_balance_unknown",
+  "fee_not_supported_v1",
+  "mode_mismatch",
+] as const;
+export type BookingDeferralCode = (typeof BOOKING_DEFERRAL_CODES)[number];
+
+export const DEFERRAL_TEXT: Record<BookingDeferralCode, string> = {
+  control_account_unknown: "the debtors or creditors control account is not filled in",
+  ledger_account_unknown: "the ledger account is not known in Exact yet",
+  relation_code_unknown: "the customer or supplier code is not known yet",
+  relation_unknown: "the customer or supplier is not known in Exact yet",
+  item_entry_number_unknown: "the invoice entry number from Exact is not known yet",
+  bank_balance_unknown: "the opening balance of the journal in Exact is not known",
+  fee_not_supported_v1: "the bank line has a fee, which is not booked automatically yet",
+  mode_mismatch:
+    "the bank line's Revolut connection uses another setting for who creates bank entries",
+};
+
+export const DEFERRAL_FALLBACK = "something else is missing";
+
+export function deferralReason(code: string): string {
+  if (Object.prototype.hasOwnProperty.call(DEFERRAL_TEXT, code)) {
+    return DEFERRAL_TEXT[code as BookingDeferralCode];
+  }
+  if (/^build_[a-z0-9_]{1,60}$/.test(code)) return "the request to Exact could not be built";
+  return DEFERRAL_FALLBACK;
+}
+
+/** The calm chip text for a deferred match. */
+export function deferredChipText(code: string): string {
+  return `Cannot be booked yet: ${deferralReason(code)}`;
+}
+
+/**
+ * Why the PREVIEW says a match would not be booked now (`wouldDefer.code`): the deferrals above,
+ * plus v1 rules that end as "Needs a person" (part payments, foreign currency...), states of the
+ * match itself, and what Exact answered on the read-back (`preflight_<verdict>`).
+ */
+export const PREVIEW_OUTCOME_TEXT: Record<string, string> = {
+  match_not_found: "the match no longer exists",
+  match_undone: "the match was undone",
+  match_already_claimed: "the booking job has already picked this match up",
+  match_flagged: "the match needs a check first",
+  tx_not_final: "the bank line is not final at Revolut",
+  match_not_bookable: "the match cannot be booked in its current state",
+  bank_entries_undecided: "it is not decided who creates the bank entries in Exact",
+  ledger_booking_with_feed_manual:
+    "a ledger booking is not made by this app while another integration creates the bank entries; book it in Exact by hand",
+  bad_amount: "the amount is not valid",
+  no_items: "the match has no invoice",
+  item_not_open: "an invoice is no longer open",
+  mixed_currency: "the bank line and the invoices use different currencies",
+  mixed_item_kinds: "the match mixes invoices and bills",
+  multiple_relations: "the invoices belong to more than one customer or supplier",
+  fx_not_supported_v1: "foreign currency is not booked automatically yet",
+  part_payment_not_supported_v1: "a part payment is not booked automatically yet",
+  partial_match_not_supported_v1:
+    "a match that leaves an amount open is not booked automatically yet",
+  preflight_already_settled: "Exact already shows the invoice as settled",
+  preflight_changed: "the invoice changed in Exact since the match",
+  preflight_inconclusive: "Exact could not be checked just now",
+};
+
+export function previewOutcomeReason(code: string): string {
+  if (Object.prototype.hasOwnProperty.call(PREVIEW_OUTCOME_TEXT, code)) {
+    return PREVIEW_OUTCOME_TEXT[code] as string;
+  }
+  return deferralReason(code);
+}
+
+/** What a read of the preview may report as its error (worker preview.ts `readErrorCode`). */
+export const PREVIEW_READ_ERROR_TEXT: Record<string, string> = {
+  rate_limited: "Exact asked us to slow down; try again in a minute",
+  exact_auth: "the Exact connection needs to be renewed",
+  gate_budget: "today's Exact call budget is used up",
+  read_failed: "a read from Exact failed",
+  body_too_large: "a body is too large to show here",
+};
+
+export function previewReadErrorText(code: string): string {
+  return Object.prototype.hasOwnProperty.call(PREVIEW_READ_ERROR_TEXT, code)
+    ? (PREVIEW_READ_ERROR_TEXT[code] as string)
+    : "a read from Exact failed";
+}
+
+// ---- verifying the write path (one tick per check, DEPLOY.md step 0 item 18) -----------------
+
+/**
+ * One instruction per check of core BOOKING_VERIFY_CHECKS (the type forces completeness). ONE
+ * source for the dialog and the runbook: `doc` is the assumption reference used in docs/DEPLOY.md
+ * step 0 item 18, and a test asserts that DEPLOY.md names every check code, its label and its `doc`
+ * reference, so the dialog and the runbook cannot drift apart.
+ */
+export const VERIFY_CHECK_TEXT: Record<
+  BookingVerifyCheck,
+  { label: string; how: string; doc: string }
+> = {
+  probe_zero_for_random_ref: {
+    label: "The duplicate probe finds nothing for a random reference",
+    how: "On the test journal, the bank-line search for a reference that does not exist returned zero lines, and exactly one line for the real test reference (also in upper case). If a random reference returns lines, stop: booking must not be enabled.",
+    doc: "A6/A13",
+  },
+  bank_entry_sign: {
+    label: "The bank entry has the right sign",
+    how: "You posted the bank entry body from Preview booking by hand on the test journal, and Exact shows one line with the right sign, date and reference.",
+    doc: "A1, A3, A7, A9, A10",
+  },
+  matchset_signs_and_control_account: {
+    label: "The match uses the right signs and control account",
+    how: "You uploaded the match body from Preview booking by hand (the placeholder number 999999999 replaced by the real entry number) and Exact shows the match with the right signs and the debtors or creditors control account.",
+    doc: "A2, A4, A5, A8, A14, A15, A16",
+  },
+  balance_chain: {
+    label: "The balance chain continues",
+    how: "The newest entry of the test journal shows the closing balance that the next entry must open with.",
+    doc: "A12",
+  },
+  matchset_readback: {
+    label: "The read-back shows the invoice as paid",
+    how: "After the match, the receivables read shows the test invoice as paid, and the bank entry alone did not already settle it.",
+    doc: "A16",
+  },
+  lost_answer_drill: {
+    label: "The lost-answer drill passed",
+    how: "You blocked the network right after sending: the row ended as outcome unknown, the next run did not send again, and Retry found the entry instead of making a second one.",
+    doc: "Lost answer",
+  },
+  preview_matches_manual_payload: {
+    label: "Preview booking matches what you sent by hand",
+    how: "The bodies you posted by hand on the test administration are byte for byte the bodies Preview booking shows, with the same hashes.",
+    doc: "byte for byte",
+  },
+};
+
+/** The plain label of a recorded check; an unknown code keeps one calm sentence. */
+export function verifyCheckLabel(code: string): string {
+  return Object.prototype.hasOwnProperty.call(VERIFY_CHECK_TEXT, code)
+    ? VERIFY_CHECK_TEXT[code as BookingVerifyCheck].label
+    : "A check this version does not know";
 }

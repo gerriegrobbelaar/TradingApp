@@ -97,7 +97,15 @@ function AdminCards() {
           <AutoSwitchCard config={config.data} onChanged={config.reload} />
         </>
       )}
-      <PatternsCard />
+      <PatternsCard
+        autoLedger={
+          config.data !== null &&
+          config.data !== undefined &&
+          config.data.autoEnabled &&
+          config.data.config.autoLedgerPatterns
+        }
+        phrase={config.data?.autoConfirmPhrase || undefined}
+      />
       <BookingCard isAdmin />
     </>
   );

@@ -1,5 +1,5 @@
 import { vi } from "vitest";
-import { render } from "@testing-library/react";
+import { act, render } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { AppShell } from "./App";
 import type { Me, UsersResponse } from "./api";
@@ -85,4 +85,19 @@ export function renderApp(path = "/") {
       <AppShell />
     </MemoryRouter>,
   );
+}
+
+/**
+ * Let pending promises, effects and timers run for AT LEAST `ms` of real time, inside act(), then a
+ * few more task turns. Used before NEGATIVE assertions ("nothing more happened"). It asserts nothing
+ * about elapsed time, so a slow machine can only make it wait longer, never fail (review S1).
+ *
+ * Not fake timers on purpose: switching to fake timers here would leave timers the code already
+ * scheduled on the real clock un-run, and the negative assertion after it would pass vacuously.
+ */
+export async function settle(ms: number): Promise<void> {
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, ms));
+    for (let i = 0; i < 3; i++) await new Promise((r) => setTimeout(r, 0));
+  });
 }

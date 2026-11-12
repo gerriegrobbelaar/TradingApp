@@ -1,5 +1,6 @@
 import { AUTO_MATCH_CONFIRM_PHRASE } from "@camelthorn/core";
 import type {
+  BookingPreviewItem,
   BookingOutboxItemDto,
   BookingOutboxResponse,
   BookingSettingsResponse,
@@ -30,6 +31,7 @@ export const TUNABLES: MatchTunablesDto = {
   amountToleranceMinor: 0,
   blockAutoOnRecentIbanChangeDays: 90,
   autoLedgerPatterns: false,
+  autoIncomingUnknownIban: false,
   autoTxTypes: ["transfer", "topup", "card_payment"],
   noMatchTxTypes: ["exchange"],
   internalAccountTypes: ["self"],
@@ -179,6 +181,7 @@ export function config(over: Partial<MatchConfigResponse> = {}): MatchConfigResp
     updatedAt: null,
     updatedBy: null,
     autoConfirmPhrase: AUTO_MATCH_CONFIRM_PHRASE,
+    rev: "rev-1",
     ...over,
   };
 }
@@ -195,6 +198,9 @@ export function accountMap(over: Partial<MatchAccountMapResponse> = {}): MatchAc
         divisionName: "Camelthorn B.V.",
         journalCode: "RB1",
         bankGlAccountCode: "1210",
+        receivableGlAccountCode: "1300",
+        payableGlAccountCode: "1600",
+        openingBalanceMinor: null,
         updatedAt: "2026-11-01T00:00:00.000Z",
         updatedBy: "gerrie@camelthorncapital.com",
       },
@@ -236,16 +242,70 @@ export function pattern(over: Partial<MatchPatternDto> = {}): MatchPatternDto {
   };
 }
 
-export function booking(over: Partial<BookingSettingsResponse> = {}): BookingSettingsResponse {
+/**
+ * A preview answer for one match (POST /api/booking/preview), in the worker's real shape
+ * (booking/preview.ts): the bodies are the exact strings the executor would send.
+ */
+export function previewItem(over: Partial<BookingPreviewItem> = {}): BookingPreviewItem {
   return {
+    matchId: 50,
+    mode: "matched",
+    wouldDefer: null,
+    bankEntryBody: JSON.stringify({
+      Journal: "RB1",
+      Currency: "EUR",
+      BankEntryLines: [{ GLAccount: "1300", AmountFC: 12.34, YourRef: "rv-abc123" }],
+    }),
+    matchSetXml: "<eExact><MatchSets><MatchSet><MatchLines/></MatchSet></MatchSets></eExact>",
+    bankEntryHash: "a".repeat(64),
+    matchSetHash: "b".repeat(64),
+    matchSetBankLinePlaceholder: false,
+    reads: {
+      probeHits: 0,
+      closingBalanceMinor: 100_000,
+      openingBalanceSource: "exact",
+      preflight: "open_as_expected",
+      readError: null,
+    },
+    ...over,
+  };
+}
+
+/**
+ * The booking settings as the worker answers them. Unless a test sets `blockers` itself, they are
+ * derived the way the worker's `blockersOf` derives them (so "off" always carries
+ * `writes_disabled`, an empty allow-list `no_division_allowed`, and so on).
+ */
+export function booking(over: Partial<BookingSettingsResponse> = {}): BookingSettingsResponse {
+  const s: BookingSettingsResponse = {
     enabled: false,
     verified: null,
     protocolVersion: "2026-11-a",
     protocolChanged: false,
     createsBankEntries: true,
     blockers: [],
+    bookingFrom: null,
+    backlogCount: 0,
+    backlogIfEnabledNow: 0,
+    divisions: [],
+    maxPerRun: 1,
     ...over,
   };
+  if (over.blockers === undefined) {
+    const b: string[] = [];
+    if (s.verified === null) b.push("not_verified");
+    else if (s.protocolChanged) b.push("protocol_changed");
+    else if (
+      s.verified.createsBankEntries !== undefined &&
+      s.verified.createsBankEntries !== s.createsBankEntries
+    )
+      b.push("mode_changed");
+    if (s.createsBankEntries === null) b.push("bank_entries_undecided");
+    if ((s.divisions ?? []).length === 0) b.push("no_division_allowed");
+    if (!s.enabled) b.push("writes_disabled");
+    s.blockers = b;
+  }
+  return s;
 }
 
 const ZERO_COUNTS: Record<BookingStatus, number> = {

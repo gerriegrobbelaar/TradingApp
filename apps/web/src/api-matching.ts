@@ -4,7 +4,10 @@
  */
 import type {
   BookingOutboxResponse,
+  BookingPreviewRequest,
+  BookingPreviewResponse,
   BookingSettingsResponse,
+  BookingVerifyRequest,
   MatchAccountMapRequest,
   MatchAccountMapResponse,
   MatchAutoResponse,
@@ -134,15 +137,40 @@ export const deletePattern = (id: number) =>
 export const getBookingSettings = (signal?: AbortSignal) =>
   request<BookingSettingsResponse>("/api/booking/settings", sig(signal));
 /**
- * Switching booking ON needs the typed phrase (and a fresh sign-in); switching it OFF is the safe
- * direction and sends `{enabled: false}` only: no phrase, no step-up (orchestrator decision M7d).
+ * The shapes the server takes (worker booking/routes.ts putSettingsHandler):
+ *  - the switch: `{enabled: false}` (safe direction: no phrase, no step-up, nothing else) or
+ *    `{enabled: true, confirm, note?, divisions?, maxPerRun?}` (fresh sign-in, the typed phrase;
+ *    the limits are applied in the same batch; the SERVER sets the watermark to now);
+ *  - the limits: `{divisions?, maxPerRun?, bookingFrom?, note?}` without `enabled` (widening any of
+ *    them needs a fresh sign-in; narrowing does not).
  */
 export type BookingSettingsPut =
-  { enabled: false } | { enabled: true; confirm: string; note?: string };
+  | { enabled: false; note?: string }
+  | {
+      enabled: true;
+      confirm: string;
+      note?: string;
+      /** Applied in the same server batch as the switch, before its conditions are checked. */
+      divisions?: number[];
+      maxPerRun?: number;
+    }
+  | {
+      /** Divisions (divisions.id) booking may write to. */
+      divisions?: number[];
+      /** Matches the job may start per run, 1 to 10. */
+      maxPerRun?: number;
+      /** UTC ISO; moving it earlier widens what is booked. */
+      bookingFrom?: string;
+      note?: string;
+    };
 export const putBookingSettings = (body: BookingSettingsPut) =>
   request<BookingSettingsResponse>("/api/booking/settings", { method: "PUT", body });
-export const verifyBookingPath = (body: { note: string; confirm: string }) =>
+export const verifyBookingPath = (body: BookingVerifyRequest) =>
   request<BookingSettingsResponse>("/api/booking/verify", { method: "POST", body });
+
+/** Admin, fresh sign-in. Builds the real bodies and hashes; NOTHING is sent to Exact. */
+export const previewBooking = (body: BookingPreviewRequest) =>
+  request<BookingPreviewResponse>("/api/booking/preview", { method: "POST", body });
 
 export const getBookingOutbox = (
   params: { status?: BookingStatus | undefined; limit?: number; cursor?: string | null },

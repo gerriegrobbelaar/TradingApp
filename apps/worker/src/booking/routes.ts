@@ -157,6 +157,8 @@ async function settingsResponse(
     blockers: blockersOf(s),
     bookingFrom: s.bookingFrom,
     backlogCount: await backlogCountOf(db, s.bookingFrom),
+    // Enabling sets the watermark to now: every live not-booked match stays behind (U3).
+    backlogIfEnabledNow: await backlogCountOf(db, null),
     divisions: s.divisions,
     maxPerRun: s.maxPerRun,
   };

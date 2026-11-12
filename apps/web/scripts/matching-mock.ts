@@ -4,6 +4,7 @@
  * logs a console 404 in a suite that does not look at matching (apps/web/README.md). The m7d suite
  * passes a scene to pick the state it photographs.
  */
+import { BOOKING_VERIFY_CHECKS } from "@camelthorn/core";
 import {
   accountMap,
   autoItem,
@@ -15,15 +16,20 @@ import {
   outbox,
   outboxItem,
   pattern,
+  previewItem,
   queue,
   stats,
 } from "../src/test-fixtures-matching";
 import { listResponse, row } from "../src/test-fixtures";
 
 export interface MatchScene {
-  auto: "populated" | "empty";
+  /** `deferred`: one live match that cannot be booked yet (a calm chip). */
+  auto: "populated" | "empty" | "deferred";
   autoEnabled: boolean;
-  booking: "off" | "blocked" | "ready";
+  /** `verified`: verified with every check ticked, switched off (Enable is offered). */
+  booking: "off" | "blocked" | "ready" | "verified";
+  /** `incomplete`: a mapped account without control accounts. */
+  map: "complete" | "incomplete";
   /** The line the sheet opens: a normal one with candidates, or other states. */
   line: "candidates" | "conflict" | "matched";
 }
@@ -32,6 +38,7 @@ export const DEFAULT_SCENE: MatchScene = {
   auto: "populated",
   autoEnabled: false,
   booking: "off",
+  map: "complete",
   line: "candidates",
 };
 
@@ -146,6 +153,14 @@ export function matchingApi(
                   { id: 51, exactState: "booked", undoAvailable: false },
                   { id: 5, counterpartyName: "Beta GmbH" },
                 ),
+                ...(scene.auto === "deferred"
+                  ? [
+                      autoItem(
+                        { id: 52, bookingDeferredCode: "control_account_unknown" },
+                        { id: 6, counterpartyName: "Gamma Ltd" },
+                      ),
+                    ]
+                  : []),
               ],
         nextCursor: null,
       };
@@ -169,19 +184,63 @@ export function matchingApi(
       );
     case "/api/matching/config":
       return config({ autoEnabled: scene.autoEnabled });
-    case "/api/matching/account-map":
-      return accountMap();
+    case "/api/matching/account-map": {
+      if (scene.map === "complete") return accountMap();
+      const m = accountMap();
+      return {
+        ...m,
+        accounts: m.accounts.map((a, i) =>
+          i === 0 ? { ...a, receivableGlAccountCode: null, payableGlAccountCode: null } : a,
+        ),
+      };
+    }
+    case "/api/booking/preview":
+      return {
+        items: [
+          previewItem(),
+          previewItem({
+            matchId: 51,
+            wouldDefer: { code: "bank_balance_unknown" },
+            bankEntryBody: null,
+            bankEntryHash: null,
+            matchSetBankLinePlaceholder: true,
+          }),
+        ],
+      };
     case "/api/matching/patterns":
       return { patterns: [pattern()] };
     case "/api/booking/settings":
-      if (scene.booking === "ready") return booking({ enabled: true, verified: VERIFIED });
+      if (scene.booking === "ready") {
+        return booking({
+          enabled: true,
+          verified: { ...VERIFIED, checks: [...BOOKING_VERIFY_CHECKS], createsBankEntries: true },
+          bookingFrom: "2026-11-10T08:00:00.000Z",
+          backlogCount: 12,
+          divisions: [1],
+          maxPerRun: 1,
+        });
+      }
+      if (scene.booking === "verified") {
+        return booking({
+          verified: { ...VERIFIED, checks: [...BOOKING_VERIFY_CHECKS], createsBankEntries: true },
+          backlogCount: 12,
+          backlogIfEnabledNow: 12,
+        });
+      }
       if (scene.booking === "blocked") {
         // Switched on, but the write format changed since it was verified: blocked.
         return booking({
           enabled: true,
           verified: VERIFIED,
           protocolChanged: true,
-          blockers: ["protocol_changed", "bank_entries_undecided"],
+          blockers: [
+            "protocol_changed",
+            "bank_entries_undecided",
+            "control_accounts_missing",
+            "journal_unmapped",
+            "no_division_allowed",
+            "mode_changed",
+          ],
           createsBankEntries: null,
         });
       }

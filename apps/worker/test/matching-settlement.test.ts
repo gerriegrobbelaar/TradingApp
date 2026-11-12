@@ -669,6 +669,13 @@ describe("outbox payload retention (N3)", () => {
       .bind(m.id, w.divisionId, kind, key, "h".repeat(64), updatedAt, payloadJson)
       .run();
     const id = r.meta.last_row_id;
+    // Migration 0024 (U1) allows only real status transitions: these come from 'sending'.
+    if (["failed", "outcome_unknown", "sent_unverified"].includes(status)) {
+      await db
+        .prepare("UPDATE exact_write_outbox SET status = 'sending', updated_at = ?2 WHERE id = ?1")
+        .bind(id, updatedAt)
+        .run();
+    }
     if (status !== "pending") {
       // Setup only: forced into the status (migration 0024's transition guard is lifted for it).
       await withoutTriggers(["outbox_guard_status"], () =>
@@ -687,6 +694,30 @@ describe("outbox payload retention (N3)", () => {
         .bind(id)
         .first<{ p: string }>()
     )?.p ?? "";
+
+  it("the redaction exception cannot be used to change the 0024 columns of a terminal row", async () => {
+    const id = await outbox("verified", daysAgo(500));
+    for (const set of [
+      "admin_resolved_by = 'x@camelthorncapital.com'",
+      "admin_resolved_at = '2026-07-20T00:00:00.000Z'",
+      "creates_bank_entries = 0",
+    ]) {
+      await expect(
+        db
+          .prepare(
+            `UPDATE exact_write_outbox SET payload_json = json_object('v', 1, 'stage', 'redacted',
+               'input', json_object('bankEntryNumber', json_extract(payload_json, '$.input.bankEntryNumber'))),
+               ${set} WHERE id = ?1`,
+          )
+          .bind(id)
+          .run(),
+        set,
+      ).rejects.toThrow(/terminal/);
+    }
+    // the plain redaction still works
+    expect(await redactOldOutboxPayloads(db, NOW)).toBeGreaterThanOrEqual(1);
+    expect(await payload(id)).toBe(REDACTED_PAYLOAD);
+  });
 
   it("redacts terminal rows older than 400 days, keeps the row, status, hash and updated_at", async () => {
     const old = await outbox("verified", daysAgo(401));

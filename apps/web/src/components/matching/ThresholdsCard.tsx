@@ -1,5 +1,10 @@
 import { useMemo, useState } from "react";
-import type { MatchConfigResponse } from "@camelthorn/core";
+import {
+  AUTO_MATCH_CONFIRM_PHRASE,
+  type MatchConfigResponse,
+  type MatchTunablesDto,
+} from "@camelthorn/core";
+import { ApiError } from "../../api";
 import { Button, Card } from "@camelthorn/ui";
 import { putMatchConfig } from "../../api-matching";
 import {
@@ -7,11 +12,13 @@ import {
   NUMBER_FIELDS,
   checkTunables,
   toForm,
+  tunablesLoosen,
   type TunablesForm,
 } from "../../lib/matching-settings";
 import { useAction } from "../../lib/useAction";
 import { useToast } from "../../toasts";
 import { ErrorLine, StepUpNotice } from "./MatchParts";
+import { TypedPhraseSheet } from "./TypedPhraseSheet";
 
 /** The tunable thresholds, checked live with the same rules the server and the engine use. */
 export function ThresholdsCard({
@@ -27,13 +34,36 @@ export function ThresholdsCard({
   const saved = useMemo(() => JSON.stringify(toForm(config.config)), [config.config]);
   const dirty = JSON.stringify(form) !== saved;
   const check = useMemo(() => checkTunables(form), [form]);
+  const [asking, setAsking] = useState<MatchTunablesDto | null>(null);
+  const phrase = config.autoConfirmPhrase || AUTO_MATCH_CONFIRM_PHRASE;
+  // The revision this form was built from: a save over somebody else's change answers 409.
+  const rev = "rev" in config ? { rev: config.rev ?? null } : {};
+  const loosens = check.ok && config.autoEnabled && tunablesLoosen(config.config, check.value);
+
+  function saved_() {
+    toast.show("Saved the matching thresholds.");
+    onSaved();
+  }
 
   async function save() {
     if (!check.ok) return;
-    const r = await run(() => putMatchConfig({ config: check.value }));
-    if (r?.ok) {
-      toast.show("Saved the matching thresholds.");
-      onSaved();
+    // While automatic matching is on, a change that lets it do more needs the phrase again.
+    if (loosens) {
+      setAsking(check.value);
+      return;
+    }
+    const value = check.value;
+    const r = await run(() => putMatchConfig({ config: value, ...rev }));
+    if (r?.ok) saved_();
+    else if (
+      r &&
+      !r.ok &&
+      r.error instanceof ApiError &&
+      r.error.status === 422 &&
+      r.error.code === "confirmation_required"
+    ) {
+      // The server judged it loosening after all (its rule is authoritative): ask for the phrase.
+      setAsking(value);
     }
   }
 
@@ -106,6 +136,21 @@ export function ThresholdsCard({
         <label className="choice">
           <input
             type="checkbox"
+            checked={form.autoIncomingUnknownIban}
+            onChange={(e) => setForm({ ...form, autoIncomingUnknownIban: e.target.checked })}
+          />
+          <span>
+            Let incoming payments from an unknown account be matched automatically (loosens
+            automatic matching)
+            <span className="hint">
+              Off by default. When off, money in from an account that is not on file for the
+              customer always goes to review.
+            </span>
+          </span>
+        </label>
+        <label className="choice">
+          <input
+            type="checkbox"
             checked={form.autoLedgerPatterns}
             onChange={(e) => setForm({ ...form, autoLedgerPatterns: e.target.checked })}
           />
@@ -123,6 +168,12 @@ export function ThresholdsCard({
             ))}
           </ul>
         )}
+        {loosens && dirty && (
+          <p role="note" className="notice warn">
+            Automatic matching is on and this change lets it do more, so saving asks you to type the
+            confirmation again.
+          </p>
+        )}
         {state.needsStepUp && <StepUpNotice />}
         {state.error && <ErrorLine>{state.error}</ErrorLine>}
         <div className="stack-row">
@@ -134,6 +185,29 @@ export function ThresholdsCard({
           </Button>
         </div>
       </form>
+      <TypedPhraseSheet
+        open={asking !== null}
+        title="Confirm looser automatic matching"
+        phrase={phrase}
+        confirmLabel="Save thresholds"
+        intro={
+          <p>
+            Automatic matching is on. This change lets it match more lines without a person (a lower
+            score or gap, more tolerance, fewer days after an account change, more payment types, or
+            unknown incoming accounts). It needs a Google sign-in from the last 15 minutes.
+          </p>
+        }
+        onClose={() => setAsking(null)}
+        onConfirm={({ phrase: typed }) =>
+          asking
+            ? putMatchConfig({ config: asking, confirm: typed, ...rev })
+            : Promise.reject(new Error("nothing to save"))
+        }
+        onDone={() => {
+          setAsking(null);
+          saved_();
+        }}
+      />
     </Card>
   );
 }

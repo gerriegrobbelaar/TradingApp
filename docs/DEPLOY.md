@@ -613,9 +613,11 @@ sync panel on the test division.
     1. **Prepare.** A test division with a test bank journal, a test debtor with one open invoice
        of EUR 0.01 or more, and a test creditor with one open bill. In Settings, Matching map the
        Revolut account (journal, bank GL account) AND the debtor and creditor control accounts
-       (`receivableGlAccountCode`, `payableGlAccountCode` via `PUT /api/matching/account-map`
-       until the screen has fields for them). If the test journal has NO bank entry yet, also give
-       its opening balance (`openingBalanceMinor`, minor units): it is used only for the first
+       (Settings, Matching, Account map: "Debtors control account", "Creditors control account";
+       or `receivableGlAccountCode`, `payableGlAccountCode` via `PUT /api/matching/account-map`).
+       If the test journal has NO bank entry yet, also give its opening balance ("Opening balance
+       of an empty journal", typed in the account currency, a minus sign in front for an overdrawn
+       journal; stored as `openingBalanceMinor`, signed minor units): it is used only for the first
        entry (A12b). Decide `creates_bank_entries` on the Revolut connection (does Revolut's own
        Exact integration import the lines?): changing it later switches booking off and clears the
        verification. Make sure the test bank line has NO Revolut fee: lines with a fee are not
@@ -627,8 +629,8 @@ sync panel on the test division.
     2. **Create the test match** in the app (a test bank line against the test invoice). It shows
        "cannot book yet: <code>" if a control account or the opening balance is missing; `GET
        /api/booking/settings` lists `control_accounts_missing` / `journal_unmapped` as blockers.
-    3. **Preview.** `POST /api/booking/preview {"matchIds":[<id>]}` (admin, fresh sign-in; works
-       with booking OFF). It reads Exact (probe by YourRef, the journal balance, the item
+    3. **Preview.** "Preview booking" in the Booking card or on the match's own sheet, or `POST
+       /api/booking/preview {"matchIds":[<id>]}` (admin, fresh sign-in; works with booking OFF). It reads Exact (probe by YourRef, the journal balance, the item
        read-back) and returns the REAL bank entry body and MatchSet XML with their hashes, and
        `wouldDefer` when the executor would not book it. Nothing is written or stored (one audit
        row `booking.preview`). Expect `reads.preflight = open_as_expected`.
@@ -667,25 +669,43 @@ sync panel on the test division.
        - A11: POST the same bank entry body twice: two entries (Exact has no idempotency, which is
          why the probe, the item read-back and the balance check are mandatory). Reverse the test
          entries afterwards.
-       - The bytes you posted by hand must equal the preview bodies. Fix `EXACT_WRITE_NAMES` / the
+       - The bytes you posted by hand must equal the preview bodies byte for byte. Fix `EXACT_WRITE_NAMES` / the
          builders where Exact differs (this changes `BOOKING_PROTOCOL_VERSION`; start this item
          again). Then reverse the by-hand test entries in Exact and create a fresh test match.
-    5. **Verify.** In the Booking card (Settings): "Verify" with a note that lists what you
-       checked; the dialog has one tick per check (`BOOKING_VERIFY_CHECKS`; the server refuses the
-       verification unless every one is ticked) and asks for the phrase
+    5. **Verify.** In the Booking card (Settings): "Verify write path" with a note (10 to 500
+       characters) that lists what you checked; the dialog has one tick per check
+       (`BOOKING_VERIFY_CHECKS`; the server refuses the verification unless every one is ticked):
+       - `probe_zero_for_random_ref`: "The duplicate probe finds nothing for a random reference"
+         (A6/A13 above).
+       - `bank_entry_sign`: "The bank entry has the right sign" (A1, A3, A7, A9, A10).
+       - `matchset_signs_and_control_account`: "The match uses the right signs and control
+         account" (A2, A4, A5, A8, A14, A15, A16).
+       - `balance_chain`: "The balance chain continues" (A12).
+       - `matchset_readback`: "The read-back shows the invoice as paid" (A16).
+       - `lost_answer_drill`: "The lost-answer drill passed" (step 8 (a), Lost answer; do it on the
+         test division before verifying).
+       - `preview_matches_manual_payload`: "Preview booking matches what you sent by hand" (step 4,
+         byte for byte).
+
+       It asks for the phrase
        `I VERIFIED THE EXACT WRITE PATH ON A TEST DIVISION`; the note is stored with your email,
        the time, the protocol version, the ticked checks and the booking mode. Verifying always
        leaves booking off.
-    6. **Enable for ONE division.** "Enable" in the Booking card (fresh sign-in, phrase `ENABLE
-       EXACT BOOKING`), tick ONLY the test division and keep "Matches booked per run" at 1; the
-       call is `PUT /api/booking/settings {"enabled":true,"confirm":"ENABLE EXACT BOOKING",
-       "divisions":[<our id of the TEST division>],"maxPerRun":1}`. Enabling sets the watermark
+    6. **Limits, then enable for ONE division.** "Enable booking" in the Booking card (fresh
+       sign-in, phrase `ENABLE EXACT BOOKING`): tick ONLY the test administration and keep "Matches
+       booked per run" at 1. The dialog reads the settings again (it stops if a blocker appeared
+       meanwhile), then sends ONE call that carries the limits with the switch: `PUT
+       /api/booking/settings {"enabled":true,"confirm":"ENABLE EXACT BOOKING",
+       "divisions":[<our id of the TEST division>],"maxPerRun":1}` (only the limits that differ
+       from what is stored are sent). The server checks every precondition against those limits
+       and writes them, the switch and the watermark in one batch. Enabling sets the watermark
        `bookingFrom` to now (a value sent along can only move it later), so only matches made from
-       now on are booked; the dialog shows how many older matches stay untouched (`backlogCount`).
-       `GET /api/booking/settings` must show no blockers. Moving the watermark EARLIER later on
-       re-opens older matches: look first with `GET /api/booking/settings?bookingFrom=<ISO>`
-       (`proposed.reopenedCount`), then `PUT {"bookingFrom":"<ISO>"}` (fresh sign-in, audited with
-       the count).
+       now on are booked; the dialog shows how many existing matches stay untouched
+       (`backlogIfEnabledNow`) and the card shows the recorded watermark afterwards (`backlogCount`
+       then counts the matches older than it). `GET /api/booking/settings` must show no blockers.
+       Moving the watermark EARLIER later on re-opens older matches: look first with `GET
+       /api/booking/settings?bookingFrom=<ISO>` (`proposed.reopenedCount`), then `PUT
+       {"bookingFrom":"<ISO>"}` (fresh sign-in, audited with the count).
     7. **Book one.** Create one real test match in the app (a test bank line against the test
        invoice, made AFTER the switch-on), wait out the 10-minute undo window, and press **Run
        now** on `exact.book_matches` (admin, fresh sign-in; the job itself ships disabled). Expect
@@ -913,8 +933,11 @@ Schedules.
 
 `bank.match` is switched **on** after a fresh install (every 10 minutes at :02, :12, ...). It reads
 completed Revolut transactions and open invoices and bills from D1 and writes **suggestions** for
-the review queue. It never writes to Exact or Revolut in this release (the booking step is a later
-task). Existing databases get the job when the new release starts (default jobs version 3).
+the review queue. Matching itself never writes to Exact or Revolut. A separate booking step exists
+(job `exact.book_matches`, Settings, Matching, Booking in Exact): it is **OFF by default and fails
+closed**, so a fresh or upgraded install writes nothing to Exact until an administrator verifies
+the write path and enables it (step 0, item 18). Revolut is never written to by matching or
+booking. Existing databases get the job when the new release starts (default jobs version 3).
 
 - **Automatic matching is off.** Turn it on only after reviewing suggestions for a while:
   `PUT /api/matching/config` with `{"autoEnabled":true,"confirm":"ENABLE AUTOMATIC MATCHING"}`
@@ -939,11 +962,10 @@ task). Existing databases get the job when the new release starts (default jobs 
 - First-live checks of migration 0022 (staging first, then production), because the trigger
   behaviour is only tested on Miniflare:
   1. After `wrangler d1 migrations apply <db> --remote`, `SELECT name FROM sqlite_master WHERE
-     type = 'trigger' ORDER BY name` lists nine triggers (`bank_account_map_guard_delete`,
-     `bank_account_map_guard_update`, `bank_transactions_guard_matched`,
-     `bank_transactions_guard_status`, `match_allocations_guard`,
-     `match_allocations_guard_update`, `matches_guard_immutable`, `matches_guard_insert`,
-     `matches_guard_update`). If wrangler split a trigger body, the migration fails; do not hand-edit.
+     type = 'trigger' ORDER BY name` lists exactly the triggers created by migrations
+     0022/0023/0024/0025 and not dropped later; the authoritative list and a hash of each body is
+     `apps/worker/test/fixtures/trigger-hashes.json` (do not rely on a number written here). If
+     wrangler split a trigger body, the migration fails; do not hand-edit.
   2. On staging only: with a test line and an invoice smaller than it, a manual match whose
      allocation passes the open balance returns 409 `item_changed` and leaves NO `matches` row and
      no `match.manual` audit row (D1 batch rollback on a trigger abort).
@@ -1090,6 +1112,10 @@ encrypted Exact tokens, IBANs and the audit log: store them as sensitive.
    (**unverified** on this account).
 4. If data is damaged, stop the jobs (above), take an export, then use Time Travel (above) to
    restore to just before the apply.
+5. Any migration that rebuilds a guarded table (create new, copy, drop old, rename) must recreate
+   that table's triggers in the same file: dropping a table silently drops its triggers, and the
+   guards (matching, booking, settlement) then no longer exist. Compare the trigger list with
+   `apps/worker/test/fixtures/trigger-hashes.json` after every such migration.
 
 ---
 

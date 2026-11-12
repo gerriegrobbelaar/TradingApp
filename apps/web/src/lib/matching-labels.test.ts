@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 import { describe, expect, it } from "vitest";
-import { BLOCK_CODES, REASON_CODES, explainBlock } from "@camelthorn/core";
+import { BLOCK_CODES, BOOKING_VERIFY_CHECKS, REASON_CODES, explainBlock } from "@camelthorn/core";
 import { ApiError, StepUpRequired } from "../api";
 import {
   BLOCK_LABELS,
@@ -13,6 +13,18 @@ import {
   blockLabels,
   BLOCKER_FALLBACK,
   BOOKING_BLOCKERS,
+  BOOKING_DEFERRAL_CODES,
+  DEFERRAL_FALLBACK,
+  DEFERRAL_TEXT,
+  VERIFY_CHECK_TEXT,
+  PREVIEW_READ_ERROR_TEXT,
+  RUN_BLOCKERS,
+  isRunBlocker,
+  previewOutcomeReason,
+  previewReadErrorText,
+  deferralReason,
+  deferredChipText,
+  verifyCheckLabel,
   NO_PAYMENT,
   blockerText,
   bookingSentence,
@@ -202,6 +214,10 @@ describe("booking wording", () => {
     expect([...BOOKING_BLOCKERS].sort()).toEqual(
       [
         "bank_entries_undecided",
+        "control_accounts_missing",
+        "journal_unmapped",
+        "mode_changed",
+        "no_division_allowed",
         "no_exact_connection",
         "not_verified",
         "protocol_changed",
@@ -225,5 +241,171 @@ describe("booking wording", () => {
     for (const s of BOOKING_STATUS_ORDER) expect(BOOKING_STATUS[s].label).toBeTruthy();
     expect(exactStateLabel("not_booked")).toBe("Not booked in Exact");
     expect(exactStateLabel("mystery")).toBe("Handled in Exact");
+  });
+});
+
+const workerBooking = import.meta.glob("../../../worker/src/booking/*.ts", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+}) as Record<string, string>;
+const src = (name: string): string =>
+  Object.entries(workerBooking).find(([n]) => n.endsWith(`/${name}`))?.[1] ?? "";
+
+describe("booking deferral reasons (a deferred match is calm, never an error)", () => {
+  it("labels every code the worker defers a match with (plan.ts, the fee and mode checks)", () => {
+    const plan = src("plan.ts");
+    expect(plan.length).toBeGreaterThan(1000);
+    const block = /DEFER_PLAN_CODES[^=]*=\s*\[([^\]]*)\]/.exec(plan)?.[1] ?? "";
+    const codes = [...block.matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1] as string);
+    expect(codes.length).toBeGreaterThanOrEqual(6);
+    codes.push(/FEE_DEFER_CODE\s*=\s*"([a-z0-9_]+)"/.exec(plan)?.[1] ?? "missing_fee_code");
+    for (const m of plan.matchAll(/return "([a-z0-9_]+)";/g)) codes.push(m[1] as string); // modeDeferral
+    expect(codes).toContain("mode_mismatch");
+    // the executor's own literal deferrals
+    for (const m of src("executor.ts").matchAll(/defer\(cand, "([a-z0-9_]+)"\)/g))
+      codes.push(m[1] as string);
+    for (const code of codes) {
+      expect(deferralReason(code), code).not.toBe(DEFERRAL_FALLBACK);
+      const chip = deferredChipText(code);
+      expect(chip, code).toMatch(/^Cannot be booked yet: [a-zA-Z]/);
+      expect(chip, code).not.toMatch(/[a-z]+_[a-z]+/);
+      expect(chip, code).not.toContain("!");
+    }
+    // and nothing is labelled that the worker never sends (a stale label is a lie)
+    for (const code of BOOKING_DEFERRAL_CODES) expect(codes, code).toContain(code);
+    expect(Object.keys(DEFERRAL_TEXT).sort()).toEqual([...BOOKING_DEFERRAL_CODES].sort());
+    expect(new Set(BOOKING_DEFERRAL_CODES.map(deferralReason)).size).toBe(
+      BOOKING_DEFERRAL_CODES.length,
+    );
+  });
+
+  it("a build_<error> deferral has one sentence; an unknown code a fixed fallback, never echoed", () => {
+    expect(deferralReason("build_bad_amount")).toBe("the request to Exact could not be built");
+    for (const odd of [
+      "brand_new",
+      "",
+      "__proto__",
+      "constructor",
+      "NL91ABNA0417164300",
+      "build_",
+    ]) {
+      expect(deferralReason(odd)).toBe(DEFERRAL_FALLBACK);
+      expect(deferredChipText(odd)).toBe(`Cannot be booked yet: ${DEFERRAL_FALLBACK}`);
+    }
+  });
+
+  it("the preview explains every outcome code the worker can send (preview.ts, plan.ts)", () => {
+    const preview = src("preview.ts");
+    const plan = src("plan.ts");
+    expect(preview.length).toBeGreaterThan(1000);
+    const codes = new Set<string>();
+    for (const m of plan.matchAll(/fail\("([a-z0-9_]+)"\)/g)) codes.add(m[1] as string);
+    for (const m of preview.matchAll(/return "([a-z0-9_]+)";/g)) codes.add(m[1] as string);
+    for (const m of preview.matchAll(/empty\(matchId, "([a-z0-9_]+)"\)/g))
+      codes.add(m[1] as string);
+    for (const m of preview.matchAll(/wouldDefer \?\? "([a-z0-9_]+)"/g)) codes.add(m[1] as string);
+    for (const m of preview.matchAll(/wouldDefer \?\?= "([a-z0-9_]+)"/g)) codes.add(m[1] as string);
+    for (const v of ["already_settled", "changed", "inconclusive"]) codes.add(`preflight_${v}`);
+    expect(codes.size).toBeGreaterThan(20);
+    const readErrors = new Set<string>();
+    for (const m of preview.matchAll(/readError(?: \?\?)?= "([a-z0-9_]+)"/g))
+      readErrors.add(m[1] as string);
+    const fn = /function readErrorCode[\s\S]*?\n\}/.exec(preview)?.[0] ?? "";
+    for (const m of fn.matchAll(/return "([a-z0-9_]+)"/g)) readErrors.add(m[1] as string);
+    expect(readErrors.size).toBeGreaterThanOrEqual(5);
+    for (const c of readErrors) {
+      expect(Object.keys(PREVIEW_READ_ERROR_TEXT), `read error ${c}`).toContain(c);
+    }
+    for (const c of codes) {
+      if (readErrors.has(c)) continue;
+      const t = previewOutcomeReason(c);
+      expect(t, c).not.toBe(DEFERRAL_FALLBACK);
+      expect(t, c).not.toMatch(/[a-z]+_[a-z]+/);
+    }
+    expect(previewReadErrorText("weird_code")).toBe("a read from Exact failed");
+  });
+});
+
+describe("booking blockers match the worker", () => {
+  it("lists exactly the worker's blocker codes and its run blockers", () => {
+    const settings = src("settings.ts");
+    const type = /export type BookingBlocker =([^;]*);/.exec(settings)?.[1] ?? "";
+    const all = [...type.matchAll(/"([a-z_]+)"/g)].map((m) => m[1] as string);
+    expect(all.length).toBeGreaterThanOrEqual(9);
+    expect([...BOOKING_BLOCKERS].sort()).toEqual([...all].sort());
+    const run = /RUN_BLOCKERS[^=]*=\s*\[([^\]]*)\]/.exec(settings)?.[1] ?? "";
+    const runCodes = [...run.matchAll(/"([a-z_]+)"/g)].map((m) => m[1] as string);
+    expect([...RUN_BLOCKERS].sort()).toEqual(runCodes.sort());
+    for (const b of all) expect(isRunBlocker(b), b).toBe(runCodes.includes(b));
+    expect(isRunBlocker("unknown_future_blocker")).toBe(true);
+  });
+});
+
+describe("booking route refusals in plain words", () => {
+  it("every code booking/*.ts sends has its own sentence", () => {
+    const codes = new Set<string>();
+    for (const [name, text] of Object.entries(workerBooking)) {
+      if (name.endsWith(".test.ts")) continue;
+      for (const m of text.matchAll(/ApiError\(\s*"([a-z_]+)"/g)) codes.add(m[1] as string);
+      for (const m of text.matchAll(/note\([^)]*"([a-z_]+)"\)/g)) codes.add(m[1] as string);
+      for (const m of text.matchAll(/error: "([a-z_]+)"/g)) codes.add(m[1] as string);
+    }
+    expect(codes.size).toBeGreaterThan(15);
+    for (const c of ["checks_incomplete", "blocked", "bad_note", "step_up_required", "in_flight"]) {
+      expect(codes, c).toContain(c);
+    }
+    for (const code of codes) {
+      expect(Object.prototype.hasOwnProperty.call(ERROR_TEXT, code), code).toBe(true);
+      const text = describeMatchError(new ApiError(409, code));
+      expect(text, code).toMatch(/^[A-Z]/);
+      expect(text, code).not.toContain(code);
+    }
+  });
+});
+
+describe("verification checks (one instruction per core code)", () => {
+  it("has a label and an instruction for every check in core, and nothing else", () => {
+    expect(Object.keys(VERIFY_CHECK_TEXT).sort()).toEqual([...BOOKING_VERIFY_CHECKS].sort());
+    for (const c of BOOKING_VERIFY_CHECKS) {
+      const t = VERIFY_CHECK_TEXT[c];
+      expect(t.label, c).toMatch(/^[A-Z]/);
+      expect(t.how, c).toMatch(/^[A-Z].*\.$/);
+      expect(t.label + t.how, c).not.toMatch(/[a-z]+_[a-z]+/);
+      expect(t.label + t.how, c).not.toContain("!");
+      expect(verifyCheckLabel(c)).toBe(t.label);
+    }
+  });
+
+  it("docs/DEPLOY.md step 0 item 18 names every check code, its label and its reference", () => {
+    const deploy =
+      Object.values(
+        import.meta.glob("../../../../docs/DEPLOY.md", {
+          query: "?raw",
+          import: "default",
+          eager: true,
+        }) as Record<string, string>,
+      )[0] ?? "";
+    const start = deploy.indexOf("18. **Booking: verify the write path");
+    expect(start).toBeGreaterThan(0);
+    const end = deploy.indexOf("\n### ", start);
+    const item = deploy.slice(start, end).replace(/\s+/g, " ");
+    for (const c of BOOKING_VERIFY_CHECKS) {
+      const t = VERIFY_CHECK_TEXT[c];
+      expect(item, c).toContain(`\`${c}\``);
+      expect(item, `${c} label`).toContain(`"${t.label}"`);
+      expect(item, `${c} reference`).toContain(t.doc);
+    }
+    // the placeholder number the dialog names is the one the runbook names
+    expect(item).toContain("999999999");
+  });
+
+  it("an unknown recorded check gets one calm sentence", () => {
+    expect(verifyCheckLabel("future_check")).toBe("A check this version does not know");
+    expect(verifyCheckLabel("__proto__")).toBe("A check this version does not know");
+  });
+
+  it("the checks error has a sentence", () => {
+    expect(describeMatchError(new ApiError(400, "checks_incomplete"))).toMatch(/Tick every check/);
   });
 });

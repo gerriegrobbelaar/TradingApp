@@ -50,7 +50,7 @@ let server: Server;
 let base = "";
 let browser: Browser;
 
-type Step = "none" | "select" | "manual" | "conflict" | "ledger";
+type Step = "none" | "select" | "manual" | "conflict" | "ledger" | "verify" | "enable" | "preview";
 interface Shot {
   name: string;
   path: string;
@@ -111,6 +111,43 @@ const SHOTS: Shot[] = [
     scene: { booking: "blocked" },
     ready: ".mt-outbox table tbody tr td",
     height: 3600,
+  },
+  {
+    name: "map-incomplete",
+    path: "/settings/matching",
+    scene: { map: "incomplete", booking: "blocked" },
+    ready: ".mt-outbox table tbody tr td",
+    height: 3600,
+  },
+  {
+    name: "auto-deferred",
+    path: "/treasury/bank?tab=auto",
+    scene: { auto: "deferred" },
+    ready: "table tbody tr td button",
+  },
+  {
+    name: "booking-verify",
+    path: "/settings/matching",
+    scene: { booking: "off" },
+    ready: ".mt-outbox table tbody tr td",
+    step: "verify",
+    height: 2400,
+  },
+  {
+    name: "booking-enable",
+    path: "/settings/matching",
+    scene: { booking: "verified" },
+    ready: ".mt-outbox table tbody tr td",
+    step: "enable",
+    height: 2000,
+  },
+  {
+    name: "booking-preview",
+    path: "/settings/matching",
+    scene: { booking: "ready" },
+    ready: ".mt-outbox table tbody tr td",
+    step: "preview",
+    height: 3000,
   },
   {
     name: "booking-ready",
@@ -236,6 +273,35 @@ describe("Bank matching and Settings, Matching", () => {
               await page.click("[role='dialog'] button[aria-label='Add INV-22']");
               await page.waitForSelector("[role='dialog'] .mt-alloc-row", { timeout: 15_000 });
             }
+          }
+          if (shot.step === "verify") {
+            await page.click("button:has-text('Verify write path')");
+            await page.waitForSelector("[role='dialog'] input[type='checkbox']", {
+              timeout: 15_000,
+            });
+            await page.evaluate(
+              "document.querySelectorAll(\"[role='dialog'] input[type='checkbox']\").forEach((c) => c.click())",
+            );
+          }
+          if (shot.step === "enable") {
+            await page.click("button:has-text('Enable booking')");
+            await page.waitForSelector("[role='dialog'] input[type='checkbox']", {
+              timeout: 15_000,
+            });
+            await page.evaluate(
+              "document.querySelector(\"[role='dialog'] input[type='checkbox']\").click()",
+            );
+          }
+          if (shot.step === "preview") {
+            await page.click("button:has-text('Preview booking')");
+            await page.waitForSelector("[role='dialog'] input[type='checkbox']", {
+              timeout: 15_000,
+            });
+            await page.evaluate(
+              "document.querySelector(\"[role='dialog'] input[type='checkbox']\").click()",
+            );
+            await page.click("[role='dialog'] button:has-text('Preview booking')");
+            await page.waitForSelector("[role='dialog'] .mt-preview-item", { timeout: 15_000 });
           }
           if (shot.step === "conflict") {
             await page.click("button[data-row-primary='2']");

@@ -3,7 +3,7 @@ import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { configureAxe } from "vitest-axe";
 import * as api from "./api";
-import { ADMIN, USERS, VIEWER, mockFetch, renderApp } from "./test-utils";
+import { ADMIN, USERS, VIEWER, mockFetch, renderApp, settle } from "./test-utils";
 import { STEP_UP_DENIED_MESSAGE } from "./App";
 import { EXPIRED_MESSAGE } from "./pages/SignedOut";
 
@@ -77,7 +77,7 @@ describe("signed-out screens", () => {
     });
     renderApp("/?auth=denied");
     const alert = await screen.findByRole("alert");
-    await new Promise((r) => setTimeout(r, 20));
+    await settle(20);
     expect(alert.textContent).toBe(
       "That Google account has no access. Ask an admin to invite your company email.",
     );

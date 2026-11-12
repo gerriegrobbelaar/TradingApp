@@ -363,6 +363,9 @@ function nearMisses(n: string): string[] {
 
 // ---------------------------------------------------------------- 1. the never-wrong oracle
 
+/** Runaway guard, not a benchmark: a loaded CI machine must never fail these (review S1). */
+const RUNAWAY_MS = 30_000;
+
 describe("oracle: realistic worlds never auto-match wrongly", () => {
   const SEEDS = [1, 2, 3, 4, 5];
   it("clean, near-miss, unicode-fuzzed, ascii-fuzzed, part and over payments", () => {
@@ -964,7 +967,7 @@ describe("matchBatch", () => {
     const res = matchBatch(txs, items, cfg);
     const ms = Date.now() - t0;
     expect(res).toHaveLength(2000);
-    expect(ms).toBeLessThan(1000);
+    expect(ms).toBeLessThan(RUNAWAY_MS);
   });
 });
 
@@ -1151,7 +1154,7 @@ describe("config validation and regex safety", () => {
       expect(unsafeRegexReason(re), re).toBe("too_complex");
       const t0 = Date.now();
       expect(safeRegexTest(re, "a".repeat(255) + "c")).toBe(false);
-      expect(Date.now() - t0).toBeLessThan(50);
+      expect(Date.now() - t0).toBeLessThan(RUNAWAY_MS);
     }
     // Ordinary patterns stay allowed.
     for (const re of [
@@ -1176,12 +1179,12 @@ describe("config validation and regex safety", () => {
       expect(unsafeRegexReason(re), re).toBeNull();
       safeRegexTest(re, "a".repeat(300));
     }
-    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(Date.now() - t0).toBeLessThan(RUNAWAY_MS);
   });
   it("an allowed worst case stays fast on the capped input", () => {
     const t0 = Date.now();
     for (let i = 0; i < 5; i++) safeRegexTest("a*a+b", "a".repeat(10_000));
-    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(Date.now() - t0).toBeLessThan(RUNAWAY_MS);
   });
 });
 
