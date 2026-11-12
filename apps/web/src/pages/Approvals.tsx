@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link, useSearchParams } from "react-router";
 import type { ApprovalItemDto, ApprovalStatus, ApprovalsResponse } from "@camelthorn/core";
-import { Button, Card, Chip, type ChipTone } from "@camelthorn/ui";
+import { Button, Card, Chip, Segmented, type ChipTone } from "@camelthorn/ui";
 import { listApprovals } from "../api";
 import { useMe } from "../auth";
 import { useDivision } from "../division";
@@ -15,12 +15,18 @@ import {
   MappingVerifySheet,
 } from "../components/MappingVerifySheet";
 import { FreshnessStamp } from "../components/FreshnessStamp";
+import { Lazy, lazyNamed } from "../components/Lazy";
 import { Money } from "../components/Money";
 import { PageHeader } from "../components/PageHeader";
 import { describeLoadError } from "../lib/errors";
 import { NO_VALUE, formatDate, formatDays } from "../lib/format";
 import { useCursorList } from "../lib/useCursorList";
 import { useSearchText } from "../lib/useSearchText";
+
+const PaymentApprovals = lazyNamed(
+  () => import("../components/payments/PaymentApprovals"),
+  "PaymentApprovals",
+);
 
 type View = "pending_approval" | "approved" | "rejected" | "all";
 const VIEWS: readonly View[] = ["pending_approval", "approved", "rejected", "all"];
@@ -73,7 +79,69 @@ function PdfCell({ v }: { v: boolean | null }) {
   return v ? <Chip>PDF attached</Chip> : <Chip tone="warn">No PDF</Chip>;
 }
 
+/**
+ * Two kinds of approval live here and are kept apart (ADR 0051): the bills waiting for sign-off in
+ * Exact (read-only, the default tab) and the payment requests waiting for a second person in this
+ * app (the Payments tab, `?tab=payments`).
+ */
 export function Approvals() {
+  const [params, setParams] = useSearchParams();
+  const tab = params.get("tab") === "payments" ? "payments" : "bills";
+  if (tab === "bills") {
+    return (
+      <ExactApprovals
+        tabs={
+          <ApprovalTabs
+            tab={tab}
+            onTab={(t) => setParams(t === "payments" ? { tab: "payments" } : {})}
+          />
+        }
+      />
+    );
+  }
+  return (
+    <>
+      <PageHeader
+        eyebrow="Purchases"
+        title="Approvals"
+        lede="Supplier bills and where they are in sign-off, and payments waiting for a second person."
+      />
+      <ApprovalTabs
+        tab={tab}
+        onTab={(t) => setParams(t === "payments" ? { tab: "payments" } : {})}
+      />
+      <Card>
+        <Lazy>
+          <PaymentApprovals />
+        </Lazy>
+      </Card>
+    </>
+  );
+}
+
+function ApprovalTabs({
+  tab,
+  onTab,
+}: {
+  tab: "bills" | "payments";
+  onTab: (t: "bills" | "payments") => void;
+}) {
+  return (
+    <div className="bank-tabs">
+      <Segmented
+        label="Approval type"
+        value={tab}
+        options={[
+          { value: "bills", label: "Bills in Exact" },
+          { value: "payments", label: "Payments" },
+        ]}
+        onChange={onTab}
+      />
+    </div>
+  );
+}
+
+function ExactApprovals({ tabs }: { tabs: ReactNode }) {
   const { selected, status: divStatus } = useDivision();
   const auth = useMe();
   const admin = auth.status === "ready" && auth.me.roles.includes("admin");
@@ -180,6 +248,7 @@ export function Approvals() {
         lede="Supplier bills and where they are in sign-off. This screen only shows status; approving happens in Exact."
         tools={<FreshnessStamp freshness={list.first?.freshness ?? null} what="Approval status" />}
       />
+      {tabs}
       {notVerified && (
         <div role="status" className="notice warn">
           <p>{list.first?.mappingChanged ? MAPPING_CHANGED_NOTICE : MAPPING_NOTICE}</p>

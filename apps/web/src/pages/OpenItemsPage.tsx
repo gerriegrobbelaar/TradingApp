@@ -13,6 +13,7 @@ import { useFxRates } from "../fx";
 import { Money } from "../components/Money";
 import { POSSIBLY_PAID_LABEL, itemTitle } from "../components/OpenItemDetailBody";
 import { OpenItemSheet } from "../components/OpenItemSheets";
+import { usePayablesActions } from "../components/payments/PayablesActions";
 import { PageHeader } from "../components/PageHeader";
 import { BUCKET_LABEL, BUCKET_TONE } from "../lib/ageing";
 import { describeLoadError } from "../lib/errors";
@@ -71,7 +72,7 @@ export const PAYABLES_COPY: Copy = {
   path: "/api/bills",
   eyebrow: "Purchases",
   title: "Payables",
-  lede: "Supplier bills from Exact, with what is still open and how late it is. Read-only for now.",
+  lede: "Supplier bills from Exact, with what is still open and how late it is. Finance can request a payment from here once payments are switched on.",
   party: "Supplier",
   nothing: "No bills match these filters.",
   plural: "bills",
@@ -284,6 +285,8 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
     [copy.kind, copy.party],
   );
 
+  const pay = usePayablesActions(copy.kind === "bill", list.items, divisionId);
+  const allColumns = pay.columns.length > 0 ? [...columns, ...pay.columns] : columns;
   const totals = list.first?.totalsByCurrency ?? [];
   const possiblyPaidTotal = totals.reduce((n, t) => n + t.possiblyPaid, 0);
   const noDivision = divStatus === "ready" && selected === null;
@@ -420,9 +423,10 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
           </EmptyState>
         ) : (
           <>
+            {pay.bar}
             <DataTable
               caption={copy.title}
-              columns={columns}
+              columns={allColumns}
               rows={list.items}
               rowKey={rowId}
               status={divStatus === "loading" ? "loading" : status}
@@ -461,6 +465,7 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
                       <Money minor={t.openMinor} currency={t.currency} />
                     )}
                   </td>
+                  {pay.columns.length > 0 && <td colSpan={pay.columns.length} />}
                 </tr>
               ))}
             />
@@ -476,6 +481,7 @@ export function OpenItemsPage({ copy }: { copy: Copy }) {
           </>
         )}
       </Card>
+      {pay.sheets}
       <OpenItemSheet
         itemId={itemId}
         kind={copy.kind}

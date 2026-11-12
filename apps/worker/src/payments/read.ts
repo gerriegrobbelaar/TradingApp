@@ -7,79 +7,17 @@ import {
   isPaymentStatus,
   paymentConfirmPhrase,
   type ApprovalReason,
+  type BatchDto,
+  type DecisionDto,
+  type PaymentDto,
+  type PaymentEventDto,
   type PaymentMode,
   type PaymentStatus,
 } from "@camelthorn/core";
 import { maskedIbans } from "./iban-store";
 
-export interface DecisionDto {
-  decision: "approved" | "rejected";
-  by: string;
-  at: string;
-  note: string | null;
-}
-
-export interface PaymentDto {
-  kind: "payment";
-  id: number;
-  requestId: string;
-  batchId: number | null;
-  status: PaymentStatus;
-  statusReason: string | null;
-  mode: PaymentMode;
-  openItemId: number;
-  invoiceNumber: string | null;
-  dueDate: string | null;
-  supplierName: string;
-  ibanMasked: string;
-  /** First 16 hex characters of the IBAN fingerprint: enough to compare, useless to attack. */
-  ibanFingerprintShort: string;
-  amountMinor: number;
-  currency: string;
-  eurMinor: number | null;
-  eurRate: string | null;
-  reference: string;
-  sourceAccountId: number;
-  sourceAccountName: string;
-  approvalsRequired: ApprovalReason[];
-  /** What a second approver's screen must send back so the approval binds to this exact payload. */
-  payloadHash: string;
-  requestedBy: string;
-  confirmedAt: string | null;
-  expiresAt: string;
-  createdAt: string;
-  updatedAt: string | null;
-  providerId: string | null;
-  /** Shown while the request is a draft: the phrase to type to confirm. */
-  confirmPhrase: string | null;
-  decision: DecisionDto | null;
-}
-
-export interface BatchDto {
-  kind: "batch";
-  id: number;
-  requestId: string;
-  status: PaymentStatus;
-  statusReason: string | null;
-  mode: PaymentMode;
-  currency: string;
-  totalMinor: number;
-  itemCount: number;
-  eurMinor: number | null;
-  sourceAccountId: number;
-  sourceAccountName: string;
-  approvalsRequired: ApprovalReason[];
-  payloadHash: string;
-  requestedBy: string;
-  confirmedAt: string | null;
-  expiresAt: string;
-  createdAt: string;
-  updatedAt: string | null;
-  providerId: string | null;
-  confirmPhrase: string | null;
-  decision: DecisionDto | null;
-  items: PaymentDto[];
-}
+// The DTO types live in core (api-types.ts) so the web shares them; re-exported for the worker's own imports.
+export type { BatchDto, DecisionDto, PaymentDto } from "@camelthorn/core";
 
 const PAYMENT_SELECT = `SELECT p.id, p.request_id, p.batch_id, p.status, p.status_reason, p.mode, p.open_item_id,
     p.amount_minor, p.currency, p.eur_minor, p.eur_rate, p.beneficiary_name, p.iban_fingerprint, p.reference,
@@ -355,4 +293,36 @@ export async function listBatches(
     if (b !== null) items.push(b);
   }
   return { items, nextCursor: ids.length > f.limit ? (page[page.length - 1] ?? null) : null };
+}
+
+/**
+ * The status history of one request, oldest first (payment_events is append-only). Read-only
+ * addition of P9c for the detail screen; carries no request data, only states, a stable code and
+ * the actor's email (the same facts the audit log holds).
+ */
+export async function readEvents(
+  db: D1Database,
+  kind: "payment" | "batch",
+  id: number,
+): Promise<PaymentEventDto[]> {
+  const col = kind === "payment" ? "payment_id" : "batch_id";
+  const rows = await db
+    .prepare(
+      `SELECT from_status, to_status, code, actor, at FROM payment_events WHERE ${col} = ?1 ORDER BY id`,
+    )
+    .bind(id)
+    .all<{
+      from_status: string | null;
+      to_status: string;
+      code: string | null;
+      actor: string;
+      at: string;
+    }>();
+  return rows.results.map((r) => ({
+    fromStatus: r.from_status === null ? null : status(r.from_status),
+    toStatus: status(r.to_status),
+    code: r.code,
+    actor: r.actor,
+    at: r.at,
+  }));
 }

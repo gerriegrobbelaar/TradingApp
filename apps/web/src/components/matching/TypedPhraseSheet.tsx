@@ -24,6 +24,7 @@ export function TypedPhraseSheet({
   onConfirm,
   onDone,
   onFailed,
+  describe,
 }: {
   open: boolean;
   title: string;
@@ -48,10 +49,12 @@ export function TypedPhraseSheet({
   onDone: (value: unknown) => void;
   /** Called after a refusal (the error is shown here already), e.g. to refresh what is behind. */
   onFailed?: (error: unknown) => void;
+  /** Words for a refusal; the matching words by default. */
+  describe?: (e: unknown) => string;
 }) {
   const [typed, setTyped] = useState("");
   const [text, setText] = useState("");
-  const { state, run, clear } = useAction();
+  const { state, run, clear } = useAction(describe);
   useEffect(() => {
     if (open) {
       setTyped("");

@@ -7,6 +7,7 @@ import "./bank.css";
 import "./matching.css";
 import "./health.css";
 import "./fx.css";
+import "./payments.css";
 import "./print.css";
 import { App } from "./App";
 import { rootErrorHandlers } from "./lib/root-errors";

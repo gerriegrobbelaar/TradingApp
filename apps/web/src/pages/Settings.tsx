@@ -19,9 +19,17 @@ import { Users } from "./Users";
 const FxRates = lazyNamed(() => import("./FxRates"), "FxRates");
 const Notifications = lazyNamed(() => import("./Notifications"), "Notifications");
 const MatchingSettings = lazyNamed(() => import("./MatchingSettings"), "MatchingSettings");
+const PaymentsSettings = lazyNamed(() => import("./PaymentsSettings"), "PaymentsSettings");
 
 type Tab =
-  "appearance" | "users" | "connections" | "schedules" | "fx" | "matching" | "notifications";
+  | "appearance"
+  | "users"
+  | "connections"
+  | "schedules"
+  | "fx"
+  | "matching"
+  | "payments"
+  | "notifications";
 
 const THEME_OPTIONS: SegmentedOption<ThemeMode>[] = [
   { value: "auto", label: "Auto" },
@@ -70,6 +78,7 @@ export function Settings() {
     { value: "schedules", label: "Schedules" },
     { value: "fx", label: "FX rates" },
     { value: "matching", label: "Matching" },
+    ...(isAdmin ? [{ value: "payments" as const, label: "Payments" }] : []),
     ...(isAdmin ? [{ value: "notifications" as const, label: "Notifications" }] : []),
   ];
   const current = options.find((o) => o.value === tab)?.value;
@@ -80,7 +89,7 @@ export function Settings() {
       <PageHeader
         eyebrow="Settings"
         title="Settings"
-        lede="Appearance, people, connections, schedules, exchange rates, bank matching and alert emails."
+        lede="Appearance, people, connections, schedules, exchange rates, bank matching, payments and alert emails."
       />
       <div className="settings-seg">
         <Segmented
@@ -102,6 +111,11 @@ export function Settings() {
       {current === "matching" && (
         <Lazy>
           <MatchingSettings />
+        </Lazy>
+      )}
+      {current === "payments" && (
+        <Lazy>
+          <PaymentsSettings />
         </Lazy>
       )}
       {current === "notifications" && (

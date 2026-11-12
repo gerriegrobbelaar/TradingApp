@@ -19,6 +19,8 @@ import type {
   DqThresholdSpec,
 } from "./dq/types";
 import type { DqNotificationSettings } from "./dq/notify";
+import type { IbanState } from "./payments/iban-state";
+import type { ApprovalReason, PaymentMode, PaymentSettings, PaymentStatus } from "./payments/types";
 import type { BalanceSheet } from "./reports/balance-sheet";
 import type { BalanceSheetSection, ProfitLossSection } from "./reports/classify";
 import type { ProfitLoss } from "./reports/profit-loss";
@@ -1386,4 +1388,168 @@ export interface DqNotificationsTestResponse {
   /** What the sender answered: sent, failed, unknown or skipped_not_configured. */
   status: "sent" | "failed" | "unknown" | "skipped_not_configured";
   code: string | null;
+}
+
+// ---- payments (Phase 9, P9a API, typed for the web in P9c, ADR 0049 and 0051) -------------------------------
+// BEGIN payments DTOs (moved verbatim from apps/worker/src/payments/read.ts; pinned by api-types.test.ts)
+
+export interface DecisionDto {
+  decision: "approved" | "rejected";
+  by: string;
+  at: string;
+  note: string | null;
+}
+
+export interface PaymentDto {
+  kind: "payment";
+  id: number;
+  requestId: string;
+  batchId: number | null;
+  status: PaymentStatus;
+  statusReason: string | null;
+  mode: PaymentMode;
+  openItemId: number;
+  invoiceNumber: string | null;
+  dueDate: string | null;
+  supplierName: string;
+  ibanMasked: string;
+  /** First 16 hex characters of the IBAN fingerprint: enough to compare, useless to attack. */
+  ibanFingerprintShort: string;
+  amountMinor: number;
+  currency: string;
+  eurMinor: number | null;
+  eurRate: string | null;
+  reference: string;
+  sourceAccountId: number;
+  sourceAccountName: string;
+  approvalsRequired: ApprovalReason[];
+  /** What a second approver's screen must send back so the approval binds to this exact payload. */
+  payloadHash: string;
+  requestedBy: string;
+  confirmedAt: string | null;
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string | null;
+  providerId: string | null;
+  /** Shown while the request is a draft: the phrase to type to confirm. */
+  confirmPhrase: string | null;
+  decision: DecisionDto | null;
+}
+
+export interface BatchDto {
+  kind: "batch";
+  id: number;
+  requestId: string;
+  status: PaymentStatus;
+  statusReason: string | null;
+  mode: PaymentMode;
+  currency: string;
+  totalMinor: number;
+  itemCount: number;
+  eurMinor: number | null;
+  sourceAccountId: number;
+  sourceAccountName: string;
+  approvalsRequired: ApprovalReason[];
+  payloadHash: string;
+  requestedBy: string;
+  confirmedAt: string | null;
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string | null;
+  providerId: string | null;
+  confirmPhrase: string | null;
+  decision: DecisionDto | null;
+  items: PaymentDto[];
+}
+
+// END payments DTOs
+
+/** One row of the append-only status history (payment_events). `code` is a stable word, not text for people. */
+export interface PaymentEventDto {
+  fromStatus: PaymentStatus | null;
+  toStatus: PaymentStatus;
+  code: string | null;
+  actor: string;
+  at: string;
+}
+
+/** GET /api/payments?status=&mine=1&limit=&cursor= (any role) */
+export interface PaymentListResponse {
+  items: PaymentDto[];
+  nextCursor: string | null;
+}
+/** GET /api/payment-batches?... (any role) */
+export interface BatchListResponse {
+  items: BatchDto[];
+  nextCursor: string | null;
+}
+/** GET /api/payments/:id: the events are the status history, oldest first. */
+export interface PaymentDetailResponse {
+  payment: PaymentDto;
+  events: PaymentEventDto[];
+}
+export interface BatchDetailResponse {
+  batch: BatchDto;
+  events: PaymentEventDto[];
+}
+/** POST /api/payments: 201 (or 200 when replayed). A 422 `blocked` body is PaymentBlockedBody. */
+export interface PaymentCreateResponse {
+  payment: PaymentDto;
+  replayed: boolean;
+  warnings: string[];
+}
+export interface BatchCreateResponse {
+  batch: BatchDto;
+  replayed: boolean;
+}
+export interface PaymentBlockedBody {
+  error: "blocked";
+  blocks: string[];
+  warnings?: string[];
+  itemBlocks?: unknown[];
+}
+/** The answer of confirm, approve, reject and cancel. */
+export interface PaymentActionResponse {
+  payment: PaymentDto;
+}
+export interface BatchActionResponse {
+  batch: BatchDto;
+}
+
+/** GET /api/payments/ibans/:relationId and the answers of verify and revoke (`iban`). */
+export interface SupplierIbanStatusDto {
+  relationId: number;
+  name: string;
+  isSupplier: boolean;
+  /** Country, check digits and last four. Never the full IBAN. */
+  ibanMasked: string | null;
+  /** The identity of the IBAN as Exact holds it now (64 hex); what a verification must repeat. */
+  ibanFingerprint: string | null;
+  state: IbanState;
+  verifiedBy: string | null;
+  verifiedAt: string | null;
+  /** When a complete bank-account read last saw this IBAN. */
+  readAt: string | null;
+}
+
+/** GET /api/settings/payments (admin, finance, approver) and the answers of its PATCH, verify and switch. */
+export interface PaymentsSettingsResponse {
+  settings: PaymentSettings;
+  defaults: PaymentSettings;
+  enabled: boolean;
+  verified: {
+    at: string;
+    by: string;
+    note: string;
+    protocolVersion: string;
+    checks: string[];
+  } | null;
+  protocolVersion: string;
+  protocolChanged: boolean;
+  connectionMode: PaymentMode | null;
+  approverCount: number;
+  submitterAvailable: boolean;
+  blockers: string[];
+  verifyChecks: string[];
+  blockCodes: string[];
 }

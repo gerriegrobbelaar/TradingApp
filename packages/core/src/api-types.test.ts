@@ -23,3 +23,85 @@ describe("matching api types", () => {
     expect(Object.keys(byLedger).sort()).toEqual(["ledgerAccountCode", "transactionId"]);
   });
 });
+
+// ---- payments DTOs: the shapes moved from the worker's read.ts must stay byte-identical (P9c) ----------
+import type { ApprovalReason, PaymentMode, PaymentStatus } from "./payments/types";
+import type { BatchDto, DecisionDto, PaymentDto } from "./api-types";
+
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
+const assertTrue = <T extends true>(): T | undefined => undefined;
+
+/** A copy of the declarations as P9a wrote them in apps/worker/src/payments/read.ts. */
+interface P9aDecisionDto {
+  decision: "approved" | "rejected";
+  by: string;
+  at: string;
+  note: string | null;
+}
+interface P9aPaymentDto {
+  kind: "payment";
+  id: number;
+  requestId: string;
+  batchId: number | null;
+  status: PaymentStatus;
+  statusReason: string | null;
+  mode: PaymentMode;
+  openItemId: number;
+  invoiceNumber: string | null;
+  dueDate: string | null;
+  supplierName: string;
+  ibanMasked: string;
+  ibanFingerprintShort: string;
+  amountMinor: number;
+  currency: string;
+  eurMinor: number | null;
+  eurRate: string | null;
+  reference: string;
+  sourceAccountId: number;
+  sourceAccountName: string;
+  approvalsRequired: ApprovalReason[];
+  payloadHash: string;
+  requestedBy: string;
+  confirmedAt: string | null;
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string | null;
+  providerId: string | null;
+  confirmPhrase: string | null;
+  decision: P9aDecisionDto | null;
+}
+interface P9aBatchDto {
+  kind: "batch";
+  id: number;
+  requestId: string;
+  status: PaymentStatus;
+  statusReason: string | null;
+  mode: PaymentMode;
+  currency: string;
+  totalMinor: number;
+  itemCount: number;
+  eurMinor: number | null;
+  sourceAccountId: number;
+  sourceAccountName: string;
+  approvalsRequired: ApprovalReason[];
+  payloadHash: string;
+  requestedBy: string;
+  confirmedAt: string | null;
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string | null;
+  providerId: string | null;
+  confirmPhrase: string | null;
+  decision: P9aDecisionDto | null;
+  items: P9aPaymentDto[];
+}
+
+describe("payments DTO shapes", () => {
+  it("are identical to what P9a returned (compile-time check)", () => {
+    assertTrue<Equal<DecisionDto, P9aDecisionDto>>();
+    assertTrue<Equal<PaymentDto, P9aPaymentDto>>();
+    assertTrue<Equal<BatchDto, P9aBatchDto>>();
+    expect(true).toBe(true);
+  });
+});

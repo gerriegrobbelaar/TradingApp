@@ -1,0 +1,160 @@
+/* Payment screens (P9c, ADR 0051). Layout only: every colour is a token already used by the Bank
+   and matching screens (--ink, --muted, --fill, --hover, --control-line, --accent-text), so the
+   pairs are covered by payments-contrast.test.ts. No transitions, so reduced motion is honoured. */
+.app .pay-sheet,
+.app .pay-view,
+.app .pay-confirm,
+.app .pay-decision,
+.app .pay-cancel,
+.app .pay-status,
+.app .pay-form,
+.app .pay-list-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.app .pay-status p,
+.app .pay-confirm p,
+.app .pay-sheet p {
+  margin: 0;
+}
+.app .pay-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.app .pay-list .pay-list {
+  margin-left: 14px;
+}
+.app .pay-todo {
+  color: var(--muted);
+}
+.app .pay-blocks-title {
+  font-weight: 600;
+  margin: 0;
+}
+.app .pay-dl {
+  min-width: 0;
+}
+.app .pay-dl dd {
+  overflow-wrap: anywhere;
+}
+.app .pay-iban {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+.app .pay-fp {
+  display: inline-block;
+}
+.app .pay-phrase {
+  display: block;
+  padding: 10px 12px;
+  background: var(--fill);
+  border: 1px solid var(--control-line);
+  border-radius: 12px;
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 1rem;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+.app .pay-confirm {
+  padding: 14px;
+  border: 1px solid var(--control-line);
+  border-radius: 18px;
+}
+.app .pay-accounts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+.app .pay-account {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  background: var(--fill);
+  border: 1px solid var(--control-line);
+  border-radius: 14px;
+  cursor: pointer;
+}
+.app .pay-account:has(input:checked) {
+  background: var(--hover);
+  border-color: var(--accent-text);
+}
+.app .pay-account input {
+  margin-top: 4px;
+}
+.app .pay-low {
+  color: var(--ink);
+}
+.app .pay-bills {
+  margin: 0;
+}
+.app .pay-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.app .pay-check {
+  width: 20px;
+  height: 20px;
+}
+.app .pay-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 14px;
+  margin: 0 0 10px;
+  background: var(--fill);
+  border: 1px solid var(--accent-text);
+  border-radius: 14px;
+}
+.app .pay-timeline {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0 0 0 14px;
+  border-left: 2px solid var(--control-line);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.app .pay-timeline .pay-tl-what {
+  color: var(--ink);
+}
+.app .pay-filters {
+  align-items: center;
+  flex-wrap: wrap;
+}
+.app .check-inline {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  color: var(--ink);
+}
+.app .pay-form .field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.app .pay-checks li {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+@media (max-width: 560px) {
+  .app .pay-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}

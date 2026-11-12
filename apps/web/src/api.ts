@@ -66,13 +66,29 @@ export class ApiError extends Error {
   readonly retryAfterSeconds: number | undefined;
   /** A sentence from the server for people (for example why a schedule is not valid). */
   readonly detail: string | undefined;
-  constructor(status: number, code: string, retryAfterSeconds?: number, detail?: string) {
+  /**
+   * Lists of stable codes some refusals carry (`blocks`, `blockers`, `loosened`), kept as plain
+   * string arrays; nothing else of the body is kept.
+   */
+  readonly lists: Readonly<Record<string, readonly string[]>> | undefined;
+  /** A refused batch: the block codes of each bill (`itemBlocks`), checked for shape. */
+  readonly itemBlocks: readonly { openItemId: number; blocks: readonly string[] }[] | undefined;
+  constructor(
+    status: number,
+    code: string,
+    retryAfterSeconds?: number,
+    detail?: string,
+    lists?: Readonly<Record<string, readonly string[]>>,
+    itemBlocks?: readonly { openItemId: number; blocks: readonly string[] }[],
+  ) {
     super(code);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
     this.retryAfterSeconds = retryAfterSeconds;
     this.detail = detail;
+    this.lists = lists;
+    this.itemBlocks = itemBlocks;
   }
 }
 
@@ -135,16 +151,48 @@ interface RequestOptions {
   signal?: AbortSignal;
 }
 
-async function errorInfo(
-  res: Response,
-): Promise<{ code: string; retryAfterSeconds?: number; detail?: string }> {
+async function errorInfo(res: Response): Promise<{
+  code: string;
+  retryAfterSeconds?: number;
+  detail?: string;
+  lists?: Record<string, string[]>;
+  itemBlocks?: { openItemId: number; blocks: string[] }[];
+}> {
   try {
     const v: unknown = await res.json();
     if (v && typeof v === "object" && "error" in v && typeof v.error === "string") {
       const wait = "retryAfterSeconds" in v ? v.retryAfterSeconds : undefined;
       const msg = "message" in v ? v.message : undefined;
+      const lists: Record<string, string[]> = {};
+      for (const k of ["blocks", "blockers", "loosened", "warnings"]) {
+        const x = (v as Record<string, unknown>)[k];
+        if (Array.isArray(x) && x.every((e) => typeof e === "string")) {
+          lists[k] = (x as string[]).slice(0, 50);
+        }
+      }
+      const rawItems = (v as Record<string, unknown>)["itemBlocks"];
+      const itemBlocks: { openItemId: number; blocks: string[] }[] = [];
+      if (Array.isArray(rawItems)) {
+        for (const x of rawItems.slice(0, 200)) {
+          const o = x as { openItemId?: unknown; blocks?: unknown } | null;
+          if (
+            o !== null &&
+            typeof o === "object" &&
+            typeof o.openItemId === "number" &&
+            Array.isArray(o.blocks) &&
+            o.blocks.every((b) => typeof b === "string")
+          ) {
+            itemBlocks.push({
+              openItemId: o.openItemId,
+              blocks: (o.blocks as string[]).slice(0, 50),
+            });
+          }
+        }
+      }
       return {
         code: v.error,
+        ...(Object.keys(lists).length > 0 ? { lists } : {}),
+        ...(itemBlocks.length > 0 ? { itemBlocks } : {}),
         ...(typeof wait === "number" && Number.isFinite(wait) && wait > 0
           ? { retryAfterSeconds: Math.ceil(wait) }
           : {}),
@@ -185,7 +233,14 @@ export async function request<T>(path: string, opts: RequestOptions = {}): Promi
   }
   if (!res.ok) {
     const info = await errorInfo(res);
-    throw new ApiError(res.status, info.code, info.retryAfterSeconds, info.detail);
+    throw new ApiError(
+      res.status,
+      info.code,
+      info.retryAfterSeconds,
+      info.detail,
+      info.lists,
+      info.itemBlocks,
+    );
   }
   return (await res.json()) as T;
 }

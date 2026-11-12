@@ -48,6 +48,7 @@ const AutoMatchedList = lazyNamed(
 );
 const IgnoredList = lazyNamed(() => import("../components/matching/IgnoredList"), "IgnoredList");
 const ReviewQueue = lazyNamed(() => import("../components/matching/ReviewQueue"), "ReviewQueue");
+const PaymentsList = lazyNamed(() => import("../components/payments/PaymentsList"), "PaymentsList");
 
 const PAGE = 50;
 const POSITIVE_ID = /^[1-9][0-9]{0,15}$/;
@@ -71,8 +72,8 @@ const isDay = (v: string | null): v is string =>
 const OWN = ["account", "state", "direction", "from", "to", "tab", "queue"] as const;
 
 /** The views of the Bank screen; the address carries `tab` (none means Transactions). */
-export type BankTab = "transactions" | "review" | "auto" | "ignored";
-const TABS: readonly BankTab[] = ["transactions", "review", "auto", "ignored"];
+export type BankTab = "transactions" | "review" | "auto" | "ignored" | "payments";
+const TABS: readonly BankTab[] = ["transactions", "review", "auto", "ignored", "payments"];
 const isTab = (v: string | null): v is BankTab =>
   v !== null && v !== "transactions" && (TABS as readonly string[]).includes(v);
 /** Filters that only belong to the Transactions view. */
@@ -484,6 +485,7 @@ export function Bank() {
                 label: "Ignored",
                 ...(statsData ? { count: statsData.ignored } : {}),
               },
+              { value: "payments", label: "Payments" },
             ]}
             onChange={goTab}
           />
@@ -492,7 +494,13 @@ export function Bank() {
       {available && tab !== "transactions" && (
         <Card className="bank-tx match-tab">
           <h2 className="h2" id="match-heading">
-            {tab === "review" ? "To review" : tab === "auto" ? "Matched automatically" : "Ignored"}
+            {tab === "review"
+              ? "To review"
+              : tab === "auto"
+                ? "Matched automatically"
+                : tab === "payments"
+                  ? "Payments"
+                  : "Ignored"}
           </h2>
           <Lazy>
             {tab === "review" && (
@@ -511,6 +519,7 @@ export function Bank() {
                 onChanged={reloadStats}
               />
             )}
+            {tab === "payments" && <PaymentsList />}
             {tab === "ignored" && (
               <IgnoredList
                 account={account}

@@ -7,7 +7,7 @@
  *  GET  /api/payments?status=open|all|<status>&mine=1&limit=&cursor=   any role
  *  POST /api/payments                {openItemId, sourceAccountId, amountMinor?, clientKey}   finance
  *       201 {payment, replayed:false, warnings} | 200 replay | 422 {error:'blocked', blocks, warnings}
- *  GET  /api/payments/:id                                     any role
+ *  GET  /api/payments/:id                                     any role  ({payment, events}: the status history, P9c)
  *  POST /api/payments/:id/confirm   {confirm}                 finance (the requester), fresh sign-in
  *  POST /api/payments/:id/approve   {payloadHash, note?}      approver, fresh sign-in, not the requester
  *  POST /api/payments/:id/reject    {payloadHash, note}       approver, fresh sign-in, not the requester
@@ -38,7 +38,14 @@ import { auditStatement } from "../db/audit";
 import { json, type Ctx, type Router } from "../router";
 import { actor, idParam, note, readBody, safely } from "./http";
 import { ibanStatus, revokeIban, verifyIban } from "./iban-verify";
-import { listBatches, listPayments, readBatch, readPayment, type ListFilter } from "./read";
+import {
+  listBatches,
+  listPayments,
+  readBatch,
+  readEvents,
+  readPayment,
+  type ListFilter,
+} from "./read";
 import {
   ENABLE_PHRASE,
   ibanKeyOf,
@@ -172,7 +179,7 @@ function registerSubject(router: Router, kind: SubjectKind, base: string): void 
       if (dto === null || (dto.kind === "payment" && dto.batchId !== null)) {
         throw new PaymentError("not_found", 404);
       }
-      return json({ [name]: dto });
+      return json({ [name]: dto, events: await readEvents(ctx.env.DB, kind, dto.id) });
     }),
   );
 
