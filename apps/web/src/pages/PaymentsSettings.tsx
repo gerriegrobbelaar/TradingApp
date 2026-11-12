@@ -56,11 +56,13 @@ function parseLimit(text: string): Parsed {
   return { ok: true, minor: toSafeNumber(p.minor) };
 }
 
+type FieldErrors = Partial<Record<"limit" | "maxRequest" | "maxDaily", string>>;
+
 function nextSettings(
   base: PaymentSettings,
   f: Form,
-): { next: PaymentSettings; errors: Partial<Record<"limit" | "maxRequest" | "maxDaily", string>> } {
-  const errors: Partial<Record<"limit" | "maxRequest" | "maxDaily", string>> = {};
+): { next: PaymentSettings; errors: FieldErrors } {
+  const errors: FieldErrors = {};
   const next: PaymentSettings = { ...base, allowedCurrencies: [...base.allowedCurrencies] };
   next.mode = f.mode;
   next.fourEyesEnabled = f.fourEyesEnabled;
@@ -74,6 +76,28 @@ function nextSettings(
   else errors.maxRequest = b.text;
   if (c.ok) next.maxDailyMinor = c.minor;
   else errors.maxDaily = c.text;
+  return { next, errors };
+}
+
+/**
+ * What this person changed, applied to what is stored NOW. The form was built from `startedFrom`;
+ * only the fields they edited relative to that are sent, so a field somebody else changed in the
+ * meantime is never silently set back to the value this form happened to hold (the server applies
+ * a PATCH on top of its current settings).
+ */
+function ownChange(
+  stored: PaymentSettings,
+  startedFrom: PaymentSettings,
+  f: Form,
+): { next: PaymentSettings; patch: Record<string, unknown>; errors: FieldErrors } {
+  const mine = nextSettings(startedFrom, f);
+  const edits = patchOf(startedFrom, mine.next);
+  const next: PaymentSettings = {
+    ...stored,
+    allowedCurrencies: [...stored.allowedCurrencies],
+    ...(edits as Partial<PaymentSettings>),
+  };
+  const errors = { ...mine.errors };
   if (
     Object.keys(errors).length === 0 &&
     (next.fourEyesLimitMinor > next.maxRequestMinor || next.maxRequestMinor > next.maxDailyMinor)
@@ -81,7 +105,7 @@ function nextSettings(
     errors.limit =
       "The four-eyes limit must be at most the ceiling per payment, which must be at most the daily ceiling.";
   }
-  return { next, errors };
+  return { next, patch: patchOf(stored, next), errors };
 }
 
 const FIELDS = [
@@ -121,28 +145,41 @@ export function PaymentsSettings() {
   const [formBase, setFormBase] = useState<string | null>(null);
   const [loadedAt, setLoadedAt] = useState<number | null>(null);
   const [phraseOpen, setPhraseOpen] = useState(false);
-  const { state, run } = useAction(describePaymentError);
+  /** The server's own list when it wanted the phrase for a change this screen did not see as one. */
+  const [serverLoosened, setServerLoosened] = useState<string[] | null>(null);
+  const { state, run, clear } = useAction(describePaymentError);
   const off = useAction(describePaymentError);
 
   // (Re)build the form from the stored settings when they arrive or changed elsewhere and the
   // person has not edited anything; never overwrite typed values.
+  // The form keeps the settings it was built from (`formBase`) while it holds edits, so the screen
+  // can say that somebody else saved meanwhile and the PATCH carries only this person's edits.
   useEffect(() => {
     if (!data || baseJson === null) return;
     setLoadedAt(Date.now());
-    setForm((f) => {
-      if (f === null || formBase === null) return toForm(data.settings);
-      const untouched =
-        JSON.stringify(f) === JSON.stringify(toForm(JSON.parse(formBase) as PaymentSettings));
-      return untouched ? toForm(data.settings) : f;
-    });
-    setFormBase(baseJson);
+    const untouched =
+      form === null ||
+      formBase === null ||
+      JSON.stringify(form) === JSON.stringify(toForm(JSON.parse(formBase) as PaymentSettings));
+    if (untouched) {
+      setForm(toForm(data.settings));
+      setFormBase(baseJson);
+    }
+    // Only a new stored value rebuilds the form (form and formBase are read, not watched).
   }, [baseJson]);
 
   const computed = useMemo(
-    () => (data && form ? nextSettings(data.settings, form) : null),
-    [data, form],
+    () =>
+      data && form
+        ? ownChange(
+            data.settings,
+            formBase !== null ? (JSON.parse(formBase) as PaymentSettings) : data.settings,
+            form,
+          )
+        : null,
+    [data, form, formBase],
   );
-  const patch = data && computed ? patchOf(data.settings, computed.next) : {};
+  const patch = computed ? computed.patch : {};
   const changed = Object.keys(patch);
   // One-click pay needs the Company plan; the server refuses it too (409 plan_not_company).
   const planBlocks =
@@ -152,8 +189,9 @@ export function PaymentsSettings() {
     data.settings.mode !== "pay" &&
     data.connectionMode !== "pay";
   const hasErrors = (computed ? Object.keys(computed.errors).length > 0 : false) || planBlocks;
-  const loosened =
+  const loosened: string[] =
     data && computed && !hasErrors ? loosenedFields(data.settings, computed.next) : [];
+  const loosenedWords = (serverLoosened ?? loosened).map(settingFieldText).join(", ");
   const staleForm = data !== null && formBase !== null && baseJson !== formBase;
 
   if (res.status === "loading" || (res.status === "ready" && form === null)) {
@@ -191,11 +229,21 @@ export function PaymentsSettings() {
     const r = await run(() => patchPaymentsSettings(patch));
     if (r?.ok) {
       toast.show("Payment controls saved.");
-      setFormBase(null);
+      setFormBase(JSON.stringify(r.value.settings));
       setForm(toForm(r.value.settings));
       res.refresh();
     } else if (r && r.error instanceof ApiError && r.error.code === "conflict") {
       res.refresh();
+    } else if (
+      r &&
+      r.error instanceof ApiError &&
+      r.error.code === "confirmation_required" &&
+      (r.error.lists?.["loosened"]?.length ?? 0) > 0
+    ) {
+      // The server sees a loosening here (its settings moved on): the same typed phrase, with its list.
+      clear();
+      setServerLoosened([...(r.error.lists?.["loosened"] ?? [])]);
+      setPhraseOpen(true);
     }
   }
   async function switchOff() {
@@ -322,7 +370,7 @@ export function PaymentsSettings() {
             <Button
               size="sm"
               onClick={() => {
-                setFormBase(null);
+                setFormBase(baseJson);
                 setForm(toForm(data.settings));
               }}
             >
@@ -389,11 +437,14 @@ export function PaymentsSettings() {
               inputMode="decimal"
               value={form.maxRequest}
               aria-invalid={computed.errors.maxRequest ? true : undefined}
+              aria-describedby={computed.errors.maxRequest ? "pay-maxreq-err" : undefined}
               onChange={(e) => set("maxRequest", e.target.value)}
             />
           </label>
           {computed.errors.maxRequest && (
-            <p className="notice warn">{computed.errors.maxRequest}</p>
+            <p id="pay-maxreq-err" className="notice warn">
+              {computed.errors.maxRequest}
+            </p>
           )}
           <label className="field">
             Ceiling per 24 hours (EUR) <Chip tone="gold">Placeholder</Chip>
@@ -402,10 +453,15 @@ export function PaymentsSettings() {
               inputMode="decimal"
               value={form.maxDaily}
               aria-invalid={computed.errors.maxDaily ? true : undefined}
+              aria-describedby={computed.errors.maxDaily ? "pay-maxdaily-err" : undefined}
               onChange={(e) => set("maxDaily", e.target.value)}
             />
           </label>
-          {computed.errors.maxDaily && <p className="notice warn">{computed.errors.maxDaily}</p>}
+          {computed.errors.maxDaily && (
+            <p id="pay-maxdaily-err" className="notice warn">
+              {computed.errors.maxDaily}
+            </p>
+          )}
           <p className="cap">
             The two ceilings are placeholders chosen to be careful. They are not the company's real
             limits yet. Raising them is a loosening.
@@ -454,7 +510,7 @@ export function PaymentsSettings() {
           <Button
             disabled={changed.length === 0 || state.busy}
             onClick={() => {
-              setFormBase(null);
+              setFormBase(baseJson);
               setForm(toForm(data.settings));
             }}
           >
@@ -468,28 +524,33 @@ export function PaymentsSettings() {
         title="Loosen payment controls"
         intro={
           <p className="lede">
-            You are loosening {loosened.map(settingFieldText).join(", ")}. This makes it easier for
-            money to leave the company. Type the text below to confirm.
+            You are loosening {loosenedWords}. This makes it easier for money to leave the company.
+            Type the text below to confirm.
           </p>
         }
         phrase={PAYMENTS_LOOSEN_PHRASE}
         confirmLabel="Loosen controls"
         note={{ label: "Why (optional)", required: false, maxLength: 200 }}
-        onClose={() => setPhraseOpen(false)}
+        onClose={() => {
+          setPhraseOpen(false);
+          setServerLoosened(null);
+        }}
         describe={describePaymentError}
         onConfirm={({ phrase, note }) =>
           patchPaymentsSettings({ ...patch, confirm: phrase, ...(note !== "" ? { note } : {}) })
         }
         onDone={(v) => {
           setPhraseOpen(false);
+          setServerLoosened(null);
           toast.show("Payment controls saved.");
-          setFormBase(null);
+          setFormBase(JSON.stringify((v as PaymentsSettingsResponse).settings));
           setForm(toForm((v as PaymentsSettingsResponse).settings));
           res.refresh();
         }}
         onFailed={(e) => {
           if (e instanceof ApiError && e.code === "conflict") {
             setPhraseOpen(false);
+            setServerLoosened(null);
             res.refresh();
           }
         }}

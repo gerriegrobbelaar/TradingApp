@@ -4,7 +4,8 @@
  * page does not scroll sideways and that no request reached an unmocked path. Shots: Payables for
  * finance (Pay, tick boxes, the selection bar), the Pay sheet (account choice, switched off,
  * blocked, the confirmation with the typed phrase, a batch), payment approvals (list, decision
- * sheet), bank details, Treasury payments (list, an unconfirmed payment with its history) and
+ * sheet, a payload that changed under the approver), bank details, Treasury payments (list, an
+ * unconfirmed payment with its history) and
  * Settings, Payments (switched off, the loosening dialog). The API is mocked in the browser; the
  * app is the production build.
  */
@@ -56,6 +57,7 @@ type Step =
   | "pay_disabled"
   | "batch_confirm"
   | "decision"
+  | "decision_moved"
   | "iban"
   | "payment_detail"
   | "loosen";
@@ -131,6 +133,14 @@ const SHOTS: Shot[] = [
     ready: "table tbody tr td button",
     step: "decision",
     height: 2200,
+  },
+  {
+    name: "approval-payload-changed",
+    path: "/purchases/approvals?tab=payments",
+    scene: { me: "approver", payloadMoves: true },
+    ready: "table tbody tr td button",
+    step: "decision_moved",
+    height: 2400,
   },
   {
     name: "bank-details",
@@ -330,6 +340,16 @@ describe("Payment screens", () => {
             case "decision":
               await page.click("table tbody tr td button");
               await page.waitForSelector(`${D} button:has-text('Approve payment')`, {
+                timeout: 15_000,
+              });
+              break;
+            case "decision_moved":
+              await page.click("table tbody tr td button");
+              await page.waitForSelector(`${D} button:has-text('Approve payment')`, {
+                timeout: 15_000,
+              });
+              await page.click(`${D} button:has-text('Check status again')`);
+              await page.waitForSelector(`${D} [data-testid='pay-payload-changed']`, {
                 timeout: 15_000,
               });
               break;

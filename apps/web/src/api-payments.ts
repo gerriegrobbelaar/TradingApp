@@ -17,35 +17,14 @@ import type {
   SupplierIbanStatusDto,
 } from "@camelthorn/core";
 import { queryString, request as rawRequest, type QueryParams } from "./api";
-import { maskIbans } from "@camelthorn/core";
+import { maskDeep } from "./lib/mask";
 
 /**
- * Fields that hold hex identifiers, not text for people. A SHA-256 or HMAC in hex can look like an
- * IBAN (two letters, two digits, then alphanumerics), so masking them would corrupt the payload
- * hash an approver must send back. They are copied as they are; every other string is masked.
+ * Every string IBAN-masked, except identifier fields of the exact identifier shape (`payloadHash`,
+ * `ibanFingerprint`, `requestId`, cursors, ...; lib/mask). A SHA-256 in hex can look like an IBAN,
+ * and masking it would corrupt the payload hash an approver must send back.
  */
-export const HEX_ID_KEYS: ReadonlySet<string> = new Set([
-  "payloadHash",
-  "ibanFingerprint",
-  "ibanFingerprintShort",
-  "requestId",
-  "providerId",
-  "protocolVersion",
-]);
-
-/** Every string IBAN-masked, except the hex identifier fields above. */
-export function maskPaymentsAnswer<T>(value: T): T {
-  const walk = (v: unknown, key: string | null, depth: number): unknown => {
-    if (typeof v === "string") return key !== null && HEX_ID_KEYS.has(key) ? v : maskIbans(v);
-    if (v === null || typeof v !== "object" || depth > 20) return v;
-    if (Array.isArray(v)) return v.map((x) => walk(x, key, depth + 1));
-    const out: Record<string, unknown> = {};
-    for (const [k, x] of Object.entries(v as Record<string, unknown>))
-      out[k] = walk(x, k, depth + 1);
-    return out;
-  };
-  return walk(value, null, 0) as T;
-}
+export const maskPaymentsAnswer = <T>(value: T): T => maskDeep(value);
 
 const request = async <T>(path: string, init?: Parameters<typeof rawRequest>[1]): Promise<T> =>
   maskPaymentsAnswer(await rawRequest<T>(path, init));

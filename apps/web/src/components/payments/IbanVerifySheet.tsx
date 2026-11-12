@@ -103,13 +103,21 @@ export function IbanVerifySheet({
       setDone(r.value.iban);
       setLastFour("");
       onChanged?.();
-    } else if (r) status.refresh();
+    } else if (r) {
+      // Refused (changed meanwhile, wrong last four, ...): show what the server holds now.
+      setDone(null);
+      setLastFour("");
+      status.refresh();
+    }
   }
   async function revoke() {
     const r = await run(() => revokeSupplierIban(relationId));
     if (r?.ok) {
       setDone(r.value.iban);
       onChanged?.();
+    } else if (r) {
+      setDone(null);
+      status.refresh();
     }
   }
 

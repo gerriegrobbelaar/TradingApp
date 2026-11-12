@@ -252,6 +252,7 @@ export function BatchSummary({ dto, account }: { dto: BatchDto; account: BankAcc
               <th scope="col">Bill</th>
               <th scope="col">Supplier</th>
               <th scope="col">Bank account</th>
+              <th scope="col">Reference</th>
               <th scope="col" className="r">
                 Amount
               </th>
@@ -265,6 +266,7 @@ export function BatchSummary({ dto, account }: { dto: BatchDto; account: BankAcc
                 <td>
                   <span className="pay-iban">{i.ibanMasked}</span>
                 </td>
+                <td>{i.reference}</td>
                 <td className="r">
                   <Money minor={i.amountMinor} currency={i.currency} />
                 </td>
@@ -466,6 +468,11 @@ export function DecisionPanel({
   const [rejecting, setRejecting] = useState(false);
   const { state, run } = useAction(describePaymentError);
   const [expiredNow, setExpiredNow] = useState(false);
+  // The payload this person has read. A re-read (after a refusal, "Check status again" or the
+  // quiet refresh) can bring another payload under the same buttons: then nothing can be decided
+  // until the person says they have read the new one.
+  const [seenHash, setSeenHash] = useState(dto.payloadHash);
+  const changedUnderneath = seenHash !== dto.payloadHash;
   useEffect(() => {
     const t = Date.parse(dto.expiresAt);
     setExpiredNow(Number.isFinite(t) && t <= Date.now());
@@ -490,6 +497,7 @@ export function DecisionPanel({
   }
   const noteOk = !rejecting || note.trim().length >= 3;
   async function decide(decision: "approve" | "reject") {
+    if (changedUnderneath) return;
     const r = await run(() =>
       decideRequest(
         dto.kind,
@@ -517,6 +525,18 @@ export function DecisionPanel({
       {state.needsStepUp && <StepUpNotice />}
       {!me.stepUpFresh && !state.needsStepUp && <StepUpNotice />}
       {state.error && <ErrorLine>{state.error}</ErrorLine>}
+      {changedUnderneath && (
+        <div role="alert" className="notice warn" data-testid="pay-payload-changed">
+          <p>
+            This payment changed since you started reading it (fingerprint{" "}
+            <code>{shortHash(seenHash)}</code> is now <code>{shortHash(dto.payloadHash)}</code>).
+            Nothing was approved. Read everything above again before you decide.
+          </p>
+          <Button size="sm" onClick={() => setSeenHash(dto.payloadHash)}>
+            I have read the new details
+          </Button>
+        </div>
+      )}
       {rejecting && (
         <label className="field">
           Reason for turning this down
@@ -545,7 +565,7 @@ export function DecisionPanel({
         {!rejecting && (
           <Button
             variant="primary"
-            disabled={state.busy || !me.stepUpFresh}
+            disabled={state.busy || !me.stepUpFresh || changedUnderneath}
             onClick={() => void decide("approve")}
           >
             Approve payment
@@ -559,7 +579,7 @@ export function DecisionPanel({
           <>
             <Button
               variant="primary"
-              disabled={state.busy || !noteOk || !me.stepUpFresh}
+              disabled={state.busy || !noteOk || !me.stepUpFresh || changedUnderneath}
               onClick={() => void decide("reject")}
             >
               Turn down payment
@@ -679,6 +699,8 @@ export function RequestView({
       {dto.status === "draft" &&
         (mine && hasRole(me, "finance") ? (
           <ConfirmPanel
+            // A changed payload is a new decision: what was typed for the old one is dropped.
+            key={dto.payloadHash}
             dto={dto}
             stepUpFresh={me.stepUpFresh}
             onDone={onChanged}

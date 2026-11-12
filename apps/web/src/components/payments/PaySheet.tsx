@@ -2,7 +2,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import type { BankAccountDto, BatchDto, OpenItemRow, PaymentDto } from "@camelthorn/core";
 import { Button, Skeleton } from "@camelthorn/ui";
-import { ApiError, getBankAccounts } from "../../api";
+import { ApiError, getBankAccounts, stepUp } from "../../api";
 import {
   createPayment,
   createPaymentBatch,
@@ -27,6 +27,38 @@ export const PAYMENTS_PATH = "/treasury/bank?tab=payments";
 
 /** A random key for one sheet opening: a repeated click or a retry makes the same request. */
 const newClientKey = (): string => `ui-${crypto.randomUUID()}`;
+
+/**
+ * What one create request asks for. The client key belongs to exactly this: a retry of the same
+ * bills from the same account sends the same key (the server answers with the draft it already
+ * made, even when the first answer was lost), and another account gets another key, so a key is
+ * never reused for a different payload (the server would refuse it as `client_key_reused`).
+ */
+const payloadKeyOf = (accountId: number, items: readonly OpenItemRow[]): string =>
+  `${accountId}|${items.map((i) => `${i.id}:${i.openMinor}:${i.currency}`).join(",")}`;
+
+/**
+ * Whether the draft the server answered with is the one this sheet asked for (same bills, same
+ * account, same currency). The amounts may differ when Exact moved meanwhile: that is shown, and
+ * the phrase follows the server's amount. Anything else and the sheet refuses to go on.
+ */
+export function draftMatchesRequest(
+  dto: RequestDto,
+  items: readonly OpenItemRow[],
+  accountId: number,
+): boolean {
+  const first = items[0];
+  if (first === undefined || dto.sourceAccountId !== accountId || dto.currency !== first.currency)
+    return false;
+  if (dto.kind === "payment") return items.length === 1 && dto.openItemId === first.id;
+  const want = [...items.map((i) => i.id)].sort((a, b) => a - b);
+  const got = [...dto.items.map((i) => i.openItemId)].sort((a, b) => a - b);
+  return (
+    dto.itemCount === items.length &&
+    got.length === want.length &&
+    got.every((id, n) => id === want[n])
+  );
+}
 
 const activeSameCurrency = (accounts: BankAccountDto[], currency: string) =>
   accounts.filter((a) => a.isActive && a.currency === currency);
@@ -62,7 +94,15 @@ export function PaySheet({
     items: { openItemId: number; blocks: readonly string[] }[];
   } | null>(null);
   const [dirty, setDirty] = useState(false);
-  const key = useRef(newClientKey());
+  const [mismatch, setMismatch] = useState(false);
+  const keys = useRef(new Map<string, string>());
+  const keyFor = (payload: string): string => {
+    const known = keys.current.get(payload);
+    if (known !== undefined) return known;
+    const k = newClientKey();
+    keys.current.set(payload, k);
+    return k;
+  };
   const { state, run } = useAction(describePaymentError);
 
   const candidates = useMemo(
@@ -87,30 +127,32 @@ export function PaySheet({
   async function prepare() {
     if (accountId === null) return;
     setBlocked(null);
+    const clientKey = keyFor(payloadKeyOf(accountId, items));
     const r = await run(
       (): Promise<{ payment: PaymentDto; warnings: string[] } | { batch: BatchDto }> =>
         single
           ? createPayment({
               openItemId: first.id,
               sourceAccountId: accountId,
-              clientKey: key.current,
+              clientKey,
             })
           : createPaymentBatch({
               sourceAccountId: accountId,
               items: items.map((i) => ({ openItemId: i.id })),
-              clientKey: key.current,
+              clientKey,
             }),
     );
     if (r === null) return;
     if (r.ok) {
       const v = r.value;
-      if ("payment" in v) {
-        setDto(v.payment);
-        setWarnings(v.warnings);
-      } else {
-        setDto(v.batch);
-      }
+      const next: RequestDto = "payment" in v ? v.payment : v.batch;
       onChanged();
+      if (!draftMatchesRequest(next, items, accountId)) {
+        setMismatch(true);
+        return;
+      }
+      setDto(next);
+      if ("payment" in v) setWarnings(v.warnings);
       return;
     }
     const codes = blocksOf(r.error);
@@ -138,6 +180,19 @@ export function PaySheet({
   return (
     <DrillSheet open title={title} onClose={onClose} dirty={dirty}>
       <div className="pay-sheet">
+        {mismatch && (
+          <p role="alert" className="notice warn" data-testid="pay-mismatch">
+            The server prepared a request for other bills or another account than this sheet asked
+            for, so it cannot be confirmed here. Nothing was paid. Close the sheet and look at the
+            request in Treasury, Bank, Payments, and cancel it there if it is not right.
+          </p>
+        )}
+        {dto !== null && amountMoved(dto, items) && (
+          <p role="status" className="notice warn" data-testid="pay-amount-moved">
+            The amount below is what Exact shows as open now. It differs from the{" "}
+            {formatMoney(total, currency)} in the list. Check it before you confirm.
+          </p>
+        )}
         {dto !== null ? (
           <RequestView
             dto={dto}
@@ -175,6 +230,17 @@ export function PaySheet({
               ))}
             </ul>
             {loading && <Skeleton height={20} />}
+            {!me.stepUpFresh && !disabled && (
+              <div role="status" className="notice" data-testid="pay-stepup-early">
+                <p>
+                  Confirming a payment needs a Google sign-in from the last 15 minutes. Sign in
+                  again first, so you do not have to leave this sheet half done.
+                </p>
+                <Button size="sm" onClick={() => stepUp()}>
+                  Sign in again
+                </Button>
+              </div>
+            )}
             {settings.status === "error" && (
               <ErrorNotice
                 message={
@@ -242,7 +308,7 @@ export function PaySheet({
             <div className="stack-row">
               <Button
                 variant="primary"
-                disabled={disabled || accountId === null || state.busy || loading}
+                disabled={disabled || accountId === null || state.busy || loading || mismatch}
                 onClick={() => void prepare()}
               >
                 {state.busy ? "Checking" : "Review payment"}
@@ -262,6 +328,12 @@ export function PaySheet({
       </div>
     </DrillSheet>
   );
+}
+
+/** True when the server's amount is not the open balance the list showed for the same bills. */
+function amountMoved(dto: RequestDto, items: readonly OpenItemRow[]): boolean {
+  const listed = items.reduce((n, i) => n + BigInt(i.openMinor), 0n);
+  return BigInt(dto.kind === "payment" ? dto.amountMinor : dto.totalMinor) !== listed;
 }
 
 /** Shown beside an IBAN block: what the supplier's account looks like to the app now. */

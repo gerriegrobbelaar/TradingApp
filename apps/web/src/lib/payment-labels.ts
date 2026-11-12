@@ -429,7 +429,17 @@ export const ERROR_TEXT: Record<string, string> = {
   unauthenticated: "You are signed out. Sign in again.",
 };
 
-export const ERROR_FALLBACK = "That did not go through. Nothing was paid. Try again.";
+/**
+ * An unknown refusal. It does not promise "nothing was paid" or "nothing was changed": for a write
+ * the server may have done it before the answer failed. The person checks before trying again (a
+ * retry of the same sheet sends the same client key, so it cannot make a second request).
+ */
+export const ERROR_FALLBACK =
+  "That did not go through. Check the status in Treasury, Bank, Payments before you try again.";
+
+/** No answer at all (network, timeout): the request may or may not have arrived. */
+export const NO_ANSWER_TEXT =
+  "Could not reach the server, so we cannot tell whether this arrived. Check the status in Treasury, Bank, Payments before you try again.";
 
 /** A sentence for a refusal or a failure; never the server's text. */
 export function describePaymentError(e: unknown): string {
@@ -437,7 +447,7 @@ export function describePaymentError(e: unknown): string {
     if (e.status === 403 && !own(ERROR_TEXT, e.code)) return ERROR_TEXT["forbidden"] as string;
     return own(ERROR_TEXT, e.code) ? (ERROR_TEXT[e.code] as string) : ERROR_FALLBACK;
   }
-  return "Could not reach the server. Nothing was changed. Try again.";
+  return NO_ANSWER_TEXT;
 }
 
 /** Per-bill block codes of a refused batch (422 `blocked`), by open item id. */

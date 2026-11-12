@@ -3,10 +3,14 @@
  * Read-only: oldest first, states, a stable code and the actor, no request data.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { paymentConfirmPhrase, type SupplierIbanStatusDto } from "@camelthorn/core";
+import {
+  batchConfirmPhrase,
+  paymentConfirmPhrase,
+  type SupplierIbanStatusDto,
+} from "@camelthorn/core";
 import type { IbanStatusDto } from "../src/payments/iban-verify";
 import { authed } from "./helpers";
-import { payWorld, SUPPLIER_IBAN, type PayWorld } from "./payments-helpers";
+import { addBill, payWorld, SUPPLIER_IBAN, type PayWorld } from "./payments-helpers";
 
 let w: PayWorld;
 let fetchSpy: ReturnType<typeof vi.spyOn>;
@@ -80,6 +84,49 @@ describe("GET /api/payments/:id history", () => {
 
   it("is a 404 for a request that does not exist", async () => {
     expect((await send("viewer", "GET", "/api/payments/99999")).status).toBe(404);
+  });
+});
+
+describe("GET /api/payment-batches/:id history", () => {
+  it("lists the batch's own moves (not its items') for every role, without an IBAN", async () => {
+    const second = await addBill(w);
+    const c = await send<{ batch: { id: number; totalMinor: number; itemCount: number } }>(
+      "finance",
+      "POST",
+      "/api/payment-batches",
+      {
+        sourceAccountId: w.accountId,
+        items: [{ openItemId: w.itemId }, { openItemId: second.itemId }],
+        clientKey: "events-batch-key-0123456789",
+      },
+    );
+    expect(c.status, c.text).toBe(201);
+    const id = c.body.batch.id;
+    const done = await send("finance", "POST", `/api/payment-batches/${id}/confirm`, {
+      confirm: batchConfirmPhrase(c.body.batch.itemCount, c.body.batch.totalMinor, "EUR"),
+    });
+    expect(done.status, done.text).toBe(200);
+    for (const who of ["viewer", "finance", "approver", "admin"] as const) {
+      const r = await send<{ batch: { id: number }; events: Events["events"] }>(
+        who,
+        "GET",
+        `/api/payment-batches/${id}`,
+      );
+      expect(r.status, r.text).toBe(200);
+      expect(r.body.batch.id).toBe(id);
+      expect(r.text).not.toContain(SUPPLIER_IBAN);
+      expect(r.text).not.toMatch(/NL\d{2}[A-Z]{4}\d{10}/);
+      const moves = r.body.events.map((e) => [e.fromStatus, e.toStatus]);
+      expect(moves[0]).toEqual([null, "draft"]);
+      expect(moves.at(-1)?.[1]).toBe("pending_approval");
+      // one row per move of the batch, not one per bill in it
+      expect(moves).toHaveLength(2);
+    }
+  });
+
+  it("an unauthenticated read is refused", async () => {
+    const res = await authed("/api/payment-batches/1", "");
+    expect([401, 403]).toContain(res.status);
   });
 });
 

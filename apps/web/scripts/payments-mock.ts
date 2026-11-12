@@ -24,6 +24,8 @@ export interface PayScene {
   status: "pending_approval" | "outcome_unknown" | "paid" | "draft";
   /** Stale sign-in: the step-up notice shows. */
   stale: boolean;
+  /** The second read of the request returns another payload (the approver must re-read it). */
+  payloadMoves: boolean;
 }
 
 export const DEFAULT_PAY_SCENE: PayScene = {
@@ -32,7 +34,11 @@ export const DEFAULT_PAY_SCENE: PayScene = {
   create: "draft",
   status: "pending_approval",
   stale: false,
+  payloadMoves: false,
 };
+
+/** Reads of the request detail per scene (one scene object per screenshot). */
+const detailReads = new WeakMap<PayScene, number>();
 
 const ADMIN = {
   email: "gerrie.grobbelaar@camelthorncapital.com",
@@ -77,12 +83,13 @@ const BILLS = [
   }),
 ];
 
-function current(scene: PayScene) {
+function current(scene: PayScene, moved = false) {
   return payment({
     status: scene.status,
     approvalsRequired: ["above_limit"],
     requestedBy: FINANCE.email,
     ...(scene.status === "paid" ? { providerId: "tx-1" } : {}),
+    ...(moved ? { amountMinor: 132456, payloadHash: `be68539007547034${"b".repeat(48)}` } : {}),
   });
 }
 
@@ -153,9 +160,11 @@ export function paymentsApi(
         ],
         nextCursor: null,
       };
-    case "GET /api/payments/11":
+    case "GET /api/payments/11": {
+      const reads = (detailReads.get(scene) ?? 0) + 1;
+      detailReads.set(scene, reads);
       return {
-        payment: current(scene),
+        payment: current(scene, scene.payloadMoves && reads > 1),
         events: [
           event(),
           event({
@@ -191,6 +200,7 @@ export function paymentsApi(
             : []),
         ],
       };
+    }
     case "GET /api/payment-batches/5":
       return {
         batch: batch({
