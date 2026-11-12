@@ -306,7 +306,7 @@ describe("payment writes through the gate", () => {
     ] as const) {
       const r = await call(
         rreq(w.revolutConnectionId, {
-          method,
+          method: method as never,
           path,
           body: "{}",
           jobId: "revolut-payment",

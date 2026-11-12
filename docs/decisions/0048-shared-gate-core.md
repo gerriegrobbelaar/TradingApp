@@ -128,11 +128,15 @@ Found by reading both files and `git log` of each (Exact: 9 commits, Revolut: 4)
 4. **Clock read twice in one decision (Exact fix e70f782, "load flake").** The same hazard does not
    exist in RevolutGate (no minimum-age comparison), and the shared refresh passes one clock
    reading (`ThrottleContext.now`) to the provider hook. No code change needed.
-5. **Not fixed, recorded.** `JOB_ID_RE` exists three times (`@camelthorn/exact`,
-   `@camelthorn/revolut`, `revolut/request.ts`) plus the core's copy; a test pins that the core's
-   equals both packages'. `exact/wire.ts` and `revolut/wire.ts` are near copies (`toWire`,
-   `fromWire`, `unwrap`) and must stay in step until a shared envelope is worth a package change.
-   The 429 maximum block (24 h vs 1 h) and the default 429 wait are intentional differences.
+5. **Fixed in P9b (G9 follow-ups).** `JOB_ID_RE` is defined once, in `@camelthorn/core`
+   (`job-id.ts`); `@camelthorn/exact`, `@camelthorn/revolut` and the gate core import that object
+   (a test fails on a second definition). `exact/wire.ts` and `revolut/wire.ts` stay two files
+   (each rebuilds its own typed errors) but `test/gate-wire-envelope.test.ts` pins that their
+   envelopes are identical in shape and behaviour, and that the two files differ only in the
+   provider's name. A refused write after a 401 has its own wire kind
+   (`write_auth_retry_refused`, `RevolutWriteAuthRetryRefused`, still a `RevolutApiError` 503),
+   distinct from `gate_unavailable`. The 429 maximum block (24 h vs 1 h) and the default 429 wait
+   are intentional differences.
 
 ## Consequences
 

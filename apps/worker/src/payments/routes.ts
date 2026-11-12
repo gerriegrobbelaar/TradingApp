@@ -223,7 +223,10 @@ function registerSubject(router: Router, kind: SubjectKind, base: string): void 
       await expireStale(ctx.env.DB, ctx.nowMs);
       const r = await submitPayment(ctx.env, { kind, id, nowMs: ctx.nowMs, actor: actor(ctx) });
       const dto = await read(ctx.env.DB, id);
-      if (r.status === "refused") return json({ error: r.code, [name]: dto }, 409);
+      if (r.status === "refused") {
+        const gone = r.code === "not_found" || r.code === "batch_item";
+        return json({ error: r.code, [name]: dto }, gone ? 404 : 409);
+      }
       if (r.status === "already_claimed")
         return json({ error: "already_claimed", [name]: dto }, 409);
       return json({ result: { to: r.to, code: r.code }, [name]: dto });

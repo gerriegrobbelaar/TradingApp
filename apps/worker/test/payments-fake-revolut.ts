@@ -39,9 +39,11 @@ export class FakeRevolut {
     this.stub.restore();
   }
 
-  calls(method: string, pathPrefix: string): ApiCall[] {
+  calls(method: string, path: string): ApiCall[] {
+    const full = `/api/1.0${path}`;
     return this.stub.apiCalls.filter(
-      (c) => c.method === method && c.url.pathname.startsWith(`/api/1.0${pathPrefix}`),
+      (c) =>
+        c.method === method && (c.url.pathname === full || c.url.pathname.startsWith(`${full}/`)),
     );
   }
 
@@ -67,6 +69,12 @@ export class FakeRevolut {
       if (queued instanceof Error) throw queued;
       return typeof queued === "function" ? queued(c) : queued;
     }
+    return this.process(c);
+  }
+
+  /** The normal (unfaulted) behaviour; a fault function may call it to let Revolut act. */
+  process(c: ApiCall): Response {
+    const path = c.url.pathname.replace("/api/1.0", "");
     if (c.method === "POST" && path === "/counterparty") {
       const b = JSON.parse(c.body ?? "{}") as { company_name: string; iban: string };
       const cp = { id: this.id(), name: b.company_name, iban: b.iban };
