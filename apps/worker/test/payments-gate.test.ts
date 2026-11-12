@@ -37,7 +37,7 @@ beforeEach(async () => {
   fake = w.fake;
   const s = await stageSubmitting(w, CP);
   RID = s.requestId;
-  leg = { ...leg, accountId: s.accountUuid, amountMinor: s.amountMinor };
+  leg = { ...leg, accountId: s.accountUuid, amountMinor: s.amountMinor, reference: s.reference };
 });
 afterEach(() => fake.restore());
 

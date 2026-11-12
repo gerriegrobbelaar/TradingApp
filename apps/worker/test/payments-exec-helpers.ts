@@ -20,6 +20,7 @@ import {
   type PayWorld,
 } from "./payments-helpers";
 import { setRevolutClientSleepForTests } from "../src/revolut/client-timing";
+import { withoutTriggers } from "./booking-helpers";
 
 export { db, TEST_IBAN_KEY };
 
@@ -38,6 +39,11 @@ export async function execWorld(
   // No real waiting between retries of a read in the client.
   setRevolutClientSleepForTests(() => Promise.resolve());
   const w = await payWorld(o.nowMs === undefined ? {} : { nowMs: o.nowMs });
+  // Fixture transaction ids ("t-1") are reused by every test; real ones are unique. The table is
+  // append-only (and its transaction id unique), so the guard is lifted for the reset.
+  await withoutTriggers(["payment_draft_transactions_guard_delete"], async () => {
+    await db.prepare("DELETE FROM payment_draft_transactions").run();
+  });
   await useUuidAccount(w.accountId);
   await db
     .prepare("UPDATE connections SET payments_mode = ?2 WHERE id = ?1")
@@ -161,7 +167,13 @@ export async function readyBatch(w: PayWorld, itemIds: number[]): Promise<number
 export async function stageSubmitting(
   w: PayWorld,
   counterpartyId: string,
-): Promise<{ id: number; requestId: string; amountMinor: number; accountUuid: string }> {
+): Promise<{
+  id: number;
+  requestId: string;
+  amountMinor: number;
+  accountUuid: string;
+  reference: string;
+}> {
   const id = await readyPayment(w);
   await db
     .prepare(
@@ -185,16 +197,22 @@ export async function stageSubmitting(
     .run();
   const r = (await db
     .prepare(
-      `SELECT p.request_id, p.amount_minor, a.external_id FROM payments p
+      `SELECT p.request_id, p.amount_minor, p.reference, a.external_id FROM payments p
          JOIN bank_accounts a ON a.id = p.bank_account_id WHERE p.id = ?1`,
     )
     .bind(id)
-    .first()) as { request_id: string; amount_minor: number; external_id: string };
+    .first()) as {
+    request_id: string;
+    amount_minor: number;
+    external_id: string;
+    reference: string;
+  };
   return {
     id,
     requestId: r.request_id,
     amountMinor: r.amount_minor,
     accountUuid: r.external_id,
+    reference: r.reference,
   };
 }
 

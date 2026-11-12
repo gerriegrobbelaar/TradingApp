@@ -512,6 +512,93 @@ describe("S3: the provisional verification mark for the staging drill", () => {
     expect(r.status).toBe(409);
   });
 
+  it("review F9a: the enabling SQL itself refuses when the connection turns production between the checks and the write", async () => {
+    await setEnv("sandbox");
+    await api("admin", "POST", "/api/settings/payments/verify", body([]));
+    const race = {
+      ...e,
+      DB: racingDb(async () => {
+        await setEnv("production");
+      }),
+    };
+    const r = await api(
+      "admin",
+      "PUT",
+      "/api/settings/payments/switch",
+      { enabled: true, confirm: PAYMENTS_ENABLE_PHRASE },
+      { env: race as Env },
+    );
+    expect(r.status, r.text).toBe(409);
+    expect(
+      await db.prepare("SELECT value_json FROM settings WHERE key = 'payments.enabled'").first(),
+    ).toMatchObject({ value_json: "false" });
+    expect(await audits("payments.enabled")).toHaveLength(0);
+  });
+
+  it("review F9a: a second ACTIVE Revolut connection that is production (or unknown) voids the mark everywhere", async () => {
+    await setEnv("sandbox");
+    await api("admin", "POST", "/api/settings/payments/verify", body([]));
+    await api("admin", "PUT", "/api/settings/payments/switch", {
+      enabled: true,
+      confirm: PAYMENTS_ENABLE_PHRASE,
+    });
+    expect(await paymentWritesOpen({ DB: db, REVOLUT_PAYMENTS_EXECUTION: "on" })).toEqual({
+      open: true,
+    });
+    for (const env of ["production", null]) {
+      const other = await db
+        .prepare(
+          `INSERT INTO connections (kind, name, status, revolut_environment)
+           VALUES ('revolut', ?1, 'active', ?2) RETURNING id`,
+        )
+        .bind(`second-${String(env)}`, env)
+        .first<{ id: number }>();
+      expect(
+        await paymentWritesOpen({ DB: db, REVOLUT_PAYMENTS_EXECUTION: "on" }),
+        String(env),
+      ).toEqual({
+        open: false,
+        reason: "not_verified",
+      });
+      // ... also for the sandbox connection's own gate
+      expect(
+        await revolutGate(w.revolutConnectionId).acquirePaymentLease(w.revolutConnectionId, "t"),
+      ).toMatchObject({ ok: false, code: "payments_not_verified" });
+      await db
+        .prepare("UPDATE connections SET status = 'disabled' WHERE id = ?1")
+        .bind(other?.id)
+        .run();
+    }
+    // a disabled production connection does not count: open again
+    expect(await paymentWritesOpen({ DB: db, REVOLUT_PAYMENTS_EXECUTION: "on" })).toEqual({
+      open: true,
+    });
+    // and the deploy var off closes it whatever the mark
+    expect(await paymentWritesOpen({ DB: db, REVOLUT_PAYMENTS_EXECUTION: "off" })).toEqual({
+      open: false,
+      reason: "execution_off",
+    });
+    expect(await paymentWritesOpen({ DB: db })).toEqual({ open: false, reason: "execution_off" });
+  });
+
+  it("review F9a: a provisional mark of an older protocol version counts for nothing, even on the sandbox", async () => {
+    await setEnv("sandbox");
+    await api("admin", "POST", "/api/settings/payments/verify", body([]));
+    await db
+      .prepare(
+        "UPDATE settings SET value_json = json_set(value_json, '$.protocolVersion', ?1) WHERE key = 'payments.verified'",
+      )
+      .bind("0".repeat(64))
+      .run();
+    await db
+      .prepare("UPDATE settings SET value_json = 'true' WHERE key = 'payments.enabled'")
+      .run();
+    expect(await paymentWritesOpen({ DB: db, REVOLUT_PAYMENTS_EXECUTION: "on" })).toEqual({
+      open: false,
+      reason: "protocol_changed",
+    });
+  });
+
   it("a COMPLETE verification replaces a provisional one: no flag, payments off, covers the modes by its list", async () => {
     await setEnv("sandbox");
     await api("admin", "POST", "/api/settings/payments/verify", body([]));

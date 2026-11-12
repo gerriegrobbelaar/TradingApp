@@ -416,6 +416,10 @@ export const ERROR_TEXT: Record<string, string> = {
   iban_changed: "The bank account changed while this was open. Reload and check it again.",
   requester_inactive:
     "The person who asked for this payment can no longer do so. Nothing was paid. Ask a finance user to request it again.",
+  draft_not_expired:
+    "The Revolut draft can still be approved until it expires. Wait for the expiry, then check again.",
+  no_bank_evidence:
+    "The bank feed does not prove that nothing was paid: it is not up to date, or it shows a payment of this amount. Check the Revolut app and the statement first.",
   provisional_not_allowed:
     "A trial verification is only possible on the Revolut sandbox with payments enabled in this deployment.",
   iban_missing: "The supplier has no bank account.",

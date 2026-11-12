@@ -20,6 +20,7 @@ import {
 } from "@camelthorn/revolut";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { claimIdempotencyKey } from "../src/db/idempotency";
+import { paymentBodyMismatch } from "../src/payments/gate-request";
 import { storedKeyRotated } from "../src/payments/iban-store";
 import {
   MAX_PRIOR_DRAFTS,
@@ -393,7 +394,7 @@ describe("N7: the gate compares the body with the stored request", () => {
     counterpartyId: CP,
     amountMinor: s.amountMinor,
     currency: "EUR",
-    reference: "Invoice 1",
+    reference: s.reference,
   });
   const payReq = (body: string, ref = s.requestId) =>
     rreq(w.revolutConnectionId, {
@@ -466,6 +467,59 @@ describe("N7: the gate compares the body with the stored request", () => {
       await gate().call(payReq(buildPay({ ...leg(), requestId: s.requestId }).body)),
     ).toMatchObject({ ok: false, error: { code: "payment_payee_unknown" } });
     expect(writes()).toHaveLength(0);
+  });
+
+  it("review F9a: byte equality, not number equality: other spellings, duplicate keys, another reference", async () => {
+    const good = buildPay({ ...leg(), requestId: s.requestId }).body;
+    const amount = (good.match(/"amount":([0-9.]+)/) as RegExpMatchArray)[1] as string;
+    const variants: [string, string][] = [
+      // the same double, another token: a receiver that reads decimals could read it differently
+      ["trailing zero", good.replace(`"amount":${amount}`, `"amount":${amount}0`)],
+      ["exponent", good.replace(`"amount":${amount}`, `"amount":${Number(amount) * 100}e-2`)],
+      ["string amount", good.replace(`"amount":${amount}`, `"amount":"${amount}"`)],
+      // JSON.parse keeps the LAST of two keys, another parser the first
+      [
+        "duplicate key",
+        good.replace(`"amount":${amount}`, `"amount":999999.99,"amount":${amount}`),
+      ],
+      ["reference", good.replace(/"reference":"[^"]*"/, '"reference":"Other invoice"')],
+      ["whitespace", good.replace(",", ", ")],
+    ];
+    for (const [what, body] of variants) {
+      expect(body, what).not.toBe(good);
+      const r = await gate().call(payReq(body));
+      expect(r, what).toMatchObject({ ok: false });
+    }
+    expect(writes()).toHaveLength(0);
+  });
+
+  it("review F9a: a request whose source account belongs to ANOTHER Revolut connection is unknown to this gate", async () => {
+    const other = await db
+      .prepare(
+        `INSERT INTO connections (kind, name, status, revolut_environment) VALUES ('revolut', 'other-f9a', 'disabled', 'production') RETURNING id`,
+      )
+      .first<{ id: number }>();
+    await db
+      .prepare(
+        "UPDATE bank_accounts SET connection_id = ?2 WHERE id = (SELECT bank_account_id FROM payments WHERE id = ?1)",
+      )
+      .bind(s.id, other?.id)
+      .run();
+    expect(
+      await gate().call(payReq(buildPay({ ...leg(), requestId: s.requestId }).body)),
+    ).toMatchObject({ ok: false, error: { code: "payment_unknown_request" } });
+    expect(writes()).toHaveLength(0);
+  });
+
+  it("review F9a: a D1 failure while reading the stored request refuses (the check throws, nothing passes)", async () => {
+    const broken = {
+      prepare: () => {
+        throw new Error("D1 down");
+      },
+    } as unknown as D1Database;
+    await expect(
+      paymentBodyMismatch(broken, payReq(buildPay({ ...leg(), requestId: s.requestId }).body)),
+    ).rejects.toThrow(/D1 down/);
   });
 
   it("the matching body goes through (control); a draft body is checked item by item", async () => {

@@ -22,14 +22,23 @@ person.
   (reconciliation looks again and raises `duplicate`); only a readable list with no draft of ours makes
   the refusal a `rejected`. Exactly one draft is adopted as before.
 - **(c) "Not found" never fails a known draft** (`reconcile.ts`, `viaDraft`). A draft we hold an id for
-  that answers 404 stays `submitted` and raises the alert `draft_gone`. It becomes
-  `failed / draft_expired` only past `payments.draft_expiry_days` AND with positive evidence
-  (`nothingPaidEvidence`): the account's bank feed was read in the last 24 hours (`bank_accounts.balance_at`)
-  and holds no line of that account with that amount (any item of a batch) since the request was made,
-  other than a failed/declined/reverted one.
-- **Protocol version re-pinned.** The worker label is now `payments-execution-v2` (a behaviour change
+  that answers 404 stays `submitted` and raises the alert `draft_gone`, whatever the bank feed says.
+  Review F9a: the reconciliation never fails it on its own (the builder's version failed it automatically
+  on "evidence"; but the balance is read before the transactions, so a fresh balance did not prove the
+  lines were read, and a failed request makes the invoice payable again). An ADMIN ends it with
+  `resolveNotSent` (`POST .../resolve-not-sent`, fresh sign-in, typed phrase), which for a `submitted`
+  draft with an open-or-acknowledged `draft_gone` demands: past `payments.draft_expiry_days`
+  (`draft_not_expired`), the last lookup a "not found" at most 30 minutes old (`lookup_not_fresh`), and
+  `nothingPaidEvidence` (`no_bank_evidence`): the account's balance read AND a complete transactions walk
+  (`revolut_sync_state.watermark`) started after the draft was first seen gone, both within 24 hours, and
+  no line of that account and currency since the request (one day of slack) with its amount, with or
+  without a fee, to anybody, other than a failed/declined/reverted one. It becomes `failed /
+  draft_expired` (audit `payment.draft_gone_resolved` under the admin), so the 30-day watch and the
+  earlier-attempt check of a new request still look at that draft.
+- **Protocol version re-pinned.** The worker label is now `payments-execution-v3` (v2 by the builder, v3
+  by the review: byte-equal gate check, the human step of (c), one transaction per request; a behaviour change
   the sampled outputs cannot show), the core checklist and block codes changed, so both pins moved:
-  core `db5c8f24...cf367` (`packages/core/src/payments/protocol.test.ts`), worker `7383ba67...0cb8`
+  core `db5c8f24...cf367` (`packages/core/src/payments/protocol.test.ts`), worker `501f9a43...6787`
   (`test/payments-p9b-api.test.ts`). Every earlier verification mark is void.
 
 ### B2 (worker half) and N8: batch items linked to bank lines; a completed draft needs its transactions
@@ -70,7 +79,10 @@ Rules (all in `reconcile.ts`, tested in `test/payments-f9a-reconcile.test.ts`):
 
 - Raising is idempotent: while an alert is open, or was acknowledged and the new one is the same kind, a
   later run changes none of the four alert columns. A different kind after an acknowledgement raises
-  again and clears the acknowledgement.
+  again and clears the acknowledgement. Review F9a: an ACKNOWLEDGED alert is cleared (all four columns
+  NULL) when a run sees the subject healthy (`last_result` pending, paid, failed, draft_expired,
+  resolved; never on an error or a "not found"), so the same condition coming back is raised and audited
+  again. An unacknowledged alert is never cleared by a run.
 - Every raise writes ONE audit row in the same batch (`payment.<kind>` / `payment_batch.<kind>`, actor
   `system`, entity id = the request id), only when that very run raised it. `mismatch`, `duplicate`
   (no audit row before), `draft_gone`, `draft_completed_unlinked`, plus the two that had one
@@ -171,9 +183,17 @@ an IBAN or a name.
 - **N6** `PUT /api/settings/payments/draft-expiry` needs a fresh sign-in.
 - **N7** The gate (`gate-request.ts`, called from `#assertPaymentWrite` at the door and again before the
   fetch) reads the stored request from D1 and refuses a `/pay` or `/payment-drafts` body that disagrees
-  with it: unknown request or not `submitting` (`payment_unknown_request`), no cached payee
-  (`payment_payee_unknown`), another account, amount, currency or payee ids (`payment_body_mismatch`).
-  The counterparty create is not compared (it moves no money).
+  with it: not JSON (`payment_body_unreadable`), unknown request, not `submitting` or a source account of
+  another Revolut connection (`payment_unknown_request`), no cached payee (`payment_payee_unknown`), any
+  other byte (`payment_body_mismatch`). Review F9a: the gate REBUILDS the body with the real builders
+  (`buildPay` / `buildPaymentDraft`) from the stored rows (by id) and the cached payee and demands byte
+  equality, so the amount is compared as its token text (never as a float), and a duplicated key,
+  another spelling of the number or another reference are refused. A D1 error throws, and the gate
+  refuses. The counterparty create is not compared (it moves no money).
+- **One transaction, one request** (review F9a): a completed draft naming a transaction another request
+  already recorded is a `mismatch`; `payment_draft_transactions_tx` (UNIQUE on `transaction_id`) is the
+  database's fence. Batch items are paired by reference also in the form the builder SENT
+  (`revolutReference`); two items with the same sent reference and amount are never paired.
 - **N3** The three real-time tests: the timeout test uses fake timers (`vi.useFakeTimers` for
   `setTimeout`); the other two wait for an event (the call reaching the fake bank, the guard being
   consulted), not for milliseconds. Where no clock is involved a signal is the right fix; this deviates

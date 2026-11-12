@@ -17,7 +17,8 @@
  *  the same under /api/payment-batches (create takes {sourceAccountId, items:[{openItemId, amountMinor?}], clientKey})
  * Sending (P9b, ADR 0050; every one answers 409 with a stable code while the switches are off)
  *  POST /api/payments/:id/submit            finance, fresh sign-in: sends a `ready` request (also /api/payment-batches/:id/submit)
- *  POST /api/payments/:id/resolve-not-sent  {confirm}  admin, fresh sign-in: an unknown outcome was NOT sent (after a lookup said so)
+ *  POST /api/payments/:id/resolve-not-sent  {confirm}  admin, fresh sign-in: an unknown outcome was NOT sent (after a lookup said so);
+ *       also a `submitted` draft Revolut no longer shows (`draft_gone`), past the expiry and with bank-feed evidence -> failed
  *  GET  /api/payments/:id/settlement        any role: bank-confirmed and booked in Exact? (also: approved after expiry, reverted after paid)
  *  POST /api/payments/:id/alert/ack         {note?}  finance, admin: "I looked at this alert" (audited; moves nothing; also under /api/payment-batches)
  *  POST /api/payments/preview               {kind, id}  admin, fresh sign-in: the real request bodies and hashes, no call

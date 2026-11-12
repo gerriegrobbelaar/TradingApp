@@ -60,6 +60,11 @@ CREATE TABLE payment_draft_transactions (
   PRIMARY KEY (subject_kind, subject_id, transaction_id)
 ) WITHOUT ROWID;
 
+-- One Revolut transaction belongs to ONE payment request: a transaction named by two drafts would let
+-- two requests claim the same bank line (review F9a). The reconciliation checks this before the move and
+-- raises a mismatch; this index is the database's own fence.
+CREATE UNIQUE INDEX payment_draft_transactions_tx ON payment_draft_transactions (transaction_id);
+
 -- Recorded only for a subject that is `paid` (the move comes first in the same batch), append-only.
 CREATE TRIGGER payment_draft_transactions_guard_insert BEFORE INSERT ON payment_draft_transactions
 BEGIN

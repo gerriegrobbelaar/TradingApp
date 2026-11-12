@@ -18,9 +18,10 @@
  *    bank entry is ever created here. `paymentSettlement` says how far the booking is.
  *  - A draft not approved after `payments.draft_expiry_days` becomes `failed` (`draft_expired`) ONLY
  *    while Revolut still shows it as pending. A known draft that answers "not found" never moves a
- *    payment (F9a, B3c): it stays `submitted` with a `draft_gone` alert, unless there is positive
- *    evidence that nothing was paid (no bank line of that account, amount and currency since it was
- *    sent). An expired draft stays on the watch list for 30 days so an approval after the expiry is raised.
+ *    payment (F9a, B3c): it stays `submitted` with a `draft_gone` alert. Only an admin ends it
+ *    (`resolveNotSent`), past the expiry and with positive evidence that nothing was paid (a fresh,
+ *    complete bank feed without a line of that account, amount and currency since it was sent).
+ *    An expired draft stays on the watch list for 30 days so an approval after the expiry is raised.
  *  - A draft that says `completed` without naming a transaction for every payment is NOT `paid`
  *    (F9a, N8): the payment stays `submitted` and `draft_completed_unlinked` is raised.
  *  - Alerts (`mismatch`, `duplicate`, `approved_after_expiry`, `reverted_after_paid`, `draft_gone`,
@@ -32,6 +33,7 @@
 import { phraseMatches, PAYMENTS_RESOLVE_PHRASE } from "@camelthorn/core";
 import {
   draftTitle,
+  revolutReference,
   type PaymentDraftView,
   type RevolutClient,
   type RevolutTransaction,
@@ -198,6 +200,11 @@ function note(
   extra: { providerState?: string | null; transactionId?: string | null; alert?: AlertKind } = {},
 ): D1PreparedStatement {
   const raise = `(alert_at IS NULL OR (alert_ack_at IS NOT NULL AND alert_kind IS NOT excluded.alert_kind))`;
+  // Review F9a: an ACKNOWLEDGED alert is forgotten once a run sees the subject healthy again (a final
+  // or pending answer, never an error or a "not found"), so the same condition coming back later is
+  // raised (and audited) again. An alert nobody acknowledged stays open whatever the run sees.
+  const clear = `(excluded.alert_kind IS NULL AND alert_ack_at IS NOT NULL
+                  AND excluded.last_result IN ('pending', 'paid', 'failed', 'draft_expired', 'resolved'))`;
   return db
     .prepare(
       `INSERT INTO payment_reconcile (subject_kind, subject_id, first_checked_at, last_checked_at, checks,
@@ -208,10 +215,14 @@ function note(
          not_found_checks = not_found_checks + excluded.not_found_checks,
          last_result = excluded.last_result, provider_state = excluded.provider_state,
          transaction_id = COALESCE(excluded.transaction_id, transaction_id),
-         alert_at = CASE WHEN excluded.alert_kind IS NOT NULL AND ${raise} THEN excluded.alert_at ELSE alert_at END,
-         alert_ack_at = CASE WHEN excluded.alert_kind IS NOT NULL AND ${raise} THEN NULL ELSE alert_ack_at END,
-         alert_ack_by = CASE WHEN excluded.alert_kind IS NOT NULL AND ${raise} THEN NULL ELSE alert_ack_by END,
-         alert_kind = CASE WHEN excluded.alert_kind IS NOT NULL AND ${raise} THEN excluded.alert_kind ELSE alert_kind END`,
+         alert_at = CASE WHEN excluded.alert_kind IS NOT NULL AND ${raise} THEN excluded.alert_at
+                         WHEN ${clear} THEN NULL ELSE alert_at END,
+         alert_ack_at = CASE WHEN excluded.alert_kind IS NOT NULL AND ${raise} THEN NULL
+                             WHEN ${clear} THEN NULL ELSE alert_ack_at END,
+         alert_ack_by = CASE WHEN excluded.alert_kind IS NOT NULL AND ${raise} THEN NULL
+                             WHEN ${clear} THEN NULL ELSE alert_ack_by END,
+         alert_kind = CASE WHEN excluded.alert_kind IS NOT NULL AND ${raise} THEN excluded.alert_kind
+                           WHEN ${clear} THEN NULL ELSE alert_kind END`,
     )
     .bind(
       s.kind,
@@ -422,17 +433,10 @@ async function viaDraft(
   if (view === null) {
     if (s.providerId !== null) {
       // A draft WE KNOW that Revolut now calls "not found": deleted in the app, or a lookup that
-      // lies. "Not found" never moves a payment (F9a, B3c). The request stays as it is and a person
-      // is told. Only POSITIVE evidence that nothing was paid (the bank feed is fresh and shows no
-      // line of this account with this amount since the request was made) lets an expired one fail.
-      if (
-        nowMs - Date.parse(s.updatedAt) > expiryDays * 86_400_000 &&
-        (await nothingPaidEvidence(db, s, nowMs))
-      ) {
-        if (await applyMove(db, s, "failed", "draft_expired", nowIso, "draft_expired"))
-          sum.failed++;
-        return;
-      }
+      // lies. "Not found" never moves a payment (F9a, B3c): the request stays `submitted` and a
+      // person is told (`draft_gone`). Review F9a: not even with "evidence" from our own bank feed is
+      // it failed automatically (a failed request makes the invoice payable again, and a feed can
+      // miss a line); an admin ends it with `resolveNotSent`, which demands that evidence as well.
       sum.alerts++;
       await db.batch(alertStatements(db, s, nowIso, "not_found", "draft_gone"));
       return;
@@ -523,8 +527,10 @@ async function viaDraft(
     return;
   }
   if (nowMs - Date.parse(s.updatedAt) > expiryDays * 86_400_000) {
+    // The provider id is kept (review F9a) so the watch on expired drafts can see a late approval.
     if (
       await applyMove(db, s, "failed", "draft_expired", nowIso, "draft_expired", {
+        providerId: s.providerId ?? view.id,
         providerState: view.state ?? "pending",
       })
     )
@@ -582,6 +588,17 @@ async function draftTransactionsState(
     txs.push({ id: tx.id, amountMinor: -leg.amountMinor, currency: leg.currency });
     states.push(tx.state);
   }
+  // Review F9a: a transaction another request already recorded as ITS payment is not ours twice.
+  if (txs.length === 0) return { state: "mismatch", txs: [] };
+  const marks = txs.map((_, i) => `?${i + 3}`).join(", ");
+  const taken = await db
+    .prepare(
+      `SELECT 1 AS n FROM payment_draft_transactions
+        WHERE transaction_id IN (${marks}) AND NOT (subject_kind = ?1 AND subject_id = ?2) LIMIT 1`,
+    )
+    .bind(s.kind, s.id, ...txs.map((t) => t.id.slice(0, 100)))
+    .first();
+  if (taken !== null) return { state: "mismatch", txs: [] };
   // Our amounts, one for one (a batch: the multiset of its items). Anything else is reported, never believed.
   const expected = await db
     .prepare(
@@ -608,23 +625,44 @@ async function draftTransactionsState(
 }
 
 /**
- * Positive evidence that a draft that Revolut no longer shows was never paid: the account's bank feed
- * is fresh (read in the last 24 hours) AND it holds no line of this account with this amount (any
- * request item of a batch) since the request was made, that is not itself failed/declined/reverted.
- * Absence of evidence is not evidence: with a stale feed this answers false.
+ * Positive evidence that a draft that Revolut no longer shows was never paid (F9a, B3c; tightened in
+ * review F9a). ALL of:
+ *  - the account's balance was read in the last 24 hours (`bank_accounts.balance_at`), AND
+ *  - a COMPLETE transactions walk of the account's connection started after the draft was first seen
+ *    gone (`revolut_sync_state.watermark >= goneSince`) and in the last 24 hours: the balance is read
+ *    before the transactions, so a fresh balance alone does not prove the lines were read, AND
+ *  - no line of this account and currency since the request was made (one day of slack) carries the
+ *    amount of the request (any item of a batch), with or without its fee, unless that line is itself
+ *    failed/declined/reverted. Any outgoing line of that amount counts, whoever it went to: a stranger's
+ *    payment of the same amount makes this answer "not proven", which is the safe direction.
+ * Absence of evidence is not evidence: anything stale or unreadable answers false. This is only ever
+ * one of the conditions of a PERSON's decision (`resolveNotSent`), never a reason to fail by itself.
  */
-async function nothingPaidEvidence(db: D1Database, s: Subject, nowMs: number): Promise<boolean> {
+export async function nothingPaidEvidence(
+  db: D1Database,
+  s: Pick<Subject, "kind" | "id" | "bankAccountId" | "createdAt">,
+  nowMs: number,
+  goneSince: string,
+): Promise<boolean> {
+  const dayAgo = new Date(nowMs - 24 * 3_600_000).toISOString();
   const fresh = await db
-    .prepare("SELECT 1 AS n FROM bank_accounts WHERE id = ?1 AND balance_at >= ?2")
-    .bind(s.bankAccountId, new Date(nowMs - 24 * 3_600_000).toISOString())
+    .prepare(
+      `SELECT 1 AS n FROM bank_accounts a
+         JOIN revolut_sync_state st ON st.connection_id = a.connection_id AND st.entity = 'transactions'
+        WHERE a.id = ?1 AND a.balance_at >= ?2 AND st.watermark >= ?2 AND st.watermark >= ?3`,
+    )
+    .bind(s.bankAccountId, dayAgo, goneSince)
     .first();
   if (fresh === null) return false;
   const since = new Date(Date.parse(s.createdAt) - 86_400_000).toISOString();
   const hit = await db
     .prepare(
       `SELECT 1 AS n FROM bank_transactions t JOIN payments p ON ${s.kind === "payment" ? "p.id" : "p.batch_id"} = ?1
-        WHERE t.bank_account_id = p.bank_account_id AND t.currency = p.currency
-          AND t.amount_minor = -p.amount_minor AND t.state NOT IN ('failed', 'declined', 'reverted')
+        WHERE t.bank_account_id = p.bank_account_id AND t.currency = p.currency AND t.amount_minor < 0
+          AND (-t.amount_minor = p.amount_minor
+               OR -t.amount_minor = p.amount_minor + ABS(COALESCE(t.fee_minor, 0))
+               OR -t.amount_minor + ABS(COALESCE(t.fee_minor, 0)) = p.amount_minor)
+          AND t.state NOT IN ('failed', 'declined', 'reverted')
           AND t.booked_at >= ?2 LIMIT 1`,
     )
     .bind(s.id, since)
@@ -739,6 +777,15 @@ export async function linkPaidPayments(db: D1Database, nowIso: string): Promise<
  * unlinked (`awaiting_bank_line`), which the settlement answer and the data-quality rule show. The
  * database repeats the account/currency/amount rule (payment_bank_links_guard_insert).
  */
+/** The reference as the request builder sends it (or the stored text when it cannot be sent). */
+function sentReference(raw: string): string {
+  try {
+    return revolutReference(raw);
+  } catch {
+    return raw;
+  }
+}
+
 export async function linkBatchItems(db: D1Database, nowIso: string): Promise<number> {
   const batches = await db
     .prepare(
@@ -796,10 +843,13 @@ export async function linkBatchItems(db: D1Database, nowIso: string): Promise<nu
         continue;
       }
       for (const item of g.items) {
+        // The bank shows the reference as SENT (sanitised by `revolutReference`), so both forms count;
+        // two items whose sent references are the same can never be told apart.
+        const sent = sentReference(item.reference);
         const sameRef = g.lines.filter(
-          (l) => l.reference !== null && l.reference === item.reference,
+          (l) => l.reference !== null && (l.reference === item.reference || l.reference === sent),
         );
-        const rivals = g.items.filter((o) => o.reference === item.reference);
+        const rivals = g.items.filter((o) => sentReference(o.reference) === sent);
         if (sameRef.length === 1 && rivals.length === 1) {
           pairs.push({ paymentId: item.id, lineId: (sameRef[0] as { id: number }).id });
         }
@@ -909,6 +959,15 @@ export async function reconcilePayments(deps: ReconcileDeps): Promise<ReconcileS
 
 export type ResolveResult = { ok: true } | { ok: false; code: string };
 
+/**
+ * A person (admin, fresh sign-in, typed phrase) ends a request the bank never made:
+ *  - `outcome_unknown` -> `rejected` (`resolved_not_sent`) after a fresh, late-enough "not found";
+ *  - review F9a (B3c): a `submitted` DRAFT whose draft Revolut no longer shows (`draft_gone` alert,
+ *    the last lookup a fresh "not found") -> `failed` (`draft_expired`), only past the draft expiry and
+ *    only with positive evidence from the bank feed (`nothingPaidEvidence`). The reconciliation never
+ *    does this on its own. `draft_expired` keeps the request on the watch for a late approval and in
+ *    the earlier-attempt check of any new request for the same invoice.
+ */
 export async function resolveNotSent(
   db: D1Database,
   a: { kind: SubjectKind; id: number; actor: string; nowMs: number; confirm: unknown },
@@ -919,23 +978,36 @@ export async function resolveNotSent(
   const table = a.kind === "payment" ? "payments" : "payment_batches";
   const s = await db
     .prepare(
-      `SELECT s.id, s.request_id, s.status, COALESCE(s.updated_at, s.created_at) AS updated_at,
-              r.last_result, r.last_checked_at, r.not_found_checks
+      `SELECT s.id, s.request_id, s.status, s.mode, s.provider_id, s.bank_account_id, s.created_at,
+              COALESCE(s.updated_at, s.created_at) AS updated_at,
+              r.last_result, r.last_checked_at, r.not_found_checks, r.alert_kind, r.alert_at
          FROM ${table} s LEFT JOIN payment_reconcile r ON r.subject_kind = ?2 AND r.subject_id = s.id
-        WHERE s.id = ?1`,
+        WHERE s.id = ?1 ${a.kind === "payment" ? "AND s.batch_id IS NULL" : ""}`,
     )
     .bind(a.id, a.kind)
     .first<{
       id: number;
       request_id: string;
       status: string;
+      mode: string;
+      provider_id: string | null;
+      bank_account_id: number;
+      created_at: string;
       updated_at: string;
       last_result: string | null;
       last_checked_at: string | null;
       not_found_checks: number | null;
+      alert_kind: string | null;
+      alert_at: string | null;
     }>();
   if (s === null) return { ok: false, code: "not_found" };
-  if (s.status !== "outcome_unknown") return { ok: false, code: "not_unknown" };
+  const goneDraft =
+    s.status === "submitted" &&
+    s.mode === "drafts" &&
+    s.provider_id !== null &&
+    s.alert_kind === "draft_gone" &&
+    s.alert_at !== null;
+  if (s.status !== "outcome_unknown" && !goneDraft) return { ok: false, code: "not_unknown" };
   if (
     s.last_result !== "not_found" ||
     (s.not_found_checks ?? 0) < 1 ||
@@ -943,6 +1015,46 @@ export async function resolveNotSent(
     a.nowMs - Date.parse(s.last_checked_at) > NOT_FOUND_FRESH_MS
   ) {
     return { ok: false, code: "lookup_not_fresh" };
+  }
+  const nowIso = new Date(a.nowMs).toISOString();
+  if (goneDraft) {
+    const days = await loadDraftExpiryDays(db);
+    if (!(a.nowMs - Date.parse(s.updated_at) > days * 86_400_000)) {
+      return { ok: false, code: "draft_not_expired" };
+    }
+    const evidence = await nothingPaidEvidence(
+      db,
+      { kind: a.kind, id: s.id, bankAccountId: s.bank_account_id, createdAt: s.created_at },
+      a.nowMs,
+      s.alert_at as string,
+    );
+    if (!evidence) return { ok: false, code: "no_bank_evidence" };
+    const move = {
+      kind: a.kind,
+      id: a.id,
+      requestId: s.request_id,
+      from: "submitted" as const,
+      to: "failed" as const,
+      actor: a.actor,
+      code: "draft_expired",
+      nowIso,
+      audit: {
+        action:
+          a.kind === "payment"
+            ? "payment.draft_gone_resolved"
+            : "payment_batch.draft_gone_resolved",
+        after: { notFoundChecks: s.not_found_checks, goneSince: s.alert_at },
+      },
+    };
+    try {
+      const out = await db.batch([
+        ...moveStatements(db, move),
+        ...(a.kind === "batch" ? childMoveStatements(db, move) : []),
+      ]);
+      return (out[2]?.meta.changes ?? 0) === 1 ? { ok: true } : { ok: false, code: "conflict" };
+    } catch {
+      return { ok: false, code: "refused" };
+    }
   }
   if (a.nowMs - Date.parse(s.updated_at) < NOT_FOUND_MIN_AGE_MS) {
     return { ok: false, code: "too_soon" };
@@ -953,7 +1065,6 @@ export async function resolveNotSent(
   if (Date.parse(s.last_checked_at) - Date.parse(s.updated_at) < NOT_FOUND_MIN_AGE_MS) {
     return { ok: false, code: "lookup_too_early" };
   }
-  const nowIso = new Date(a.nowMs).toISOString();
   const move = {
     kind: a.kind,
     id: a.id,

@@ -16,11 +16,13 @@ import {
   type RevolutTransaction,
 } from "@camelthorn/revolut";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { PAYMENTS_RESOLVE_PHRASE } from "@camelthorn/core";
 import {
   ackAlert,
   linkBatchItems,
   paymentSettlement,
   reconcilePayments,
+  resolveNotSent,
 } from "../src/payments/reconcile";
 import { runSubmission, setSubmitterForTests, type SubmitOutcome } from "../src/payments/submit";
 import {
@@ -145,11 +147,31 @@ describe("B3c: 'not found' on a known draft never fails a payment by itself", ()
     await toState(id, { kind: "accepted", providerId: "draft-1" });
     return id;
   }
-  const freshFeed = (): Promise<unknown> =>
-    db
+  /** The balance AND a complete transactions walk, both at `atMs` (review F9a: both are needed). */
+  const freshFeed = async (atMs: number, walk = true): Promise<void> => {
+    await db
       .prepare("UPDATE bank_accounts SET balance_at = ?2 WHERE id = ?1")
-      .bind(w.accountId, new Date(Date.now() + 6 * DAY - 60_000).toISOString())
+      .bind(w.accountId, new Date(atMs).toISOString())
       .run();
+    if (walk) {
+      await db
+        .prepare(
+          `INSERT INTO revolut_sync_state (connection_id, entity, watermark, last_completed_at, last_status)
+           VALUES (?1, 'transactions', ?2, ?2, 'ok')
+           ON CONFLICT (connection_id, entity) DO UPDATE SET watermark = excluded.watermark`,
+        )
+        .bind(w.revolutConnectionId, new Date(atMs).toISOString())
+        .run();
+    }
+  };
+  const resolve = (kind: "payment" | "batch", id: number, nowMs: number) =>
+    resolveNotSent(db, {
+      kind,
+      id,
+      actor: w.emails.admin,
+      nowMs,
+      confirm: PAYMENTS_RESOLVE_PHRASE,
+    });
 
   it("past the expiry with a STALE bank feed: stays submitted, alert draft_gone, audited, nothing failed", async () => {
     const id = await submittedWithDraft();
@@ -173,40 +195,104 @@ describe("B3c: 'not found' on a known draft never fails a payment by itself", ()
     expect((await audits("payment.draft_gone")).length).toBe(1);
   });
 
-  it("past the expiry, fresh feed, but a bank line of this account and amount exists: stays submitted", async () => {
+  it("review F9a: even with a fresh, complete feed and no such line the RECONCILIATION never fails it", async () => {
     const id = await submittedWithDraft();
-    await freshFeed();
-    await addTx({
+    const t = Date.now() + 6 * DAY;
+    await freshFeed(t);
+    const s = await run(t);
+    expect(s.failed).toBe(0);
+    expect((await rowOf(id)).status).toBe("submitted");
+    expect(await rec("payment", id)).toMatchObject({ alert_kind: "draft_gone" });
+    // ... and runs after it neither
+    await freshFeed(t + DAY);
+    await run(t + DAY);
+    expect((await rowOf(id)).status).toBe("submitted");
+  });
+
+  it("before the expiry it is also an alert and a person is told; nothing moves, the admin cannot end it yet", async () => {
+    const id = await submittedWithDraft();
+    const t = Date.now() + DAY;
+    await freshFeed(t);
+    await run(t);
+    expect((await rowOf(id)).status).toBe("submitted");
+    expect(await rec("payment", id)).toMatchObject({ alert_kind: "draft_gone" });
+    expect(await resolve("payment", id, t + 60_000)).toEqual({
+      ok: false,
+      code: "draft_not_expired",
+    });
+    expect((await rowOf(id)).status).toBe("submitted");
+  });
+
+  it("an admin ends it past the expiry with positive evidence: failed/draft_expired, audited under the admin", async () => {
+    const id = await submittedWithDraft();
+    const t = Date.now() + 6 * DAY;
+    await run(t); // first seen gone at t
+    await freshFeed(t + 10 * 60_000); // a complete walk that began after it was seen gone
+    await run(t + 15 * 60_000);
+    expect(await resolve("payment", id, t + 20 * 60_000)).toEqual({ ok: true });
+    expect(await rowOf(id)).toMatchObject({ status: "failed", status_reason: "draft_expired" });
+    const a = await db
+      .prepare(
+        "SELECT actor_email FROM audit_log WHERE action = 'payment.draft_gone_resolved' AND id > ?1",
+      )
+      .bind(auditFrom)
+      .all<{ actor_email: string }>();
+    expect(a.results.map((r) => r.actor_email)).toEqual([w.emails.admin]);
+    // a second press changes nothing
+    expect((await resolve("payment", id, t + 21 * 60_000)).ok).toBe(false);
+  });
+
+  it("refused without evidence: fresh balance but no complete walk since it was gone (the walk can fail after the balance)", async () => {
+    const id = await submittedWithDraft();
+    const t = Date.now() + 6 * DAY;
+    await freshFeed(t - 60 * 60_000); // a walk BEFORE the draft was seen gone
+    await run(t);
+    await freshFeed(t + 5 * 60_000, false); // only the balance is read again
+    expect(await resolve("payment", id, t + 10 * 60_000)).toEqual({
+      ok: false,
+      code: "no_bank_evidence",
+    });
+    expect((await rowOf(id)).status).toBe("submitted");
+  });
+
+  it("refused when a line of this account and amount exists (whoever it went to), or the amount plus its fee", async () => {
+    const id = await submittedWithDraft();
+    const t = Date.now() + 6 * DAY;
+    await run(t);
+    await freshFeed(t + 5 * 60_000);
+    const lineId = await addTx({
       connectionId: w.revolutConnectionId,
       accountId: w.accountId,
       amountMinor: -100_000,
       createdAt: new Date().toISOString(),
     });
-    const s = await run(Date.now() + 6 * DAY);
-    expect(s.failed).toBe(0);
+    expect((await resolve("payment", id, t + 10 * 60_000)).ok).toBe(false);
+    // the leg carries the fee in its amount
+    await db
+      .prepare("UPDATE bank_transactions SET amount_minor = -100_050, fee_minor = 50 WHERE id = ?1")
+      .bind(lineId)
+      .run();
+    await run(t + 6 * 60_000);
+    expect(await resolve("payment", id, t + 10 * 60_000)).toEqual({
+      ok: false,
+      code: "no_bank_evidence",
+    });
+    // a pending line is money on its way: also refused
+    await db
+      .prepare(
+        "UPDATE bank_transactions SET amount_minor = -100_000, fee_minor = NULL, state = 'pending' WHERE id = ?1",
+      )
+      .bind(lineId)
+      .run();
+    expect((await resolve("payment", id, t + 10 * 60_000)).ok).toBe(false);
     expect((await rowOf(id)).status).toBe("submitted");
-    expect(await rec("payment", id)).toMatchObject({ alert_kind: "draft_gone" });
-  });
-
-  it("before the expiry it is also an alert and a person is told; nothing moves", async () => {
-    const id = await submittedWithDraft();
-    await run(Date.now() + DAY);
-    expect((await rowOf(id)).status).toBe("submitted");
-    expect(await rec("payment", id)).toMatchObject({ alert_kind: "draft_gone" });
-  });
-
-  it("with POSITIVE evidence (fresh feed, no such line since the request) an expired draft fails, no alert", async () => {
-    const id = await submittedWithDraft();
-    await freshFeed();
-    const s = await run(Date.now() + 6 * DAY);
-    expect(s.failed).toBe(1);
-    expect(await rowOf(id)).toMatchObject({ status: "failed", status_reason: "draft_expired" });
-    expect((await rec("payment", id))?.["alert_kind"]).toBeNull();
   });
 
   it("a failed-state bank line does not count as a payment (it is evidence of NO money moved)", async () => {
     const id = await submittedWithDraft();
-    await freshFeed();
+    const t = Date.now() + 6 * DAY;
+    await run(t);
+    await freshFeed(t + 5 * 60_000);
     await addTx({
       connectionId: w.revolutConnectionId,
       accountId: w.accountId,
@@ -214,8 +300,51 @@ describe("B3c: 'not found' on a known draft never fails a payment by itself", ()
       state: "declined",
       createdAt: new Date().toISOString(),
     });
-    expect((await run(Date.now() + 6 * DAY)).failed).toBe(1);
+    await run(t + 6 * 60_000);
+    expect(await resolve("payment", id, t + 10 * 60_000)).toEqual({ ok: true });
     expect((await rowOf(id)).status).toBe("failed");
+  });
+
+  it("refused when the last lookup is stale or was not 'not found'", async () => {
+    const id = await submittedWithDraft();
+    const t = Date.now() + 6 * DAY;
+    await run(t);
+    await freshFeed(t + 5 * 60_000);
+    expect(await resolve("payment", id, t + 60 * 60_000)).toEqual({
+      ok: false,
+      code: "lookup_not_fresh",
+    });
+    // the draft is back (pending): no longer "gone" in the last lookup
+    client.drafts.set("draft-1", draft("draft-1", [{ state: "pending" }]));
+    await run(t + 2 * 60 * 60_000 - 60_000);
+    expect((await resolve("payment", id, t + 2 * 60 * 60_000)).ok).toBe(false);
+  });
+
+  it("a draft that is still pending is not 'gone': the admin cannot end it this way", async () => {
+    const id = await readyPayment(w);
+    await toState(id, { kind: "accepted", providerId: "draft-1" });
+    client.drafts.set("draft-1", draft("draft-1", [{ state: "pending" }]));
+    await run();
+    expect(await resolve("payment", id, Date.now() + 6 * DAY)).toEqual({
+      ok: false,
+      code: "not_unknown",
+    });
+  });
+
+  it("the earlier-attempt check of a NEW request still looks at a draft ended this way", async () => {
+    const id = await submittedWithDraft();
+    const t = Date.now() + 6 * DAY;
+    await run(t);
+    await freshFeed(t + 5 * 60_000);
+    await run(t + 6 * 60_000);
+    expect(await resolve("payment", id, t + 10 * 60_000)).toEqual({ ok: true });
+    const row = await db
+      .prepare(
+        "SELECT 1 AS n FROM payments WHERE id = ?1 AND status = 'failed' AND status_reason = 'draft_expired' AND provider_id = 'draft-1'",
+      )
+      .bind(id)
+      .first();
+    expect(row).not.toBeNull();
   });
 });
 
@@ -283,6 +412,30 @@ describe("N8: a completed draft must name a transaction for every payment", () =
     client.txById.set("t-2", tx("t-2", "completed", 40_000));
     await run();
     expect((await rowOf(batch, "payment_batches")).status).toBe("paid");
+  });
+
+  it("review F9a: a transaction another request already recorded as paid is a mismatch, never paid twice", async () => {
+    const first = await readyPayment(w);
+    await toState(first, { kind: "accepted", providerId: "draft-1" });
+    client.drafts.set("draft-1", draft("draft-1", [{ state: "completed", tx: "t-1" }]));
+    client.txById.set("t-1", tx("t-1", "completed"));
+    await run();
+    expect((await rowOf(first)).status).toBe("paid");
+    const second = await readyPayment(w, { itemId: await anotherBill(w) });
+    await toState(second, { kind: "accepted", providerId: "draft-2" });
+    // Revolut (or a mix-up) names the SAME transaction for the second draft
+    client.drafts.set("draft-2", draft("draft-2", [{ state: "completed", tx: "t-1" }]));
+    await run();
+    expect((await rowOf(second)).status).toBe("submitted");
+    expect(await rec("payment", second)).toMatchObject({ alert_kind: "mismatch" });
+    // the database has its own fence: one transaction id, one row
+    expect(
+      await db
+        .prepare(
+          "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'payment_draft_transactions_tx'",
+        )
+        .first<{ sql: string }>(),
+    ).toMatchObject({ sql: expect.stringMatching(/UNIQUE INDEX[\s\S]*\(transaction_id\)/) });
   });
 
   it("control: one transaction per payment, in our amounts, completed: paid, and the transactions are recorded", async () => {
@@ -561,6 +714,63 @@ describe("S1: alerts are visible state, audited once, acknowledged by a person",
       alert_ack_by: null,
     });
     expect((await audits("payment.draft_completed_unlinked")).length).toBe(1);
+  });
+
+  it("review F9a: an acknowledged alert is raised (and audited) again when the condition comes BACK", async () => {
+    const id = await readyPayment(w);
+    await toState(id, { kind: "accepted", providerId: "draft-1" });
+    await run(); // 404: draft_gone
+    expect((await audits("payment.draft_gone")).length).toBe(1);
+    expect(
+      (
+        await ackAlert(db, {
+          kind: "payment",
+          id,
+          actor: w.emails.finance,
+          nowMs: Date.now(),
+          note: null,
+        })
+      ).ok,
+    ).toBe(true);
+    // still gone: stays acknowledged, no new audit row
+    await run();
+    expect((await rec("payment", id))?.["alert_ack_by"]).toBe(w.emails.finance);
+    // an unreadable answer is no sign of health: the acknowledged alert stays as it is
+    client.drafts.set("draft-1", new RevolutApiError(500, "boom"));
+    await run();
+    expect(await rec("payment", id)).toMatchObject({
+      alert_kind: "draft_gone",
+      alert_ack_by: w.emails.finance,
+    });
+    // healthy again (pending): the acknowledged alert is forgotten
+    client.drafts.set("draft-1", draft("draft-1", [{ state: "pending" }]));
+    await run();
+    expect(await rec("payment", id)).toMatchObject({
+      alert_at: null,
+      alert_kind: null,
+      alert_ack_at: null,
+    });
+    // gone again: raised again, open, audited a second time
+    client.drafts.delete("draft-1");
+    await run();
+    expect(await rec("payment", id)).toMatchObject({
+      alert_kind: "draft_gone",
+      alert_ack_at: null,
+    });
+    expect((await audits("payment.draft_gone")).length).toBe(2);
+  });
+
+  it("an alert nobody acknowledged stays open even when the subject looks healthy again", async () => {
+    const id = await readyPayment(w);
+    await toState(id, { kind: "accepted", providerId: "draft-1" });
+    await run();
+    client.drafts.set("draft-1", draft("draft-1", [{ state: "pending" }]));
+    await run();
+    expect(await rec("payment", id)).toMatchObject({
+      alert_kind: "draft_gone",
+      alert_ack_at: null,
+    });
+    expect((await rec("payment", id))?.["alert_at"]).not.toBeNull();
   });
 
   it("settlement: a draft approved after its request expired is NOT 'not_paid'", async () => {

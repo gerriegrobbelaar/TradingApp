@@ -138,7 +138,7 @@ describe("2. every gate layer on its own blocks a payment write (zero network ca
     w = await execWorld({ mode: "pay" });
     const s = await stageSubmitting(w, CP);
     RID = s.requestId;
-    leg = { ...LEG0, accountId: s.accountUuid, amountMinor: s.amountMinor };
+    leg = { ...LEG0, accountId: s.accountUuid, amountMinor: s.amountMinor, reference: s.reference };
   });
   afterEach(() => {
     RID = RID0;
