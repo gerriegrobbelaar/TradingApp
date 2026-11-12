@@ -38,6 +38,7 @@ import {
   type DescribeHandler,
   type DqDivision,
 } from "./load";
+import { loadPayments } from "./load-payments";
 import { runAlerts, type AlertDeps, type AlertOutcome } from "./alerts";
 import {
   applyResults,
@@ -178,6 +179,8 @@ export async function runDqChecks(ctx: JobContext, deps: DqRunDeps): Promise<Han
       jobs: await section("jobs", () => loadJobs(db, nowMs, deps.describeHandler)),
       webhook: await section("webhook", () => loadWebhook(db, nowMs)),
       exactConnection: await section("exact_connection", () => loadExactConnection(db)),
+      // Payment requests (D1 only; ADR 0053): a failing read makes the payment rules not_available.
+      payments: await section("payments", () => loadPayments(db, nowMs)),
     };
     const res = evaluateRules(input, "global", configs);
     outcome = add(outcome, await applyResults(db, 0, res, startedAt, ctx.run.id));

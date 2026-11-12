@@ -7,7 +7,10 @@
  *  - pending approvals (purchase_entries.status = pending_approval) of the chosen administration;
  *  - bank lines with a suggested match (the matching review queue);
  *  - bookings that need a person (outbox manual_required, outcome_unknown) and stale settlements;
- *  - open data quality issues, critical and warning, not snoozed.
+ *  - open data quality issues, critical and warning, not snoozed;
+ *  - payment requests (Phase 9 final review S2, ADR 0053): `payment_approval` (pending a second
+ *    person; only for an approver, never their own request) and `payment_ready` (approved, not sent;
+ *    only for finance). Both read D1 through idx_payments_status / idx_payment_batches_status.
  *
  * Cost: five index-backed queries (approvals, matches, bookings, issues per scope), each reads at
  * most CAP + 1 rows, plus the counts and the last data check run. Each source is read IN QUEUE
@@ -24,6 +27,7 @@ import {
   maskIbans,
   TODAY_DQ_SKIPPED_RULES,
   TODAY_KINDS,
+  TODAY_PAYMENT_READY_RULE,
   TODAY_PRIORITY,
   TODAY_STALE_SETTLEMENT_RULE,
   ageDaysBetween,
@@ -78,6 +82,8 @@ const dayStart = (d: string | null): string | null =>
 interface Ref {
   divisionId: number | null;
   roles: readonly Role[];
+  /** Lower-case e-mail of the caller (never shown), for "not your own request". */
+  email: string;
   nowMs: number;
   todayDate: string;
 }
@@ -238,6 +244,103 @@ function bookingItem(r: BookingRow, ref: Ref): TodayItemDto {
   };
 }
 
+// ---- payment requests -------------------------------------------------------------------------------
+
+/** A ready request older than this is no longer a queue item (the DQ rule still reports it). */
+export const PAYMENT_READY_LOOKBACK_MS = 7 * 86_400_000;
+const HOUR = 3_600_000;
+
+interface PaymentRow {
+  kind: "payment" | "batch";
+  id: number;
+  amount_minor: number;
+  currency: string;
+  created_at: string;
+  expires_at: string;
+}
+
+const PAYMENT_ID_SQL = "CASE kind WHEN 'batch' THEN 'batch-' || id ELSE CAST(id AS TEXT) END";
+/**
+ * Requests waiting for a second person: this administration, not yet expired, NOT requested by the
+ * caller (?2, lower case). Each branch is found by status through idx_payments_status /
+ * idx_payment_batches_status (status, created_at); only that small set is sorted. Top-level
+ * requests only: the items of a batch are decided with the batch. Queue order: oldest first, then
+ * the id as text (`batch-N` for a batch), the same total order as core `compareToday`.
+ */
+export const PAYMENT_APPROVAL_SQL = `SELECT kind, id, amount_minor, currency, created_at, expires_at FROM (
+    SELECT 'payment' AS kind, p.id AS id, p.amount_minor AS amount_minor, p.currency AS currency,
+           p.created_at AS created_at, p.expires_at AS expires_at
+      FROM payments p
+     WHERE p.status = 'pending_approval' AND p.division_id = ?1 AND p.batch_id IS NULL
+       AND p.requested_by <> ?2 AND p.expires_at > ?3
+    UNION ALL
+    SELECT 'batch', b.id, b.total_minor, b.currency, b.created_at, b.expires_at
+      FROM payment_batches b
+     WHERE b.status = 'pending_approval' AND b.division_id = ?1
+       AND b.requested_by <> ?2 AND b.expires_at > ?3
+  ) ORDER BY created_at ASC, ${PAYMENT_ID_SQL} ASC LIMIT ${TODAY_SOURCE_CAP + 1}`;
+export const PAYMENT_APPROVAL_COUNT_SQL = `SELECT
+    (SELECT COUNT(*) FROM payments WHERE status = 'pending_approval' AND division_id = ?1
+        AND batch_id IS NULL AND requested_by <> ?2 AND expires_at > ?3)
+  + (SELECT COUNT(*) FROM payment_batches WHERE status = 'pending_approval' AND division_id = ?1
+        AND requested_by <> ?2 AND expires_at > ?3) AS n`;
+
+/** Approved, not sent (status ready) in this administration, created within the look-back (?2). */
+export const PAYMENT_READY_SQL = `SELECT kind, id, amount_minor, currency, created_at, expires_at FROM (
+    SELECT 'payment' AS kind, p.id AS id, p.amount_minor AS amount_minor, p.currency AS currency,
+           p.created_at AS created_at, p.expires_at AS expires_at
+      FROM payments p
+     WHERE p.status = 'ready' AND p.division_id = ?1 AND p.batch_id IS NULL AND p.created_at >= ?2
+    UNION ALL
+    SELECT 'batch', b.id, b.total_minor, b.currency, b.created_at, b.expires_at
+      FROM payment_batches b
+     WHERE b.status = 'ready' AND b.division_id = ?1 AND b.created_at >= ?2
+  ) ORDER BY created_at ASC, ${PAYMENT_ID_SQL} ASC LIMIT ${TODAY_SOURCE_CAP + 1}`;
+export const PAYMENT_READY_COUNT_SQL = `SELECT
+    (SELECT COUNT(*) FROM payments WHERE status = 'ready' AND division_id = ?1
+        AND batch_id IS NULL AND created_at >= ?2)
+  + (SELECT COUNT(*) FROM payment_batches WHERE status = 'ready' AND division_id = ?1
+        AND created_at >= ?2) AS n`;
+
+const hours = (n: number): string => `${n} ${n === 1 ? "hour" : "hours"}`;
+
+function expiryText(expiresAt: string, nowMs: number): string {
+  const t = Date.parse(expiresAt);
+  if (!Number.isFinite(t)) return "expiry unknown";
+  if (t <= nowMs) return "expired";
+  return `expires in ${hours(Math.ceil((t - nowMs) / HOUR))}`;
+}
+
+function paymentItem(
+  r: PaymentRow,
+  ref: Ref,
+  kind: "payment_approval" | "payment_ready",
+): TodayItemDto {
+  const approval = kind === "payment_approval";
+  const priority = approval ? TODAY_PRIORITY.paymentApproval : TODAY_PRIORITY.paymentReady;
+  const since = canonicalSince(r.created_at);
+  const waited = since === null ? 0 : Math.floor(Math.max(0, ref.nowMs - Date.parse(since)) / HOUR);
+  const what = r.kind === "batch" ? "Batch" : "Payment";
+  return {
+    kind,
+    id: `${kind}:${r.kind === "batch" ? "batch-" : ""}${r.id}`,
+    title: approval
+      ? `${hours(waited)} waiting for a second approver`
+      : `${hours(waited)} since approval, not sent`,
+    subtitle: `${what} ${r.id} · ${expiryText(r.expires_at, ref.nowMs)}`,
+    severity: severityOfPriority(priority),
+    priority,
+    since,
+    ageDays: ageDaysBetween(r.created_at, ref.nowMs),
+    amountMinor: r.amount_minor,
+    currency: r.currency,
+    fix: approval ? "payment_approvals" : "payments",
+    fixPath: DQ_FIX_PATHS[approval ? "payment_approvals" : "payments"],
+    actions: todayActions(kind, ref.roles, false),
+    issueId: null,
+  };
+}
+
 interface IssueRow {
   id: number;
   rule_id: string;
@@ -259,9 +362,21 @@ const NOT_SUGGESTED_LINE = `NOT (i.rule_id = 'bank.unmatched_old' AND EXISTS (
     SELECT 1 FROM bank_transactions t
     WHERE t.id = json_extract(i.payload_json, '$.txId') AND t.match_status = 'suggested'
       AND t.is_final = 1 AND t.state = 'completed'))`;
+/**
+ * An issue about a ready payment is the same thing as its `payment_ready` item: hidden only when the
+ * caller sees that item (?2 = the caller's division when the caller holds finance, else -1; ?3 = the
+ * same look-back cut-off as PAYMENT_READY_SQL). Anyone else still gets the issue.
+ */
+const NOT_READY_PAYMENT_ITEM = `NOT (i.rule_id = '${TODAY_PAYMENT_READY_RULE}' AND (
+    (json_extract(i.payload_json, '$.subjectKind') = 'payment' AND EXISTS (
+       SELECT 1 FROM payments p WHERE p.id = json_extract(i.payload_json, '$.subjectId')
+         AND p.status = 'ready' AND p.batch_id IS NULL AND p.division_id = ?2 AND p.created_at >= ?3))
+    OR (json_extract(i.payload_json, '$.subjectKind') = 'batch' AND EXISTS (
+       SELECT 1 FROM payment_batches b WHERE b.id = json_extract(i.payload_json, '$.subjectId')
+         AND b.status = 'ready' AND b.division_id = ?2 AND b.created_at >= ?3))))`;
 const SKIPPED = TODAY_DQ_SKIPPED_RULES.map((r) => `'${r}'`).join(", ");
 /**
- * One query per scope (the division, then the global id 0), in queue order: the priority of
+ * One query per scope (the division, then the global id 0; ?2 and ?3 see NOT_READY_PAYMENT_ITEM), in queue order: the priority of
  * `issueItem` (stale settlements 75, critical 90, warning 60), then first seen, then id as text.
  * idx_dq_issues_list finds the open rows of the scope; only those are sorted.
  */
@@ -271,6 +386,7 @@ export const DQ_SQL = `SELECT i.id, i.rule_id, i.severity, i.subject, i.message,
   WHERE i.division_id = ?1 AND i.status = 'open' AND i.severity_rank >= 1 AND COALESCE(r.enabled, 1) = 1
     AND i.rule_id NOT IN (${SKIPPED})
     AND ${NOT_SUGGESTED_LINE}
+    AND ${NOT_READY_PAYMENT_ITEM}
   ORDER BY CASE WHEN i.rule_id = '${TODAY_STALE_SETTLEMENT_RULE}' THEN ${TODAY_PRIORITY.staleSettlements}
                 WHEN i.severity_rank = 2 THEN ${TODAY_PRIORITY.dqCritical}
                 ELSE ${TODAY_PRIORITY.dqWarning} END DESC,
@@ -280,6 +396,7 @@ export const DQ_COUNT_SQL = `SELECT i.rule_id AS rule_id, COUNT(*) AS n
   WHERE i.division_id = ?1 AND i.status = 'open' AND i.severity_rank >= 1 AND COALESCE(r.enabled, 1) = 1
     AND i.rule_id NOT IN (${SKIPPED})
     AND ${NOT_SUGGESTED_LINE}
+    AND ${NOT_READY_PAYMENT_ITEM}
   GROUP BY i.rule_id`;
 
 function issueItem(r: IssueRow, ref: Ref): TodayItemDto {
@@ -349,12 +466,19 @@ async function todayHandler(ctx: Ctx): Promise<Response> {
   const cursor = rawCursor === null ? null : decodeTodayCursor(rawCursor);
   if (rawCursor !== null && cursor === null) throw new BadRequest("bad_cursor");
   const divisionId = await divisionOrNone(ctx);
+  const roles = ctx.session?.roles ?? [];
+  const sees = { approval: roles.includes("approver"), ready: roles.includes("finance") };
+  const nowIso = new Date(ctx.nowMs).toISOString();
+  const readyCutoff = new Date(ctx.nowMs - PAYMENT_READY_LOOKBACK_MS).toISOString();
   const ref: Ref = {
     divisionId,
-    roles: ctx.session?.roles ?? [],
+    roles,
+    email: (ctx.session?.email ?? "").toLowerCase(),
     nowMs: ctx.nowMs,
     todayDate: today(ctx),
   };
+  // The DQ query hides a ready-payment issue only for the division whose ready items this caller sees.
+  const readyDivision = sees.ready && divisionId !== null ? divisionId : -1;
   const dqScopes = divisionId === null ? [0] : [divisionId, 0];
   const none = { results: [] as never[] };
 
@@ -371,7 +495,22 @@ async function todayHandler(ctx: Ctx): Promise<Response> {
           db.prepare(BOOKING_SQL).bind(divisionId),
           db.prepare(BOOKING_COUNT_SQL).bind(divisionId),
         ]),
-    ...dqScopes.flatMap((s) => [db.prepare(DQ_SQL).bind(s), db.prepare(DQ_COUNT_SQL).bind(s)]),
+    ...(divisionId !== null && sees.approval
+      ? [
+          db.prepare(PAYMENT_APPROVAL_SQL).bind(divisionId, ref.email, nowIso),
+          db.prepare(PAYMENT_APPROVAL_COUNT_SQL).bind(divisionId, ref.email, nowIso),
+        ]
+      : []),
+    ...(divisionId !== null && sees.ready
+      ? [
+          db.prepare(PAYMENT_READY_SQL).bind(divisionId, readyCutoff),
+          db.prepare(PAYMENT_READY_COUNT_SQL).bind(divisionId, readyCutoff),
+        ]
+      : []),
+    ...dqScopes.flatMap((s) => [
+      db.prepare(DQ_SQL).bind(s, readyDivision, readyCutoff),
+      db.prepare(DQ_COUNT_SQL).bind(s, readyDivision, readyCutoff),
+    ]),
   ];
   const out = await db.batch<Record<string, unknown>>(stmts);
   let at = 0;
@@ -391,6 +530,24 @@ async function todayHandler(ctx: Ctx): Promise<Response> {
       source("booking", next().results as unknown as BookingRow[], (r) => bookingItem(r, ref)),
     );
     bookingCount = Number(next().results[0]?.["n"] ?? 0);
+  }
+  let paymentApprovalCount = 0;
+  let paymentReadyCount = 0;
+  if (divisionId !== null && sees.approval) {
+    sources.push(
+      source("payment_approval", next().results as unknown as PaymentRow[], (r) =>
+        paymentItem(r, ref, "payment_approval"),
+      ),
+    );
+    paymentApprovalCount = Number(next().results[0]?.["n"] ?? 0);
+  }
+  if (divisionId !== null && sees.ready) {
+    sources.push(
+      source("payment_ready", next().results as unknown as PaymentRow[], (r) =>
+        paymentItem(r, ref, "payment_ready"),
+      ),
+    );
+    paymentReadyCount = Number(next().results[0]?.["n"] ?? 0);
   }
   const dqCountByRule = new Map<string, number>();
   for (let i = 0; i < dqScopes.length; i++) {
@@ -418,6 +575,8 @@ async function todayHandler(ctx: Ctx): Promise<Response> {
     match: matchCount,
     booking: bookingCount + staleCount,
     dq: dqTotal - staleCount,
+    payment_approval: paymentApprovalCount,
+    payment_ready: paymentReadyCount,
   };
   // Exact per kind: a kind is cut when it has more matching rows than were read (the batch is one
   // transaction, so the counts and the rows agree).
@@ -432,7 +591,15 @@ async function todayHandler(ctx: Ctx): Promise<Response> {
     total: TODAY_KINDS.reduce((n, k) => n + counts[k], 0),
     capped: capped.length > 0 || cappedKinds.length > 0,
     cappedKinds,
-    notChecked: divisionId === null ? ["approval", "booking"] : [],
+    notChecked:
+      divisionId === null
+        ? [
+            "approval",
+            "booking",
+            ...(sees.approval ? (["payment_approval"] as const) : []),
+            ...(sees.ready ? (["payment_ready"] as const) : []),
+          ]
+        : [],
     dqLastRun:
       run === undefined
         ? null

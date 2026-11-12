@@ -44,7 +44,14 @@ export function todayResponse(
   items: TodayItemDto[] = [todayItem()],
   over: Partial<TodayResponse> = {},
 ): TodayResponse {
-  const counts = { approval: 0, match: 0, booking: 0, dq: 0 };
+  const counts = {
+    approval: 0,
+    match: 0,
+    booking: 0,
+    dq: 0,
+    payment_approval: 0,
+    payment_ready: 0,
+  };
   for (const i of items) counts[i.kind] += 1;
   return {
     items,

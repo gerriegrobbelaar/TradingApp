@@ -3,6 +3,7 @@
  * (what to insert, refresh, reopen and resolve after a run). No I/O.
  */
 import { BANK_RULES } from "./rules-bank";
+import { PAYMENT_RULES } from "./rules-payments";
 import { RELATION_RULES } from "./rules-relations";
 import { SYSTEM_RULES } from "./rules-system";
 import {
@@ -21,7 +22,12 @@ import {
 /** Bump when a rule's meaning changes; stored with every run. */
 export const DQ_ENGINE_VERSION = "1";
 
-export const DQ_RULES: readonly DqRuleDef[] = [...BANK_RULES, ...RELATION_RULES, ...SYSTEM_RULES];
+export const DQ_RULES: readonly DqRuleDef[] = [
+  ...BANK_RULES,
+  ...RELATION_RULES,
+  ...SYSTEM_RULES,
+  ...PAYMENT_RULES,
+];
 
 const BY_ID = new Map(DQ_RULES.map((r) => [r.id, r] as const));
 

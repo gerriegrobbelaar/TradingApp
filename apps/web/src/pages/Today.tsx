@@ -40,6 +40,8 @@ const KIND_PLURAL: Record<TodayKind, [string, string]> = {
   match: ["suggested match", "suggested matches"],
   booking: ["booking", "bookings"],
   dq: ["data check", "data checks"],
+  payment_approval: ["payment to approve", "payments to approve"],
+  payment_ready: ["payment not sent", "payments not sent"],
 };
 
 const itemId = (i: TodayItemDto): string => i.id;
@@ -91,6 +93,8 @@ function actLabel(i: TodayItemDto): string {
   if (i.issueId !== null && (i.actions.includes("snooze") || i.actions.includes("resolve"))) {
     return "Review";
   }
+  if (i.kind === "payment_approval") return "Review payment";
+  if (i.kind === "payment_ready") return "Open payment";
   return i.kind === "approval" ? "Open approvals" : i.kind === "match" ? "Review match" : "Open";
 }
 

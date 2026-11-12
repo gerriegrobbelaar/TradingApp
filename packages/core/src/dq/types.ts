@@ -51,7 +51,9 @@ export type DqFixTarget =
   | "fx"
   | "ledger"
   | "schedules"
-  | "connections";
+  | "connections"
+  | "payments"
+  | "payment_approvals";
 
 export const DQ_FIX_PATHS: Record<DqFixTarget, string> = {
   bank: "/treasury/bank",
@@ -64,6 +66,9 @@ export const DQ_FIX_PATHS: Record<DqFixTarget, string> = {
   ledger: "/reporting/balance-sheet",
   schedules: "/settings/schedules",
   connections: "/settings/connections",
+  // The Payments views of Phase 9 (P9c): Treasury > Bank, tab Payments; Approvals, tab Payments.
+  payments: "/treasury/bank?tab=payments",
+  payment_approvals: "/purchases/approvals?tab=payments",
 };
 
 /** How a rule's threshold is shaped (and edited). */
@@ -304,6 +309,64 @@ export const DQ_DELIBERATE_SKIP_CODES: readonly string[] = [
   "no_recipients",
 ];
 
+// ---- payments (Phase 9 final review S1, ADR 0053) ----------------------------------------------------
+
+/** A payment or a batch (a batch is one subject; its items are not listed on their own). */
+export type DqPaymentSubjectKind = "payment" | "batch";
+
+export interface DqPaymentSubjectIn {
+  kind: DqPaymentSubjectKind;
+  id: number;
+  amountMinor: number;
+  currency: string;
+  /** When the request entered the state the rule is about (ISO); null = unreadable. */
+  since: string | null;
+  /** The request's own 24 h validity (ISO), or null. */
+  expiresAt: string | null;
+}
+
+export interface DqPaymentAlertIn {
+  kind: DqPaymentSubjectKind;
+  id: number;
+  /** The reconcile result that raised the alert (approved_after_expiry, mismatch, ...). */
+  result: string;
+  alertAt: string | null;
+  amountMinor: number | null;
+  currency: string | null;
+}
+
+export interface DqPaymentUnbookedIn {
+  id: number;
+  amountMinor: number;
+  currency: string;
+  /** When the bank said paid (ISO); null = unreadable. */
+  paidAt: string | null;
+  /** How far the Exact side is: no bank line yet, no match yet, or a match not yet in Exact. */
+  stage: "awaiting_bank_line" | "awaiting_match" | "awaiting_booking";
+}
+
+export type DqPaymentsList =
+  "outcomeUnknown" | "alerts" | "paidNotBooked" | "ready" | "draftsWaiting";
+
+export interface DqPaymentsIn {
+  /** Top-level requests with status outcome_unknown (payments not in a batch, and batches). */
+  outcomeUnknown: DqPaymentSubjectIn[];
+  alerts: DqPaymentAlertIn[];
+  /** Paid at the bank, the Exact side not booked (the rule applies its own number of days). */
+  paidNotBooked: DqPaymentUnbookedIn[];
+  /** Status ready; `since` = when it became ready. */
+  ready: DqPaymentSubjectIn[];
+  /** Submitted drafts waiting for the Revolut app approval; `since` = when submitted. */
+  draftsWaiting: DqPaymentSubjectIn[];
+  /** Days after which an unapproved draft becomes failed (setting payments.draft_expiry_days). */
+  draftExpiryDays: number;
+  switchOn: boolean;
+  /** Requests in flight (pending_approval, ready, submitting, submitted, outcome_unknown). */
+  inFlight: number;
+  /** A list had more rows than the loader reads: its rule reports what it saw but resolves nothing. */
+  capped: Partial<Record<DqPaymentsList, boolean>>;
+}
+
 export interface DqInput {
   nowMs: number;
   /** Per section: why it is null although it could be read (source never synced or stale). */
@@ -334,6 +397,8 @@ export interface DqInput {
   } | null;
   /** Exact calls today for this division; null when unknown. */
   exactBudget: { dailyLimit: number; calls: number; remaining: number | null } | null;
+  /** Payment requests (D1 only; read in the global pass); null when the loader failed. */
+  payments: DqPaymentsIn | null;
 }
 
 /** An input with nothing loaded: every rule reports not_available. Handy for tests. */
@@ -355,5 +420,6 @@ export function emptyInput(nowMs: number, divisionId = 0, baseCurrency = "EUR"):
     webhook: null,
     exactConnection: null,
     exactBudget: null,
+    payments: null,
   };
 }

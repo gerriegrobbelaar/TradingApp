@@ -11,6 +11,7 @@ import {
   severityOfPriority,
   sortToday,
   todayActions,
+  TODAY_KINDS,
   TODAY_PRIORITY,
   type TodayCursor,
 } from "./today";
@@ -172,5 +173,94 @@ describe("review D8c: canonical instants and the capped horizon", () => {
     expect([...p1.page, ...p2.page].map((p) => p.id)).toEqual(["dq:9", "dq:1", "dq:2"]);
     expect(p2.nextCursor).toBeNull();
     expect(cappedHorizon([])).toBeNull();
+  });
+});
+
+describe("F9b: payment kinds (Phase 9 final review S2, ADR 0053)", () => {
+  it("ranks a payment waiting for approval above warnings and below critical issues", () => {
+    expect(TODAY_PRIORITY.paymentApproval).toBeLessThan(TODAY_PRIORITY.dqCritical);
+    expect(TODAY_PRIORITY.paymentApproval).toBeGreaterThan(TODAY_PRIORITY.dqWarning);
+    expect(TODAY_PRIORITY.paymentReady).toBeGreaterThan(TODAY_PRIORITY.dqWarning);
+    expect(TODAY_PRIORITY.paymentReady).toBeLessThan(TODAY_PRIORITY.paymentApproval);
+    expect(severityOfPriority(TODAY_PRIORITY.paymentApproval)).toBe("warning");
+    expect(TODAY_KINDS).toContain("payment_approval");
+    expect(TODAY_KINDS).toContain("payment_ready");
+  });
+
+  it("keeps a total order and stable paging with the new ids, batches included", () => {
+    const t = (d: number) => `2026-01-0${d}T00:00:00.000Z`;
+    const items = [
+      row(TODAY_PRIORITY.paymentApproval, t(1), "payment_approval:12"),
+      row(TODAY_PRIORITY.paymentApproval, t(1), "payment_approval:batch-3"),
+      row(TODAY_PRIORITY.paymentApproval, t(1), "payment_approval:2"),
+      row(TODAY_PRIORITY.paymentApproval, t(2), "payment_approval:1"),
+      row(TODAY_PRIORITY.paymentReady, t(1), "payment_ready:7"),
+      row(TODAY_PRIORITY.paymentReady, null, "payment_ready:batch-1"),
+      row(TODAY_PRIORITY.dqCritical, t(3), "dq:1"),
+      row(TODAY_PRIORITY.dqWarning, t(1), "dq:2"),
+    ];
+    const order = sortToday(items).map((i) => i.id);
+    expect(order).toEqual([
+      "dq:1",
+      "payment_approval:12",
+      "payment_approval:2",
+      "payment_approval:batch-3",
+      "payment_approval:1",
+      "payment_ready:7",
+      "payment_ready:batch-1",
+      "dq:2",
+    ]);
+    for (const size of [1, 2, 3, 5, 8]) {
+      const seen: string[] = [];
+      let cursor: TodayCursor | null = null;
+      for (let guard = 0; guard < 20; guard++) {
+        const { page, nextCursor } = pageToday(items, size, cursor);
+        seen.push(...page.map((i) => i.id));
+        if (nextCursor === null) break;
+        cursor = decodeTodayCursor(nextCursor);
+        expect(cursor, `size ${size}`).not.toBeNull();
+      }
+      expect(seen, `size ${size}`).toEqual(order);
+    }
+  });
+
+  it("round-trips cursors on payment ids and refuses malformed ones", () => {
+    const enc = (id: string) => encodeTodayCursor(row(85, "2026-01-01T00:00:00.000Z", id));
+    for (const id of [
+      "payment_approval:5",
+      "payment_approval:batch-5",
+      "payment_ready:9",
+      "payment_ready:batch-9",
+    ]) {
+      expect(decodeTodayCursor(enc(id))?.id).toBe(id);
+    }
+    for (const bad of [
+      "payment_ready:0",
+      "payment_ready:batch-",
+      "payment_other:1",
+      "payment_approval:batch-0",
+    ]) {
+      expect(decodeTodayCursor(enc(bad)), bad).toBeNull();
+    }
+  });
+
+  it("gives payment actions by role only", () => {
+    expect(todayActions("payment_approval", ["approver"], false)).toEqual(["open"]);
+    expect(todayActions("payment_approval", ["finance", "approver"], false)).toEqual(["open"]);
+    for (const roles of [["finance"], ["admin"], ["viewer"], []] as const) {
+      expect(todayActions("payment_approval", roles, false), roles.join()).toEqual([]);
+    }
+    expect(todayActions("payment_ready", ["finance"], false)).toEqual(["open"]);
+    for (const roles of [["approver"], ["admin"], ["viewer"], []] as const) {
+      expect(todayActions("payment_ready", roles, false), roles.join()).toEqual([]);
+    }
+  });
+
+  it("the capped horizon still cuts across the new kinds", () => {
+    const a = row(85, "2026-01-02T00:00:00.000Z", "payment_approval:4");
+    const b = row(70, "2026-01-01T00:00:00.000Z", "payment_ready:3");
+    expect(cappedHorizon([b, a])?.id).toBe("payment_approval:4");
+    const items = [a, b, row(60, "2026-01-01T00:00:00.000Z", "dq:1")];
+    expect(pageToday(items, 10, null, a).page.map((i) => i.id)).toEqual(["payment_approval:4"]);
   });
 });

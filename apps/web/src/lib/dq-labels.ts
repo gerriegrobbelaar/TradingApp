@@ -39,6 +39,8 @@ export const KIND_LABEL: Record<TodayKind, string> = {
   match: "Match",
   booking: "Booking",
   dq: "Data check",
+  payment_approval: "Payment approval",
+  payment_ready: "Payment ready",
 };
 
 type RuleState = DqRuleStatusDto["status"];

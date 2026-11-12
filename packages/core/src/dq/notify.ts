@@ -7,7 +7,7 @@
  * first.
  */
 import { amsterdamParts } from "../local-time";
-import { DQ_AREAS, SEVERITY_RANK, type DqArea, type DqSeverity } from "./types";
+import { DQ_AREAS, DQ_FIX_PATHS, SEVERITY_RANK, type DqArea, type DqSeverity } from "./types";
 
 // ---- e-mail types (shared by every sender) -------------------------------------------------------------
 
@@ -346,6 +346,9 @@ const field = (s: string): string => oneLine(s, MAX_FIELD_CHARS);
  * plain relative path or "/", so an e-mail can never carry a link to somewhere else.
  */
 export function safeAppPath(p: string): string {
+  // The fix paths of DQ_FIX_PATHS are our own constants; the ones with a tab query (the Payments
+  // tabs, ADR 0053) are kept as they are. Any other query is still refused.
+  if ((Object.values(DQ_FIX_PATHS) as string[]).includes(p)) return p;
   return /^\/(?![/\\])[a-z0-9/_-]*$/i.test(p) ? p : "/";
 }
 const safeBase = (b: string): string => (b !== "" && normalizeBaseUrl(b) === b ? b : "");
