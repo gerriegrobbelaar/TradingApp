@@ -1217,3 +1217,7 @@ pnpm --filter @camelthorn/web dev                          # UI on :5173, proxie
   the optional `screens` job of `.github/workflows/ci.yml`: start it by hand (Actions, CI, Run
   workflow); it never blocks a merge and uploads the screenshots as an artifact (**unverified** on
   GitHub's runners until its first run).
+
+## Today queue and Data health (Phase 8, D8c)
+
+No new migration, secret or variable. `GET /api/today` reads D1 only. The home route is now Today; Data health is at `/data-health` (footer and Overview link). "Later" on the Today queue is stored in the browser only (ADR 0047). The queue shows data issues only after the `dq.checks` job has run (see the data quality section).

@@ -5,6 +5,7 @@ import "./app.css";
 import "./reports.css";
 import "./bank.css";
 import "./matching.css";
+import "./health.css";
 import "./fx.css";
 import "./print.css";
 import { App } from "./App";

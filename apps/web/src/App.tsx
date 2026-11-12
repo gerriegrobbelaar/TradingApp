@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   BrowserRouter,
+  Link,
   Navigate,
   Route,
   Routes,
@@ -14,7 +15,7 @@ import { DivisionProvider } from "./division";
 import { FxProvider } from "./fx";
 import { AppErrorBoundary, PageErrorBoundary } from "./components/PageErrorBoundary";
 import { TopNav } from "./components/TopNav";
-import { PLACEHOLDERS, RENAMED_PATHS } from "./routes";
+import { DATA_HEALTH_PATH, PLACEHOLDERS, RENAMED_PATHS } from "./routes";
 import { ToastProvider, useToast } from "./toasts";
 import { ComingSoon, NotFound } from "./pages/Placeholder";
 import { Approvals } from "./pages/Approvals";
@@ -30,6 +31,8 @@ const BalanceSheet = lazyNamed(() => import("./pages/BalanceSheet"), "BalanceShe
 const ProfitLoss = lazyNamed(() => import("./pages/ProfitLoss"), "ProfitLoss");
 const CreditorsAgeing = lazyNamed(() => import("./pages/AgeingReport"), "CreditorsAgeing");
 const ReceivablesAgeing = lazyNamed(() => import("./pages/AgeingReport"), "ReceivablesAgeing");
+const Today = lazyNamed(() => import("./pages/Today"), "Today");
+const DataHealth = lazyNamed(() => import("./pages/DataHealth"), "DataHealth");
 const Settings = lazyNamed(() => import("./pages/Settings"), "Settings");
 
 /** Sends an old address to its new one, keeping the query (year, period, search). */
@@ -43,6 +46,9 @@ function Footer({ email }: { email: string }) {
   return (
     <footer className="foot-line">
       <span>Signed in as {email}</span>
+      <Link className="btn ghost sm" to={DATA_HEALTH_PATH}>
+        Data health
+      </Link>
       <Button
         size="sm"
         variant="ghost"
@@ -100,7 +106,9 @@ function SignedInShell() {
             <PageErrorBoundary path={pathname}>
               <Lazy resetKey={pathname}>
                 <Routes>
-                  <Route path="/" element={<Navigate to="/overview" replace />} />
+                  <Route path="/" element={<Navigate to="/today" replace />} />
+                  <Route path="/today" element={<Today />} />
+                  <Route path={DATA_HEALTH_PATH} element={<DataHealth />} />
                   <Route path="/overview" element={<Overview />} />
                   <Route path="/invoices" element={<Invoices />} />
                   <Route path="/purchases/payables" element={<Payables />} />

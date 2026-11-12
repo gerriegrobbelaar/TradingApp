@@ -1,0 +1,168 @@
+/* Data health and Today (Phase 8, D8c). Layout only: every colour is a token already checked for
+   text on cards (--ink, --muted, --fill, --hover, --control-line, --accent-text), so the pairs are
+   covered by health-contrast.test.ts. Motion respects prefers-reduced-motion. */
+.app .dq-tiles {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+.app .dq-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  width: 100%;
+  height: 100%;
+  padding: 12px 14px;
+  text-align: left;
+  color: var(--ink);
+  background: var(--fill);
+  border: 1px solid var(--control-line);
+  border-radius: 18px;
+  font: inherit;
+  cursor: pointer;
+}
+.app .dq-tile.static {
+  cursor: default;
+}
+.app .dq-tile:hover {
+  background: var(--hover);
+}
+.app .dq-tile.on {
+  background: var(--hover);
+  border-color: var(--accent-text);
+}
+.app .dq-tile .kpi {
+  font-size: 26px;
+  line-height: 32px;
+}
+.app .dq-tile .cap {
+  color: var(--muted);
+}
+.app .dq-areas-wrap summary {
+  cursor: pointer;
+  padding: 6px 0;
+}
+.app .dq-areas {
+  max-width: 480px;
+}
+.app .dq-state {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 0;
+}
+.app .dq-state .cap,
+.app .dq-sub {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.app .dq-actions,
+.app .dq-form {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+.app .dq-form {
+  flex-direction: column;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+.app .filters .field.inline {
+  display: inline-flex;
+  margin: 0;
+}
+
+/* Today */
+.app .today-summary {
+  margin-bottom: 10px;
+}
+.app .today-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.app .today-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  padding: 12px 14px;
+  color: var(--ink);
+  background: var(--fill);
+  border: 1px solid var(--control-line);
+  border-radius: 18px;
+  cursor: pointer;
+}
+.app .today-item.sel {
+  background: var(--hover);
+  border-color: var(--accent-text);
+}
+.app .today-item.later .today-title {
+  color: var(--muted);
+}
+.app .today-top {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+.app .today-title {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.app .today-sub {
+  grid-column: 1;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.app .today-amt {
+  grid-column: 2;
+  grid-row: 2 / span 2;
+  align-self: center;
+  text-align: right;
+}
+.app .today-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--control-line);
+  border-radius: 18px;
+}
+.app .today-bar-name {
+  flex: 1 1 200px;
+  min-width: 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.app .today-sk {
+  padding: 12px 0;
+}
+@media (max-width: 560px) {
+  .app .today-item {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .app .today-amt {
+    grid-column: 1;
+    grid-row: auto;
+    text-align: left;
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .app .today-item,
+  .app .dq-tile {
+    transition: background-color 0.15s ease;
+  }
+}

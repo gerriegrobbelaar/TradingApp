@@ -23,6 +23,7 @@ import {
 } from "../components/FxTotals";
 import { Money } from "../components/Money";
 import { PageHeader } from "../components/PageHeader";
+import { DATA_HEALTH_PATH } from "../routes";
 import { describeLoadError } from "../lib/errors";
 import { NO_VALUE, formatCount, formatDays, formatMoney } from "../lib/format";
 import { oldestDate, sumInBase, totalsWording } from "../lib/fx";
@@ -322,7 +323,12 @@ export function Overview() {
         title="Overview"
         lede="What customers owe you, what you owe suppliers, and what is late. Every figure opens the items behind it."
         tools={
-          <FreshnessStamp freshness={data?.freshness ?? null} what="Open invoices and bills" />
+          <>
+            <FreshnessStamp freshness={data?.freshness ?? null} what="Open invoices and bills" />
+            <Link className="btn sm" to={DATA_HEALTH_PATH}>
+              Data health
+            </Link>
+          </>
         }
       />
       <FxPageChip

@@ -46,6 +46,7 @@ export function isGroup(i: NavItem): i is Extract<NavItem, { id: string }> {
 
 /** Pages with a real screen. Everything else in the menu is a placeholder. */
 export const BUILT_PAGES: readonly string[] = [
+  "/today",
   "/overview",
   "/invoices",
   "/purchases/payables",
@@ -61,6 +62,12 @@ export const BUILT_PAGES: readonly string[] = [
 export const PLACEHOLDERS: NavLeaf[] = NAV.flatMap((i) => (isGroup(i) ? i.items : [i])).filter(
   (l) => !BUILT_PAGES.includes(l.to),
 );
+
+/**
+ * Data health is not a menu entry (CLAUDE.md 4.8 fixes the menu). It opens from the Overview and
+ * Today headers and from the footer (ADR 0047).
+ */
+export const DATA_HEALTH_PATH = "/data-health";
 
 export function groupLabel(path: string): string | null {
   for (const i of NAV) {

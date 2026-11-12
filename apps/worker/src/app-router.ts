@@ -4,6 +4,7 @@
  */
 import { registerAuthRoutes } from "./auth/routes";
 import { registerDqRoutes } from "./dq/routes";
+import { registerTodayRoutes } from "./today/routes";
 import { registerBookingRoutes } from "./booking/routes";
 import { registerUserRoutes } from "./auth/users-routes";
 import { registerExactRoutes } from "./exact/routes";
@@ -35,6 +36,7 @@ export function buildRouter(): Router {
   registerMatchingRoutes(router);
   registerBookingRoutes(router);
   registerDqRoutes(router);
+  registerTodayRoutes(router);
   registerJobRoutes(router);
   return router;
 }
