@@ -3,7 +3,7 @@
  * data-quality alerts and the daily digest. Administrators only (the tab is not offered to others).
  * The API key is a Workers secret: this screen only learns whether it is set, never its value.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import {
   MAX_ALERTS_LIMIT,
@@ -28,6 +28,8 @@ import { useResource } from "../lib/useResource";
 import { useToast } from "../toasts";
 
 const TEST_WAIT_MS = 60_000;
+/** A server wait longer than this is shown as this (a wrong header must not lock the button for days). */
+const MAX_WAIT_S = 3600;
 
 interface Form {
   enabled: boolean;
@@ -110,10 +112,20 @@ function describeSave(e: unknown): string {
   return "Could not reach the server. Nothing was changed. Try again.";
 }
 
-function describeTest(e: unknown): string {
+/** Whole seconds to wait after a "too soon" answer: the server's value, else 60, at most an hour. */
+export function testWaitSeconds(e: ApiError): number {
+  const s = e.retryAfterSeconds;
+  if (s === undefined || !Number.isInteger(s) || s < 1) return TEST_WAIT_MS / 1000;
+  return s > MAX_WAIT_S ? MAX_WAIT_S : s;
+}
+
+function describeTest(e: unknown, domain: string): string {
   if (e instanceof ApiError) {
     if (e.code === "not_an_allowed_recipient") {
-      return "You are not among the people who receive alerts, so a test cannot be sent to you. Check the recipients setting and your roles.";
+      return `A test goes only to an administrator with an @${domain} address. Yours is not one, so nothing was sent.`;
+    }
+    if (e.code === "too_soon") {
+      return `A test email was sent in the last minute. Wait ${testWaitSeconds(e)} seconds before sending another.`;
     }
     if (e.status >= 500) return "The server could not send the test. Try again.";
     return "Could not send the test. Try again.";
@@ -167,35 +179,50 @@ function Status({ view }: { view: DqNotificationsResponse }) {
   );
 }
 
-function TestEmail({ view, email }: { view: DqNotificationsResponse; email: string }) {
-  const { state, run } = useAction(describeTest);
+function TestEmail({
+  view,
+  email,
+  unsaved,
+}: {
+  view: DqNotificationsResponse;
+  email: string;
+  /** The form above has changes that are not saved: the test would use the saved settings. */
+  unsaved: boolean;
+}) {
+  const domain = view.allowedDomain;
+  const describe = useCallback((e: unknown) => describeTest(e, domain), [domain]);
+  const { state, run } = useAction(describe);
   const [message, setMessage] = useState<string | null>(null);
   const [until, setUntil] = useState(0);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (until <= Date.now()) return;
-    const id = setInterval(() => setNow(Date.now()), 1000);
+    if (until === 0) return;
+    // Ticks once a second and stops as soon as the wait is over.
+    const id = setInterval(() => {
+      const t = Date.now();
+      setNow(t);
+      if (t >= until) clearInterval(id);
+    }, 1000);
     return () => clearInterval(id);
   }, [until]);
   const wait = until > now ? Math.ceil((until - now) / 1000) : 0;
 
   async function send() {
+    if (unsaved || wait > 0) return;
     setMessage(null);
+    // The body is empty on purpose: the server sends with the SAVED settings, never the form's.
     const r = await run(() => sendDqTestEmail());
+    if (r === null) return;
     const t = Date.now();
-    if (r?.ok) {
+    if (r.ok) {
       setMessage(testOutcome(r.value, email));
       if (r.value.status !== "skipped_not_configured") {
         setNow(t);
         setUntil(t + TEST_WAIT_MS);
       }
-    } else if (r && r.error instanceof ApiError && r.error.code === "too_soon") {
-      const s = r.error.retryAfterSeconds ?? TEST_WAIT_MS / 1000;
-      setMessage(
-        `A test email was sent in the last minute. Wait ${s} seconds before sending another.`,
-      );
+    } else if (r.error instanceof ApiError && r.error.code === "too_soon") {
       setNow(t);
-      setUntil(t + s * 1000);
+      setUntil(t + testWaitSeconds(r.error) * 1000);
     }
   }
 
@@ -208,41 +235,64 @@ function TestEmail({ view, email }: { view: DqNotificationsResponse; email: stri
       </p>
       {state.needsStepUp && <StepUpNotice />}
       {state.error && <ErrorLine>{state.error}</ErrorLine>}
-      {message !== null && (
-        <p role="status" className="notice">
-          {message}
-        </p>
-      )}
+      {/* Always in the page so the outcome is announced when it appears. */}
+      <p role="status" className={message !== null ? "notice" : "sr-only"}>
+        {message ?? ""}
+      </p>
       <div className="stack-row">
-        <Button disabled={state.busy || wait > 0 || !view.senderActive} onClick={() => void send()}>
+        <Button
+          disabled={state.busy || wait > 0 || !view.senderActive || unsaved}
+          onClick={() => void send()}
+        >
           Send test email to me
         </Button>
         {wait > 0 && <span className="cap">You can send another in {wait} s.</span>}
         {!view.senderActive && (
           <span className="cap">Set up and save the sender first, with the key set.</span>
         )}
+        {view.senderActive && unsaved && (
+          <span className="cap">
+            Save or discard your changes first. The test uses the saved settings.
+          </span>
+        )}
       </div>
     </Card>
   );
 }
 
+const sameForm = (a: Form, b: Form): boolean =>
+  (Object.keys(a) as (keyof Form)[]).every((k) => a[k] === b[k]);
+
 function SettingsForm({
   view,
   onSaved,
   onConflict,
+  onUnsavedChange,
+  takeFocus,
 }: {
   view: DqNotificationsResponse;
   onSaved: (v: DqNotificationsResponse) => void;
   onConflict: () => void;
+  onUnsavedChange: (unsaved: boolean) => void;
+  /** True once after a save: the new form takes the focus (the old Save button is gone). */
+  takeFocus: () => boolean;
 }) {
   const toast = useToast();
   const [form, setForm] = useState<Form>(() => toForm(view));
-  const [asking, setAsking] = useState(false);
+  /** The host the person was asked about; the confirm saves only if it is still the host. */
+  const [asking, setAsking] = useState<string | null>(null);
   const { state, run, clear } = useAction(describeSave);
   const check = useMemo(() => checkForm(form, view), [form, view]);
   const dirty = check.ok ? Object.keys(check.patch).length > 0 : true;
+  const changed = !sameForm(form, toForm(view));
   const err = check.ok ? {} : check.errors;
   const set = <K extends keyof Form>(k: K, v: Form[K]) => setForm((f) => ({ ...f, [k]: v }));
+  const heading = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    // A new rev mounts a new form; takeFocus is stable and answers true once.
+    if (takeFocus()) heading.current?.focus();
+  }, [takeFocus]);
+  useEffect(() => onUnsavedChange(dirty), [dirty, onUnsavedChange]);
 
   // The key is sent to the host: a new host (or switching sending on) redirects it.
   const redirects =
@@ -251,35 +301,42 @@ function SettingsForm({
     check.host !== "" &&
     ("emailHost" in check.patch || "emailProvider" in check.patch);
 
-  async function save() {
-    if (!check.ok || Object.keys(check.patch).length === 0) return;
+  async function save(confirmedHost: string | null) {
+    if (state.busy || !check.ok || Object.keys(check.patch).length === 0) return;
+    // The key would go to a host nobody confirmed (form changed, or no question asked): ask again.
+    if (redirects && confirmedHost !== check.host) {
+      setAsking(check.host);
+      return;
+    }
     const body = { ...check.patch, rev: view.rev };
     const r = await run(() => patchDqNotifications(body));
     if (r?.ok) {
-      setAsking(false);
+      setAsking(null);
       toast.show("Saved the notification settings.");
       onSaved(r.value);
     } else if (r && !r.ok && r.error instanceof ApiError && r.error.status === 409) {
-      setAsking(false);
+      setAsking(null);
       onConflict();
     }
   }
 
   return (
     <Card>
-      <h2 className="h2">Alerts and sender</h2>
+      <h2 className="h2" ref={heading} tabIndex={-1}>
+        Alerts and sender
+      </h2>
       <p className="lede">
-        Critical data issues are e-mailed as they appear, and a digest goes out every morning. The
-        hour of the digest is set in <Link to="/settings/schedules">Settings, Schedules</Link>.
-        Saving needs a Google sign-in from the last 15 minutes.
+        Critical data issues are emailed as they appear, and a digest goes out every morning. The
+        hour of the digest is set in <Link to="/settings/schedules">Settings, Schedules</Link> (Data
+        quality digest). Saving needs a Google sign-in from the last 15 minutes.
       </p>
       <form
         className="mt-form"
         noValidate
         onSubmit={(e) => {
           e.preventDefault();
-          if (redirects) setAsking(true);
-          else void save();
+          // Enter in a field: never saves a new host without the question.
+          void save(null);
         }}
       >
         <Switch
@@ -293,12 +350,16 @@ function SettingsForm({
             label="Sending"
             options={[
               { value: "disabled" as const, label: "Off" },
-              { value: "https" as const, label: "E-mail API" },
+              { value: "https" as const, label: "Email API" },
             ]}
             value={form.provider}
             onChange={(v) => set("provider", v)}
           />
-          {err.provider && <span className="cap bad">{err.provider}</span>}
+          {err.provider && (
+            <span role="alert" className="cap bad">
+              {err.provider}
+            </span>
+          )}
         </div>
         <label className="field">
           Provider host
@@ -313,14 +374,15 @@ function SettingsForm({
           />
           <span id="nt-host-hint" className={err.host ? "cap bad" : "cap"}>
             {err.host ??
-              "The host name of your transactional e-mail service. The API key is sent to it."}
+              "The host name of your transactional email service. The API key is sent to it."}
           </span>
         </label>
         <label className="field">
           From address
           <input
             className="input"
-            type="email"
+            type="text"
+            inputMode="email"
             autoComplete="off"
             spellCheck={false}
             value={form.from}
@@ -345,7 +407,7 @@ function SettingsForm({
             onChange={(e) => set("baseUrl", e.target.value)}
           />
           <span id="nt-url-hint" className={err.baseUrl ? "cap bad" : "cap"}>
-            {err.baseUrl ?? "Links in e-mails open here. Leave empty to show only the path."}
+            {err.baseUrl ?? "Links in emails open here. Leave empty to show only the path."}
           </span>
         </label>
         <div className="field">
@@ -375,7 +437,7 @@ function SettingsForm({
             onChange={(e) => set("max", e.target.value)}
           />
           <span id="nt-max-hint" className={err.max ? "cap bad" : "cap"}>
-            {err.max ?? "More than this in one run are grouped into one summary e-mail."}
+            {err.max ?? "More than this in one run are grouped into one summary email."}
           </span>
         </label>
         {state.needsStepUp && <StepUpNotice />}
@@ -386,7 +448,7 @@ function SettingsForm({
           </Button>
           <Button
             type="button"
-            disabled={state.busy || !check.ok || !dirty}
+            disabled={state.busy || !changed}
             onClick={() => {
               setForm(toForm(view));
               clear();
@@ -397,20 +459,26 @@ function SettingsForm({
         </div>
       </form>
       <DrillSheet
-        open={asking}
+        open={asking !== null}
         title="Send the API key to this host?"
-        onClose={() => setAsking(false)}
+        onClose={() => setAsking(null)}
       >
         <div className="mt-phrase">
           <p>
-            From now on the e-mail API key will be sent to{" "}
-            <strong>https://{check.ok ? check.host : ""}</strong> with every message. Continue only
-            if you trust that service and it is the one you set the key for.
+            From now on the email API key will be sent to <strong>https://{asking ?? ""}</strong>{" "}
+            with every message. Continue only if you trust that service and it is the one you set
+            the key for.
           </p>
+          {asking !== null && /(^|\.)xn--/.test(asking) && (
+            <p className="notice warn">
+              This host name is written in punycode (xn--), the form of a name with non-Latin
+              letters. Check it letter by letter: such names can look like a known service.
+            </p>
+          )}
           {state.needsStepUp && <StepUpNotice />}
           {state.error && <ErrorLine>{state.error}</ErrorLine>}
           <div className="stack-row">
-            <Button variant="primary" disabled={state.busy} onClick={() => void save()}>
+            <Button variant="primary" disabled={state.busy} onClick={() => void save(asking)}>
               Save and send the key there
             </Button>
           </div>
@@ -428,13 +496,38 @@ export function Notifications({ email }: { email?: string }) {
   const [saved, setSaved] = useState<DqNotificationsResponse | null>(null);
   const [conflict, setConflict] = useState(false);
   const [loadedAt, setLoadedAt] = useState<number | null>(null);
+  const [unsaved, setUnsaved] = useState(false);
+  const unsavedRef = useRef(false);
+  unsavedRef.current = unsaved;
+  const view = saved ?? res.data;
+  const shownRev = useRef<string | null | undefined>(undefined);
   useEffect(() => {
     if (res.data) {
+      // A quiet refresh that brings another rev replaces the form: say so when edits were open.
+      if (
+        shownRev.current !== undefined &&
+        res.data.rev !== shownRev.current &&
+        unsavedRef.current
+      ) {
+        setConflict(true);
+      }
       setSaved(null);
       setLoadedAt(Date.now());
     }
   }, [res.data]);
-  const view = saved ?? res.data;
+  useEffect(() => {
+    if (view) shownRev.current = view.rev;
+  }, [view]);
+  const focusForm = useRef(false);
+  const takeFocus = useCallback(() => {
+    const v = focusForm.current;
+    focusForm.current = false;
+    return v;
+  }, []);
+  const alertRef = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    if (conflict) alertRef.current?.focus();
+  }, [conflict]);
   return (
     <>
       <Card>
@@ -443,7 +536,7 @@ export function Notifications({ email }: { email?: string }) {
           {loadedAt !== null && <Stamp at={loadedAt} />}
         </div>
         {conflict && (
-          <p role="alert" className="notice warn">
+          <p role="alert" className="notice warn" ref={alertRef} tabIndex={-1}>
             Someone else changed these settings first. The form now shows the current values and
             your edits were not saved.
           </p>
@@ -468,16 +561,20 @@ export function Notifications({ email }: { email?: string }) {
             view={view}
             onSaved={(v) => {
               setConflict(false);
+              focusForm.current = true;
+              shownRev.current = v.rev;
               setSaved(v);
               setLoadedAt(Date.now());
             }}
             onConflict={() => {
               setConflict(true);
-              setSaved(null);
-              res.reload();
+              // Quiet: the form stays until the current values are in, then it is replaced.
+              res.refresh();
             }}
+            onUnsavedChange={setUnsaved}
+            takeFocus={takeFocus}
           />
-          <TestEmail view={view} email={email ?? "your address"} />
+          <TestEmail view={view} email={email ?? "your address"} unsaved={unsaved} />
         </>
       )}
     </>

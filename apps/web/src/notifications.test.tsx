@@ -175,7 +175,7 @@ describe("the Notifications tab", () => {
           body: notifications({}, { emailProvider: "disabled", emailHost: "", emailFrom: "" }),
         }),
       });
-      await userEvent.click(screen.getByRole("button", { name: "E-mail API" }));
+      await userEvent.click(screen.getByRole("button", { name: "Email API" }));
       expect(screen.getByText(/Sending needs a host name and a sender address/)).toBeTruthy();
       expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(
         true,
@@ -300,7 +300,11 @@ describe("the test email", () => {
       "POST /api/dq/notifications/test": () => ({ status: 409, body: { error: "too_soon" } }),
     });
     await userEvent.click(screen.getByRole("button", { name: "Send test email to me" }));
-    expect(await screen.findByText(/Wait 60 seconds before sending another/)).toBeTruthy();
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      "A test email was sent in the last minute. Wait 60 seconds before sending another.",
+    );
+    // One sentence, not a generic "try again" next to the wait.
+    expect(screen.queryByText(/Try again/)).toBeNull();
     expect(screen.getByText(/You can send another in/)).toBeTruthy();
   });
 
@@ -313,8 +317,8 @@ describe("the test email", () => {
           : { body: { status: "failed", code: "http_401" } },
     });
     await userEvent.click(screen.getByRole("button", { name: "Send test email to me" }));
-    expect((await screen.findByRole("alert")).textContent).toMatch(
-      /not among the people who receive alerts/,
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      "A test goes only to an administrator with an @camelthorncapital.com address. Yours is not one, so nothing was sent.",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send test email to me" }));
     expect(await screen.findByText(/did not accept the test email \(http 401\)/)).toBeTruthy();

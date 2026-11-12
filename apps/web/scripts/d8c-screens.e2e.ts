@@ -347,6 +347,19 @@ describe("Today and Data health", () => {
             await page.click("[role='dialog'] [role='switch']");
             await page.waitForSelector("[role='dialog'] .notice.warn", { timeout: 5_000 });
           }
+          // Review V2: let sheets, focus rings and toasts finish their transitions first. On a
+          // loaded machine axe otherwise measured a button colour half-way (4.27:1, flaky).
+          await page.evaluate(
+            `Promise.race([
+              Promise.all(
+                document
+                  .getAnimations()
+                  .filter((a) => a.effect?.getComputedTiming().iterations !== Infinity)
+                  .map((a) => a.finished.catch(() => undefined)),
+              ),
+              new Promise((r) => setTimeout(r, 3000)),
+            ])`,
+          );
           const overflow = await page.evaluate<number>(
             () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
           );
@@ -387,6 +400,8 @@ describe("Today keyboard in a real browser", () => {
     expect(await count()).toBe(4);
     await page.keyboard.press("j");
     await page.waitForSelector("[role='option'][aria-selected='true'][id$='dq-4']");
+    // Focus follows in the effect after the selection renders: wait for it (flaky under load).
+    await page.waitForSelector("[role='option'][id$='dq-4']:focus", { timeout: 5_000 });
     expect(await page.evaluate<string>(() => document.activeElement?.id ?? "")).toMatch(/dq-4$/);
     await page.keyboard.press("l");
     await page.waitForSelector(".toast");

@@ -80,7 +80,7 @@ export function Settings() {
       <PageHeader
         eyebrow="Settings"
         title="Settings"
-        lede="Appearance, people, connections, schedules, exchange rates, bank matching and alert e-mails."
+        lede="Appearance, people, connections, schedules, exchange rates, bank matching and alert emails."
       />
       <div className="settings-seg">
         <Segmented
