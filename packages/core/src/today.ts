@@ -46,6 +46,18 @@ export interface TodayResponse {
   total: number;
   /** A source had more rows than one answer reads; the rest show after these are handled. */
   capped: boolean;
+  /** The kinds whose source was cut at the cap (each named on the page). */
+  cappedKinds: TodayKind[];
+  /**
+   * Kinds that were NOT looked at for this answer (no administration chosen: approvals and
+   * bookings). An empty queue never claims these are clear.
+   */
+  notChecked: TodayKind[];
+  /**
+   * The last run of the data checks, or null when they never ran. The queue's data issues are only
+   * as fresh as this; an empty queue with no (or a failed) run is not "all good".
+   */
+  dqLastRun: { status: "ok" | "partial" | "error"; finishedAt: string | null } | null;
   /** False until approval status mapping was verified (ADR 0025): pending approvals may be off. */
   approvalMappingVerified: boolean;
   generatedAt: string;
@@ -118,6 +130,21 @@ export function ageDaysBetween(sinceIso: string | null, nowMs: number): number |
 }
 
 const NO_SINCE = "9999-12-31T23:59:59.999Z";
+const CANONICAL = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+/**
+ * One spelling per instant (`toISOString`, years 0000..9999) or null. The order compares `since`
+ * as text and the cursor carries it, so every source must spell instants the same way: "...33Z"
+ * and "...33.000Z" would sort apart, and a year outside 4 digits would make a cursor we issued
+ * fail to decode.
+ */
+export function canonicalSince(raw: string | null | undefined): string | null {
+  if (raw === null || raw === undefined) return null;
+  const t = Date.parse(raw);
+  if (!Number.isFinite(t)) return null;
+  const iso = new Date(t).toISOString();
+  return CANONICAL.test(iso) ? iso : null;
+}
 const sinceKey = (i: Pick<TodayItemDto, "since">): string => i.since ?? NO_SINCE;
 
 type SortKey = Pick<TodayItemDto, "priority" | "since" | "id">;
@@ -168,7 +195,9 @@ export function decodeTodayCursor(raw: string): TodayCursor | null {
     ) {
       return null;
     }
-    if (typeof since !== "string" || !/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(since)) return null;
+    if (typeof since !== "string" || (since !== NO_SINCE && canonicalSince(since) !== since)) {
+      return null;
+    }
     if (typeof id !== "string" || !ID_RE.test(id)) return null;
     return { priority, since, id };
   } catch {
@@ -186,13 +215,29 @@ export function afterCursor<T extends SortKey>(items: readonly T[], c: TodayCurs
   return items.filter((i) => compareToday(i, key) > 0);
 }
 
-/** Sorts, applies the cursor and cuts one page; `nextCursor` is set when more remain. */
+/**
+ * The last item that can be shown in true queue order when some sources were cut at the cap: the
+ * earliest (in queue order) of the capped sources' last rows. Every source is read in queue order,
+ * so beyond this point a capped source may have rows we did not read that would rank in between.
+ * Null when nothing was capped.
+ */
+export function cappedHorizon<T extends SortKey>(lastOfCapped: readonly T[]): T | null {
+  return sortToday(lastOfCapped)[0] ?? null;
+}
+
+/**
+ * Sorts, applies the cursor and cuts one page; `nextCursor` is set when more remain. With a
+ * `horizon` (see cappedHorizon) nothing after it is served: the list is always a true prefix of
+ * the full queue, never a capped source's first rows followed by lower-ranked rows of others.
+ */
 export function pageToday<T extends SortKey>(
   items: readonly T[],
   limit: number,
   cursor: TodayCursor | null,
+  horizon: SortKey | null = null,
 ): { page: T[]; nextCursor: string | null } {
-  const sorted = sortToday(items);
+  const all = sortToday(items);
+  const sorted = horizon === null ? all : all.filter((i) => compareToday(i, horizon) <= 0);
   const rest = cursor ? afterCursor(sorted, cursor) : sorted;
   const page = rest.slice(0, limit);
   const last = page[page.length - 1];

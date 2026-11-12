@@ -42,6 +42,12 @@ const ALLOWED: [string, string, number, string][] = [
     1,
     "snooze days from a select of fixed integers",
   ],
+  [
+    "./components/dq/IssueSheet.tsx",
+    "Math.*",
+    1,
+    "Math.min keeps the snooze inside the server's 90 days (integer milliseconds)",
+  ],
   ["./components/dq/RuleSheet.tsx", "Number(...)", 1, "an integer threshold typed as digits only"],
   [
     "./pages/Today.tsx",
@@ -112,8 +118,9 @@ describe("health and today sources", () => {
 
   it("builds Fix links only from the fix-path table or the app-path check", () => {
     const today = stripComments(files["./pages/Today.tsx"] as string);
-    expect(today).toMatch(/safeAppPath\(item\.fixPath\)/);
-    expect(today).not.toMatch(/navigate\((?!safeAppPath)/);
+    expect(today).toMatch(/navigate\(todayFixPath\(item\)\)/);
+    expect(today).not.toMatch(/navigate\((?!todayFixPath)/);
+    expect(today).not.toMatch(/safeAppPath|\.fixPath\b/);
     const health = stripComments(files["./pages/DataHealth.tsx"] as string);
     expect(health).toMatch(/to=\{fixPathOf\(r\.fix\)\}/);
     expect(health).not.toMatch(/\.fixPath/);

@@ -1,6 +1,22 @@
 /** Words for the Data health and Today screens (Phase 8, D8c). Sentence case, no exclamation marks. */
-import type { DqArea, DqRuleStatusDto, DqSeverity, TodayKind } from "@camelthorn/core";
+import {
+  DQ_FIX_PATHS,
+  type DqArea,
+  type DqRuleStatusDto,
+  type DqSeverity,
+  type TodayItemDto,
+  type TodayKind,
+} from "@camelthorn/core";
 import { ApiError } from "../api";
+
+/** Checks older than this are called out: the hourly job has not run for a while. */
+export const CHECKS_STALE_HOURS = 3;
+
+/** True when the last finished check run is older than CHECKS_STALE_HOURS (or unreadable). */
+export function checksStale(finishedAt: string | null, nowMs: number = Date.now()): boolean {
+  const at = finishedAt === null ? NaN : Date.parse(finishedAt);
+  return !Number.isFinite(at) || nowMs - at > CHECKS_STALE_HOURS * 3_600_000;
+}
 
 export const AREA_LABEL: Record<DqArea, string> = {
   bank: "Bank",
@@ -111,6 +127,21 @@ export function safeAppPath(p: string): string {
   return /^\/[A-Za-z0-9/_-]*(\?[A-Za-z0-9=&_-]*)?$/.test(p) && !p.startsWith("//")
     ? p
     : "/overview";
+}
+
+/**
+ * Where a queue item's "Fix" or "Open" goes: the screen of DQ_FIX_PATHS for its `fix` key (own
+ * keys only), never a path the server made up. The server's `fixPath` is used only when it IS that
+ * screen with a plain query added (the suggested-matches tab); anything else falls back to the
+ * screen itself, and an unknown key to the Overview.
+ */
+export function todayFixPath(item: Pick<TodayItemDto, "fix" | "fixPath">): string {
+  if (!Object.hasOwn(DQ_FIX_PATHS, item.fix)) return "/overview";
+  const screen = DQ_FIX_PATHS[item.fix];
+  const p = item.fixPath;
+  if (p === screen) return screen;
+  if (p.startsWith(`${screen}?`) && safeAppPath(p) === p) return p;
+  return screen;
 }
 
 export const SNOOZE_CHOICES: readonly { days: number; label: string }[] = [

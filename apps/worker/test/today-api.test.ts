@@ -402,7 +402,7 @@ describe("cost", () => {
       .map((r) => r.detail)
       .join("\n");
 
-  it("uses an index for every query and sorts none of them", async () => {
+  it("uses an index for every query; only the matching rows of a source are sorted", async () => {
     const queries: [string, string, number[]][] = [
       ["approvals", APPROVALS_SQL, [1]],
       ["approvals count", APPROVALS_COUNT_SQL, [1]],
@@ -418,9 +418,6 @@ describe("cost", () => {
       expect(p, name).toMatch(/SEARCH|COVERING INDEX/);
       // A full scan of the big tables would read every row on each visit.
       expect(p, name).not.toMatch(/SCAN (purchase_entries|bank_transactions|dq_issues)\b/);
-      if (name === "approvals" || name === "dq" || name === "matches") {
-        expect(p, name).not.toMatch(/USE TEMP B-TREE FOR ORDER BY/);
-      }
     }
     expect(await plan(APPROVALS_SQL, 1)).toContain("idx_purchase_entries_list");
     expect(await plan(DQ_SQL, 1)).toContain("idx_dq_issues_list");
@@ -457,5 +454,151 @@ describe("cost", () => {
       if (cursor === null) break;
     }
     expect(seen).toBe(TODAY_SOURCE_CAP);
+    expect(r.cappedKinds).toEqual(["approval"]);
+  });
+
+  it("reads a cut source in queue order: the oldest issue is never the one left out", async () => {
+    // Inserted first (lowest id) but waiting longest: a list read newest-id-first would drop it.
+    const oldest = await addIssue({ firstSeen: daysAgo(30), message: "Oldest" });
+    const stmts = [];
+    for (let i = 0; i < TODAY_SOURCE_CAP + 5; i++) {
+      stmts.push(
+        env.DB.prepare(
+          `INSERT INTO dq_issues (division_id, rule_id, fingerprint, area, severity, status, subject, message, fix,
+             payload_json, first_seen_at, last_seen_at)
+           VALUES (?1, 'bank.unmatched_old', ?2, 'bank', 'warning', 'open', 's', 'm', 'bank', '{}', ?3, ?3)`,
+        ).bind(w.divisionId, `bank.unmatched_old:bulk-${i}`, daysAgo(1)),
+      );
+    }
+    // A stale-settlement issue (priority 75) with an id above all of them still ranks first.
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO dq_issues (division_id, rule_id, fingerprint, area, severity, status, subject, message, fix,
+           payload_json, first_seen_at, last_seen_at)
+         VALUES (?1, 'bank.stale_settlements', 'bank.stale_settlements:division', 'bank', 'warning', 'open',
+           'Booking health', '2 booked payments', 'booking', '{}', ?2, ?2)`,
+      ).bind(w.divisionId, daysAgo(0)),
+    );
+    await env.DB.batch(stmts);
+    const r = (await get("admin", "/api/today?limit=50")).body;
+    expect(r.items[0]?.id).toMatch(/^booking:stale-\d+$/);
+    expect(r.items[1]?.id).toBe(`dq:${oldest}`);
+    expect(r.capped).toBe(true);
+    expect(r.cappedKinds).toEqual(["dq"]);
+  });
+
+  it("serves nothing past a cut source's last row, so the queue is a true prefix", async () => {
+    const stmts = [];
+    for (let i = 0; i < TODAY_SOURCE_CAP + 3; i++) {
+      stmts.push(
+        env.DB.prepare(
+          `INSERT INTO dq_issues (division_id, rule_id, fingerprint, area, severity, status, subject, message, fix,
+             payload_json, first_seen_at, last_seen_at)
+           VALUES (?1, 'bank.unmatched_old', ?2, 'bank', 'warning', 'open', 's', 'm', 'bank', '{}', ?3, ?3)`,
+        ).bind(w.divisionId, `bank.unmatched_old:bulk-${i}`, daysAgo(1)),
+      );
+    }
+    await env.DB.batch(stmts);
+    // Lower priority than any warning issue: they must wait until the unread warnings are served.
+    await addEntry({ submittedAt: daysAgo(6) });
+    await suggested("Customer", 90);
+    const kinds: string[] = [];
+    let cursor: string | null = null;
+    for (let guard = 0; guard < 10; guard++) {
+      const p: { body: TodayResponse } = await get(
+        "admin",
+        `/api/today?limit=40${cursor ? `&cursor=${cursor}` : ""}`,
+      );
+      kinds.push(...p.body.items.map((i) => i.kind));
+      cursor = p.body.nextCursor;
+      if (cursor === null) break;
+    }
+    expect(kinds).toHaveLength(TODAY_SOURCE_CAP);
+    expect(new Set(kinds)).toEqual(new Set(["dq"]));
+    const first = (await get("admin")).body;
+    expect(first.counts).toMatchObject({ dq: TODAY_SOURCE_CAP + 3, approval: 1, match: 1 });
+    expect(first.cappedKinds).toEqual(["dq"]);
+  });
+});
+
+describe("honesty and robustness", () => {
+  it("says which kinds were not looked at and whether the data checks ran", async () => {
+    let r = (await get("viewer")).body;
+    expect(r.notChecked).toEqual([]);
+    expect(r.dqLastRun).toBeNull();
+    expect(r.cappedKinds).toEqual([]);
+    await db
+      .prepare(
+        `INSERT INTO dq_runs (started_at, finished_at, status, engine_version)
+         VALUES (?1, ?1, 'error', 'v')`,
+      )
+      .bind(NOW_ISO())
+      .run();
+    r = (await get("viewer")).body;
+    expect(r.dqLastRun?.status).toBe("error");
+    await db.batch([
+      db.prepare("DELETE FROM match_allocations"),
+      db.prepare("DELETE FROM matches"),
+      db.prepare("DELETE FROM bank_account_exact_map"),
+      db.prepare("DELETE FROM relation_bank_accounts"),
+      db.prepare("DELETE FROM open_items"),
+      db.prepare("DELETE FROM sync_state"),
+      db.prepare("DELETE FROM divisions"),
+    ]);
+    r = (await get("viewer")).body;
+    expect(r.notChecked).toEqual(["approval", "booking"]);
+  });
+
+  it("maps an unknown or prototype fix key to a real path", async () => {
+    for (const fix of ["constructor", "toString", "__proto__", "nope"]) {
+      await addIssue({ fix, severity: "critical", message: fix });
+    }
+    const r = (await get("viewer")).body;
+    expect(r.items).toHaveLength(4);
+    for (const i of r.items) {
+      expect(i.fix).toBe("bank");
+      expect(i.fixPath).toBe("/treasury/bank");
+    }
+  });
+
+  it("pages across instants spelled differently and out-of-range years without a bad cursor", async () => {
+    await addEntry({ submittedAt: "+010000-01-01T00:00:00.000Z" });
+    await addEntry({ submittedAt: daysAgo(2) });
+    await suggested("A", 70, "2026-01-05T10:00:00Z");
+    await suggested("B", 70, "2026-01-05T10:00:00.000Z");
+    const got: string[] = [];
+    let cursor: string | null = null;
+    for (let guard = 0; guard < 10; guard++) {
+      const p: { status: number; body: TodayResponse } = await get(
+        "admin",
+        `/api/today?limit=1${cursor ? `&cursor=${cursor}` : ""}`,
+      );
+      expect(p.status).toBe(200);
+      got.push(...p.body.items.map((i) => i.id));
+      for (const i of p.body.items) {
+        if (i.since !== null)
+          expect(i.since).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+      }
+      cursor = p.body.nextCursor;
+      if (cursor === null) break;
+    }
+    expect(got).toHaveLength(4);
+    expect(new Set(got).size).toBe(4);
+  });
+
+  it("does not skip or repeat when an item is handled between pages", async () => {
+    const ids: number[] = [];
+    for (let i = 0; i < 6; i++) ids.push(await addIssue({ firstSeen: daysAgo(10 - i) }));
+    const p1 = (await get("admin", "/api/today?limit=2")).body;
+    expect(p1.items.map((i) => i.id)).toEqual([`dq:${ids[0]}`, `dq:${ids[1]}`]);
+    // Someone resolves the first item and the third before page 2 is read.
+    await db
+      .prepare(
+        "UPDATE dq_issues SET status = 'resolved', resolved_at = ?2, resolved_by = 'x' WHERE id IN (?1, ?3)",
+      )
+      .bind(ids[0], NOW_ISO(), ids[2])
+      .run();
+    const p2 = (await get("admin", `/api/today?limit=2&cursor=${p1.nextCursor}`)).body;
+    expect(p2.items.map((i) => i.id)).toEqual([`dq:${ids[3]}`, `dq:${ids[4]}`]);
   });
 });

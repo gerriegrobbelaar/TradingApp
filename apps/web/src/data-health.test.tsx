@@ -348,7 +348,93 @@ describe("issues", () => {
     renderApp("/data-health");
     await loaded({ emptyIssues: true });
     expect(await screen.findByText("0 open issues.")).toBeTruthy();
-    expect(screen.getByText(/a check that could not run is not a pass/)).toBeTruthy();
+    expect(screen.getByText(/Every check that is switched on ran/)).toBeTruthy();
+  });
+
+  it("review D8c: an empty list with unjudged checks, a failed run or no summary is not 'all good'", async () => {
+    const cases: [string, () => { status?: number; body?: unknown }, RegExp][] = [
+      [
+        "never run",
+        () => ({
+          body: dqSummary({}, { "bank.unmatched_old": { status: "never_run", evaluatedAt: null } }),
+        }),
+        /1 check could not run and is not counted as fine/,
+      ],
+      [
+        "error",
+        () => ({
+          body: dqSummary(
+            {},
+            { "bank.unmatched_old": { status: "error", reason: "evaluator_failed" } },
+          ),
+        }),
+        /1 check could not run/,
+      ],
+      [
+        "run failed",
+        () => {
+          const b = dqSummary();
+          b.lastRun = { ...(b.lastRun as NonNullable<typeof b.lastRun>), status: "error" };
+          return { body: b };
+        },
+        /The last run failed/,
+      ],
+      [
+        "old run",
+        () => {
+          const b = dqSummary();
+          b.lastRun = {
+            ...(b.lastRun as NonNullable<typeof b.lastRun>),
+            finishedAt: ISO(5 * 3_600_000),
+          };
+          return { body: b };
+        },
+        /have not finished in the last 3 hours/,
+      ],
+    ];
+    for (const [name, summary, why] of cases) {
+      mockFetch(
+        base(FINANCE, {
+          "GET /api/dq/summary": summary,
+          "GET /api/dq/issues": () => ({ body: dqIssues([]) }),
+        }),
+      );
+      const r = renderApp("/data-health");
+      expect(
+        await screen.findByText("0 open issues found, but not everything was checked."),
+        name,
+      ).toBeTruthy();
+      expect(screen.getByText(why), name).toBeTruthy();
+      expect(screen.queryByText("0 open issues.")).toBeNull();
+      r.unmount();
+    }
+  });
+
+  it("review D8c: a not-run check counts in the 'could not run' tile", async () => {
+    mockFetch(
+      base(FINANCE, {
+        "GET /api/dq/summary": () => ({
+          body: dqSummary({}, { "bank.unmatched_old": { status: "never_run", evaluatedAt: null } }),
+        }),
+      }),
+    );
+    renderApp("/data-health");
+    await loaded();
+    const tiles = screen.getByRole("list", { name: "Open issues by severity" });
+    expect(within(tiles).getByText(/Check that could not run/)).toBeTruthy();
+  });
+
+  it("review D8c: when the summary fails, the empty list says nothing is known", async () => {
+    mockFetch(
+      base(FINANCE, {
+        "GET /api/dq/summary": () => ({ status: 500, body: { error: "boom" } }),
+        "GET /api/dq/issues": () => ({ body: dqIssues([]) }),
+      }),
+    );
+    renderApp("/data-health");
+    expect(await screen.findByText("0 open issues listed.")).toBeTruthy();
+    expect(screen.getByText(/not known whether the checks ran/)).toBeTruthy();
+    expect(screen.queryByText("No issues, but no check has run yet.")).toBeNull();
   });
 });
 

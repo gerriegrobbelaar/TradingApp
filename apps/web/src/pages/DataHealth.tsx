@@ -24,6 +24,8 @@ import { RuleSheet } from "../components/dq/RuleSheet";
 import { PageHeader } from "../components/PageHeader";
 import {
   AREA_LABEL,
+  CHECKS_STALE_HOURS,
+  checksStale,
   RULE_STATE_LABEL,
   RULE_STATE_TONE,
   SEVERITY_LABEL,
@@ -45,8 +47,7 @@ const isSeverity = (v: string | null): v is DqSeverity =>
 const isArea = (v: string | null): v is DqArea =>
   v !== null && (DQ_AREAS as readonly string[]).includes(v);
 
-/** Checks older than this are called out: the hourly job has not run for a while. */
-export const CHECKS_STALE_HOURS = 3;
+export { CHECKS_STALE_HOURS } from "../lib/dq-labels";
 
 const SEVERITY_TONE: Record<DqSeverity, ChipTone> = {
   critical: "warn",
@@ -65,6 +66,16 @@ function SeverityChip({ s }: { s: DqSeverity }) {
   return <Chip tone={SEVERITY_TONE[s]}>{SEVERITY_LABEL[s]}</Chip>;
 }
 
+/** Rules that were not judged: never counted as fine (a switched-off rule is shown on its own). */
+export const UNCHECKED_STATES: readonly DqRuleStatusDto["status"][] = [
+  "not_available",
+  "not_configured",
+  "error",
+  "never_run",
+];
+const uncheckedCount = (d: DqSummaryResponse): number =>
+  d.rules.filter((r) => UNCHECKED_STATES.includes(r.status)).length;
+
 function Tiles({
   data,
   severity,
@@ -76,9 +87,7 @@ function Tiles({
   onSeverity: (s: DqSeverity | null) => void;
   onSnoozed: () => void;
 }) {
-  const unchecked = data.rules.filter(
-    (r) => r.status === "not_available" || r.status === "not_configured" || r.status === "error",
-  ).length;
+  const unchecked = uncheckedCount(data);
   return (
     <ul className="dq-tiles" aria-label="Open issues by severity">
       {DQ_SEVERITIES.slice()
@@ -192,6 +201,58 @@ function LastRun({ data }: { data: DqSummaryResponse }) {
         </Chip>
       )}
     </div>
+  );
+}
+
+/**
+ * The empty issue list never reads as "all good" unless every check really ran: it names what
+ * could not run, a failed, partial or old run, and says nothing is known when the summary failed.
+ */
+function IssuesEmpty({ sum, filtered }: { sum: DqSummaryResponse | null; filtered: boolean }) {
+  if (filtered) {
+    return (
+      <EmptyState title="No issues match these filters.">
+        Change the filters to see more.
+      </EmptyState>
+    );
+  }
+  if (sum === null) {
+    return (
+      <EmptyState title="0 open issues listed.">
+        The summary of the checks could not be loaded, so it is not known whether the checks ran.
+      </EmptyState>
+    );
+  }
+  const run = sum.lastRun;
+  if (run === null) {
+    return (
+      <EmptyState title="No issues, but no check has run yet.">
+        Nothing here means the data is fine.
+      </EmptyState>
+    );
+  }
+  const unchecked = uncheckedCount(sum);
+  const notes: string[] = [];
+  if (run.status === "error") notes.push("The last run failed.");
+  else if (run.status === "partial") notes.push("The last run was partial.");
+  if (checksStale(run.finishedAt)) {
+    notes.push(`The checks have not finished in the last ${CHECKS_STALE_HOURS} hours.`);
+  }
+  if (unchecked > 0) {
+    notes.push(
+      `${unchecked} ${unchecked === 1 ? "check" : "checks"} could not run and ${unchecked === 1 ? "is" : "are"} not counted as fine.`,
+    );
+  }
+  return (
+    <EmptyState
+      title={
+        notes.length > 0 ? "0 open issues found, but not everything was checked." : "0 open issues."
+      }
+    >
+      {notes.length > 0
+        ? `${notes.join(" ")} See the list of checks below.`
+        : "Every check that is switched on ran. The list of checks below shows what each one looked at."}
+    </EmptyState>
   );
 }
 
@@ -483,19 +544,10 @@ export function DataHealth() {
             ? { errorMessage: describeLoadError(list.error), onRetry: list.reload }
             : {})}
           empty={
-            <EmptyState
-              title={
-                view === "open" && area === null && severity === null
-                  ? sum?.lastRun
-                    ? "0 open issues."
-                    : "No issues, but no check has run yet."
-                  : "No issues match these filters."
-              }
-            >
-              {view === "open" && area === null && severity === null && sum?.lastRun
-                ? "Check the list of checks below: a check that could not run is not a pass."
-                : "Change the filters to see more."}
-            </EmptyState>
+            <IssuesEmpty
+              sum={sum}
+              filtered={view !== "open" || area !== null || severity !== null}
+            />
           }
         />
         <LoadMore

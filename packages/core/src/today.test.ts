@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  canonicalSince,
+  cappedHorizon,
   ageDaysBetween,
   approvalPriority,
   compareToday,
@@ -119,5 +121,56 @@ describe("today ranking", () => {
     expect(ageDaysBetween("2027-01-01T00:00:00Z", now)).toBe(0);
     expect(ageDaysBetween("nope", now)).toBeNull();
     expect(ageDaysBetween(null, now)).toBeNull();
+  });
+});
+
+describe("review D8c: canonical instants and the capped horizon", () => {
+  it("spells every instant one way and drops what a cursor could not carry", () => {
+    expect(canonicalSince("2026-01-05T10:00:00Z")).toBe("2026-01-05T10:00:00.000Z");
+    expect(canonicalSince("2026-01-05T11:00:00+01:00")).toBe("2026-01-05T10:00:00.000Z");
+    expect(canonicalSince("+010000-01-01T00:00:00.000Z")).toBeNull();
+    expect(canonicalSince("nonsense")).toBeNull();
+    expect(canonicalSince(null)).toBeNull();
+    expect(canonicalSince(undefined)).toBeNull();
+  });
+
+  it("issues only cursors it can decode, and refuses non-canonical ones", () => {
+    const c = encodeTodayCursor(row(40, canonicalSince("2026-01-05T10:00:00Z"), "match:1"));
+    expect(decodeTodayCursor(c)).toEqual({
+      priority: 40,
+      since: "2026-01-05T10:00:00.000Z",
+      id: "match:1",
+    });
+    const bad = encodeTodayCursor(row(40, "2026-01-05T10:00:00Z", "match:1"));
+    expect(decodeTodayCursor(bad)).toBeNull();
+    expect(decodeTodayCursor(encodeTodayCursor(row(40, null, "match:1")))).not.toBeNull();
+  });
+
+  it("serves nothing past the earliest last row of a capped source", () => {
+    const capped = [
+      row(60, "2026-01-01T00:00:00.000Z", "dq:1"),
+      row(60, "2026-01-02T00:00:00.000Z", "dq:2"),
+    ];
+    const others = [
+      row(90, "2026-01-09T00:00:00.000Z", "dq:9"),
+      row(60, "2026-01-03T00:00:00.000Z", "dq:3"),
+      row(40, "2026-01-01T00:00:00.000Z", "approval:1"),
+    ];
+    const horizon = cappedHorizon([capped[1]!, row(45, null, "match:7")]);
+    expect(horizon?.id).toBe("dq:2");
+    const { page, nextCursor } = pageToday([...capped, ...others], 50, null, horizon);
+    expect(page.map((p) => p.id)).toEqual(["dq:9", "dq:1", "dq:2"]);
+    expect(nextCursor).toBeNull();
+    // Paging inside the horizon: same items, no repeats.
+    const p1 = pageToday([...capped, ...others], 2, null, horizon);
+    const p2 = pageToday(
+      [...capped, ...others],
+      2,
+      decodeTodayCursor(p1.nextCursor as string),
+      horizon,
+    );
+    expect([...p1.page, ...p2.page].map((p) => p.id)).toEqual(["dq:9", "dq:1", "dq:2"]);
+    expect(p2.nextCursor).toBeNull();
+    expect(cappedHorizon([])).toBeNull();
   });
 });

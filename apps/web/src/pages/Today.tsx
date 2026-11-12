@@ -15,10 +15,17 @@ import { IssueSheet, type IssueChange } from "../components/dq/IssueSheet";
 import { LoadMore } from "../components/DataTable";
 import { Money } from "../components/Money";
 import { PageHeader } from "../components/PageHeader";
-import { KIND_LABEL, SEVERITY_LABEL, safeAppPath } from "../lib/dq-labels";
+import { KIND_LABEL, SEVERITY_LABEL, checksStale, todayFixPath } from "../lib/dq-labels";
 import { describeLoadError } from "../lib/errors";
-import { formatCount, formatDate, formatDateTime, formatDays } from "../lib/format";
-import { laterUntil, readLater, writeLater, type LaterMap } from "../lib/later";
+import { formatAgo, formatCount, formatDate, formatDateTime, formatDays } from "../lib/format";
+import {
+  isPostponed,
+  laterUntil,
+  readLater,
+  writeLater,
+  type LaterEntry,
+  type LaterMap,
+} from "../lib/later";
 import { useCursorList } from "../lib/useCursorList";
 import { useToast } from "../toasts";
 
@@ -38,6 +45,45 @@ const KIND_PLURAL: Record<TodayKind, [string, string]> = {
 const itemId = (i: TodayItemDto): string => i.id;
 const optionId = (id: string): string => `today-opt-${id.replace(/[^a-z0-9-]/gi, "-")}`;
 const TYPING = /^(INPUT|TEXTAREA|SELECT)$/;
+/** Widgets with their own letter and arrow keys: the queue's shortcuts stay out of them. */
+const OWN_KEYS =
+  '[role="menu"],[role="menubar"],[role="combobox"],[role="dialog"],[role="alertdialog"]';
+const SUMMARY_ID = "today-summary-h";
+
+/**
+ * What the answer could not vouch for, as sentences. An empty queue with any of these is not
+ * "nothing to do": it says what was not looked at.
+ */
+function limitsOf(r: TodayResponse, nowMs: number): string[] {
+  const out: string[] = [];
+  if (r.notChecked.length > 0) {
+    out.push(
+      `${r.notChecked.map((k) => KIND_PLURAL[k][1]).join(" and ")} are not included: no administration is chosen.`.replace(
+        /^./,
+        (c) => c.toUpperCase(),
+      ),
+    );
+  }
+  if (r.dqLastRun === null) {
+    out.push("The data checks have not run yet, so data issues are not included.");
+  } else if (r.dqLastRun.status === "error") {
+    out.push("The last data check failed, so data issues may be missing.");
+  } else if (r.dqLastRun.status === "partial") {
+    out.push("The last data check was partial, so some data issues may be missing.");
+  } else if (checksStale(r.dqLastRun.finishedAt, nowMs)) {
+    out.push(
+      r.dqLastRun.finishedAt === null
+        ? "The data checks are still running, so data issues may be out of date."
+        : `The data checks last finished ${formatAgo(r.dqLastRun.finishedAt, nowMs)}, so data issues may be out of date.`,
+    );
+  }
+  if (!r.approvalMappingVerified && !r.notChecked.includes("approval")) {
+    out.push(
+      "The approval status mapping from Exact has not been verified, so the approvals listed may be incomplete or out of date.",
+    );
+  }
+  return out;
+}
 
 /** What pressing A does for an item, in words for the buttons and announcements. */
 function actLabel(i: TodayItemDto): string {
@@ -66,9 +112,9 @@ export function Today() {
   const [later, setLater] = useState<LaterMap>(() => readLater(me.email));
   const [showLater, setShowLater] = useState(false);
   const now = Date.now();
-  const postponed = (i: TodayItemDto): boolean => (later[i.id] ?? 0) > now;
+  const postponed = (i: TodayItemDto): boolean => isPostponed(later, i, now);
   const visible = useMemo(
-    () => list.items.filter((i) => showLater || (later[i.id] ?? 0) <= Date.now()),
+    () => list.items.filter((i) => showLater || !isPostponed(later, i, Date.now())),
     // `later` and the list decide; the clock is read at the moment of filtering.
     [list.items, later, showLater],
   );
@@ -79,8 +125,10 @@ export function Today() {
     visible.find((i) => i.id === selectedId) ?? (visible.length > 0 ? visible[0] : undefined);
   const [sheet, setSheet] = useState<TodayItemDto | null>(null);
   const [said, setSaid] = useState("");
-  const last = useRef<{ id: string; before: number | undefined } | null>(null);
+  const last = useRef<{ id: string; before: LaterEntry | undefined } | null>(null);
   const [undoable, setUndoable] = useState(false);
+  /** After a snooze or resolve the list reloads; focus then goes to the queue (or its heading). */
+  const refocus = useRef<{ after: TodayResponse | null } | null>(null);
 
   const focusOption = useCallback((id: string) => {
     requestAnimationFrame(() => document.getElementById(optionId(id))?.focus());
@@ -95,10 +143,10 @@ export function Today() {
   );
 
   const setLaterFor = useCallback(
-    (id: string, until: number | undefined): boolean => {
+    (id: string, entry: LaterEntry | undefined): boolean => {
       const next = { ...readLater(me.email) };
-      if (until === undefined) delete next[id];
-      else next[id] = until;
+      if (entry === undefined) delete next[id];
+      else next[id] = entry;
       const stored = writeLater(me.email, next);
       setLater(stored ? next : (l) => l);
       return stored;
@@ -121,9 +169,9 @@ export function Today() {
 
   const postpone = useCallback(
     (item: TodayItemDto) => {
-      const before = later[item.id];
+      const before = Object.hasOwn(later, item.id) ? later[item.id] : undefined;
       // Pressing L on a postponed item brings it back.
-      if (before !== undefined && before > Date.now()) {
+      if (isPostponed(later, item)) {
         last.current = null;
         setUndoable(false);
         setLaterFor(item.id, undefined);
@@ -132,16 +180,18 @@ export function Today() {
       }
       const at = visible.findIndex((i) => i.id === item.id);
       const nextItem = visible[at + 1] ?? visible[at - 1];
-      if (!setLaterFor(item.id, laterUntil())) {
+      if (!setLaterFor(item.id, { until: laterUntil(), priority: item.priority })) {
+        // The toast is the announcement (role status); the queue's own live line stays quiet.
         toast.show("Your browser blocked saving this, so the item stays in the queue.");
-        setSaid("Could not postpone. Your browser blocked saving.");
         return;
       }
       last.current = { id: item.id, before };
       setUndoable(true);
-      setSaid(`Postponed until tomorrow: ${item.title}.`);
+      setSaid("");
       toast.show(`Postponed until tomorrow: ${item.title}`, { onUndo: undoLater });
       if (nextItem) select(nextItem.id);
+      // The last item went: focus the heading that now says what is left, never the page body.
+      else requestAnimationFrame(() => document.getElementById(SUMMARY_ID)?.focus());
     },
     [later, visible, setLaterFor, toast, undoLater, select],
   );
@@ -159,7 +209,7 @@ export function Today() {
         setSheet(item);
         return;
       }
-      navigate(safeAppPath(item.fixPath));
+      navigate(todayFixPath(item));
     },
     [navigate],
   );
@@ -172,7 +222,8 @@ export function Today() {
       if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
       const t = e.target;
       if (t instanceof HTMLElement && (TYPING.test(t.tagName) || t.isContentEditable)) return;
-      if (document.querySelector('[role="dialog"]')) return;
+      if (t instanceof Element && t.closest(OWN_KEYS)) return;
+      if (document.querySelector('[role="dialog"],[role="alertdialog"]')) return;
       const {
         visible: v,
         current: cur,
@@ -190,18 +241,22 @@ export function Today() {
       else if (key === "Home" && inList) to = 0;
       else if (key === "End" && inList) to = v.length - 1;
       else if (key === "a" || (key === "Enter" && inList)) {
+        // A held key repeats: one press is one action, never a run of them.
+        if (e.repeat) return;
         if (cur) {
           e.preventDefault();
           doAct(cur);
         }
         return;
       } else if (key === "l") {
+        if (e.repeat) return;
         if (cur) {
           e.preventDefault();
           doLater(cur);
         }
         return;
       } else if (key === "z") {
+        if (e.repeat) return;
         e.preventDefault();
         doUndo();
         return;
@@ -219,19 +274,34 @@ export function Today() {
   const onChanged = (c: IssueChange) => {
     const item = sheet;
     setSheet(null);
+    // The refresh is quiet (the old list stays until the new one is in): wait for a new answer.
+    refocus.current = { after: list.first };
     list.refresh();
     toast.show(
       c.kind === "snoozed"
         ? `Snoozed until ${formatDate(c.until)}${item ? `: ${item.title}` : ""}. It comes back then if it is still true.`
         : `Resolved${item ? `: ${item.title}` : ""}. If the problem is still there, the next check reopens it.`,
     );
-    setSaid(c.kind === "snoozed" ? "Snoozed." : "Resolved.");
   };
+
+  // After a snooze or resolve: once the refreshed list is in, focus the selected item, else the
+  // heading, so a keyboard user is not left on the page body.
+  useEffect(() => {
+    const r = refocus.current;
+    if (r === null || list.status !== "ready" || list.first === r.after) return;
+    refocus.current = null;
+    const target = current ? optionId(current.id) : SUMMARY_ID;
+    requestAnimationFrame(() => {
+      (document.getElementById(target) ?? document.getElementById(SUMMARY_ID))?.focus();
+    });
+  }, [list.first, list.status, current]);
 
   const first = list.first;
   const counts = first?.counts;
   const total = counts ? TODAY_KINDS.reduce((n, k) => n + counts[k], 0) : null;
   const status = list.status === "ready" ? "ready" : list.status === "error" ? "error" : "loading";
+  const limits = first ? limitsOf(first, now) : [];
+  const cappedKinds = first ? first.cappedKinds : [];
 
   return (
     <>
@@ -256,8 +326,12 @@ export function Today() {
       <Card>
         {status === "ready" && counts && total !== null && (
           <div className="today-summary">
-            <h2 className="h2">
-              {total === 0 ? "0 items need you" : `${formatCount(total)} to handle`}
+            <h2 className="h2" id={SUMMARY_ID} tabIndex={-1}>
+              {total === 0
+                ? limits.length > 0
+                  ? "0 items found"
+                  : "0 items need you"
+                : `${formatCount(total)} to handle`}
             </h2>
             <ul className="mt-chips" aria-label="Items by kind">
               {TODAY_KINDS.filter((k) => counts[k] > 0).map((k) => (
@@ -270,17 +344,21 @@ export function Today() {
             </ul>
           </div>
         )}
-        {first && first.capped && (
-          <p className="notice warn" role="status">
-            A lot is waiting. The list shows the oldest items of each kind first; the rest appear as
-            you handle these.
+        {status === "ready" && first && first.capped && (
+          <p className="notice warn">
+            {cappedKinds.length > 0
+              ? `More than 100 ${cappedKinds.map((k) => KIND_PLURAL[k][1]).join(" and ")} are waiting.`
+              : "More than 100 items of one kind are waiting."}{" "}
+            The list shows the most urgent first and stops where the unread ones would come; the
+            rest appear as you handle these.
           </p>
         )}
-        {first && !first.approvalMappingVerified && (first.counts.approval ?? 0) > 0 && (
-          <p className="notice warn" role="status">
-            The approval status mapping from Exact has not been verified, so the approvals listed
-            may be incomplete or out of date.
-          </p>
+        {status === "ready" && limits.length > 0 && (
+          <ul className="notice warn today-limits" aria-label="Not fully checked">
+            {limits.map((l) => (
+              <li key={l}>{l}</li>
+            ))}
+          </ul>
         )}
 
         {status === "error" && (
@@ -300,7 +378,13 @@ export function Today() {
         )}
         {status === "ready" && visible.length === 0 && (
           <EmptyState
-            title={hiddenCount > 0 ? `0 items now. ${hiddenCount} postponed.` : "0 items need you."}
+            title={
+              hiddenCount > 0
+                ? `0 items now. ${hiddenCount} postponed.`
+                : limits.length > 0
+                  ? "0 items found, but not everything was checked."
+                  : "0 items need you."
+            }
             {...(hiddenCount > 0
               ? {
                   action: (
@@ -310,8 +394,10 @@ export function Today() {
               : {})}
           >
             {hiddenCount > 0
-              ? "Postponed items come back by themselves tomorrow."
-              : "No approvals, suggested matches, bookings or data issues are waiting. Data health shows what the checks could not look at."}
+              ? "Postponed items come back by themselves within 24 hours, or at once if they get more urgent."
+              : limits.length > 0
+                ? "See the notes above for what was not looked at. Data health shows every check and what it could not look at."
+                : "No approvals, suggested matches, bookings or data issues are waiting. Data health shows what the checks could not look at."}
           </EmptyState>
         )}
         {status === "ready" && visible.length > 0 && (
@@ -324,8 +410,8 @@ export function Today() {
             >
               {visible.map((i) => {
                 const isCurrent = current?.id === i.id;
-                const later_ = later[i.id];
-                const isPostponed = later_ !== undefined && later_ > now;
+                const later_ = Object.hasOwn(later, i.id) ? later[i.id]?.until : undefined;
+                const hidden = later_ !== undefined && postponed(i);
                 return (
                   <li
                     key={i.id}
@@ -333,7 +419,7 @@ export function Today() {
                     role="option"
                     aria-selected={isCurrent}
                     tabIndex={isCurrent ? 0 : -1}
-                    className={`today-item${isCurrent ? " sel" : ""}${isPostponed ? " later" : ""}`}
+                    className={`today-item${isCurrent ? " sel" : ""}${hidden ? " later" : ""}`}
                     onClick={() => {
                       setSelectedId(i.id);
                     }}
@@ -342,7 +428,7 @@ export function Today() {
                     <span className="today-top">
                       <Chip tone={TONE[i.severity]}>{SEVERITY_LABEL[i.severity]}</Chip>
                       <span className="cap">{KIND_LABEL[i.kind]}</span>
-                      {isPostponed && (
+                      {hidden && later_ !== undefined && (
                         <Chip>Later until {formatDateTime(new Date(later_).toISOString())}</Chip>
                       )}
                     </span>
@@ -406,7 +492,7 @@ export function Today() {
         title={sheet?.title ?? "Issue"}
         {...(sheet?.subtitle ? { subtitle: sheet.subtitle } : {})}
         issueId={sheet?.issueId ?? null}
-        fixPath={safeAppPath(sheet?.fixPath ?? "/overview")}
+        fixPath={sheet ? todayFixPath(sheet) : "/overview"}
         canAct
         onChanged={onChanged}
       />

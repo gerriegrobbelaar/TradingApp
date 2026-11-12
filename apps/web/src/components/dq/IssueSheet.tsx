@@ -12,6 +12,8 @@ export type IssueChange = { kind: "snoozed"; until: string } | { kind: "resolved
 type Mode = "view" | "snooze" | "resolve";
 
 const NOTE_MAX = 200;
+/** Same limit as the server (worker dq/routes MAX_SNOOZE_DAYS). */
+const MAX_SNOOZE_MS = 90 * 86_400_000;
 
 /**
  * One data quality issue: what it is, a Fix link, and (finance and admin) Snooze and Resolve. Both
@@ -60,7 +62,10 @@ export function IssueSheet({
   async function send() {
     if (issueId === null || text === "") return;
     if (mode === "snooze") {
-      const until = new Date(Date.now() + days * 86_400_000).toISOString();
+      // The server refuses more than 90 days from ITS clock; 5 minutes of margin keep a browser
+      // clock that runs a little ahead from turning "90 days" into until_too_far.
+      const span = Math.min(days * 86_400_000, MAX_SNOOZE_MS - 5 * 60_000);
+      const until = new Date(Date.now() + span).toISOString();
       const r = await run(() => snoozeDqIssue(issueId, { until, note: text }));
       if (r?.ok) onChanged({ kind: "snoozed", until });
     } else if (mode === "resolve") {

@@ -84,3 +84,34 @@ describe("tiles, queue items and the action bar keep their contrast", () => {
     }
   }
 });
+
+describe("review D8c: severity chips and the focus ring inside queue items and tiles", () => {
+  // Queue items have no fill (health.css): their chips (packages/ui components.css) sit on the bare
+  // card. A fill under them drops the dark-theme chips below 4.5:1 (measured 3.6 to 4.1), so this
+  // test also guards against a fill coming back.
+  const CHIPS: [string, string][] = [
+    ["--warn-text", "--warn-soft"], // critical
+    ["--gold", "--gold-soft"], // warning
+    ["--muted", "--fill"], // info / neutral
+  ];
+  it("queue items carry no background fill", () => {
+    const item = /\.app \.today-item(\.sel)? \{[^}]*\}/g;
+    for (const block of css.match(item) ?? []) expect(block).not.toMatch(/background/);
+  });
+  for (const [name, t] of SETS) {
+    for (const surface of SURFACES) {
+      for (const [fg, bg] of CHIPS) {
+        it(`${name}: chip ${fg} on ${bg} inside a queue item on ${surface}`, () => {
+          expect(contrastRatio(tok(t, fg), stack(t, [surface, bg]))).toBeGreaterThanOrEqual(4.5);
+        });
+      }
+      it(`${name}: focus ring and selection (--accent-text) are 3:1 on ${surface}, > --fill, > --hover`, () => {
+        for (const back of [[], ["--fill"], ["--hover"]]) {
+          expect(
+            contrastRatio(tok(t, "--accent-text"), stack(t, [surface, ...back])),
+          ).toBeGreaterThanOrEqual(3);
+        }
+      });
+    }
+  }
+});

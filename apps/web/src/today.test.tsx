@@ -147,7 +147,7 @@ describe("Today queue", () => {
     );
     renderApp("/today");
     await queue();
-    expect(screen.getByText(/A lot is waiting/)).toBeTruthy();
+    expect(screen.getByText(/More than 100 items of one kind are waiting/)).toBeTruthy();
     expect(screen.getByText(/has not been verified/)).toBeTruthy();
   });
 });
@@ -266,10 +266,12 @@ describe("Later (this browser only)", () => {
     await waitFor(() => expect(options()).toHaveLength(3));
     const stored = readLater(FINANCE.email);
     expect(Object.keys(stored)).toEqual(["booking:7"]);
-    const until = stored["booking:7"] as number;
+    const until = stored["booking:7"]?.until as number;
+    expect(stored["booking:7"]?.priority).toBe(100);
     expect(until - Date.now()).toBeGreaterThan(23 * 3_600_000);
     expect(until - Date.now()).toBeLessThanOrEqual(24 * 3_600_000);
-    expect(screen.getByTestId("today-live").textContent).toContain("Postponed until tomorrow");
+    // The toast announces it (role status); the queue's own live line stays quiet (no double read).
+    expect(screen.getByTestId("today-live").textContent).toBe("");
     // The toast offers Undo; Z does the same.
     const toast = document.querySelector(".toast") as HTMLElement;
     expect(toast.textContent).toContain("Postponed until tomorrow: 2 days");
@@ -306,8 +308,8 @@ describe("Later (this browser only)", () => {
 
   it("an expired postponement is ignored", async () => {
     localStorage.setItem(
-      `camelthorn.today.later.v1:${FINANCE.email}`,
-      JSON.stringify({ "booking:7": Date.now() - 1000 }),
+      `camelthorn.today.later.v2:${FINANCE.email}`,
+      JSON.stringify({ "booking:7": { u: Date.now() - 1000, p: 100 } }),
     );
     mockFetch(base());
     renderApp("/today");
@@ -317,8 +319,8 @@ describe("Later (this browser only)", () => {
 
   it("is per person: another user's postponements do not hide anything", async () => {
     localStorage.setItem(
-      `camelthorn.today.later.v1:someone@camelthorncapital.com`,
-      JSON.stringify({ "booking:7": Date.now() + 3_600_000 }),
+      `camelthorn.today.later.v2:someone@camelthorncapital.com`,
+      JSON.stringify({ "booking:7": { u: Date.now() + 3_600_000, p: 100 } }),
     );
     mockFetch(base());
     renderApp("/today");
@@ -327,7 +329,7 @@ describe("Later (this browser only)", () => {
   });
 
   it("copes with unreadable storage and with storage that refuses writes", async () => {
-    localStorage.setItem(`camelthorn.today.later.v1:${FINANCE.email}`, "{not json");
+    localStorage.setItem(`camelthorn.today.later.v2:${FINANCE.email}`, "{not json");
     mockFetch(base());
     const user = userEvent.setup();
     renderApp("/today");
@@ -407,7 +409,43 @@ describe("roles", () => {
     const loc = withLocation("/today");
     await queue();
     await user.keyboard("a");
-    await waitFor(() => expect(loc.path).toBe("/overview"));
+    // The screen of its fix key (DQ_FIX_PATHS), never the server's path.
+    await waitFor(() => expect(loc.path).toBe("/treasury/bank"));
+  });
+
+  it("review D8c: an in-app path that is not the item's screen is not followed either", async () => {
+    for (const [fix, fixPath, want] of [
+      ["approvals", "/settings/users", "/purchases/approvals"],
+      [
+        "matching",
+        "/treasury/bank?tab=review&queue=suggested",
+        "/treasury/bank?tab=review&queue=suggested",
+      ],
+      ["constructor", "/treasury/bank", "/overview"],
+    ] as const) {
+      mockFetch(
+        base(FINANCE, {
+          "GET /api/today": () => ({
+            body: todayResponse([
+              todayItem({
+                id: "approval:2",
+                kind: "approval",
+                actions: ["open"],
+                issueId: null,
+                fix: fix as never,
+                fixPath,
+              }),
+            ]),
+          }),
+        }),
+      );
+      const user = userEvent.setup();
+      const loc = withLocation("/today");
+      await queue();
+      await user.keyboard("a");
+      await waitFor(() => expect(loc.path, fix).toBe(want));
+      document.body.innerHTML = "";
+    }
   });
 });
 
@@ -531,5 +569,177 @@ describe("a11y, copy and privacy", () => {
     const links = screen.getAllByRole("link", { name: "Data health" });
     expect(links.every((l) => l.getAttribute("href") === "/data-health")).toBe(true);
     await settle(0);
+  });
+});
+
+describe("review D8c: honesty, Later edge cases and keyboard safety", () => {
+  const KEY = `camelthorn.today.later.v2:${FINANCE.email}`;
+
+  it("an empty queue never says 'need you' when sources were not checked", async () => {
+    for (const over of [
+      { notChecked: ["approval", "booking"] as const },
+      { dqLastRun: null },
+      { dqLastRun: { status: "error" as const, finishedAt: new Date().toISOString() } },
+      { dqLastRun: { status: "partial" as const, finishedAt: new Date().toISOString() } },
+      {
+        dqLastRun: {
+          status: "ok" as const,
+          finishedAt: new Date(Date.now() - 10 * 3_600_000).toISOString(),
+        },
+      },
+      { approvalMappingVerified: false },
+    ]) {
+      mockFetch(
+        base(FINANCE, {
+          "GET /api/today": () => ({
+            body: todayResponse([], over as unknown as Partial<ReturnType<typeof todayResponse>>),
+          }),
+        }),
+      );
+      const r = renderApp("/today");
+      expect(
+        await screen.findByText("0 items found, but not everything was checked."),
+        JSON.stringify(over),
+      ).toBeTruthy();
+      expect(screen.queryByText("0 items need you.")).toBeNull();
+      expect(screen.getByRole("list", { name: "Not fully checked" })).toBeTruthy();
+      r.unmount();
+    }
+  });
+
+  it("names the kinds that were cut at the cap", async () => {
+    mockFetch(
+      base(FINANCE, {
+        "GET /api/today": () => ({
+          body: todayResponse(mixedQueue(), { capped: true, cappedKinds: ["dq", "match"] }),
+        }),
+      }),
+    );
+    renderApp("/today");
+    await queue();
+    expect(
+      screen.getByText(/More than 100 data checks and suggested matches are waiting/),
+    ).toBeTruthy();
+  });
+
+  it("a postponed item comes back at once when it gets more urgent", async () => {
+    localStorage.setItem(
+      KEY,
+      JSON.stringify({
+        "dq:4": { u: Date.now() + 3_600_000, p: 60 },
+        "booking:7": { u: Date.now() + 3_600_000, p: 100 },
+      }),
+    );
+    // dq:4 is now critical (90 > 60): shown. booking:7 is unchanged: hidden.
+    mockFetch(
+      base(FINANCE, {
+        "GET /api/today": () => ({
+          body: todayResponse(
+            mixedQueue().map((i) => (i.id === "dq:4" ? { ...i, priority: 90 } : i)),
+          ),
+        }),
+      }),
+    );
+    renderApp("/today");
+    await queue();
+    const ids = options().map((o) => o.id);
+    expect(ids).toContain("today-opt-dq-4");
+    expect(ids).not.toContain("today-opt-booking-7");
+  });
+
+  it("ignores stored entries that would hide an item for more than a day, or are malformed", async () => {
+    localStorage.setItem(
+      KEY,
+      JSON.stringify({
+        "booking:7": { u: Date.now() + 400 * 86_400_000, p: 100 },
+        "dq:4": 1e15,
+        "approval:3": { u: "soon", p: 40 },
+        "evil:1": { u: Date.now() + 3_600_000, p: 100 },
+      }),
+    );
+    expect(readLater(FINANCE.email)).toEqual({});
+    mockFetch(base());
+    renderApp("/today");
+    await queue();
+    expect(options()).toHaveLength(4);
+  });
+
+  it("a held L key postpones one item, not a run of them", async () => {
+    mockFetch(base());
+    const user = userEvent.setup();
+    renderApp("/today");
+    await queue();
+    await user.keyboard("{l>5/}");
+    await waitFor(() => expect(options()).toHaveLength(3));
+    expect(Object.keys(readLater(FINANCE.email))).toEqual(["booking:7"]);
+  });
+
+  it("letter keys inside a menu do nothing to the queue", async () => {
+    mockFetch(base());
+    renderApp("/today");
+    await queue();
+    const menu = document.createElement("div");
+    menu.setAttribute("role", "menu");
+    const item = document.createElement("button");
+    item.setAttribute("role", "menuitem");
+    menu.appendChild(item);
+    document.body.appendChild(menu);
+    item.focus();
+    item.dispatchEvent(new KeyboardEvent("keydown", { key: "l", bubbles: true }));
+    item.dispatchEvent(new KeyboardEvent("keydown", { key: "j", bubbles: true }));
+    expect(readLater(FINANCE.email)).toEqual({});
+    expect(selectedTitle()).toBe("2 days: booking outcome unknown");
+    menu.remove();
+  });
+
+  it("postponing the last item moves focus to the summary heading, not the page body", async () => {
+    mockFetch(
+      base(FINANCE, {
+        "GET /api/today": () => ({ body: todayResponse([mixedQueue()[0] as never]) }),
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/today");
+    await queue();
+    await user.keyboard("l");
+    await waitFor(() => expect(document.activeElement?.id).toBe("today-summary-h"));
+    expect(screen.getByText("0 items now. 1 postponed.")).toBeTruthy();
+  });
+
+  it("a storage that throws on read still shows the queue", async () => {
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new DOMException("denied", "SecurityError");
+    });
+    mockFetch(base());
+    renderApp("/today");
+    await queue();
+    expect(options()).toHaveLength(4);
+  });
+});
+
+describe("review D8c: snooze limit", () => {
+  it("90 days stays inside the server's 90-day limit and every choice is at most 90 days", async () => {
+    const calls = mockFetch(
+      base(FINANCE, {
+        "GET /api/today": () => ({ body: todayResponse([mixedQueue()[1] as never]) }),
+        "POST /api/dq/issues/4/snooze": () => ({ body: { issue: {} } }),
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/today");
+    await queue();
+    await user.keyboard("a");
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "Snooze" }));
+    const select = within(dialog).getByLabelText("Snooze for") as HTMLSelectElement;
+    const values = Array.from(select.options).map((o) => Number(o.value));
+    expect(Math.max(...values)).toBe(90);
+    await user.selectOptions(select, "90");
+    await user.type(within(dialog).getByLabelText(/Note/), "Known");
+    await user.click(within(dialog).getAllByRole("button", { name: "Snooze" })[0] as HTMLElement);
+    const body = calls.find((c) => c.method === "POST")?.body as { until: string };
+    const ms = Date.parse(body.until) - Date.now();
+    expect(ms).toBeLessThan(90 * 86_400_000 - 60_000);
+    expect(ms).toBeGreaterThan(89.9 * 86_400_000);
   });
 });

@@ -56,7 +56,7 @@ let server: Server;
 let base = "";
 let browser: Browser;
 
-type Scene = "full" | "empty" | "nocheck";
+type Scene = "full" | "empty" | "nocheck" | "limited";
 
 function api(path: string, scene: Scene): unknown {
   switch (path) {
@@ -67,6 +67,14 @@ function api(path: string, scene: Scene): unknown {
     case "/api/fx/rates":
       return fxRates();
     case "/api/today":
+      if (scene === "limited") {
+        // Review D8c: an empty queue that could not vouch for everything says so.
+        return todayResponse([], {
+          dqLastRun: null,
+          approvalMappingVerified: false,
+          notChecked: ["approval", "booking"],
+        });
+      }
       return scene === "empty" ? todayResponse([]) : todayResponse(mixedQueue());
     case "/api/dq/summary":
       return scene === "nocheck"
@@ -204,6 +212,7 @@ const SHOTS: Shot[] = [
     height: 1400,
   },
   { name: "today-empty", path: "/today", scene: "empty", ready: ".empty" },
+  { name: "today-limited", path: "/today", scene: "limited", ready: ".today-limits" },
   {
     name: "health",
     path: "/data-health",

@@ -9,11 +9,15 @@
  *  - bookings that need a person (outbox manual_required, outcome_unknown) and stale settlements;
  *  - open data quality issues, critical and warning, not snoozed.
  *
- * Cost: four index-backed queries, each reads at most CAP + 1 rows, plus four counts. The merge,
- * order (core `pageToday`) and cursor are computed in memory over at most 5 x (CAP + 1) rows, so a
- * page costs the same however deep the cursor is. `capped` says a source had more rows than CAP;
- * handling the first ones reveals the rest. No full IBAN, no email, no free bank text leaves here:
- * only names that Approvals and Bank already show, amounts and codes. Nothing here writes.
+ * Cost: five index-backed queries (approvals, matches, bookings, issues per scope), each reads at
+ * most CAP + 1 rows, plus the counts and the last data check run. Each source is read IN QUEUE
+ * ORDER (the same priority / since / id-as-text rule as core `compareToday`), so its first CAP rows
+ * are its top CAP. The merge, order (core `pageToday`) and cursor are computed in memory over at
+ * most 5 x (CAP + 1) rows, so a page costs the same however deep the cursor is. When a source is
+ * cut, nothing past its last read row is served (core `cappedHorizon`): the queue is always a true
+ * prefix of the full order, and `cappedKinds` names the cut sources; handling the first ones
+ * reveals the rest. No full IBAN, no email, no free bank text leaves here: only names that
+ * Approvals and Bank already show, amounts and codes. Nothing here writes.
  */
 import {
   DQ_FIX_PATHS,
@@ -24,10 +28,13 @@ import {
   TODAY_STALE_SETTLEMENT_RULE,
   ageDaysBetween,
   approvalAgeDays,
+  canonicalSince,
+  cappedHorizon,
   approvalPriority,
   decodeTodayCursor,
   pageToday,
   severityOfPriority,
+  sortToday,
   todayActions,
   type DqFixTarget,
   type DqSeverity,
@@ -88,13 +95,24 @@ interface ApprovalRow {
   submitted_at: string | null;
 }
 
-/** Same ordering expression as the Approvals list, so the index is used (idx_purchase_entries_list). */
+/** No `since` sorts last (core NO_SINCE). */
+const NO_SINCE_SQL = "'9999-12-31T23:59:59.999Z'";
+
+/**
+ * Queue order: `since` (submitted, else the entry date at midnight UTC) ascending, then the id as
+ * text. Priority (late above 3 days) only grows with age, so oldest-first is also priority-first.
+ * The sort runs over the pending entries of one administration only (idx_purchase_entries_list
+ * finds them); stored instants are `toISOString` text (Exact sync), so text order is time order.
+ */
 export const APPROVALS_SQL = `SELECT pe.id, pe.entry_number, pe.relation_name, r.name AS relation_row_name,
     pe.currency, pe.amount_minor, pe.entry_date, pe.submitted_at
   FROM purchase_entries pe
   LEFT JOIN relations r ON r.division_id = pe.division_id AND r.exact_id = pe.relation_id
   WHERE pe.division_id = ?1 AND pe.status = 'pending_approval'
-  ORDER BY COALESCE(pe.entry_date, '0000-01-01') ASC, pe.id ASC LIMIT ${TODAY_SOURCE_CAP + 1}`;
+  ORDER BY COALESCE(pe.submitted_at,
+             CASE WHEN pe.entry_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+                  THEN pe.entry_date || 'T00:00:00.000Z' END, ${NO_SINCE_SQL}) ASC,
+           CAST(pe.id AS TEXT) ASC LIMIT ${TODAY_SOURCE_CAP + 1}`;
 export const APPROVALS_COUNT_SQL =
   "SELECT COUNT(*) AS n FROM purchase_entries WHERE division_id = ?1 AND status = 'pending_approval'";
 
@@ -116,7 +134,7 @@ function approvalItem(r: ApprovalRow, ref: Ref): TodayItemDto {
     subtitle: `${entry} · ${supplier}`,
     severity: severityOfPriority(priority),
     priority,
-    since: r.submitted_at ?? dayStart(r.entry_date),
+    since: canonicalSince(r.submitted_at) ?? dayStart(r.entry_date),
     ageDays: age,
     amountMinor: r.amount_minor,
     currency: r.currency,
@@ -137,13 +155,13 @@ interface MatchRow {
   score: number | null;
 }
 
-/** Rows in id order: idx_bank_tx_match (match_status) gives them without a sort. */
+/** Queue order: oldest bank line first, then the id as text (the sort covers suggested lines only). */
 export const MATCHES_SQL = `SELECT t.id, t.amount_minor, t.currency, t.counterparty_name, a.name AS account_name,
     t.created_at,
     (SELECT s.score FROM match_suggestions s WHERE s.bank_transaction_id = t.id AND s.rank = 1) AS score
   FROM bank_transactions t LEFT JOIN bank_accounts a ON a.id = t.bank_account_id
   WHERE t.match_status = 'suggested' AND t.is_final = 1 AND t.state = 'completed'
-  ORDER BY t.id ASC LIMIT ${TODAY_SOURCE_CAP + 1}`;
+  ORDER BY t.created_at ASC, CAST(t.id AS TEXT) ASC LIMIT ${TODAY_SOURCE_CAP + 1}`;
 export const MATCHES_COUNT_SQL =
   "SELECT COUNT(*) AS n FROM bank_transactions WHERE match_status = 'suggested' AND is_final = 1 AND state = 'completed'";
 
@@ -159,7 +177,7 @@ function matchItem(r: MatchRow, ref: Ref): TodayItemDto {
     subtitle: account ? `${who} · ${account}` : who,
     severity: severityOfPriority(TODAY_PRIORITY.matchSuggested),
     priority: TODAY_PRIORITY.matchSuggested,
-    since: r.created_at,
+    since: canonicalSince(r.created_at),
     ageDays: ageDaysBetween(r.created_at, ref.nowMs),
     amountMinor: r.amount_minor,
     currency: r.currency,
@@ -180,12 +198,14 @@ interface BookingRow {
   currency: string | null;
 }
 
+/** Queue order: unknown outcome (100) before manual (80), then oldest change, then id as text. */
 export const BOOKING_SQL = `SELECT o.id, o.status, o.kind, o.updated_at, o.attempts, t.amount_minor, t.currency
   FROM exact_write_outbox o
   JOIN matches m ON m.id = o.match_id
   LEFT JOIN bank_transactions t ON t.id = m.bank_transaction_id
   WHERE o.status IN ('outcome_unknown', 'manual_required') AND o.division_id = ?1 AND m.undone_at IS NULL
-  ORDER BY o.id ASC LIMIT ${TODAY_SOURCE_CAP + 1}`;
+  ORDER BY CASE o.status WHEN 'outcome_unknown' THEN 0 ELSE 1 END ASC, o.updated_at ASC,
+           CAST(o.id AS TEXT) ASC LIMIT ${TODAY_SOURCE_CAP + 1}`;
 export const BOOKING_COUNT_SQL = `SELECT COUNT(*) AS n FROM exact_write_outbox o JOIN matches m ON m.id = o.match_id
   WHERE o.status IN ('outcome_unknown', 'manual_required') AND o.division_id = ?1 AND m.undone_at IS NULL`;
 
@@ -207,7 +227,7 @@ function bookingItem(r: BookingRow, ref: Ref): TodayItemDto {
     }`,
     severity: severityOfPriority(priority),
     priority,
-    since: r.updated_at,
+    since: canonicalSince(r.updated_at),
     ageDays: age,
     amountMinor: r.amount_minor,
     currency: r.currency,
@@ -231,13 +251,20 @@ interface IssueRow {
 }
 
 const SKIPPED = TODAY_DQ_SKIPPED_RULES.map((r) => `'${r}'`).join(", ");
-/** One query per scope (the division, then the global id 0): idx_dq_issues_list gives the order. */
+/**
+ * One query per scope (the division, then the global id 0), in queue order: the priority of
+ * `issueItem` (stale settlements 75, critical 90, warning 60), then first seen, then id as text.
+ * idx_dq_issues_list finds the open rows of the scope; only those are sorted.
+ */
 export const DQ_SQL = `SELECT i.id, i.rule_id, i.severity, i.subject, i.message, i.fix, i.amount_minor, i.currency,
     i.first_seen_at
   FROM dq_issues i LEFT JOIN dq_rules r ON r.id = i.rule_id
   WHERE i.division_id = ?1 AND i.status = 'open' AND i.severity_rank >= 1 AND COALESCE(r.enabled, 1) = 1
     AND i.rule_id NOT IN (${SKIPPED})
-  ORDER BY i.severity_rank DESC, i.id DESC LIMIT ${TODAY_SOURCE_CAP + 1}`;
+  ORDER BY CASE WHEN i.rule_id = '${TODAY_STALE_SETTLEMENT_RULE}' THEN ${TODAY_PRIORITY.staleSettlements}
+                WHEN i.severity_rank = 2 THEN ${TODAY_PRIORITY.dqCritical}
+                ELSE ${TODAY_PRIORITY.dqWarning} END DESC,
+           i.first_seen_at ASC, CAST(i.id AS TEXT) ASC LIMIT ${TODAY_SOURCE_CAP + 1}`;
 export const DQ_COUNT_SQL = `SELECT i.rule_id AS rule_id, COUNT(*) AS n
   FROM dq_issues i LEFT JOIN dq_rules r ON r.id = i.rule_id
   WHERE i.division_id = ?1 AND i.status = 'open' AND i.severity_rank >= 1 AND COALESCE(r.enabled, 1) = 1
@@ -252,7 +279,8 @@ function issueItem(r: IssueRow, ref: Ref): TodayItemDto {
       ? TODAY_PRIORITY.dqCritical
       : TODAY_PRIORITY.dqWarning;
   const kind: TodayKind = stale ? "booking" : "dq";
-  const fix = (r.fix in DQ_FIX_PATHS ? r.fix : "bank") as DqFixTarget;
+  // Own keys only: `"constructor" in DQ_FIX_PATHS` is true and would make fixPath a function.
+  const fix = (Object.hasOwn(DQ_FIX_PATHS, r.fix) ? r.fix : "bank") as DqFixTarget;
   return {
     kind,
     id: stale ? `booking:stale-${r.id}` : `dq:${r.id}`,
@@ -260,7 +288,7 @@ function issueItem(r: IssueRow, ref: Ref): TodayItemDto {
     subtitle: clean(r.subject),
     severity: severityOfPriority(priority),
     priority,
-    since: r.first_seen_at,
+    since: canonicalSince(r.first_seen_at),
     ageDays: ageDaysBetween(r.first_seen_at, ref.nowMs),
     amountMinor: r.amount_minor,
     currency: r.currency,
@@ -284,6 +312,23 @@ async function divisionOrNone(ctx: Ctx): Promise<number | null> {
   }
 }
 
+export const DQ_LAST_RUN_SQL = "SELECT status, finished_at FROM dq_runs ORDER BY id DESC LIMIT 1";
+
+/** One source as read: its first CAP rows as items, and whether it had more. */
+interface Source {
+  kind: TodayKind;
+  items: TodayItemDto[];
+  capped: boolean;
+}
+
+function source<R>(kind: TodayKind, rows: readonly R[], toItem: (r: R) => TodayItemDto): Source {
+  return {
+    kind,
+    items: rows.slice(0, TODAY_SOURCE_CAP).map(toItem),
+    capped: rows.length > TODAY_SOURCE_CAP,
+  };
+}
+
 async function todayHandler(ctx: Ctx): Promise<Response> {
   const db = ctx.env.DB;
   const q = ctx.url.searchParams;
@@ -304,6 +349,7 @@ async function todayHandler(ctx: Ctx): Promise<Response> {
 
   // One batch: every query in a single round trip to D1.
   const stmts = [
+    db.prepare(DQ_LAST_RUN_SQL),
     db.prepare(MATCHES_SQL),
     db.prepare(MATCHES_COUNT_SQL),
     ...(divisionId === null
@@ -319,42 +365,40 @@ async function todayHandler(ctx: Ctx): Promise<Response> {
   const out = await db.batch<Record<string, unknown>>(stmts);
   let at = 0;
   const next = (): { results: Record<string, unknown>[] } => out[at++] ?? none;
-  const matches = next().results as unknown as MatchRow[];
+  const run = next().results[0] as { status: string; finished_at: string | null } | undefined;
+  const sources: Source[] = [];
+  sources.push(source("match", next().results as unknown as MatchRow[], (r) => matchItem(r, ref)));
   const matchCount = Number(next().results[0]?.["n"] ?? 0);
-  let approvals: ApprovalRow[] = [];
   let approvalCount = 0;
-  let bookings: BookingRow[] = [];
   let bookingCount = 0;
   if (divisionId !== null) {
-    approvals = next().results as unknown as ApprovalRow[];
+    sources.push(
+      source("approval", next().results as unknown as ApprovalRow[], (r) => approvalItem(r, ref)),
+    );
     approvalCount = Number(next().results[0]?.["n"] ?? 0);
-    bookings = next().results as unknown as BookingRow[];
+    sources.push(
+      source("booking", next().results as unknown as BookingRow[], (r) => bookingItem(r, ref)),
+    );
     bookingCount = Number(next().results[0]?.["n"] ?? 0);
   }
-  const issues: IssueRow[] = [];
-  let dqCapped = false;
   const dqCountByRule = new Map<string, number>();
   for (let i = 0; i < dqScopes.length; i++) {
     const rows = next().results as unknown as IssueRow[];
-    if (rows.length > TODAY_SOURCE_CAP) dqCapped = true;
-    issues.push(...rows.slice(0, TODAY_SOURCE_CAP));
+    sources.push(source("dq", rows, (r) => issueItem(r, ref)));
     for (const c of next().results) {
       const rule = String(c["rule_id"]);
       dqCountByRule.set(rule, (dqCountByRule.get(rule) ?? 0) + Number(c["n"]));
     }
   }
 
-  const capped =
-    dqCapped ||
-    matches.length > TODAY_SOURCE_CAP ||
-    approvals.length > TODAY_SOURCE_CAP ||
-    bookings.length > TODAY_SOURCE_CAP;
-  const items: TodayItemDto[] = [
-    ...matches.slice(0, TODAY_SOURCE_CAP).map((r) => matchItem(r, ref)),
-    ...approvals.slice(0, TODAY_SOURCE_CAP).map((r) => approvalItem(r, ref)),
-    ...bookings.slice(0, TODAY_SOURCE_CAP).map((r) => bookingItem(r, ref)),
-    ...issues.map((r) => issueItem(r, ref)),
-  ];
+  const items = sources.flatMap((s) => s.items);
+  const capped = sources.filter((s) => s.capped);
+  const horizon = cappedHorizon(
+    capped.flatMap((s) => {
+      const last = sortToday(s.items).at(-1);
+      return last ? [last] : [];
+    }),
+  );
 
   const staleCount = dqCountByRule.get(TODAY_STALE_SETTLEMENT_RULE) ?? 0;
   const dqTotal = [...dqCountByRule.values()].reduce((a, b) => a + b, 0);
@@ -364,13 +408,27 @@ async function todayHandler(ctx: Ctx): Promise<Response> {
     booking: bookingCount + staleCount,
     dq: dqTotal - staleCount,
   };
-  const { page, nextCursor } = pageToday(items, limit, cursor);
+  // Exact per kind: a kind is cut when it has more matching rows than were read (the batch is one
+  // transaction, so the counts and the rows agree).
+  const read = (k: TodayKind): number => items.filter((i) => i.kind === k).length;
+  const cappedKinds = TODAY_KINDS.filter((k) => counts[k] > read(k));
+  const { page, nextCursor } = pageToday(items, limit, cursor, horizon);
+  const runStatus = run?.status;
   const body: TodayResponse = {
     items: page,
     nextCursor,
     counts,
     total: TODAY_KINDS.reduce((n, k) => n + counts[k], 0),
-    capped,
+    capped: capped.length > 0 || cappedKinds.length > 0,
+    cappedKinds,
+    notChecked: divisionId === null ? ["approval", "booking"] : [],
+    dqLastRun:
+      run === undefined
+        ? null
+        : {
+            status: runStatus === "ok" || runStatus === "partial" ? runStatus : "error",
+            finishedAt: canonicalSince(run.finished_at),
+          },
     approvalMappingVerified: (await readMappingCheck(db)).verified,
     generatedAt: new Date(ctx.nowMs).toISOString(),
   };
