@@ -19,7 +19,8 @@
  * purpose. The sliding window, counters and job budgets are persisted so an eviction does not hand
  * out a fresh budget.
  *
- * Not allowed in this phase: any payment endpoint (request.ts allow-list). Nothing in here logs
+ * Payment endpoints: exactly the five of request.ts (P9b, ADR 0050), writes behind the deploy var,
+ * the D1 switch, the verification mark, the payment lease and the send ledger. Nothing in here logs
  * request bodies, URLs, IBANs or tokens.
  */
 import {
@@ -48,7 +49,7 @@ import {
 import { paymentWritesOpen } from "../payments/gate-flag";
 import { loadRevolutConfig, revolutWebhookUrl } from "./config";
 import { refreshTokens, TokenEndpointError } from "./oauth";
-import { buildUrl, paymentKindOf, validateRequest, versionOf } from "./request";
+import { buildUrl, isDirectPayment, paymentKindOf, validateRequest, versionOf } from "./request";
 import {
   aad,
   environmentOf,
@@ -276,7 +277,7 @@ export class RevolutGate extends GateCore<
 
   /** Switch, mark and lease for a payment write. Throws a typed refusal; sends nothing. */
   async #assertPaymentWrite(req: RevolutRequest): Promise<void> {
-    const flag = await paymentWritesOpen(this.env);
+    const flag = await paymentWritesOpen(this.env, isDirectPayment(req));
     if (!flag.open) {
       throw new RevolutApiError(403, "payments are closed", `payments_${flag.reason}`);
     }

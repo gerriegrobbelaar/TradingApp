@@ -340,6 +340,8 @@ describe("the submit boundary has one caller", () => {
       "../src/payments/preview.ts",
       "../src/payments/protocol-version.ts",
       "../src/payments/tx-match.ts",
+      // review P9b: the pure draft reader (a type import), shared by reconcile and the submitter
+      "../src/payments/draft-state.ts",
     ];
     for (const [f, t] of read(workerFiles).filter(([f]) => f.startsWith("../src/payments/"))) {
       if (!MAY_IMPORT_REVOLUT.includes(f)) {

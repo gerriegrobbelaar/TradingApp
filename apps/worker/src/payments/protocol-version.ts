@@ -17,6 +17,8 @@ import {
   buildPaymentDraft,
   classifyPaymentFailure,
   PAYMENT_JOB_CLASS_RE,
+  REVOLUT_AMOUNT_MAX_MINOR,
+  REVOLUT_AMOUNT_SCALE,
   REVOLUT_NAME_MAX,
   REVOLUT_REFERENCE_MAX,
   RevolutApiError,
@@ -49,6 +51,7 @@ export function paymentsProtocolVersion(): string {
     new RevolutApiError(500, "x"),
     new RevolutApiError(503, "x", "gate_unavailable"),
     new RevolutApiError(200, "x", "PAYMENT_ANSWER_UNREADABLE"),
+    new RevolutApiError(400, "x", "NL91ABNA0417164300"),
   ];
   const classes = (["never_attempted", "attempted", "unreadable"] as const).map((l) =>
     errors.map((e) => classifyPaymentFailure(e, l)),
@@ -67,6 +70,9 @@ export function paymentsProtocolVersion(): string {
       classes,
       REVOLUT_REFERENCE_MAX,
       REVOLUT_NAME_MAX,
+      // review P9b: the amount limits are rules of what is sent
+      REVOLUT_AMOUNT_MAX_MINOR,
+      REVOLUT_AMOUNT_SCALE,
       PAYMENT_JOB_CLASS_RE.source,
       paymentEndpointDescriptor(),
       PAYMENTS_VERIFY_RUNBOOK,

@@ -84,12 +84,18 @@ CREATE TABLE payment_reconcile (
 ) WITHOUT ROWID;
 
 -- An unknown outcome is called "rejected" (nothing was sent) only after a lookup found nothing.
+-- A batch item is looked up as part of its batch (one bulk draft), so for an item the batch's
+-- lookup counts, and only while the batch itself is being moved to `rejected` (review P9b).
 CREATE TRIGGER payments_guard_unknown_reject BEFORE UPDATE OF status ON payments
 WHEN OLD.status = 'outcome_unknown' AND NEW.status = 'rejected'
 BEGIN
   SELECT RAISE(ABORT, 'payment_err:not_looked_up')
   WHERE NOT EXISTS (SELECT 1 FROM payment_reconcile r
-                     WHERE r.subject_kind = 'payment' AND r.subject_id = NEW.id AND r.not_found_checks >= 1);
+                     WHERE r.subject_kind = 'payment' AND r.subject_id = NEW.id AND r.not_found_checks >= 1)
+    AND NOT (OLD.batch_id IS NOT NULL
+             AND EXISTS (SELECT 1 FROM payment_batches b WHERE b.id = OLD.batch_id AND b.status = 'rejected')
+             AND EXISTS (SELECT 1 FROM payment_reconcile r
+                          WHERE r.subject_kind = 'batch' AND r.subject_id = OLD.batch_id AND r.not_found_checks >= 1));
 END;
 CREATE TRIGGER payment_batches_guard_unknown_reject BEFORE UPDATE OF status ON payment_batches
 WHEN OLD.status = 'outcome_unknown' AND NEW.status = 'rejected'

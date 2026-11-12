@@ -14,6 +14,7 @@ import {
   revolutAmount,
   revolutName,
   revolutReference,
+  REVOLUT_AMOUNT_MAX_MINOR,
   REVOLUT_REFERENCE_MAX,
 } from "../src/payments";
 import {
@@ -53,16 +54,33 @@ describe("revolutAmount: the single audited amount function", () => {
     expect(revolutAmount(1, "EUR")).toBe("0.01");
     expect(revolutAmount(5, "EUR")).toBe("0.05");
     expect(revolutAmount(100, "EUR")).toBe("1.00");
-    expect(revolutAmount(1234, "JPY")).toBe("1234");
-    expect(revolutAmount(1234, "KWD")).toBe("1.234");
-    expect(revolutAmount(Number.MAX_SAFE_INTEGER, "EUR")).toBe("90071992547409.91");
+    expect(revolutAmount(99, "EUR")).toBe("0.99");
+    expect(revolutAmount(100_000_000_000_000, "EUR")).toBe("1000000000000.00");
+    expect(revolutAmount(REVOLUT_AMOUNT_MAX_MINOR, "EUR")).toBe("9999999999999.99");
+    expect(revolutAmount(123_456, "USD")).toBe("1234.56");
+  });
+  it("review P9b: never rounds; refuses what a double-parsing receiver could not read exactly", () => {
+    // 1e15 minor units would be 16 significant digits; MAX_SAFE_INTEGER even more
+    expect(() => revolutAmount(REVOLUT_AMOUNT_MAX_MINOR + 1, "EUR")).toThrow(RangeError);
+    expect(() => revolutAmount(1e15, "EUR")).toThrow(RangeError);
+    expect(() => revolutAmount(Number.MAX_SAFE_INTEGER, "EUR")).toThrow(RangeError);
+    // every amount we do send is exact as a double too
+    for (const m of [1, 99, 100, 123_450, 999_999_999_999_999]) {
+      const t = revolutAmount(m, "EUR");
+      expect(Number(t).toFixed(2)).toBe(t);
+    }
+  });
+  it("review P9b: currencies whose scale is not 2 are refused (A3 unverified), never converted", () => {
+    for (const c of ["JPY", "KRW", "KWD", "BHD", "CLF"]) {
+      expect(() => revolutAmount(1234, c)).toThrow(/scale/);
+    }
   });
   it("round-trips through the parser for many values (no float anywhere)", () => {
     let x = 7;
     for (let i = 0; i < 2000; i++) {
       x = (x * 48271) % 2147483647;
       const minor = x * 3 + 1;
-      for (const c of ["EUR", "JPY", "KWD"]) {
+      for (const c of ["EUR", "USD", "GBP"]) {
         expect(parseMinor(revolutAmount(minor, c), currencyScale(c))).toBe(minor);
       }
     }
@@ -332,11 +350,18 @@ describe("client: strict in send, one attempt, no retry", () => {
 
 describe("classification of a failed write", () => {
   const api = (status: number, code?: string) => new RevolutApiError(status, "m", code);
-  it("a local validation error is not executed, whatever the ledger", () => {
-    expect(classifyPaymentFailure(new RangeError("x"), "attempted")).toEqual({
+  it("a local validation error is not executed only when the ledger proves no attempt (review P9b)", () => {
+    expect(classifyPaymentFailure(new RangeError("x"), "never_attempted")).toEqual({
       kind: "not_executed",
       code: "invalid_request",
     });
+    // a RangeError after the call was made says nothing about Revolut: unknown
+    for (const l of ["attempted", "unreadable"] as const) {
+      expect(classifyPaymentFailure(new RangeError("x"), l)).toEqual({
+        kind: "unknown",
+        code: "invalid_after_send",
+      });
+    }
   });
   it("the gate's ledger 'never attempted' proves not executed for ANY error", () => {
     for (const e of [
@@ -369,9 +394,30 @@ describe("classification of a failed write", () => {
       kind: "rejected",
       code: "http_400",
     });
+    // review P9b: a 429 after the call was made is settled by lookup, never assumed "not processed"
     expect(classifyPaymentFailure(new RevolutRateLimitedError(1000), "attempted")).toEqual({
+      kind: "unknown",
+      code: "rate_limited_after_send",
+    });
+    expect(classifyPaymentFailure(new RevolutRateLimitedError(1000), "never_attempted").kind).toBe(
+      "not_executed",
+    );
+  });
+  it("review P9b: a code that looks like an IBAN or account number is never kept", () => {
+    for (const c of [
+      "NL91ABNA0417164300",
+      "nl91abna0417164300",
+      "12345678",
+      "x_DE89370400440532",
+    ]) {
+      expect(classifyPaymentFailure(api(400, c), "attempted")).toEqual({
+        kind: "rejected",
+        code: "http_400",
+      });
+    }
+    expect(classifyPaymentFailure(api(400, "3000"), "attempted")).toEqual({
       kind: "rejected",
-      code: "rate_limited",
+      code: "3000",
     });
   });
   it("after an attempt: 5xx, network, gate_unavailable, an unreadable 200, anything else is unknown", () => {

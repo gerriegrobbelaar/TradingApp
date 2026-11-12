@@ -52,6 +52,14 @@ class FakeClient {
     if (v instanceof Error) throw v;
     return v ?? null;
   }
+  byId = new Map<string, RevolutTransaction | Error>();
+  async getTransaction(id: string): Promise<RevolutTransaction> {
+    this.calls.push(`txid:${id}`);
+    const v = this.byId.get(id);
+    if (v === undefined) throw new RevolutApiError(404, "not found");
+    if (v instanceof Error) throw v;
+    return v;
+  }
   async getPaymentDraft(id: string): Promise<PaymentDraftView> {
     this.calls.push(`draft:${id}`);
     const v = this.drafts.get(id);
@@ -283,9 +291,29 @@ describe("drafts: approval in the Revolut app, lost answers, expiry", () => {
     await run();
     expect((await rowOf(id)).status).toBe("submitted");
     client.drafts.set("draft-1", view("draft-1", "completed", undefined, "tx-9"));
+    // review P9b: the draft's "completed" is checked against the transaction it names
+    client.byId.set("tx-9", txFor("x", "pending", { id: "tx-9" }));
+    await run();
+    expect((await rowOf(id)).status).toBe("submitted");
+    client.byId.set("tx-9", new RevolutApiError(503, "down"));
+    expect(await run()).toMatchObject({ errors: 1 });
+    expect((await rowOf(id)).status).toBe("submitted");
+    client.byId.set("tx-9", txFor("x", "completed", { id: "tx-9", amountMinor: 1 }));
+    expect(await run()).toMatchObject({ alerts: 1 }); // not our amount: never paid
+    expect((await rowOf(id)).status).toBe("submitted");
+    client.byId.set("tx-9", txFor("x", "completed", { id: "tx-9" }));
     await run();
     expect((await rowOf(id)).status).toBe("paid");
     expect(await reconcileRow("payment", id)).toMatchObject({ transaction_id: "tx-9" });
+  });
+
+  it("review P9b: a 'completed' draft whose transaction was declined is failed, not paid", async () => {
+    const id = await readyPayment(w);
+    await toState(id, { kind: "accepted", providerId: "draft-1" });
+    client.drafts.set("draft-1", view("draft-1", "completed", undefined, "tx-9"));
+    client.byId.set("tx-9", txFor("x", "declined", { id: "tx-9" }));
+    await run();
+    expect(await rowOf(id)).toMatchObject({ status: "failed", status_reason: "bank_declined" });
   });
 
   it("a revoked or failed draft -> failed", async () => {

@@ -19,6 +19,7 @@
 import {
   approvalStillValid,
   paymentPayloadHash,
+  verifyCoversMode,
   type PayloadItem,
   type PaymentMode,
 } from "@camelthorn/core";
@@ -277,6 +278,15 @@ export async function runSubmission(
   const items = await loadItems(db, a.kind, a.id);
   const why = await whyNot(db, a.kind, row, items, a.nowMs);
   if (why !== null) return { status: "refused", code: why };
+  // Review P9b: the request's own mode decides the call. A `pay` request made while the setting was
+  // `pay` is refused once the mark no longer covers the pay round trip (a new drafts-only
+  // verification), even if the setting has gone back to drafts meanwhile. The gate checks it too.
+  if (
+    row.mode === "pay" &&
+    (state.verified === null || !verifyCoversMode(state.verified.checks, "pay"))
+  ) {
+    return { status: "refused", code: "pay_mode_not_verified" };
+  }
   // The pre-checks again with today's facts and today's settings (an invoice paid in Exact since, an
   // IBAN changed, a tightened limit), and the stored IBAN still matches the approved fingerprint.
   const again = await recheckBeforeSubmit(db, {

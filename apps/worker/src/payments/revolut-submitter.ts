@@ -33,6 +33,7 @@ import {
   type SendLedger,
 } from "@camelthorn/revolut";
 import { claimIdempotencyKey, completeIdempotencyKey } from "../db/idempotency";
+import { draftIsLive } from "./draft-state";
 import { readSendTargets, type SendTarget } from "./iban-store";
 import { findPayee, recordPayee, type Payee } from "./payees";
 import type { PaymentSubmitter, SubmitOutcome, SubmitRequest } from "./submit";
@@ -65,7 +66,16 @@ const rejected = (code: string): SubmitOutcome => ({ kind: "rejected", code: saf
 const unknown = (): SubmitOutcome => ({ kind: "unknown" });
 
 export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
-  const call = (ledgerKey: string) => ({ lease: deps.lease, ledgerKey });
+  /**
+   * Review P9b: once the submission's deadline passed (the outcome is already `unknown`), the run
+   * that is still going must not start another write. `Promise.race` does not stop it, so every
+   * write asks this first (the gate lease, given back right after, is the second stop).
+   */
+  let pastDeadline = false;
+  const call = (ledgerKey: string) => {
+    if (pastDeadline) throw new RangeError("submission deadline passed: no further writes");
+    return { lease: deps.lease, ledgerKey };
+  };
 
   async function ledgerOf(key: string): Promise<SendLedger> {
     try {
@@ -82,7 +92,10 @@ export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
     const all = await deps.client.listCounterparties();
     for (const c of all) {
       const acc = c.accounts.find((a) => a.iban !== undefined && normalizeIban(a.iban) === want);
-      if (acc) return { counterpartyId: c.id, accountId: acc.id ?? null };
+      // A counterparty with several accounts is used only if we can name OUR account (review P9b).
+      if (acc && (acc.id !== undefined || c.accounts.length === 1)) {
+        return { counterpartyId: c.id, accountId: acc.id ?? null };
+      }
     }
     return null;
   }
@@ -139,6 +152,10 @@ export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
     const want = normalizeIban(t.iban);
     const acc = created.accounts.find((a) => a.iban !== undefined && a.iban === want);
     if (!acc) return { ok: false, code: "counterparty_iban_unconfirmed" };
+    // Review P9b: several accounts and none named: Revolut could pick another account of this payee.
+    if (acc.id === undefined && created.accounts.length > 1) {
+      return { ok: false, code: "counterparty_account_ambiguous" };
+    }
     const payee: Payee = { counterpartyId: created.id, accountId: acc.id ?? null };
     await recordPayee(deps.db, deps.connectionId, t, payee, requestId);
     try {
@@ -261,13 +278,91 @@ export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
       return { kind: "accepted", providerId: d.id };
     } catch (e) {
       const f = classifyPaymentFailure(e, await ledgerOf(req.requestId));
-      if (f.kind === "not_executed" || f.kind === "rejected") {
-        // A draft has no request_id to look up: a refusal by Revolut or a proof of "never sent" stands.
-        return rejected(f.code);
-      }
-      // Duplicate id or unclear: the draft may exist. Find it by its title; exactly one is ours.
-      return (await adoptDraft(req.requestId)) ?? unknown();
+      // Proof of "never sent" (the gate's ledger) stands without a lookup.
+      if (f.kind === "not_executed") return rejected(f.code);
+      // Review P9b: a draft has no request_id, so even a refusal by Revolut is checked against the
+      // draft list by our title before it is believed (A10 is an assumption). Exactly one = ours.
+      const found = await adoptDraft(req.requestId);
+      if (found !== null) return found;
+      if (f.kind === "rejected") return rejected(f.code);
+      return unknown();
     }
+  }
+
+  // ---- earlier attempts for the same invoices (review P9b) ----------------------------------------
+
+  /**
+   * A new request for an invoice whose EARLIER request a person called "not sent"
+   * (`resolved_not_sent`) or whose draft expired here (`draft_expired`) could be a second payment if
+   * the earlier one does exist at Revolut after all (a lookup that missed it, a draft that is still
+   * approvable in the app; A6, A7, A8). Before any write, each such earlier attempt is looked up
+   * again: found and not refused -> this request is refused (`prior_attempt_live`); the lookup fails
+   * -> refused too (`prior_attempt_unchecked`). Read-only; nothing has been sent at this point.
+   */
+  async function priorAttempts(req: SubmitRequest): Promise<string | null> {
+    const ids = req.items.map((i) => i.openItemId);
+    if (ids.length === 0) return null;
+    const own = req.items.map((i) => i.requestId);
+    const marks = ids.map((_, i) => `?${i + 1}`).join(", ");
+    const ownMarks = own.map((_, i) => `?${ids.length + i + 1}`).join(", ");
+    const rows = await deps.db
+      .prepare(
+        `SELECT p.request_id, p.mode, p.provider_id, b.request_id AS batch_request_id,
+                b.provider_id AS batch_provider_id
+           FROM payments p LEFT JOIN payment_batches b ON b.id = p.batch_id
+          WHERE p.open_item_id IN (${marks}) AND p.request_id NOT IN (${ownMarks})
+            AND ((p.status = 'rejected' AND p.status_reason = 'resolved_not_sent')
+              OR (p.status = 'failed' AND p.status_reason = 'draft_expired'))
+          ORDER BY p.id LIMIT 20`,
+      )
+      .bind(...ids, ...own)
+      .all<{
+        request_id: string;
+        mode: string;
+        provider_id: string | null;
+        batch_request_id: string | null;
+        batch_provider_id: string | null;
+      }>();
+    let list: { title?: string; view: Parameters<typeof draftIsLive>[0] }[] | null = null;
+    const seen = new Set<string>();
+    for (const r of rows.results) {
+      const titleId = r.batch_request_id ?? r.request_id;
+      const providerId = r.batch_request_id !== null ? r.batch_provider_id : r.provider_id;
+      const key = `${r.mode}:${titleId}:${r.request_id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      try {
+        if (r.mode === "pay") {
+          const tx = await deps.client.getTransactionByRequestId(r.request_id);
+          if (tx !== null && !["failed", "declined", "reverted"].includes(tx.state)) {
+            return "prior_attempt_live";
+          }
+          continue;
+        }
+        if (providerId !== null) {
+          let view;
+          try {
+            view = await deps.client.getPaymentDraft(providerId);
+          } catch (e) {
+            if ((e as { status?: number } | null)?.status === 404) continue; // gone
+            throw e;
+          }
+          if (draftIsLive(view)) return "prior_attempt_live";
+          continue;
+        }
+        if (list === null) {
+          list = (await deps.client.listPaymentDrafts()).map((v) => ({
+            ...(v.title !== undefined ? { title: v.title } : {}),
+            view: v,
+          }));
+        }
+        const title = draftTitle(titleId);
+        if (list.some((d) => d.title === title && draftIsLive(d.view))) return "prior_attempt_live";
+      } catch {
+        return "prior_attempt_unchecked";
+      }
+    }
+    return null;
   }
 
   async function run(req: SubmitRequest): Promise<SubmitOutcome> {
@@ -292,6 +387,8 @@ export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
     ) {
       return rejected("payload_mismatch");
     }
+    const prior = await priorAttempts(req);
+    if (prior !== null) return rejected(prior);
     const payees = new Map<string, Payee>();
     let index = 0;
     for (const t of targets) {
@@ -313,7 +410,10 @@ export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
       const timeoutMs = deps.timeoutMs ?? SUBMITTER_TIMEOUT_MS;
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timeout = new Promise<SubmitOutcome>((resolve) => {
-        timer = setTimeout(() => resolve(unknown()), timeoutMs);
+        timer = setTimeout(() => {
+          pastDeadline = true;
+          resolve(unknown());
+        }, timeoutMs);
       });
       try {
         return await Promise.race([run(req), timeout]);

@@ -12,7 +12,7 @@
  * Reads of payment state (transaction lookup, draft view) do NOT need this: switching payments off
  * must never blind the reconciliation of what is already in flight.
  */
-import { sameVerifyChecks } from "@camelthorn/core";
+import { sameVerifyChecks, verifyCoversMode } from "@camelthorn/core";
 import { paymentsProtocolVersion } from "./protocol-version";
 
 export const PAYMENTS_EXECUTION_VAR_ON = "on";
@@ -55,14 +55,22 @@ export function parseVerificationMark(raw: string | undefined): VerificationMark
 }
 
 export type GateClosedReason =
-  "execution_off" | "payments_disabled" | "not_verified" | "protocol_changed";
+  "execution_off" | "payments_disabled" | "not_verified" | "protocol_changed" | "pay_not_verified";
 
 export type GateFlag = { open: true } | { open: false; reason: GateClosedReason };
 
-export async function paymentWritesOpen(env: {
-  DB: D1Database;
-  REVOLUT_PAYMENTS_EXECUTION?: string | undefined;
-}): Promise<GateFlag> {
+/**
+ * `forPay`: the request is a `POST /pay` (true one-click payment). Review P9b: the gate then also
+ * needs the mark to cover the pay mode (`sandbox_pay_roundtrip`), so a drafts-only verification can
+ * never let a direct payment through, whatever a caller or a stale `ready` request says.
+ */
+export async function paymentWritesOpen(
+  env: {
+    DB: D1Database;
+    REVOLUT_PAYMENTS_EXECUTION?: string | undefined;
+  },
+  forPay = false,
+): Promise<GateFlag> {
   if (env.REVOLUT_PAYMENTS_EXECUTION !== PAYMENTS_EXECUTION_VAR_ON) {
     return { open: false, reason: "execution_off" };
   }
@@ -75,6 +83,9 @@ export async function paymentWritesOpen(env: {
   if (mark === null) return { open: false, reason: "not_verified" };
   if (mark.protocolVersion !== paymentsProtocolVersion()) {
     return { open: false, reason: "protocol_changed" };
+  }
+  if (forPay && !verifyCoversMode(mark.checks, "pay")) {
+    return { open: false, reason: "pay_not_verified" };
   }
   return { open: true };
 }

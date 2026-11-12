@@ -29,9 +29,12 @@ import {
   type RevolutTransaction,
 } from "@camelthorn/revolut";
 import { auditStatement } from "../db/audit";
+import { interpretDraft } from "./draft-state";
 import { transactionMatchesPayment } from "./tx-match";
 import { markStaleSubmissions } from "./submit";
 import { childMoveStatements, moveStatements, type SubjectKind } from "./transition";
+
+export { interpretDraft, type DraftVerdict } from "./draft-state";
 
 export const DRAFT_EXPIRY_KEY = "payments.draft_expiry_days";
 export const DEFAULT_DRAFT_EXPIRY_DAYS = 5;
@@ -91,44 +94,7 @@ export async function loadDraftExpiryDays(db: D1Database): Promise<number> {
     : DEFAULT_DRAFT_EXPIRY_DAYS;
 }
 
-// ---- reading a draft -------------------------------------------------------------------------
-
-const FAILED_WORDS = new Set([
-  "failed",
-  "declined",
-  "revoked",
-  "cancelled",
-  "canceled",
-  "rejected",
-  "reverted",
-  "deleted",
-]);
-
-export type DraftVerdict =
-  | { kind: "paid"; transactionId: string | null }
-  | { kind: "failed"; code: string }
-  | { kind: "pending" }
-  /** Some payments done and some refused: a person must look. */
-  | { kind: "mixed" };
-
-/** Reads the states of a draft (A-item words). Anything not clearly done or refused is pending. */
-export function interpretDraft(v: PaymentDraftView): DraftVerdict {
-  const states = v.payments.map((p) => p.state ?? v.state ?? "");
-  if (states.length === 0) {
-    const s = v.state ?? "";
-    if (s === "completed") return { kind: "paid", transactionId: null };
-    if (FAILED_WORDS.has(s)) return { kind: "failed", code: s };
-    return { kind: "pending" };
-  }
-  const done = states.filter((s) => s === "completed").length;
-  const bad = states.filter((s) => FAILED_WORDS.has(s));
-  if (done === states.length) {
-    return { kind: "paid", transactionId: v.payments[0]?.transactionId ?? null };
-  }
-  if (bad.length > 0 && done > 0) return { kind: "mixed" };
-  if (bad.length > 0) return { kind: "failed", code: bad[0] ?? "failed" };
-  return { kind: "pending" };
-}
+// ---- reading a draft: draft-state.ts (shared with the submitter's prior-attempt check) ----------
 
 // ---- subjects -----------------------------------------------------------------------------------
 
@@ -378,7 +344,27 @@ async function viaDraft(
     await db.batch([note(db, s, nowIso, "not_found")]);
     return;
   }
-  const verdict = interpretDraft(view);
+  let verdict = interpretDraft(view);
+  if (verdict.kind === "paid" && verdict.transactionIds.length > 0) {
+    // Review P9b: a draft's "completed" (A8) is not taken as the bank's final word when the draft
+    // names its transactions: each one is read, and only `completed` on every one is paid.
+    const bank = await draftTransactionsState(client, s, verdict.transactionIds);
+    if (bank === "error") {
+      sum.errors++;
+      await db.batch([note(db, s, nowIso, "error")]);
+      return;
+    }
+    if (bank === "mismatch") {
+      sum.alerts++;
+      await db.batch([
+        note(db, s, nowIso, "mismatch", { providerState: "completed", alert: true }),
+      ]);
+      return;
+    }
+    if (bank === "pending") verdict = { kind: "pending" };
+    else if (bank === "mixed") verdict = { kind: "mixed" };
+    else if (bank !== "completed") verdict = { kind: "failed", code: bank };
+  }
   if (verdict.kind === "paid") {
     const tx = verdict.transactionId;
     if (
@@ -431,6 +417,47 @@ async function viaDraft(
   await db.batch([note(db, s, nowIso, "pending", { providerState: view.state ?? "pending" })]);
 }
 
+/**
+ * The bank state behind a "completed" draft: `completed` only when every named transaction is
+ * completed (and, for a single payment, is our amount from our account); a refusal state when all
+ * are refused; `mixed` when some are; `pending` otherwise. Read-only.
+ */
+async function draftTransactionsState(
+  client: RevolutClient,
+  s: Subject,
+  ids: string[],
+): Promise<
+  "completed" | "pending" | "mixed" | "error" | "mismatch" | "failed" | "declined" | "reverted"
+> {
+  const states: string[] = [];
+  for (const id of ids.slice(0, 50)) {
+    let tx: RevolutTransaction;
+    try {
+      tx = await client.getTransaction(id);
+    } catch {
+      return "error";
+    }
+    if (
+      s.kind === "payment" &&
+      !transactionMatchesPayment(tx, {
+        requestId: tx.requestId ?? s.requestId,
+        amountMinor: s.amountMinor,
+        currency: s.currency,
+        sourceExternalId: s.sourceExternalId,
+      })
+    ) {
+      return "mismatch";
+    }
+    states.push(tx.state);
+  }
+  const done = states.filter((x) => x === "completed").length;
+  const bad = states.filter((x) => x === "failed" || x === "declined" || x === "reverted");
+  if (done === states.length) return "completed";
+  if (bad.length > 0 && done > 0) return "mixed";
+  if (bad.length === states.length) return bad[0] as "failed" | "declined" | "reverted";
+  return "pending";
+}
+
 // ---- the watch on expired drafts, bank links, reversals -----------------------------------------
 
 async function watchExpiredDrafts(
@@ -440,36 +467,44 @@ async function watchExpiredDrafts(
   sum: ReconcileSummary,
 ): Promise<void> {
   const since = new Date(nowMs - EXPIRED_WATCH_DAYS * 86_400_000).toISOString();
-  const rows = await db
-    .prepare(
-      `SELECT p.id, p.request_id, p.provider_id FROM payments p
-        WHERE p.mode = 'drafts' AND p.status = 'failed' AND p.status_reason = 'draft_expired'
-          AND p.provider_id IS NOT NULL AND p.batch_id IS NULL AND p.updated_at >= ?1
-          AND NOT EXISTS (SELECT 1 FROM payment_reconcile r WHERE r.subject_kind = 'payment'
-                           AND r.subject_id = p.id AND r.last_result = 'approved_after_expiry')
-        ORDER BY p.id LIMIT 20`,
-    )
-    .bind(since)
-    .all<{ id: number; request_id: string; provider_id: string }>();
-  for (const r of rows.results) {
-    try {
-      const v = interpretDraft(await client.getPaymentDraft(r.provider_id));
-      if (v.kind === "paid" || v.kind === "mixed") {
-        const nowIso = new Date(nowMs).toISOString();
-        await db.batch([
-          note(db, { kind: "payment", id: r.id }, nowIso, "approved_after_expiry", { alert: true }),
-          auditStatement(db, {
-            actorEmail: "system",
-            action: "payment.approved_after_expiry",
-            entity: "payment",
-            entityId: r.request_id,
-            after: { providerId: r.provider_id },
-          }),
-        ]);
-        sum.alerts++;
+  // Single payments and (review P9b) bulk drafts of batches: both stay approvable in the app.
+  for (const kind of ["payment", "batch"] as const) {
+    const table = kind === "payment" ? "payments" : "payment_batches";
+    const rows = await db
+      .prepare(
+        `SELECT p.id, p.request_id, p.provider_id FROM ${table} p
+          WHERE p.mode = 'drafts' AND p.status = 'failed' AND p.status_reason = 'draft_expired'
+            AND p.provider_id IS NOT NULL ${kind === "payment" ? "AND p.batch_id IS NULL" : ""}
+            AND p.updated_at >= ?1
+            AND NOT EXISTS (SELECT 1 FROM payment_reconcile r WHERE r.subject_kind = ?2
+                             AND r.subject_id = p.id AND r.last_result = 'approved_after_expiry')
+          ORDER BY p.id LIMIT 20`,
+      )
+      .bind(since, kind)
+      .all<{ id: number; request_id: string; provider_id: string }>();
+    for (const r of rows.results) {
+      try {
+        const v = interpretDraft(await client.getPaymentDraft(r.provider_id));
+        if (v.kind === "paid" || v.kind === "mixed") {
+          const nowIso = new Date(nowMs).toISOString();
+          await db.batch([
+            note(db, { kind, id: r.id }, nowIso, "approved_after_expiry", { alert: true }),
+            auditStatement(db, {
+              actorEmail: "system",
+              action:
+                kind === "payment"
+                  ? "payment.approved_after_expiry"
+                  : "payment_batch.approved_after_expiry",
+              entity: kind === "payment" ? "payment" : "payment_batch",
+              entityId: r.request_id,
+              after: { providerId: r.provider_id },
+            }),
+          ]);
+          sum.alerts++;
+        }
+      } catch {
+        // a draft that is gone is fine; other failures are tried again next run
       }
-    } catch {
-      // a draft that is gone is fine; other failures are tried again next run
     }
   }
 }
@@ -566,10 +601,15 @@ export async function reconcilePayments(deps: ReconcileDeps): Promise<ReconcileS
   const sum = empty();
   await markStaleSubmissions(db, nowMs);
   const subjects = await loadSubjects(db);
+  const since = new Date(nowMs - EXPIRED_WATCH_DAYS * 86_400_000).toISOString();
   const watch = await db
     .prepare(
-      `SELECT 1 AS n FROM payments WHERE status = 'failed' AND status_reason = 'draft_expired' AND provider_id IS NOT NULL LIMIT 1`,
+      `SELECT 1 AS n WHERE EXISTS (SELECT 1 FROM payments WHERE status = 'failed' AND status_reason = 'draft_expired'
+                                     AND provider_id IS NOT NULL AND batch_id IS NULL AND updated_at >= ?1)
+                         OR EXISTS (SELECT 1 FROM payment_batches WHERE status = 'failed' AND status_reason = 'draft_expired'
+                                     AND provider_id IS NOT NULL AND updated_at >= ?1)`,
     )
+    .bind(since)
     .first();
   if (subjects.length > 0 || watch !== null) {
     const client = await deps.client();
@@ -627,6 +667,12 @@ export async function resolveNotSent(
   }
   if (a.nowMs - Date.parse(s.updated_at) < NOT_FOUND_MIN_AGE_MS) {
     return { ok: false, code: "too_soon" };
+  }
+  // Review P9b: the "not found" must come from a lookup made at least NOT_FOUND_MIN_AGE_MS after the
+  // request became unknown (A6: a transfer can show up late); an early "not found" that is still
+  // fresh is not enough.
+  if (Date.parse(s.last_checked_at) - Date.parse(s.updated_at) < NOT_FOUND_MIN_AGE_MS) {
+    return { ok: false, code: "lookup_too_early" };
   }
   const nowIso = new Date(a.nowMs).toISOString();
   const move = {

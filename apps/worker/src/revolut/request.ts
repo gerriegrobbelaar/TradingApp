@@ -170,6 +170,14 @@ export function paymentKindOf(req: RevolutRequest): "write" | "read" | null {
   return entry?.payment ?? null;
 }
 
+/**
+ * True for the direct-payment write (`POST /pay`, Company plan). The gate needs the verification
+ * mark to cover the pay mode for it (review P9b); drafts and payees do not.
+ */
+export function isDirectPayment(req: RevolutRequest): boolean {
+  return paymentKindOf(req) === "write" && req.path === "/pay";
+}
+
 /** The API version of a request (default 1.0). */
 export const versionOf = (req: Pick<RevolutRequest, "apiVersion">): "1.0" | "2.0" =>
   req.apiVersion ?? "1.0";
@@ -206,6 +214,8 @@ export function validateRequest(req: RevolutRequest): void {
       if (typeof req.paymentRef !== "string" || !JOB_ID_RE.test(req.paymentRef)) {
         throw bad("payment_ref");
       }
+      // Review P9b: the body is the whole instruction; a query string could carry another one.
+      if (req.query !== undefined && Object.keys(req.query).length > 0) throw bad("payment_query");
       checkPaymentBody(req);
     } else if (req.paymentLease !== undefined || req.paymentRef !== undefined) {
       throw bad("payment_lease");

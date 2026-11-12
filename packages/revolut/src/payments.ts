@@ -45,6 +45,10 @@ export const REVOLUT_REFERENCE_MAX = 140;
 /** A-ITEM: longest counterparty name we send (the SEPA creditor name limit is 70). */
 export const REVOLUT_NAME_MAX = 70;
 export const REVOLUT_DRAFT_MAX_PAYMENTS = 50;
+/** The one decimal scale we send (review P9b): EUR and the other 2-decimal currencies only. */
+export const REVOLUT_AMOUNT_SCALE = 2;
+/** 15 significant digits: the largest amount a double-parsing receiver still reads exactly. */
+export const REVOLUT_AMOUNT_MAX_MINOR = 999_999_999_999_999;
 
 const REVOLUT_ID_RE =
   /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
@@ -63,8 +67,15 @@ export function revolutAmount(minor: number, currency: string): string {
   if (typeof minor !== "number" || !Number.isSafeInteger(minor) || minor < 1) {
     throw invalid("amount must be a positive safe integer of minor units");
   }
+  // Review P9b: the amount travels as a JSON NUMBER (A3). A receiver that parses it as a double keeps
+  // it exact only up to 15 significant digits, so anything longer is refused rather than risked.
+  if (minor > REVOLUT_AMOUNT_MAX_MINOR) throw invalid("amount above the sendable maximum");
   if (typeof currency !== "string" || !CCY_RE.test(currency)) throw invalid("currency");
-  return formatMinor(minor, currencyScale(currency));
+  // Review P9b: only 2-decimal currencies are sent. How Revolut wants JPY (0) or BHD/KWD (3) amounts
+  // is not verified (A3); such a payment is refused before any call, never rounded.
+  const scale = currencyScale(currency);
+  if (scale !== REVOLUT_AMOUNT_SCALE) throw invalid("currency scale not supported");
+  return formatMinor(minor, scale);
 }
 
 /** SEPA-safe reference, capped. Throws when nothing usable is left (never sends an empty one). */
@@ -347,10 +358,17 @@ export { objField };
 export type SendLedger = "never_attempted" | "attempted" | "unreadable";
 
 /** Safe, short, lower-case code for storage and audit. Never a message, URL or body. */
+/** Looks like an account number (an IBAN or a long digit run): never stored as a code. */
+const ACCOUNTISH = /[A-Za-z]{2}\d{2}[A-Za-z0-9]{8,}|\d{8,}/;
+
 export function failureCode(e: unknown): string {
   if (e instanceof RevolutApiError) {
     const c = e.code;
-    if (typeof c === "string" && /^[A-Za-z0-9_.-]{1,40}$/.test(c)) return c.toLowerCase();
+    // The code may come from Revolut's answer body: a value that could be an IBAN or an account
+    // number is replaced by the status (no full IBAN in status_reason, events or audit; review P9b).
+    if (typeof c === "string" && /^[A-Za-z0-9_.-]{1,40}$/.test(c) && !ACCOUNTISH.test(c)) {
+      return c.toLowerCase();
+    }
     return `http_${e.status}`;
   }
   if (e instanceof RevolutAuthError)
@@ -374,22 +392,31 @@ export type PaymentFailure =
  * Sorts a failed payment write. `ledger` is the gate's own record of whether it ever attempted the
  * network call for this request (written BEFORE the fetch, so `never_attempted` is proof).
  *
- *  - local validation error (RangeError)            -> not_executed
- *  - ledger never_attempted                         -> not_executed (whatever the error)
+ *  - ledger never_attempted                         -> not_executed (whatever the error; a local
+ *                                                      validation error is always this case)
+ *  - a RangeError AFTER an attempt                  -> unknown (review P9b: a local error says nothing
+ *                                                      about what Revolut did once the call was made)
  *  - 401 / refused-after-401 (the gate DID send)    -> unknown (task rule: only "never sent" is definite)
  *  - 409                                            -> duplicate_request_id (A-ITEM: Revolut's code)
- *  - 429 after an attempt                           -> rejected rate_limited (not processed)
+ *  - 429 after an attempt                           -> unknown (review P9b: "not processed" is an
+ *                                                      A-item, so it is settled by lookup, not assumed)
  *  - 400 / 403 / 404 / 422                          -> rejected (A-ITEM: these mean "refused")
  *  - 5xx, network, timeout, gate_unavailable, 200 with an unreadable body, anything else -> unknown
  */
 export function classifyPaymentFailure(e: unknown, ledger: SendLedger): PaymentFailure {
-  if (e instanceof RangeError) return { kind: "not_executed", code: "invalid_request" };
-  if (ledger === "never_attempted") return { kind: "not_executed", code: failureCode(e) };
+  if (ledger === "never_attempted") {
+    return {
+      kind: "not_executed",
+      code: e instanceof RangeError ? "invalid_request" : failureCode(e),
+    };
+  }
+  if (e instanceof RangeError) return { kind: "unknown", code: "invalid_after_send" };
   if (e instanceof RevolutWriteAuthRetryRefused) {
     return { kind: "unknown", code: "auth_refused_after_send" };
   }
   if (e instanceof RevolutAuthError) return { kind: "unknown", code: failureCode(e) };
-  if (e instanceof RevolutRateLimitedError) return { kind: "rejected", code: "rate_limited" };
+  if (e instanceof RevolutRateLimitedError)
+    return { kind: "unknown", code: "rate_limited_after_send" };
   if (e instanceof RevolutApiError) {
     if (e.status === 409) return { kind: "duplicate_request_id" };
     if ([400, 403, 404, 422].includes(e.status)) return { kind: "rejected", code: failureCode(e) };
