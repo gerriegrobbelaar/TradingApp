@@ -192,3 +192,151 @@ describe("settings validation", () => {
     expect(alertKey("a.b:1", 2)).toBe("dq-alert:a.b:1:2");
   });
 });
+
+describe("review D8b: hosts, links and field caps", () => {
+  it.each([
+    "0x7f.0x1",
+    "0x7f000001.0x0",
+    "1.2.3.4",
+    "017700000001.0",
+    "a.1",
+    "localhost",
+    "x.localhost",
+    "x.local",
+    "metadata.google.internal",
+    "router.home.arpa",
+    "1.0.0.127.in-addr.arpa",
+    "mail.corp",
+    "mail.lan",
+    "x.test",
+    "evil.com.",
+    ".evil.com",
+    "evil..com",
+    "-evil.com",
+    "evil-.com",
+    "evil.com:443",
+    "user@evil.com",
+    "evil.com/emails",
+    "evil.com?x",
+    "evil.com#x",
+    "[::1]",
+    "ev il.com",
+    "évil.com",
+    `${"a".repeat(64)}.com`,
+  ])("isPublicHostName rejects %j", (h) => {
+    expect(normalizeEmailHost(h)).toBeNull();
+  });
+
+  it.each(["api.resend.com", "API.Mail.Example.com", "xn--80ak6aa92e.com", "a-b.c-d.io"])(
+    "isPublicHostName accepts %j",
+    (h) => {
+      expect(normalizeEmailHost(h)).toBe(h.toLowerCase());
+    },
+  );
+
+  it.each([
+    "javascript:alert(1)",
+    "data:text/html,<script>x</script>",
+    "//evil.com",
+    "https://user:pw@evil.com",
+    "https://evil.com@app.example.com".replace("@app", ":x@app"),
+    "https://evil.com/path",
+    "https://evil.com/?next=//x",
+    "https://evil.com/#x",
+    "http://app.example.com",
+    "https://0x7f.1",
+    "https://127.0.0.1",
+    "https://[::1]",
+    "https://localhost",
+    "https://app.internal",
+    "ftp://app.example.com",
+  ])("normalizeBaseUrl rejects %j", (u) => {
+    expect(normalizeBaseUrl(u)).toBeNull();
+  });
+
+  it("normalizeBaseUrl keeps a port and drops the default one", () => {
+    expect(normalizeBaseUrl("https://app.example.com:8443/")).toBe("https://app.example.com:8443");
+    expect(normalizeBaseUrl("https://App.Example.com:443")).toBe("https://app.example.com");
+  });
+
+  const issue = {
+    ruleTitle: "Supplier IBAN changed",
+    area: "payables" as const,
+    subject: "Acme",
+    message: "1 problem",
+    fixPath: "/purchases/payables",
+    reopenCount: 0,
+    firstSeenAt: "2026-07-15T09:00:00.000Z",
+  };
+
+  it("a base that was not validated, or a path that leaves the app, never becomes a link", () => {
+    for (const base of [
+      "javascript:alert(1)",
+      "//evil.com",
+      "https://evil.com/x",
+      "http://a.com",
+    ]) {
+      const r = renderAlert(issue, base);
+      expect(r.html, base).not.toContain("<a ");
+      expect(r.html + r.text, base).not.toContain("evil.com");
+      expect(r.html + r.text, base).not.toContain("javascript");
+    }
+    for (const fixPath of [
+      "//evil.com",
+      "/\\evil.com",
+      "javascript:alert(1)",
+      "https://evil.com",
+      "/a?x=1",
+    ]) {
+      const r = renderAlert({ ...issue, fixPath }, "https://app.example.com");
+      expect(r.html, fixPath).toContain('href="https://app.example.com/"');
+      expect(r.html + r.text, fixPath).not.toContain("evil.com");
+    }
+  });
+
+  it("caps data fields and keeps them on one line in both parts", () => {
+    const long = "x".repeat(20_000);
+    const r = renderAlert(
+      { ...issue, subject: long, message: `a\r\nBcc: b@evil.test ${long}` },
+      "",
+    );
+    expect(r.html.length).toBeLessThan(2_000);
+    expect(r.text.length).toBeLessThan(1_500);
+    expect(r.text).not.toContain("\r");
+    expect(r.text.split("\n").some((l) => l.startsWith("Bcc:"))).toBe(false);
+    const d: DigestData = {
+      ...emptyDigest("2026-07-15"),
+      bySeverity: { critical: 1, warning: 0, info: 0 },
+      top: Array.from({ length: 30 }, () => ({
+        severity: "critical" as const,
+        area: "bank" as const,
+        ruleTitle: long,
+        subject: long,
+        message: long,
+        fixPath: "/treasury/bank",
+      })),
+      notEvaluated: [{ ruleTitle: long, reason: long }],
+    };
+    const g = renderDigest(d, "https://app.example.com");
+    expect(g.text.length).toBeLessThan(15_000);
+    expect(g.html.length).toBeLessThan(20_000);
+    const sum = renderAlertSummary(
+      { total: 3, items: [{ ruleTitle: long, subject: `${long}\n` }], listPath: "//evil.com" },
+      "https://app.example.com",
+    );
+    expect(sum.html).toContain('href="https://app.example.com/"');
+    expect(sum.text.length).toBeLessThan(2_000);
+  });
+
+  it("no exclamation marks in any copy", () => {
+    const r = [
+      renderAlert(issue, "https://app.example.com"),
+      renderAlert({ ...issue, reopenCount: 2 }, ""),
+      renderAlertSummary({ total: 12, items: [], listPath: "/overview" }, ""),
+      renderDigest(emptyDigest("2026-07-15"), ""),
+    ];
+    for (const m of r) {
+      expect(m.subject + m.text + m.html.replace("<!doctype html>", "")).not.toContain("!");
+    }
+  });
+});

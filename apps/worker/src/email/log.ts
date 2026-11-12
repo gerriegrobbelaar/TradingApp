@@ -82,14 +82,15 @@ export function claimAudit(
   );
 }
 
-/** Plain claim (digest, test): true when this caller won the key. */
+/** Plain claim (digest, test): true when this caller won the key (and `onlyIf` held). */
 export async function claimPlain(
   db: D1Database,
   spec: ClaimSpec,
   nowIso: string,
   actor = "system",
+  onlyIf?: { sql: string; binds: unknown[] },
 ): Promise<boolean> {
-  const out = await db.batch([claimInsert(db, spec, nowIso), claimAudit(db, spec, actor)]);
+  const out = await db.batch([claimInsert(db, spec, nowIso, onlyIf), claimAudit(db, spec, actor)]);
   return (out[0]?.meta.changes ?? 0) === 1;
 }
 

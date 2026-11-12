@@ -177,11 +177,13 @@ export function planStatements(
     );
   }
   for (const { id, issue } of plan.unsnooze) {
+    // notified_at is kept (ADR 0046): an issue is alerted once per life (reopen count); the end of a
+    // snooze is not a new life, and its alert key already exists.
     out.push(
       db
         .prepare(
           `UPDATE dq_issues SET ${refresh}, status = 'open', snoozed_until = NULL, snoozed_by = NULL,
-             snooze_note = NULL, notified_at = NULL
+             snooze_note = NULL
            WHERE id = ?1 AND status = 'snoozed'`,
         )
         .bind(id, ...bindFields(issue, nowIso)),
@@ -350,12 +352,39 @@ export async function recordRun(db: D1Database, s: RunSummary): Promise<number> 
 }
 
 /**
- * Resolves the open and snoozed issues of administrations that are no longer synchronised (sync
- * switched off, connection disabled or removed). Reason code `division_not_synchronised`; one audit
- * row when anything changed; the rule status rows of those administrations are removed so the
- * summary does not show stale verdicts. Global issues (division 0) are never touched.
+ * Housekeeping (D8a review, ADR 0046): the open and snoozed issues of administrations that are no
+ * longer synchronised (sync switched off, connection disabled or removed) are resolved with reason
+ * `division_not_synchronised`, but only after a GRACE period of UNSYNCED_GRACE_DAYS without
+ * synchronisation. "Disabled" is also what a failed re-authorisation leaves behind (the callback
+ * fails closed), and an admin may switch an administration off for an hour: resolving at once would
+ * throw away snoozes and notes and, when the administration comes back, reopen every issue with a new
+ * reopen count, so each critical one would be alerted AGAIN. The first time a division is seen
+ * unsynchronised is kept in setting `dq.unsynced_since`; a division that is synchronised again
+ * leaves the map. Until the grace has passed only its rule status rows are removed (they vouch for
+ * nothing now: no instant alert goes out for that administration). Global issues (division 0) are
+ * never touched. One audit row (count only) per resolving pass.
  */
 export const UNSYNCED_REASON = "division_not_synchronised";
+export const UNSYNCED_GRACE_DAYS = 7;
+export const SETTING_UNSYNCED_SINCE = "dq.unsynced_since";
+const MAX_UNSYNCED = 50;
+
+function parseSince(json: string | undefined): Map<number, string> {
+  const out = new Map<number, string>();
+  if (json === undefined) return out;
+  try {
+    const v: unknown = JSON.parse(json);
+    if (v === null || typeof v !== "object" || Array.isArray(v)) return out;
+    for (const [k, at] of Object.entries(v as Record<string, unknown>)) {
+      if (/^[1-9]\d{0,12}$/.test(k) && typeof at === "string" && !Number.isNaN(Date.parse(at))) {
+        out.set(Number(k), at);
+      }
+    }
+  } catch {
+    // unreadable: start the grace again (the safe direction)
+  }
+  return out;
+}
 
 export async function resolveUnsyncedDivisions(
   db: D1Database,
@@ -365,41 +394,82 @@ export async function resolveUnsyncedDivisions(
   const ids = [...activeDivisionIds];
   const notIn = (from: number): string =>
     ids.length > 0 ? `AND division_id NOT IN (${ids.map((_, i) => `?${i + from}`).join(",")})` : "";
+  const unsynced = (
+    await db
+      .prepare(
+        `SELECT DISTINCT division_id AS d FROM dq_issues
+         WHERE division_id > 0 ${notIn(1)} AND status IN ('open', 'snoozed')
+         ORDER BY division_id LIMIT ${MAX_UNSYNCED}`,
+      )
+      .bind(...ids)
+      .all<{ d: number }>()
+  ).results.map((r) => r.d);
+  await db
+    .prepare(`DELETE FROM dq_rule_status WHERE division_id > 0 ${notIn(1)}`)
+    .bind(...ids)
+    .run();
+
+  const row = await db
+    .prepare("SELECT value_json FROM settings WHERE key = ?1")
+    .bind(SETTING_UNSYNCED_SINCE)
+    .first<{ value_json: string }>();
+  const before = parseSince(row?.value_json);
+  const since = new Map<number, string>();
+  for (const d of unsynced) since.set(d, before.get(d) ?? nowIso);
+  const nowMs = Date.parse(nowIso);
+  const due = unsynced.filter(
+    (d) => nowMs - Date.parse(since.get(d) ?? nowIso) >= UNSYNCED_GRACE_DAYS * 86_400_000,
+  );
+  for (const d of due) since.delete(d);
+
+  const sinceJson = JSON.stringify(Object.fromEntries([...since].sort((a, b) => a[0] - b[0])));
+  const writeSince = db
+    .prepare(
+      `INSERT INTO settings (key, value_json, updated_by, updated_at) VALUES (?1, ?2, 'system', ?3)
+       ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, updated_by = 'system',
+         updated_at = excluded.updated_at
+       WHERE settings.value_json IS NOT excluded.value_json`,
+    )
+    .bind(SETTING_UNSYNCED_SINCE, sinceJson, nowIso);
+  if (due.length === 0) {
+    if (row !== null || since.size > 0) await writeSince.run();
+    return 0;
+  }
+  const inDue = due.map((_, i) => `?${i + 2}`).join(",");
   const count =
     (
       await db
         .prepare(
-          `SELECT COUNT(*) AS n FROM dq_issues WHERE division_id > 0 ${notIn(1)} AND status IN ('open', 'snoozed')`,
+          `SELECT COUNT(*) AS n FROM dq_issues
+           WHERE division_id IN (${due.map((_, i) => `?${i + 1}`).join(",")}) AND status IN ('open', 'snoozed')`,
         )
-        .bind(...ids)
+        .bind(...due)
         .first<{ n: number }>()
     )?.n ?? 0;
-  const cleanup = db
-    .prepare(`DELETE FROM dq_rule_status WHERE division_id > 0 ${notIn(1)}`)
-    .bind(...ids);
-  if (count === 0) {
-    await cleanup.run();
-    return 0;
-  }
-  await db.batch([
+  const out = await db.batch([
     db
       .prepare(
         `UPDATE dq_issues SET status = 'resolved', resolved_at = ?1, resolved_by = 'system',
            resolution_note = '${UNSYNCED_REASON}', snoozed_until = NULL, snoozed_by = NULL, snooze_note = NULL
-         WHERE division_id > 0 ${notIn(2)} AND status IN ('open', 'snoozed')`,
+         WHERE division_id IN (${inDue}) AND status IN ('open', 'snoozed')`,
       )
-      .bind(nowIso, ...ids),
+      .bind(nowIso, ...due),
     auditStatement(
       db,
       {
         actorEmail: "system",
         action: "dq.unsynced_resolved",
         entity: "dq_issue",
-        after: { reason: UNSYNCED_REASON, issues: count },
+        after: {
+          reason: UNSYNCED_REASON,
+          issues: count,
+          divisions: due.length,
+          graceDays: UNSYNCED_GRACE_DAYS,
+        },
       },
       { sql: "changes() > 0", binds: [] },
     ),
-    cleanup,
+    writeSince,
   ]);
-  return count;
+  return out[0]?.meta.changes ?? 0;
 }

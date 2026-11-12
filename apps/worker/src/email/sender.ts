@@ -14,7 +14,13 @@
  * again by the code. Nothing here logs: not the key, not the addresses, not the body, not the
  * provider's answer text.
  */
-import type { DqNotificationSettings, EmailMessage, EmailSendResult } from "@camelthorn/core";
+import {
+  isPublicHostName,
+  normalizeFromAddress,
+  type DqNotificationSettings,
+  type EmailMessage,
+  type EmailSendResult,
+} from "@camelthorn/core";
 
 export interface EmailSender {
   readonly kind: "disabled" | "https";
@@ -27,6 +33,47 @@ export const disabledSender: EmailSender = {
 };
 
 export const SEND_TIMEOUT_MS = 10_000;
+/** The provider's answer is read up to this many bytes (only for the message id). */
+export const MAX_ANSWER_BYTES = 16_384;
+const MAX_RECIPIENTS = 100;
+
+/** A plain, header-safe address (the same shape as the sender address setting). */
+const plainAddress = (a: string): boolean => normalizeFromAddress(a) === a && a !== "";
+// eslint-disable-next-line no-control-regex
+const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+
+/** Reads at most `max` bytes of a body; null when it is longer or unreadable. */
+async function readCapped(res: Response, max: number): Promise<string | null> {
+  if (!res.body) return null;
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > max) {
+        await reader.cancel().catch(() => undefined);
+        return null;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return null;
+  }
+  const all = new Uint8Array(size);
+  let at = 0;
+  for (const c of chunks) {
+    all.set(c, at);
+    at += c.byteLength;
+  }
+  return new TextDecoder().decode(all);
+}
+
+/** A provider id we are willing to store: printable ASCII without spaces, at most 200 characters. */
+const safeId = (v: unknown): string | null =>
+  typeof v === "string" && /^[\x21-\x7e]{1,200}$/.test(v) ? v : null;
 
 export interface HttpsSenderOptions {
   host: string;
@@ -42,6 +89,18 @@ export function httpsSender(opts: HttpsSenderOptions): EmailSender {
     kind: "https",
     async send(msg: EmailMessage): Promise<EmailSendResult> {
       if (msg.to.length === 0) return { status: "failed", code: "no_recipients" };
+      // Defence in depth: the settings were validated when saved and the recipients come from the
+      // users table, but nothing that could redirect the key or inject a header is ever sent.
+      if (!isPublicHostName(opts.host)) return { status: "failed", code: "bad_host" };
+      if (
+        !plainAddress(opts.from) ||
+        msg.to.length > MAX_RECIPIENTS ||
+        !msg.to.every(plainAddress) ||
+        CONTROL.test(msg.subject) ||
+        msg.subject.length > 300
+      ) {
+        return { status: "failed", code: "bad_message" };
+      }
       const doFetch = opts.fetchFn ?? ((i, init) => fetch(i, init));
       let res: Response;
       try {
@@ -70,12 +129,17 @@ export function httpsSender(opts: HttpsSenderOptions): EmailSender {
       }
       const s = res.status;
       if (s >= 200 && s < 300) {
+        // Accepted. The answer is only read for the id, capped in size; anything odd (too long, not
+        // JSON, not an object, an id with spaces or control characters) still means sent, id null.
         let id: string | null = null;
         try {
-          const j = (await res.json()) as { id?: unknown };
-          if (typeof j.id === "string" && j.id.length > 0 && j.id.length <= 200) id = j.id;
+          const text = await readCapped(res, MAX_ANSWER_BYTES);
+          const j: unknown = text === null ? null : JSON.parse(text);
+          if (j !== null && typeof j === "object" && !Array.isArray(j)) {
+            id = safeId(Object.getOwnPropertyDescriptor(j, "id")?.value);
+          }
         } catch {
-          // accepted without a readable id: still sent
+          id = null;
         }
         return { status: "sent", providerMessageId: id };
       }

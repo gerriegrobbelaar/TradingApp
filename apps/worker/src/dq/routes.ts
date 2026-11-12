@@ -718,7 +718,16 @@ async function testNotificationHandler(ctx: Ctx): Promise<Response> {
   if (!me) throw new ApiError("not_an_allowed_recipient", 422);
   const nowIso = new Date(ctx.nowMs).toISOString();
   const key = testKey(userId, Math.floor(ctx.nowMs / 60_000));
-  if (!(await claimPlain(db, { key, kind: "test", recipients: 1 }, nowIso, who))) {
+  // One per caller in any 60 seconds, not one per clock minute (12:00:59 and 12:01:00 would both
+  // pass a bucket key). The check is inside the claim INSERT, so two concurrent requests cannot both
+  // win: D1 runs writes one at a time.
+  const prefix = testKey(userId, 0).replace(/0$/, "");
+  const recent = {
+    sql: `NOT EXISTS (SELECT 1 FROM email_log WHERE idempotency_key >= ?1 AND idempotency_key < ?2
+            AND kind = 'test' AND created_at > ?3)`,
+    binds: [prefix, `${prefix.slice(0, -1)};`, new Date(ctx.nowMs - 60_000).toISOString()],
+  };
+  if (!(await claimPlain(db, { key, kind: "test", recipients: 1 }, nowIso, who, recent))) {
     throw new ApiError("too_soon", 409);
   }
   const res = await deliver(db, sender, key, { to: [me.email], ...renderTest() }, nowIso);

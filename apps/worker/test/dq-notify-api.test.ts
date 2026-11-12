@@ -6,6 +6,7 @@ import type { DqNotificationsResponse, DqNotificationsTestResponse } from "@came
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { addSession, addUser, authed, call, resetDb } from "./helpers";
 import { resetDq } from "./dq-helpers";
+import { emailLogWipeStatements } from "./outbox-wipe";
 import { db, emailRows } from "./dq-notify-helpers";
 import { auditRows } from "./sync-helpers";
 
@@ -203,6 +204,54 @@ describe("test message", () => {
     ]);
     const again = await send("admin", "POST", {}, "/api/dq/notifications/test");
     expect([again.status, err(again)]).toEqual([409, "too_soon"]);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("the limit is one per 60 seconds, not one per clock minute, and per caller", async () => {
+    await send("admin", "PATCH", { rev: null, ...PROVIDER });
+    const spy = fetchOk();
+    const me = await db
+      .prepare("SELECT id FROM users WHERE email = 'admin@camelthorncapital.com'")
+      .first<{ id: number }>();
+    // A test sent 20 seconds ago in the PREVIOUS minute bucket (12:00:59 then 12:01:00).
+    const t = Date.now() - 20_000;
+    await db
+      .prepare(
+        `INSERT INTO email_log (idempotency_key, kind, template, recipients_count, status, created_at, updated_at)
+         VALUES (?1, 'test', 'dq.test.v1', 1, 'sent', ?2, ?2)`,
+      )
+      .bind(`dq-test:${me!.id}:${Math.floor(t / 60_000) - 1}`, new Date(t).toISOString())
+      .run();
+    const r = await send("admin", "POST", {}, "/api/dq/notifications/test");
+    expect([r.status, err(r)]).toEqual([409, "too_soon"]);
+    expect(spy).not.toHaveBeenCalled();
+    // Another user's recent test does not block this one; a caller with a similar id prefix neither.
+    await db.batch(await emailLogWipeStatements(db));
+    await db
+      .prepare(
+        `INSERT INTO email_log (idempotency_key, kind, template, recipients_count, status, created_at, updated_at)
+         VALUES (?1, 'test', 'dq.test.v1', 1, 'sent', ?2, ?2)`,
+      )
+      .bind(`dq-test:${me!.id}0:${Math.floor(t / 60_000)}`, new Date(t).toISOString())
+      .run();
+    const ok = await send<DqNotificationsTestResponse>(
+      "admin",
+      "POST",
+      {},
+      "/api/dq/notifications/test",
+    );
+    expect(ok.body).toEqual({ status: "sent", code: null });
+  });
+
+  it("two concurrent test requests send one message", async () => {
+    await send("admin", "PATCH", { rev: null, ...PROVIDER });
+    const spy = fetchOk();
+    const rs = await Promise.all([
+      send("admin", "POST", {}, "/api/dq/notifications/test"),
+      send("admin", "POST", {}, "/api/dq/notifications/test"),
+      send("admin", "POST", {}, "/api/dq/notifications/test"),
+    ]);
+    expect(rs.map((r) => r.status).sort()).toEqual([200, 409, 409]);
     expect(spy).toHaveBeenCalledTimes(1);
   });
 

@@ -1075,9 +1075,11 @@ How to enable (staging first, `--env staging` on every command):
    log holds no address, subject or body (counts, codes, provider message id).
 
 Also on existing installs: from this release `dq.checks` resolves open issues of administrations that are
-no longer synchronised (`sync_enabled = 0`) with the note `division_not_synchronised` and an audit row
-`dq.unsynced_resolved`; expect a one-off batch of resolved issues if you switched an administration off
-earlier.
+no longer synchronised (`sync_enabled = 0`, or the Exact connection disabled) with the note
+`division_not_synchronised` and an audit row `dq.unsynced_resolved`, but only after **7 days** without
+synchronisation (counted from the first check run that saw it; setting `dq.unsynced_since`). A failed
+reconnect or a short switch-off resolves nothing. Expect a one-off batch of resolved issues a week after
+this release if you switched an administration off earlier.
 
 ### Emergency stop of all jobs
 

@@ -34,6 +34,7 @@ import {
 import { senderFromSettings, type EmailSender } from "../email/sender";
 import type { HandlerResult, JobContext } from "../jobs/types";
 import { loadNotificationSettings, loadRecipients } from "./notify-settings";
+import { safeText } from "./store";
 
 const DAY_MS = 86_400_000;
 const NOT_EVALUATED_CAP = 30;
@@ -75,7 +76,7 @@ export async function loadDigestData(db: D1Database, nowMs: number): Promise<Dig
     .first<{ subject: string; severity: DqSeverity; first_seen_at: string }>();
   if (oldest !== null) {
     d.oldest = {
-      subject: oldest.subject,
+      subject: safeText(oldest.subject),
       severity: oldest.severity,
       days: Math.max(0, Math.floor((nowMs - Date.parse(oldest.first_seen_at)) / DAY_MS)),
     };
@@ -99,9 +100,9 @@ export async function loadDigestData(db: D1Database, nowMs: number): Promise<Dig
     severity: t.severity,
     area: t.area,
     ruleTitle: dqRuleById(t.rule_id)?.title ?? t.rule_id,
-    subject: t.subject,
-    message: t.message,
-    fixPath: DQ_FIX_PATHS[t.fix as DqFixTarget] ?? "/",
+    subject: safeText(t.subject),
+    message: safeText(t.message),
+    fixPath: Object.hasOwn(DQ_FIX_PATHS, t.fix) ? DQ_FIX_PATHS[t.fix as DqFixTarget] : "/",
   }));
   const status = (
     await db

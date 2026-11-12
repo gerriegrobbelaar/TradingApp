@@ -52,8 +52,10 @@ describe("notification source scans (ADR 0046)", () => {
       const s = find(f);
       expect(s, f).not.toMatch(/\b(e|err|error)\.message\b|\.stack\b|res\.text\(\)/);
     }
-    // The only body read is the id of an accepted message.
-    expect(find("email/sender.ts").match(/\.json\(\)/g)).toHaveLength(1);
+    // The only body read is the id of an accepted message, through the size-capped reader.
+    const sender = find("email/sender.ts");
+    expect(sender.match(/\.json\(\)/g)).toBeNull();
+    expect(sender.match(/readCapped\(res, MAX_ANSWER_BYTES\)/g)).toHaveLength(1);
   });
 
   it("the API key is used in the sender only, and as a bearer header only", () => {

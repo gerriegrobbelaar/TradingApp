@@ -21,6 +21,7 @@
  */
 import {
   DQ_FIX_PATHS,
+  MAX_EMAIL_ATTEMPTS,
   DQ_HEALTH_PATH,
   alertKey,
   alertSkippedKey,
@@ -44,6 +45,7 @@ import {
 import { senderFromSettings, type EmailSender } from "../email/sender";
 import type { JobContext } from "../jobs/types";
 import { loadNotificationSettings, loadRecipients } from "./notify-settings";
+import { safeText } from "./store";
 
 export const SUMMARY_CHUNK = 80;
 const MAX_CANDIDATES = 1000;
@@ -115,6 +117,19 @@ export async function runAlerts(
 
   out.staleSwept = await sweepStaleClaims(db, nowMs);
 
+  // An issue whose alert key for this life already exists was alerted (or tried) before: it is
+  // marked, never alerted twice. Without this an issue that lost its notified_at by another path
+  // would keep a single-alert slot for ever (its claim always conflicts) and starve new issues.
+  await db
+    .prepare(
+      `UPDATE dq_issues SET notified_at = ?1
+       WHERE notified_at IS NULL AND status = 'open' AND severity = 'critical'
+         AND EXISTS (SELECT 1 FROM email_log l
+                     WHERE l.idempotency_key = 'dq-alert:' || dq_issues.fingerprint || ':' || dq_issues.reopen_count)`,
+    )
+    .bind(nowIso)
+    .run();
+
   const pending = (
     await db
       .prepare(
@@ -126,10 +141,16 @@ export async function runAlerts(
   const retryKeys = (
     await db
       .prepare(
+        // Only refusals whose issue is still a pending critical in the same life: a refusal for an
+        // issue that was resolved, or reopened under a new key, must not hold a retry slot for ever.
         `SELECT l.idempotency_key AS k, l.dq_issue_id AS id FROM email_log l
-         WHERE l.kind = 'dq_alert' AND l.status = 'failed' AND l.attempts < 3
+           JOIN dq_issues i ON i.id = l.dq_issue_id
+           JOIN dq_rule_status s ON s.division_id = i.division_id AND s.rule_id = i.rule_id
+         WHERE l.kind = 'dq_alert' AND l.status = 'failed' AND l.attempts < ?1 AND ${PENDING_WHERE}
+           AND l.idempotency_key = 'dq-alert:' || i.fingerprint || ':' || i.reopen_count
          ORDER BY l.id LIMIT ${MAX_RETRIES}`,
       )
+      .bind(MAX_EMAIL_ATTEMPTS)
       .all<{ k: string; id: number }>()
   ).results;
   out.candidates = pending.length;
@@ -157,13 +178,15 @@ export async function runAlerts(
   };
   const send = async (row: IssueRow, key: string): Promise<void> => {
     const rule = dqRuleById(row.rule_id);
-    const fixPath = DQ_FIX_PATHS[row.fix as DqFixTarget] ?? "/";
+    const fixPath = Object.hasOwn(DQ_FIX_PATHS, row.fix)
+      ? DQ_FIX_PATHS[row.fix as DqFixTarget]
+      : "/";
     const msg = renderAlert(
       {
         ruleTitle: rule?.title ?? row.rule_id,
         area: rule?.area ?? (row.area as DqArea),
-        subject: row.subject,
-        message: row.message,
+        subject: safeText(row.subject),
+        message: safeText(row.message),
         fixPath,
         reopenCount: row.reopen_count,
         firstSeenAt: row.first_seen_at,
@@ -235,7 +258,8 @@ export async function runAlerts(
       db
         .prepare(
           `UPDATE dq_issues SET notified_at = ?1
-           WHERE id IN (${inList(2)}) AND notified_at IS NULL AND status = 'open' AND changes() = 1`,
+           WHERE id IN (${inList(2)}) AND notified_at IS NULL AND status = 'open' AND changes() = 1
+           RETURNING id`,
         )
         .bind(nowIso, ...ids),
       claimAudit(db, spec, "system", true),
@@ -244,14 +268,18 @@ export async function runAlerts(
       out.lostClaims += 1;
       continue;
     }
-    out.folded += chunk.length;
+    // Only the issues THIS claim marked are in the message: one another run marked in between was
+    // (or will be) alerted by that run.
+    const mine = new Set(((res[1]?.results ?? []) as { id: number }[]).map((r) => r.id));
+    const claimed = chunk.filter((c) => mine.has(c.id));
+    out.folded += claimed.length;
     out.summaries += 1;
     const msg = renderAlertSummary(
       {
-        total: chunk.length,
-        items: chunk.map((c) => ({
+        total: claimed.length,
+        items: claimed.map((c) => ({
           ruleTitle: dqRuleById(c.rule_id)?.title ?? c.rule_id,
-          subject: c.subject,
+          subject: safeText(c.subject),
         })),
         listPath: DQ_HEALTH_PATH,
       },

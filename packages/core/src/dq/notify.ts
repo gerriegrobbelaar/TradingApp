@@ -93,17 +93,41 @@ export const MAX_ALERTS_LIMIT = 50;
 /** Where summary alerts point: the Data health view. A single place to change when the screen lands. */
 export const DQ_HEALTH_PATH = "/overview";
 
-/** A DNS host name with at least one dot; no IP literals, no localhost, no odd characters. */
+/** Suffixes that never name a public service (RFC 6761, RFC 8375 and common private zones). */
+const PRIVATE_SUFFIXES = [
+  "local",
+  "localhost",
+  "localdomain",
+  "internal",
+  "intranet",
+  "private",
+  "corp",
+  "home",
+  "lan",
+  "arpa",
+  "test",
+  "example",
+  "invalid",
+  "onion",
+];
+
+/**
+ * A DNS host name with at least one dot; no IP literals, no localhost, no odd characters. The last
+ * label must start with a letter: a URL parser reads a host whose last label is numeric (`1.2.3.4`,
+ * but also `0x7f.0x1` or `017700000001.0`) as an IPv4 address, which would bypass the IP check.
+ */
 export function isPublicHostName(host: string): boolean {
   const h = host.toLowerCase();
   if (
     h.length > 253 ||
-    !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(h)
+    !/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*\.[a-z]([a-z0-9-]{0,61}[a-z0-9])?$/.test(
+      h,
+    )
   ) {
     return false;
   }
-  if (/^[0-9.]+$/.test(h)) return false; // IPv4 literal
-  return !h.endsWith(".local") && !h.endsWith(".internal") && !h.endsWith(".localhost");
+  const tld = h.slice(h.lastIndexOf(".") + 1);
+  return !PRIVATE_SUFFIXES.includes(tld);
 }
 
 /** `https://app.example.com` (port allowed). Returns the normalised value, "" for none, or null. */
@@ -290,13 +314,34 @@ export interface RenderedEmail {
 const wrapHtml = (inner: string): string =>
   `<!doctype html><html lang="en"><body style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#1c1c1e;line-height:1.45">${inner}</body></html>`;
 
-function linkHtml(baseUrl: string, fixPath: string): string {
-  return baseUrl === ""
-    ? `<span>Fix in the app: ${escapeHtml(fixPath)}</span>`
-    : `<a href="${escapeHtml(baseUrl + fixPath)}">Open the fix</a>`;
+/** Longest piece of data text shown in an e-mail (subjects, messages, titles, reasons). */
+export const MAX_FIELD_CHARS = 300;
+
+/** Data text for a body: control and bidi characters out, whitespace collapsed, capped. */
+const field = (s: string): string => oneLine(s, MAX_FIELD_CHARS);
+
+/**
+ * Links are built only from a validated base (`https://host[:port]`, see normalizeBaseUrl) and an
+ * app path. Anything else (an unchecked base, a `//host` or `/\host` path, a scheme) degrades to the
+ * plain relative path or "/", so an e-mail can never carry a link to somewhere else.
+ */
+export function safeAppPath(p: string): string {
+  return /^\/(?![/\\])[a-z0-9/_-]*$/i.test(p) ? p : "/";
 }
-const linkText = (baseUrl: string, fixPath: string): string =>
-  baseUrl === "" ? `Fix in the app: ${fixPath}` : `Fix: ${baseUrl}${fixPath}`;
+const safeBase = (b: string): string => (b !== "" && normalizeBaseUrl(b) === b ? b : "");
+
+function linkHtml(baseUrl: string, fixPath: string): string {
+  const base = safeBase(baseUrl);
+  const path = safeAppPath(fixPath);
+  return base === ""
+    ? `<span>Fix in the app: ${escapeHtml(path)}</span>`
+    : `<a href="${escapeHtml(base + path)}">Open the fix</a>`;
+}
+const linkText = (baseUrl: string, fixPath: string): string => {
+  const base = safeBase(baseUrl);
+  const path = safeAppPath(fixPath);
+  return base === "" ? `Fix in the app: ${path}` : `Fix: ${base}${path}`;
+};
 
 export interface AlertIssueData {
   ruleTitle: string;
@@ -308,7 +353,14 @@ export interface AlertIssueData {
   firstSeenAt: string;
 }
 
-export function renderAlert(issue: AlertIssueData, baseUrl: string): RenderedEmail {
+export function renderAlert(raw: AlertIssueData, baseUrl: string): RenderedEmail {
+  const issue: AlertIssueData = {
+    ...raw,
+    ruleTitle: field(raw.ruleTitle),
+    subject: field(raw.subject),
+    message: field(raw.message),
+    firstSeenAt: field(raw.firstSeenAt),
+  };
   const subject = oneLine(`1 critical data issue: ${issue.ruleTitle}`);
   const reopened = issue.reopenCount > 0 ? " It was resolved before and came back." : "";
   const html = wrapHtml(
@@ -340,7 +392,9 @@ export interface AlertSummaryData {
 export function renderAlertSummary(d: AlertSummaryData, baseUrl: string): RenderedEmail {
   const head = plural(d.total, "more critical data issue", "more critical data issues");
   const subject = oneLine(`${head}: alert limit reached`);
-  const shown = d.items.slice(0, 10);
+  const shown = d.items
+    .slice(0, 10)
+    .map((i) => ({ ruleTitle: field(i.ruleTitle), subject: field(i.subject) }));
   const more = d.total - shown.length;
   const note =
     "The limit of single alerts for one check run was reached, so these are in one message.";
@@ -402,7 +456,22 @@ export const emptyDigest = (date: string): DigestData => ({
 
 const reasonText = (code: string): string => cap(code.replace(/_/g, " "));
 
-export function renderDigest(d: DigestData, baseUrl: string): RenderedEmail {
+export function renderDigest(raw: DigestData, baseUrl: string): RenderedEmail {
+  const d: DigestData = {
+    ...raw,
+    date: field(raw.date),
+    oldest: raw.oldest ? { ...raw.oldest, subject: field(raw.oldest.subject) } : null,
+    top: raw.top.map((t) => ({
+      ...t,
+      ruleTitle: field(t.ruleTitle),
+      subject: field(t.subject),
+      message: field(t.message),
+    })),
+    notEvaluated: raw.notEvaluated.map((n) => ({
+      ruleTitle: field(n.ruleTitle),
+      reason: field(n.reason),
+    })),
+  };
   const open = d.bySeverity.critical + d.bySeverity.warning + d.bySeverity.info;
   const head = plural(open, "open data quality issue", "open data quality issues");
   const subject = oneLine(

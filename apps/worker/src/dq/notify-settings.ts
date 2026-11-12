@@ -42,10 +42,16 @@ export interface Recipient {
   email: string;
 }
 
-const LOCAL = /^[a-z0-9][a-z0-9._+-]{0,63}$/;
+// Dot-atoms only: no leading, trailing or doubled dot.
+const LOCAL = /^(?=.{1,64}$)[a-z0-9+_-]+(\.[a-z0-9+_-]+)*$/;
 
-/** A plain mailbox on the allowed domain: no display name, list, comment or control character. */
+/**
+ * A plain mailbox on the allowed domain: no display name, list, comment or control character. The
+ * stored value must already be plain ASCII: lower-casing can turn a non-ASCII look-alike into ASCII
+ * (the Kelvin sign U+212A becomes "k"), so a stored address that is not what we would send to is out.
+ */
 export function isAllowedRecipient(email: string, domain: string): boolean {
+  if (!/^[\x21-\x7e]+$/.test(email.trim())) return false;
   const e = normalizeEmail(email);
   if (!isEmailInDomain(e, domain)) return false;
   return LOCAL.test(e.slice(0, e.indexOf("@")));

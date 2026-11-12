@@ -11,7 +11,7 @@ export { NOW };
 export async function resetDq(): Promise<void> {
   await db.batch([
     ...(await emailLogWipeStatements(db)),
-    db.prepare("DELETE FROM settings WHERE key = 'dq.notifications'"),
+    db.prepare("DELETE FROM settings WHERE key IN ('dq.notifications', 'dq.unsynced_since')"),
     db.prepare(
       "UPDATE dq_issues SET status = 'resolved', resolved_at = '2026-01-01T00:00:00.000Z', snoozed_until = NULL WHERE status <> 'resolved'",
     ),

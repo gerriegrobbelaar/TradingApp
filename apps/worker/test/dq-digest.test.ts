@@ -6,6 +6,7 @@ import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { loadDigestData, runDigest } from "../src/dq/digest";
 import { SETTING_NOTIFICATIONS } from "../src/dq/notify-settings";
+import { UNSYNCED_GRACE_DAYS } from "../src/dq/store";
 import { pruneEmailLog } from "../src/email/log";
 import { addUser, resetDb } from "./helpers";
 import { db, dqContext, issues, resetDq, runDq } from "./dq-helpers";
@@ -262,17 +263,33 @@ describe("dq.checks with alerts and housekeeping", () => {
     expect((await issues("status = 'open'")).length).toBeGreaterThan(0);
   });
 
-  it("resolves open issues of administrations that are no longer synchronised, with a reason and an audit row", async () => {
+  const at = (ms: number) => ({ now: () => ms });
+  const divisionOpen = async (): Promise<number> =>
+    (await issues("division_id = " + w.divisionId + " AND status = 'open'")).length;
+  const setSync = (on: 0 | 1) =>
+    db.prepare("UPDATE divisions SET sync_enabled = ?2 WHERE id = ?1").bind(w.divisionId, on).run();
+
+  it("resolves the issues of an administration that stays unsynchronised past the grace, with a reason and an audit row", async () => {
     await seedCriticalIbanChange();
-    await runDq();
-    const open = (await issues("division_id = " + w.divisionId + " AND status = 'open'")).length;
+    await runDq(at(NOW));
+    const open = await divisionOpen();
     expect(open).toBeGreaterThan(0);
     const globalBefore = (await issues("division_id = 0 AND status = 'open'")).length;
-    await db
-      .prepare("UPDATE divisions SET sync_enabled = 0 WHERE id = ?1")
+    await setSync(0);
+    const auditsBefore = (await auditRows("dq.unsynced_resolved")).length;
+    // Within the grace nothing is resolved, but the stale rule verdicts are gone (no alert vouches).
+    const early = await runDq(at(NOW + 3_600_000));
+    expect(early.summary["resolvedUnsynced"]).toBe(0);
+    expect(await divisionOpen()).toBe(open);
+    const stale = await db
+      .prepare("SELECT COUNT(*) AS n FROM dq_rule_status WHERE division_id = ?1")
       .bind(w.divisionId)
-      .run();
-    const res = await runDq();
+      .first<{ n: number }>();
+    expect(stale?.n).toBe(0);
+    expect(await auditRows("dq.unsynced_resolved")).toHaveLength(auditsBefore);
+    // Six days later: still inside the grace (counted from the first run that saw it unsynced).
+    expect((await runDq(at(NOW + 3_600_000 + 6 * DAY))).summary["resolvedUnsynced"]).toBe(0);
+    const res = await runDq(at(NOW + 3_600_000 + UNSYNCED_GRACE_DAYS * DAY));
     expect(res.summary["resolvedUnsynced"]).toBe(open);
     const rows = await issues("division_id = " + w.divisionId);
     expect(rows.every((r) => r.status === "resolved" && r.resolved_by === "system")).toBe(true);
@@ -286,14 +303,89 @@ describe("dq.checks with alerts and housekeeping", () => {
     expect((await issues("division_id = 0 AND status = 'open'")).length).toBeGreaterThanOrEqual(
       globalBefore,
     );
-    const stale = await db
-      .prepare("SELECT COUNT(*) AS n FROM dq_rule_status WHERE division_id = ?1")
+    expect(await auditRows("dq.unsynced_resolved")).toHaveLength(auditsBefore + 1);
+    // A second run changes nothing more, and the grace map is empty again.
+    const again = await runDq(at(NOW + 3_600_000 + (UNSYNCED_GRACE_DAYS + 1) * DAY));
+    expect(again.summary["resolvedUnsynced"]).toBe(0);
+    const since = await db
+      .prepare("SELECT value_json FROM settings WHERE key = 'dq.unsynced_since'")
+      .first<{ value_json: string }>();
+    expect(since?.value_json).toBe("{}");
+  });
+
+  it("a connection that is disabled for a while (failed re-authorisation) resolves nothing, keeps snoozes and does not re-alert when it comes back", async () => {
+    await seedCriticalIbanChange();
+    const s = fakeSender();
+    const { runDqChecks } = await import("../src/dq/run");
+    const run = (ms: number, id: number) =>
+      runDqChecks(
+        dqContext({
+          now: () => ms,
+          run: { id, attempt: 1, scheduledFor: new Date(ms).toISOString(), requestedBy: "system" },
+        }),
+        {
+          describeHandler: (h: string) => ({ title: h, implemented: true }),
+          alerts: { sender: s },
+        },
+      );
+    await run(NOW, 31);
+    const auditsBefore = (await auditRows("dq.unsynced_resolved")).length;
+    const alertsAfterFirst = s.calls;
+    expect(alertsAfterFirst).toBeGreaterThanOrEqual(1);
+    const reopenBefore = (await issues("division_id = " + w.divisionId)).map((r) => r.reopen_count);
+    const conn = await db
+      .prepare("SELECT connection_id AS c FROM divisions WHERE id = ?1")
+      .bind(w.divisionId)
+      .first<{ c: number }>();
+    const snoozedId = (await issues("division_id = " + w.divisionId + " AND status = 'open'"))[0]!
+      .id;
+    await db
+      .prepare(
+        "UPDATE dq_issues SET status = 'snoozed', snoozed_until = ?2, snoozed_by = 'fin@camelthorncapital.com', snooze_note = 'waiting' WHERE id = ?1",
+      )
+      .bind(snoozedId, new Date(NOW + 60 * DAY).toISOString())
+      .run();
+    await db
+      .prepare("UPDATE connections SET status = 'disabled' WHERE id = ?1")
+      .bind(conn!.c)
+      .run();
+    for (let h = 1; h <= 30; h += 1) await run(NOW + h * 3_600_000, 31 + h);
+    expect((await auditRows("dq.unsynced_resolved")).length).toBe(auditsBefore);
+    expect(await divisionOpen()).toBeGreaterThan(0);
+    await db.prepare("UPDATE connections SET status = 'active' WHERE id = ?1").bind(conn!.c).run();
+    await run(NOW + 31 * 3_600_000, 99);
+    expect((await issues("division_id = " + w.divisionId)).map((r) => r.reopen_count)).toEqual(
+      reopenBefore,
+    );
+    // No alert went out again for the administration's issues (a global "connection" issue may).
+    const divisionAlerts = await db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM email_log l JOIN dq_issues i ON i.id = l.dq_issue_id
+         WHERE i.division_id = ?1`,
+      )
       .bind(w.divisionId)
       .first<{ n: number }>();
-    expect(stale?.n).toBe(0);
-    expect((await auditRows("dq.unsynced_resolved")).length).toBeGreaterThanOrEqual(1);
-    // A second run changes nothing more.
-    const again = await runDq();
-    expect(again.summary["resolvedUnsynced"]).toBe(0);
+    expect(divisionAlerts?.n).toBe(alertsAfterFirst);
+    expect((await issues("id = " + snoozedId))[0]?.status).toBe("snoozed");
+    expect(s.sent.slice(alertsAfterFirst).every((m) => !m.subject.includes("Supplier"))).toBe(true);
+    const since = await db
+      .prepare("SELECT value_json FROM settings WHERE key = 'dq.unsynced_since'")
+      .first<{ value_json: string }>();
+    expect(since?.value_json).toBe("{}");
+  });
+
+  it("switching an administration off and on again inside the grace starts the grace again", async () => {
+    await seedCriticalIbanChange();
+    await runDq(at(NOW));
+    const open = await divisionOpen();
+    await setSync(0);
+    await runDq(at(NOW + DAY));
+    await setSync(1);
+    await runDq(at(NOW + 2 * DAY));
+    await setSync(0);
+    // 8 days after the FIRST switch-off, but only 6 after the second: nothing resolved yet.
+    await runDq(at(NOW + 3 * DAY));
+    expect((await runDq(at(NOW + 8 * DAY))).summary["resolvedUnsynced"]).toBe(0);
+    expect(await divisionOpen()).toBe(open);
   });
 });
