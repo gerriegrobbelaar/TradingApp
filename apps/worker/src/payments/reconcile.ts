@@ -1093,6 +1093,9 @@ export async function resolveNotSent(
 
 // ---- how far a paid payment is booked ---------------------------------------------------------
 
+/** What a payment row can show: the two codes below are answers of the settlement endpoint only. */
+export type RowSettlement = Exclude<Settlement, "approved_after_expiry" | "reverted_after_paid">;
+
 export type Settlement =
   | "not_paid"
   | "awaiting_bank_line"
@@ -1161,8 +1164,8 @@ export async function paymentSettlement(db: D1Database, paymentId: number): Prom
 export async function paymentSettlements(
   db: D1Database,
   ids: readonly number[],
-): Promise<Map<number, Settlement>> {
-  const out = new Map<number, Settlement>();
+): Promise<Map<number, RowSettlement>> {
+  const out = new Map<number, RowSettlement>();
   for (const id of ids) out.set(id, "not_paid");
   for (let at = 0; at < ids.length; at += 100) {
     const chunk = ids.slice(at, at + 100);
@@ -1189,7 +1192,7 @@ export async function paymentSettlements(
     const per = new Map<number, typeof rows.results>();
     for (const r of rows.results) per.set(r.pid, [...(per.get(r.pid) ?? []), r]);
     for (const [pid, rs] of per) {
-      let s: Settlement;
+      let s: RowSettlement;
       if (rs.every((r) => r.bt === null)) s = "awaiting_bank_line";
       else if (rs.every((r) => r.mid === null)) s = "awaiting_match";
       else if (!rs.some((r) => r.ours === 1)) s = "match_other_invoice";

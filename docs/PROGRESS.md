@@ -13,7 +13,7 @@ Orchestrator log. Update after every merge and every direct (trivial) edit.
 | 6 | ECB FX | Done (F1-F3, review fixes T1 booked amount/rate tables/rate conflicts, T2 error boundaries/wording/stale handling). ecb.fx_import ON by default. Unrealised difference is dormant until the Exact booked-amount source is verified live (ADR 0038, DEPLOY.md item 17). Decision 4 still open |
 | 7 | Matching | Done: M7a–M7e built, final review fixes U1 (booking path), U2 (matching safety), U3 (web/docs/tests) merged on 2026-11-12; full suite green (ui 257, core 854, exact 258, revolut 151, web 1358, worker 2001). Booking and automatic matching are OFF by default; NOT verified against real Exact |
 | 8 | Data quality | Done 2026-11-12: D8a–D8c plus final-review fixes V1 (alert key per issue, freshness gating, digest honesty), V2 (Notifications settings screen), and G9 (shared gate core, ADR 0048; RPC token leak closed) merged, each reviewed PASS; full suite green (core 1012, web 1642, worker 2353). dq.checks and dq.digest ON by default (digest sends nothing until an email sender is configured); exact.bank_balances forced OFF on upgrade. NOT verified against real Exact; ING/Rabobank balances not covered (no table); email provider not chosen (decision 5) |
-| 9 | Payments | Built and merged 2026-11-12: P9a domain/four-eyes/DB guards, P9b Revolut execution (5 gates, reconcile, verification checklist, Preview payment), P9c screens; each reviewed PASS; full suite green (core 1095, revolut 184, web 1788, worker 2650). Ships OFF: REVOLUT_PAYMENTS_EXECUTION="off", payments switch off, needs sandbox verification (17 unverified A-items, ADR 0050). Final review pending |
+| 9 | Payments | Built and merged 2026-11-12: P9a, P9b, P9c, then final-review fixes F9a (worker safety, migration 0030), F9b (payment alerts in Data health/Today), F9c (send path, honest "Paid" only when booked); each reviewer PASS; full suite green (core 1157, revolut 184, web 1886, worker 2795). Ships OFF (REVOLUT_PAYMENTS_EXECUTION="off", switch off). Short re-review of Phase 9 still to do. 17+ unverified Revolut A-items (ADR 0050); open user decisions: plan, four-eyes limit/approvers, hard ceilings, currencies, who sends, expired drafts, S9 cumulative limit, S10 Exact SEPA batch |
 | 10 | Reminders and resend emails | Not started |
 | 11 | Cash forecast and Close checklist | Not started |
 | 12 | Monthly FX revaluation booking | Not started |
@@ -78,3 +78,9 @@ Oldest first. Within a day, entries follow the order the work landed.
 
 ## Open decisions (CLAUDE.md §9)
 Answered: 7 (Workers only), 8 (domain only). Unanswered: 1-6 (needed from Phase 2 onward). Record answers as ADRs in `docs/decisions/`.
+
+## PAUSED (2026-11-12): resume after Monday 2026-11-16 16:00
+
+State: everything is merged and pushed on `claude/exact-online-frontend-brief-73wqxg`. No agents running.
+Next, in order: (1) short Phase 9 re-review (final-reviewer) against docs/reviews/phase-9-review.md B1-B3 and S1-S8; (2) Phase 10 reminders + resend emails; (3) Phase 11 cash forecast + close checklist; (4) Phase 12 monthly FX revaluation booking; each builder -> reviewer -> final review.
+Waiting on the user: staging deploy (Exact test division, Revolut sandbox, Google OAuth client); decisions 1-6 (see Phase 9 row), decision 3/4 (FX), decision 5 (reminders/email service, EU data region), financial year/budgets, monthly Revolut volume.

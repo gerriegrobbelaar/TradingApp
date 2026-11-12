@@ -9,7 +9,7 @@ import type { RevolutClient, RevolutTransaction } from "@camelthorn/revolut";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { linkPaidPayments, paymentSettlement, reconcilePayments } from "../src/payments/reconcile";
 import { listPayments, readBatch, readPayment } from "../src/payments/read";
-import type { Settlement } from "../src/payments/reconcile";
+import type { RowSettlement } from "../src/payments/reconcile";
 import { runSubmission, setSubmitterForTests, type SubmitOutcome } from "../src/payments/submit";
 import {
   anotherBill,
@@ -26,7 +26,7 @@ import { addTx } from "./matching-helpers";
 
 // The worker's union and the codes of core are the same set (a change in either fails the build).
 type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
-const sameSets: Same<Settlement, PaymentSettlement> = true;
+const sameSets: Same<RowSettlement, PaymentSettlement> = true;
 
 let w: ExecWorld;
 const tx = new Map<string, RevolutTransaction>();

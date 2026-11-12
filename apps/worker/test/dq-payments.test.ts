@@ -264,7 +264,7 @@ describe("review F9b: the alert columns are read, never assumed", () => {
       await set(gone, "not_found", "draft_gone", null); // last_result is no alert result
       await set(moved, "error", "mismatch", null); // a later transient error does not close it
       await set(acked, "approved_after_expiry", "approved_after_expiry", at(MIN));
-      await set(future, "mismatch", "some_new_kind", null); // a kind without a label
+      await set(future, "mismatch", null, null); // alert_at set, no kind: shown as an alert that needs a look
       await runDq();
       const rows = await open("payments.alert_open");
       const text = rows.map((r) => r.subject).join("|");

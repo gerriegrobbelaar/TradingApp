@@ -110,6 +110,16 @@ export async function addEvent(
  * A reconcile row. With the 0030 columns (F9a) present, an alert row also gets its `alert_kind`
  * (the last result), so the same test means the same thing in both schemas.
  */
+/** The kinds the real CHECK of migration 0030 allows. */
+const ALERT_KINDS = [
+  "mismatch",
+  "duplicate",
+  "approved_after_expiry",
+  "reverted_after_paid",
+  "draft_gone",
+  "draft_completed_unlinked",
+];
+
 export async function addReconcile(
   kind: "payment" | "batch",
   id: number,
@@ -122,6 +132,12 @@ export async function addReconcile(
       `INSERT INTO payment_reconcile (subject_kind, subject_id, first_checked_at, last_checked_at, last_result, alert_at${ack ? ", alert_kind" : ""})
        VALUES (?1, ?2, '2026-07-15T09:00:00.000Z', '2026-07-15T09:30:00.000Z', ?3, ?4${ack ? ", ?5" : ""})`,
     )
-    .bind(kind, id, lastResult, alertAt, ...(ack ? [alertAt === null ? null : lastResult] : []))
+    .bind(
+      kind,
+      id,
+      lastResult,
+      alertAt,
+      ...(ack ? [alertAt === null || !ALERT_KINDS.includes(lastResult) ? null : lastResult] : []),
+    )
     .run();
 }
