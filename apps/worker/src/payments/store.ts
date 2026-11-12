@@ -1,7 +1,9 @@
 /**
  * Payment requests and batches: create, confirm, approve, reject, cancel, expire (Phase 9, P9a,
- * ADR 0049). NOTHING HERE SENDS MONEY. A confirmed request ends at `ready` and waits; the call
- * boundary is payments/submit.ts and is wired in P9b.
+ * ADR 0049). NOTHING IN THIS FILE CALLS THE BANK: a confirmed request ends at `ready` and waits. The
+ * only code that sends is payments/submit.ts (`submitPayment`) through the gate (ADR 0050), reached by
+ * `POST .../submit`; this file only decides who may ask, confirm and approve (and, since F9a, that the
+ * requester is still an active finance user).
  *
  * Every write is one `db.batch` (change + event + audit, ADR 0013) whose statements are conditional
  * on the row still being in the state the decision was made on. The database repeats the rules with
@@ -11,6 +13,7 @@ import {
   batchConfirmPhrase,
   canApprove,
   checkBatch,
+  ibanKeyId,
   isStepUpRecent,
   maskIban,
   PAYMENT_BATCH_MAX_ITEMS,
@@ -56,6 +59,23 @@ export class PaymentError extends Error {
 }
 
 const iso = (ms: number): string => new Date(ms).toISOString();
+
+/**
+ * Is this email an active user who holds the finance role? A payment request is bound to the person who
+ * made it: when they are disabled or lose the role, nothing they requested is confirmed, approved or sent
+ * (F9a, S8). The database trigger on `ready -> submitting` cannot see roles of the requester, so the
+ * application asks at confirm, approve and send.
+ */
+export async function requesterIsActiveFinance(db: D1Database, email: string): Promise<boolean> {
+  const r = await db
+    .prepare(
+      `SELECT 1 AS n FROM users u JOIN user_roles r ON r.user_id = u.id
+        WHERE u.email = ?1 AND u.disabled_at IS NULL AND r.role = 'finance' LIMIT 1`,
+    )
+    .bind(email.toLowerCase())
+    .first();
+  return r !== null;
+}
 
 const errText = (err: unknown): string =>
   err instanceof Error ? `${err.message} ${String(err.cause)}` : String(err);
@@ -257,6 +277,7 @@ export async function createPayment(db: D1Database, a: CreateArgs): Promise<Crea
         beneficiaryName: g.supplier.name,
         iban: normalisedIban(g.supplier.iban),
         ibanFingerprint: item.ibanFingerprint,
+        keyId: ibanKeyId(a.ibanKey),
         reference: item.reference,
         payloadHash: hash,
         approvalsRequired: JSON.stringify(reasons),
@@ -586,6 +607,7 @@ export async function createBatch(db: D1Database, a: CreateBatchArgs): Promise<C
           beneficiaryName: i.g.supplier?.name ?? "",
           iban: normalisedIban(i.g.supplier?.iban ?? ""),
           ibanFingerprint: i.ibanFingerprint,
+          keyId: ibanKeyId(a.ibanKey),
           reference: i.reference,
           payloadHash: paymentPayloadHash({
             kind: "payment",
@@ -698,6 +720,9 @@ export async function confirmRequest(
   const row = subjectOrThrow(await loadSubject(db, a.kind, a.id), a.kind);
   if (row.requested_by !== a.actor) throw new PaymentError("not_requester", 403);
   if (row.status !== "draft") throw new PaymentError("not_draft", 409, { status: row.status });
+  if (!(await requesterIsActiveFinance(db, row.requested_by))) {
+    throw new PaymentError("requester_inactive", 403);
+  }
   const tail = a.kind === "payment" ? ((await maskedIbans(db, [row.id])).get(row.id) ?? "") : "";
   const expected =
     a.kind === "payment"
@@ -939,6 +964,10 @@ export async function decideRequest(db: D1Database, a: DecideArgs): Promise<Paym
       denial === "step_up_stale" ? "step_up_required" : denial,
       DENIAL_STATUS[denial],
     );
+  }
+  // Turning a request down is always allowed; approving one whose requester is gone is not (S8).
+  if (a.decision === "approved" && !(await requesterIsActiveFinance(db, row.requested_by))) {
+    throw new PaymentError("requester_inactive", 409);
   }
   const target: PaymentStatus = a.decision === "approved" ? "ready" : "rejected";
   const code = a.decision === "approved" ? "approved" : "approver_rejected";

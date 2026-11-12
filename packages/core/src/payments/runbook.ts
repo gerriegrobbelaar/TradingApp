@@ -21,8 +21,9 @@ export const PAYMENTS_VERIFY_RUNBOOK: Readonly<Record<PaymentsVerifyCheck, Runbo
     steps: [
       "Open Revolut Business, Settings, Plan, and read the plan name.",
       "Company plan: `pay` mode may be verified. Any other plan: stay on `drafts` and skip sandbox_pay_roundtrip.",
+      "A11, on a plan that is NOT Company: send one 1.00 `/pay` from the sandbox console or curl and write down the answer (status and error code). It must be refused; if it is accepted, the plan is not what Settings says: STOP.",
     ],
-    pass: "The plan is written in the note, and the connection's payment mode matches it.",
+    pass: "The plan is written in the note, the connection's payment mode matches it, and (not Company) `/pay` was refused.",
   },
   sandbox_counterparty_roundtrip: {
     title: "Sandbox: a counterparty is created from a supplier IBAN",
@@ -31,8 +32,18 @@ export const PAYMENTS_VERIFY_RUNBOOK: Readonly<Record<PaymentsVerifyCheck, Runbo
       "Send the first payment of a test supplier whose IBAN is verified. The app creates the counterparty once.",
       "In Revolut Business (sandbox), Counterparties: the new one shows the supplier name and the SAME IBAN.",
       "Send a second payment to the same supplier: no second counterparty appears.",
+      "Payee-name verification: pay a test supplier whose name differs slightly from the name on the IBAN, and one whose name is exactly right. Write down what Revolut shows or answers (match, close match, no match) and whether it blocks the payment.",
     ],
-    pass: "One counterparty, the right IBAN, reused for the second payment.",
+    pass: "One counterparty, the right IBAN, reused for the second payment; the answer to a wrong payee name is written in the note.",
+  },
+  counterparty_lookup_probe: {
+    title: "Probe: counterparties can be listed, with IBANs, and reads are rate limited sensibly",
+    steps: [
+      "A14: in the sandbox console or curl, `GET /counterparties` and look at one external counterparty. Write down whether its account carries the full `iban`. If it does not, the app cannot find a payee it created before (after a lost answer or a key change): STOP and tell the developer.",
+      "A14: write down whether the list is paged (a `limit`, a `created_before` or a next link) and how many counterparties one page holds. The app reads ONE page.",
+      "A16: send 40 reads of `GET /counterparties` within one minute. Write down the first status that is not 200, its `Retry-After` header and the error body.",
+    ],
+    pass: "The list shows IBANs, its paging is written down, and the rate-limit answer is written down.",
   },
   sandbox_draft_roundtrip: {
     title: "Sandbox: a payment draft appears in Revolut and is paid after approval",
@@ -41,8 +52,21 @@ export const PAYMENTS_VERIFY_RUNBOOK: Readonly<Record<PaymentsVerifyCheck, Runbo
       "The request shows `submitted`. In the Revolut app a draft titled CF-<12 characters> exists with the right payee, amount and reference.",
       "Approve the draft in the Revolut app. Within 10 minutes the request becomes `paid` and the bank line is linked.",
       "Repeat once with two bills in one batch: ONE bulk draft with two payments.",
+      "S13, fees: on the bank line of the paid draft look for a fee (a separate fee leg or a fee amount). Write down whether this payment type carries one. A payment with a fee line cannot be booked by the app (matching refuses fee lines): such a payment type must not be used until that is decided.",
     ],
-    pass: "Draft content equals the request; approval in the app turns the request paid; the batch is one draft.",
+    pass: "Draft content equals the request; approval in the app turns the request paid; the batch is one draft; whether a fee exists is written in the note.",
+  },
+  draft_lifecycle_probe: {
+    title: "Probe: how a draft ends, is read back, and is listed",
+    steps: [
+      "A10: send `POST /payment-drafts` from the sandbox console with an invalid body (a bad currency). Then list the drafts: NO draft may exist for it. If one does, STOP: a refused call can leave a draft.",
+      "A8, state words: write down the exact `state` words of a draft that is pending, approved and paid, deleted in the Revolut app, and expired. The app reads completed/failed/declined/revoked/cancelled/rejected/reverted/deleted; any other word counts as pending.",
+      "A8, completed: after approving a 1.00 draft read it back (`GET /payment-drafts/{id}`) and open each payment in it. Every payment must carry the id of its transaction, and `GET /transaction/{id}` must show our amount leaving our account. If a payment has no transaction id, the app will NOT mark the request paid (it raises draft_completed_unlinked): STOP and tell the developer.",
+      "A8, delete: delete a pending draft in the Revolut app, then `GET /payment-drafts/{id}`. Write down the answer (404 or a state). The app treats 404 as not found and never as failed.",
+      "A8, approve late: let a 1.00 draft stay unapproved past `payments.draft_expiry_days` (set it to 1 for the drill), see the request fail as draft_expired, then approve the draft in the Revolut app. The job must raise an alert and the request must NOT become paid by itself.",
+      "A8, paging: create more drafts than one page of `GET /payment-drafts` holds (write down the page size) and check whether the draft you look for is on the first page. If the list is paged and the app reads one page, a lost answer can be missed: STOP and tell the developer.",
+    ],
+    pass: "A refused call creates no draft, the state words and the 404 are written down, a late approval is raised, and the list paging is known.",
   },
   sandbox_pay_roundtrip: {
     title: "Sandbox: a direct payment works (pay mode, Company plan only)",
@@ -65,8 +89,8 @@ export const PAYMENTS_VERIFY_RUNBOOK: Readonly<Record<PaymentsVerifyCheck, Runbo
   lost_answer_lookup_drill: {
     title: "Drill: a lost answer is found again by request id",
     steps: [
-      "On staging, send a 1.00 request while the answer is made to fail (cut the Worker response after the gate sent: use the staging fault switch described in docs/DEPLOY.md, or stop the Worker during the call).",
-      "The request shows `outcome_unknown`. Never resend it.",
+      "On staging, send a 1.00 request and cut the Worker off after the sandbox received it: run the staging Worker with `wrangler dev --env staging --remote`, send the request, and stop the dev server (Ctrl-C) as soon as the sandbox console shows the new transfer or draft. Nothing else in the app can fake a lost answer.",
+      "The request stays `submitting` until its claim runs out (10 minutes), then shows `outcome_unknown`. Never resend it.",
       "Within 5 minutes the reconciliation job finds the transfer by request id (pay) or the draft by its title (drafts) and moves the request on.",
       "A request nothing was sent for stays unknown; a person resolves it with the typed phrase after the lookup says not found.",
     ],

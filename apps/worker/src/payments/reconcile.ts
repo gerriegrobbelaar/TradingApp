@@ -16,8 +16,16 @@
  *  - `paid` is the bank's word (ADR 0049). The Exact side is the standard match: when the payment's
  *    bank line appears (webhook or sync) it is LINKED to the payment (`payment_bank_links`); no second
  *    bank entry is ever created here. `paymentSettlement` says how far the booking is.
- *  - A draft not approved after `payments.draft_expiry_days` becomes `failed` (`draft_expired`); the
- *    draft stays on the watch list for 30 days so an approval after the expiry is raised as an alert.
+ *  - A draft not approved after `payments.draft_expiry_days` becomes `failed` (`draft_expired`) ONLY
+ *    while Revolut still shows it as pending. A known draft that answers "not found" never moves a
+ *    payment (F9a, B3c): it stays `submitted` with a `draft_gone` alert, unless there is positive
+ *    evidence that nothing was paid (no bank line of that account, amount and currency since it was
+ *    sent). An expired draft stays on the watch list for 30 days so an approval after the expiry is raised.
+ *  - A draft that says `completed` without naming a transaction for every payment is NOT `paid`
+ *    (F9a, N8): the payment stays `submitted` and `draft_completed_unlinked` is raised.
+ *  - Alerts (`mismatch`, `duplicate`, `approved_after_expiry`, `reverted_after_paid`, `draft_gone`,
+ *    `draft_completed_unlinked`) are columns of `payment_reconcile`, write an audit row when raised,
+ *    and are acknowledged with `ackAlert` (F9a, S1).
  *  - It keeps working while payments are switched OFF: switching off must not blind the lookup of
  *    what is already in flight. With nothing in flight it makes no call at all.
  */
@@ -32,7 +40,7 @@ import { auditStatement } from "../db/audit";
 import { interpretDraft } from "./draft-state";
 import { transactionMatchesPayment } from "./tx-match";
 import { markStaleSubmissions } from "./submit";
-import { childMoveStatements, moveStatements, type SubjectKind } from "./transition";
+import { childMoveStatements, moveStatements, TABLE, type SubjectKind } from "./transition";
 
 export { interpretDraft, type DraftVerdict } from "./draft-state";
 
@@ -108,9 +116,12 @@ interface Subject {
   amountMinor: number;
   currency: string;
   sourceExternalId: string;
+  bankAccountId: number;
   updatedAt: string;
   createdAt: string;
   notFoundChecks: number;
+  /** Payments in the request: 1, or the batch's item count. */
+  itemCount: number;
 }
 
 async function loadSubjects(db: D1Database): Promise<Subject[]> {
@@ -121,8 +132,8 @@ async function loadSubjects(db: D1Database): Promise<Subject[]> {
     const rows = await db
       .prepare(
         `SELECT s.id, s.request_id, s.status, s.mode, s.provider_id, ${amount} AS amount_minor, s.currency,
-                a.external_id, COALESCE(s.updated_at, s.created_at) AS updated_at, s.created_at,
-                COALESCE(r.not_found_checks, 0) AS nf
+                a.external_id, s.bank_account_id, COALESCE(s.updated_at, s.created_at) AS updated_at, s.created_at,
+                COALESCE(r.not_found_checks, 0) AS nf, ${kind === "payment" ? "1" : "s.item_count"} AS item_count
            FROM ${table} s JOIN bank_accounts a ON a.id = s.bank_account_id
            LEFT JOIN payment_reconcile r ON r.subject_kind = ?1 AND r.subject_id = s.id
           WHERE s.status IN ('submitted', 'outcome_unknown') ${kind === "payment" ? "AND s.batch_id IS NULL" : ""}
@@ -138,9 +149,11 @@ async function loadSubjects(db: D1Database): Promise<Subject[]> {
         amount_minor: number;
         currency: string;
         external_id: string;
+        bank_account_id: number;
         updated_at: string;
         created_at: string;
         nf: number;
+        item_count: number;
       }>();
     for (const r of rows.results) {
       out.push({
@@ -153,33 +166,52 @@ async function loadSubjects(db: D1Database): Promise<Subject[]> {
         amountMinor: r.amount_minor,
         currency: r.currency,
         sourceExternalId: r.external_id,
+        bankAccountId: r.bank_account_id,
         updatedAt: r.updated_at,
         createdAt: r.created_at,
         notFoundChecks: r.nf,
+        itemCount: r.item_count,
       });
     }
   }
   return out;
 }
 
+export type AlertKind =
+  | "mismatch"
+  | "duplicate"
+  | "approved_after_expiry"
+  | "reverted_after_paid"
+  | "draft_gone"
+  | "draft_completed_unlinked";
+
+/**
+ * The bookkeeping row. An alert is raised ONCE: while the current one is open, or acknowledged and of
+ * the same kind, a later run leaves `alert_at/kind/ack` as they are; a DIFFERENT kind after an
+ * acknowledgement raises again (and clears the acknowledgement). All SET expressions read the old row.
+ */
 function note(
   db: D1Database,
   s: Pick<Subject, "kind" | "id">,
   nowIso: string,
   result: ReconcileResult,
-  extra: { providerState?: string | null; transactionId?: string | null; alert?: boolean } = {},
+  extra: { providerState?: string | null; transactionId?: string | null; alert?: AlertKind } = {},
 ): D1PreparedStatement {
+  const raise = `(alert_at IS NULL OR (alert_ack_at IS NOT NULL AND alert_kind IS NOT excluded.alert_kind))`;
   return db
     .prepare(
       `INSERT INTO payment_reconcile (subject_kind, subject_id, first_checked_at, last_checked_at, checks,
-                                      not_found_checks, last_result, provider_state, transaction_id, alert_at)
-       VALUES (?1, ?2, ?3, ?3, 1, ?4, ?5, ?6, ?7, ?8)
+                                      not_found_checks, last_result, provider_state, transaction_id, alert_at, alert_kind)
+       VALUES (?1, ?2, ?3, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9)
        ON CONFLICT (subject_kind, subject_id) DO UPDATE SET
          last_checked_at = excluded.last_checked_at, checks = checks + 1,
          not_found_checks = not_found_checks + excluded.not_found_checks,
          last_result = excluded.last_result, provider_state = excluded.provider_state,
          transaction_id = COALESCE(excluded.transaction_id, transaction_id),
-         alert_at = COALESCE(alert_at, excluded.alert_at)`,
+         alert_at = CASE WHEN excluded.alert_kind IS NOT NULL AND ${raise} THEN excluded.alert_at ELSE alert_at END,
+         alert_ack_at = CASE WHEN excluded.alert_kind IS NOT NULL AND ${raise} THEN NULL ELSE alert_ack_at END,
+         alert_ack_by = CASE WHEN excluded.alert_kind IS NOT NULL AND ${raise} THEN NULL ELSE alert_ack_by END,
+         alert_kind = CASE WHEN excluded.alert_kind IS NOT NULL AND ${raise} THEN excluded.alert_kind ELSE alert_kind END`,
     )
     .bind(
       s.kind,
@@ -189,8 +221,50 @@ function note(
       result,
       (extra.providerState ?? null)?.slice(0, 40) ?? null,
       extra.transactionId?.slice(0, 100) ?? null,
-      extra.alert === true ? nowIso : null,
+      extra.alert === undefined ? null : nowIso,
+      extra.alert ?? null,
     );
+}
+
+/**
+ * The bookkeeping row of a RAISED alert plus its audit row, in the order a batch needs. The audit row is
+ * written only when this very run raised the alert (alert_at = now and the kind is the kind), so the
+ * same open alert is audited once, however many runs see it again (F9a, S1).
+ */
+function alertStatements(
+  db: D1Database,
+  s: Pick<Subject, "kind" | "id" | "requestId">,
+  nowIso: string,
+  result: ReconcileResult,
+  kind: AlertKind,
+  extra: { providerState?: string | null; transactionId?: string | null } = {},
+): D1PreparedStatement[] {
+  const prefix = s.kind === "payment" ? "payment" : "payment_batch";
+  return [
+    note(db, s, nowIso, result, { ...extra, alert: kind }),
+    auditStatement(
+      db,
+      {
+        actorEmail: "system",
+        action: `${prefix}.${kind}`,
+        entity: prefix,
+        entityId: s.requestId,
+        after: { result, providerState: extra.providerState ?? null },
+      },
+      {
+        sql: `EXISTS (SELECT 1 FROM payment_reconcile WHERE subject_kind = ?7 AND subject_id = ?8
+                       AND alert_at = ?9 AND alert_kind = ?10)`,
+        binds: [s.kind, s.id, nowIso, kind],
+      },
+    ),
+  ];
+}
+
+/** What a completed draft says it paid: one entry per transaction (money that left OUR account). */
+interface PaidTx {
+  id: string;
+  amountMinor: number;
+  currency: string;
 }
 
 /** The move plus the bookkeeping row, as one batch. True when the state really moved. */
@@ -201,7 +275,7 @@ async function applyMove(
   code: string,
   nowIso: string,
   result: ReconcileResult,
-  extra: { providerId?: string | null; providerState?: string | null; alert?: boolean } = {},
+  extra: { providerId?: string | null; providerState?: string | null; txs?: PaidTx[] } = {},
 ): Promise<boolean> {
   const move = {
     kind: s.kind,
@@ -222,8 +296,21 @@ async function applyMove(
       note(db, s, nowIso, result, {
         providerState: extra.providerState ?? null,
         transactionId: extra.providerId ?? null,
-        ...(extra.alert === true ? { alert: true } : {}),
       }),
+      // The transactions a completed draft named (B2): recorded only for a request that is `paid`
+      // (the trigger insists), so a failed move writes none of them. A plain INSERT on purpose: if a
+      // row is refused, the WHOLE batch is rolled back and the payment stays as it is for the next run
+      // (OR IGNORE would skip a refused row silently and leave a paid batch that can never be linked).
+      ...(to === "paid" ? (extra.txs ?? []) : []).map((t) =>
+        db
+          .prepare(
+            `INSERT INTO payment_draft_transactions
+               (subject_kind, subject_id, transaction_id, amount_minor, currency, recorded_at)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6
+              WHERE EXISTS (SELECT 1 FROM ${TABLE[s.kind]} WHERE id = ?2 AND status = 'paid' AND updated_at = ?6)`,
+          )
+          .bind(s.kind, s.id, t.id.slice(0, 100), t.amountMinor, t.currency, nowIso),
+      ),
     ]);
     return (out[2]?.meta.changes ?? 0) === 1;
   } catch {
@@ -261,13 +348,12 @@ async function viaTransaction(
   });
   if (!ours) {
     sum.alerts++;
-    await db.batch([
-      note(db, s, nowIso, "mismatch", {
+    await db.batch(
+      alertStatements(db, s, nowIso, "mismatch", "mismatch", {
         providerState: tx.state,
         transactionId: tx.id,
-        alert: true,
       }),
-    ]);
+    );
     return;
   }
   if (tx.state === "completed") {
@@ -320,7 +406,7 @@ async function viaDraft(
       const hits = (await client.listPaymentDrafts()).filter((d) => d.title === title);
       if (hits.length > 1) {
         sum.alerts++;
-        await db.batch([note(db, s, nowIso, "duplicate", { alert: true })]);
+        await db.batch(alertStatements(db, s, nowIso, "duplicate", "duplicate"));
         return;
       }
       view = hits[0] ?? null;
@@ -334,10 +420,21 @@ async function viaDraft(
     }
   }
   if (view === null) {
-    // Not found (a deleted draft, or one that was never created). Never moves by itself, except the
-    // expiry of a draft we know about.
-    if (s.providerId !== null && nowMs - Date.parse(s.updatedAt) > expiryDays * 86_400_000) {
-      if (await applyMove(db, s, "failed", "draft_expired", nowIso, "draft_expired")) sum.failed++;
+    if (s.providerId !== null) {
+      // A draft WE KNOW that Revolut now calls "not found": deleted in the app, or a lookup that
+      // lies. "Not found" never moves a payment (F9a, B3c). The request stays as it is and a person
+      // is told. Only POSITIVE evidence that nothing was paid (the bank feed is fresh and shows no
+      // line of this account with this amount since the request was made) lets an expired one fail.
+      if (
+        nowMs - Date.parse(s.updatedAt) > expiryDays * 86_400_000 &&
+        (await nothingPaidEvidence(db, s, nowMs))
+      ) {
+        if (await applyMove(db, s, "failed", "draft_expired", nowIso, "draft_expired"))
+          sum.failed++;
+        return;
+      }
+      sum.alerts++;
+      await db.batch(alertStatements(db, s, nowIso, "not_found", "draft_gone"));
       return;
     }
     sum.notFound++;
@@ -345,25 +442,43 @@ async function viaDraft(
     return;
   }
   let verdict = interpretDraft(view);
-  if (verdict.kind === "paid" && verdict.transactionIds.length > 0) {
-    // Review P9b: a draft's "completed" (A8) is not taken as the bank's final word when the draft
-    // names its transactions: each one is read, and only `completed` on every one is paid.
-    const bank = await draftTransactionsState(client, s, verdict.transactionIds);
-    if (bank === "error") {
+  let paidTxs: PaidTx[] = [];
+  if (verdict.kind === "paid") {
+    // N8: a draft that says "completed" must name one transaction for every payment we asked for.
+    // Without them the bank's word is not confirmed and nothing can be linked to a bank line: the
+    // request stays as it is and a person is told. It never becomes `paid` silently.
+    if (
+      verdict.paymentCount !== s.itemCount ||
+      verdict.transactionIds.length !== s.itemCount ||
+      new Set(verdict.transactionIds).size !== s.itemCount
+    ) {
+      sum.alerts++;
+      await db.batch(
+        alertStatements(db, s, nowIso, "mismatch", "draft_completed_unlinked", {
+          providerState: "completed",
+        }),
+      );
+      return;
+    }
+    // Review P9b: a draft's "completed" (A8) is not taken as the bank's final word: each named
+    // transaction is read, and only `completed` on every one, in our amounts, is paid.
+    const bank = await draftTransactionsState(db, client, s, verdict.transactionIds);
+    if (bank.state === "error") {
       sum.errors++;
       await db.batch([note(db, s, nowIso, "error")]);
       return;
     }
-    if (bank === "mismatch") {
+    if (bank.state === "mismatch") {
       sum.alerts++;
-      await db.batch([
-        note(db, s, nowIso, "mismatch", { providerState: "completed", alert: true }),
-      ]);
+      await db.batch(
+        alertStatements(db, s, nowIso, "mismatch", "mismatch", { providerState: "completed" }),
+      );
       return;
     }
-    if (bank === "pending") verdict = { kind: "pending" };
-    else if (bank === "mixed") verdict = { kind: "mixed" };
-    else if (bank !== "completed") verdict = { kind: "failed", code: bank };
+    paidTxs = bank.txs;
+    if (bank.state === "pending") verdict = { kind: "pending" };
+    else if (bank.state === "mixed") verdict = { kind: "mixed" };
+    else if (bank.state !== "completed") verdict = { kind: "failed", code: bank.state };
   }
   if (verdict.kind === "paid") {
     const tx = verdict.transactionId;
@@ -371,6 +486,7 @@ async function viaDraft(
       await applyMove(db, s, "paid", "bank_completed", nowIso, "paid", {
         providerId: s.providerId ?? view.id,
         providerState: "completed",
+        txs: paidTxs,
       })
     ) {
       sum.paid++;
@@ -392,7 +508,9 @@ async function viaDraft(
   }
   if (verdict.kind === "mixed") {
     sum.alerts++;
-    await db.batch([note(db, s, nowIso, "mismatch", { providerState: "mixed", alert: true })]);
+    await db.batch(
+      alertStatements(db, s, nowIso, "mismatch", "mismatch", { providerState: "mixed" }),
+    );
     return;
   }
   // pending: the draft waits for the approval in the Revolut app
@@ -422,20 +540,28 @@ async function viaDraft(
  * completed (and, for a single payment, is our amount from our account); a refusal state when all
  * are refused; `mixed` when some are; `pending` otherwise. Read-only.
  */
+type DraftBank =
+  | { state: "error" | "mismatch"; txs: PaidTx[] }
+  | {
+      state: "completed" | "pending" | "mixed" | "failed" | "declined" | "reverted";
+      txs: PaidTx[];
+    };
+
 async function draftTransactionsState(
+  db: D1Database,
   client: RevolutClient,
   s: Subject,
   ids: string[],
-): Promise<
-  "completed" | "pending" | "mixed" | "error" | "mismatch" | "failed" | "declined" | "reverted"
-> {
+): Promise<DraftBank> {
   const states: string[] = [];
-  for (const id of ids.slice(0, 50)) {
+  const txs: PaidTx[] = [];
+  const source = s.sourceExternalId.toLowerCase();
+  for (const id of ids) {
     let tx: RevolutTransaction;
     try {
       tx = await client.getTransaction(id);
     } catch {
-      return "error";
+      return { state: "error", txs: [] };
     }
     if (
       s.kind === "payment" &&
@@ -446,16 +572,64 @@ async function draftTransactionsState(
         sourceExternalId: s.sourceExternalId,
       })
     ) {
-      return "mismatch";
+      return { state: "mismatch", txs: [] };
     }
+    // The money that left OUR account in this transaction; a transaction without such a leg is not ours.
+    const leg = tx.legs.find(
+      (l) => l.accountId !== undefined && l.accountId.toLowerCase() === source && l.amountMinor < 0,
+    );
+    if (leg === undefined) return { state: "mismatch", txs: [] };
+    txs.push({ id: tx.id, amountMinor: -leg.amountMinor, currency: leg.currency });
     states.push(tx.state);
+  }
+  // Our amounts, one for one (a batch: the multiset of its items). Anything else is reported, never believed.
+  const expected = await db
+    .prepare(
+      s.kind === "payment"
+        ? "SELECT amount_minor, currency FROM payments WHERE id = ?1"
+        : "SELECT amount_minor, currency FROM payments WHERE batch_id = ?1",
+    )
+    .bind(s.id)
+    .all<{ amount_minor: number; currency: string }>();
+  const key = (a: number, c: string): string => `${c}:${a}`;
+  const want = expected.results.map((r) => key(r.amount_minor, r.currency)).sort();
+  const got = txs.map((t) => key(t.amountMinor, t.currency)).sort();
+  if (want.length === 0 || want.length !== got.length || want.some((w, i) => w !== got[i])) {
+    return { state: "mismatch", txs: [] };
   }
   const done = states.filter((x) => x === "completed").length;
   const bad = states.filter((x) => x === "failed" || x === "declined" || x === "reverted");
-  if (done === states.length) return "completed";
-  if (bad.length > 0 && done > 0) return "mixed";
-  if (bad.length === states.length) return bad[0] as "failed" | "declined" | "reverted";
-  return "pending";
+  if (done === states.length) return { state: "completed", txs };
+  if (bad.length > 0 && done > 0) return { state: "mixed", txs };
+  if (bad.length === states.length) {
+    return { state: bad[0] as "failed" | "declined" | "reverted", txs };
+  }
+  return { state: "pending", txs };
+}
+
+/**
+ * Positive evidence that a draft that Revolut no longer shows was never paid: the account's bank feed
+ * is fresh (read in the last 24 hours) AND it holds no line of this account with this amount (any
+ * request item of a batch) since the request was made, that is not itself failed/declined/reverted.
+ * Absence of evidence is not evidence: with a stale feed this answers false.
+ */
+async function nothingPaidEvidence(db: D1Database, s: Subject, nowMs: number): Promise<boolean> {
+  const fresh = await db
+    .prepare("SELECT 1 AS n FROM bank_accounts WHERE id = ?1 AND balance_at >= ?2")
+    .bind(s.bankAccountId, new Date(nowMs - 24 * 3_600_000).toISOString())
+    .first();
+  if (fresh === null) return false;
+  const since = new Date(Date.parse(s.createdAt) - 86_400_000).toISOString();
+  const hit = await db
+    .prepare(
+      `SELECT 1 AS n FROM bank_transactions t JOIN payments p ON ${s.kind === "payment" ? "p.id" : "p.batch_id"} = ?1
+        WHERE t.bank_account_id = p.bank_account_id AND t.currency = p.currency
+          AND t.amount_minor = -p.amount_minor AND t.state NOT IN ('failed', 'declined', 'reverted')
+          AND t.booked_at >= ?2 LIMIT 1`,
+    )
+    .bind(s.id, since)
+    .first();
+  return hit === null;
 }
 
 // ---- the watch on expired drafts, bank links, reversals -----------------------------------------
@@ -487,19 +661,15 @@ async function watchExpiredDrafts(
         const v = interpretDraft(await client.getPaymentDraft(r.provider_id));
         if (v.kind === "paid" || v.kind === "mixed") {
           const nowIso = new Date(nowMs).toISOString();
-          await db.batch([
-            note(db, { kind, id: r.id }, nowIso, "approved_after_expiry", { alert: true }),
-            auditStatement(db, {
-              actorEmail: "system",
-              action:
-                kind === "payment"
-                  ? "payment.approved_after_expiry"
-                  : "payment_batch.approved_after_expiry",
-              entity: kind === "payment" ? "payment" : "payment_batch",
-              entityId: r.request_id,
-              after: { providerId: r.provider_id },
-            }),
-          ]);
+          await db.batch(
+            alertStatements(
+              db,
+              { kind, id: r.id, requestId: r.request_id },
+              nowIso,
+              "approved_after_expiry",
+              "approved_after_expiry",
+            ),
+          );
           sum.alerts++;
         }
       } catch {
@@ -520,7 +690,9 @@ export async function linkPaidPayments(db: D1Database, nowIso: string): Promise<
          JOIN bank_transactions t ON t.bank_account_id = p.bank_account_id
               AND t.currency = p.currency AND t.amount_minor = -p.amount_minor
               AND (t.request_id = p.request_id
-                   OR t.external_id = COALESCE(r.transaction_id, p.provider_id))
+                   OR t.external_id = COALESCE(r.transaction_id, p.provider_id)
+                   OR t.external_id IN (SELECT d.transaction_id FROM payment_draft_transactions d
+                                         WHERE d.subject_kind = 'payment' AND d.subject_id = p.id))
         WHERE p.status = 'paid' AND p.batch_id IS NULL
           AND NOT EXISTS (SELECT 1 FROM payment_bank_links l WHERE l.payment_id = p.id)
           AND NOT EXISTS (SELECT 1 FROM payment_bank_links l WHERE l.bank_transaction_id = t.id)
@@ -559,6 +731,112 @@ export async function linkPaidPayments(db: D1Database, nowIso: string): Promise<
   return n;
 }
 
+/**
+ * B2: the items of a PAID batch are linked to their bank lines through the transactions the completed
+ * draft named (`payment_draft_transactions`). The pairing is one to one and never guesses: an item
+ * and a line are paired when they are the only ones of that amount, or (same amount, several of them)
+ * when the line's reference is the item's reference and nobody else has it. Anything else stays
+ * unlinked (`awaiting_bank_line`), which the settlement answer and the data-quality rule show. The
+ * database repeats the account/currency/amount rule (payment_bank_links_guard_insert).
+ */
+export async function linkBatchItems(db: D1Database, nowIso: string): Promise<number> {
+  const batches = await db
+    .prepare(
+      `SELECT b.id FROM payment_batches b
+        WHERE b.status = 'paid'
+          AND EXISTS (SELECT 1 FROM payment_draft_transactions d WHERE d.subject_kind = 'batch' AND d.subject_id = b.id)
+          AND EXISTS (SELECT 1 FROM payments p WHERE p.batch_id = b.id AND p.status = 'paid'
+                       AND NOT EXISTS (SELECT 1 FROM payment_bank_links l WHERE l.payment_id = p.id))
+        ORDER BY b.id LIMIT 20`,
+    )
+    .all<{ id: number }>();
+  let n = 0;
+  for (const b of batches.results) {
+    const items = await db
+      .prepare(
+        `SELECT p.id, p.amount_minor, p.currency, p.reference FROM payments p
+          WHERE p.batch_id = ?1 AND p.status = 'paid'
+            AND NOT EXISTS (SELECT 1 FROM payment_bank_links l WHERE l.payment_id = p.id)
+          ORDER BY p.id`,
+      )
+      .bind(b.id)
+      .all<{ id: number; amount_minor: number; currency: string; reference: string }>();
+    const lines = await db
+      .prepare(
+        `SELECT DISTINCT t.id, t.amount_minor, t.currency, t.reference
+           FROM payment_draft_transactions d
+           JOIN payment_batches pb ON pb.id = d.subject_id
+           JOIN bank_transactions t ON t.external_id = d.transaction_id AND t.bank_account_id = pb.bank_account_id
+                AND t.currency = d.currency AND t.amount_minor = -d.amount_minor
+          WHERE d.subject_kind = 'batch' AND d.subject_id = ?1
+            AND NOT EXISTS (SELECT 1 FROM payment_bank_links l WHERE l.bank_transaction_id = t.id)
+          ORDER BY t.id`,
+      )
+      .bind(b.id)
+      .all<{ id: number; amount_minor: number; currency: string; reference: string | null }>();
+    const pairs: { paymentId: number; lineId: number }[] = [];
+    const groupKey = (a: number, c: string): string => `${c}:${a}`;
+    const groups = new Map<string, { items: typeof items.results; lines: typeof lines.results }>();
+    for (const i of items.results) {
+      const k = groupKey(i.amount_minor, i.currency);
+      const g = groups.get(k) ?? { items: [], lines: [] };
+      g.items.push(i);
+      groups.set(k, g);
+    }
+    for (const l of lines.results) {
+      const g = groups.get(groupKey(-l.amount_minor, l.currency));
+      if (g) g.lines.push(l);
+    }
+    for (const g of groups.values()) {
+      if (g.items.length === 1 && g.lines.length === 1) {
+        pairs.push({
+          paymentId: (g.items[0] as { id: number }).id,
+          lineId: (g.lines[0] as { id: number }).id,
+        });
+        continue;
+      }
+      for (const item of g.items) {
+        const sameRef = g.lines.filter(
+          (l) => l.reference !== null && l.reference === item.reference,
+        );
+        const rivals = g.items.filter((o) => o.reference === item.reference);
+        if (sameRef.length === 1 && rivals.length === 1) {
+          pairs.push({ paymentId: item.id, lineId: (sameRef[0] as { id: number }).id });
+        }
+      }
+    }
+    for (const p of pairs) {
+      try {
+        const out = await db.batch([
+          db
+            .prepare(
+              "INSERT INTO payment_bank_links (payment_id, bank_transaction_id, via, linked_at) VALUES (?1, ?2, 'transaction_id', ?3)",
+            )
+            .bind(p.paymentId, p.lineId, nowIso),
+          auditStatement(
+            db,
+            {
+              actorEmail: "system",
+              action: "payment.bank_line_linked",
+              entity: "payment",
+              entityId: String(p.paymentId),
+              after: { bankTransactionId: p.lineId, via: "transaction_id", batchId: b.id },
+            },
+            {
+              sql: "EXISTS (SELECT 1 FROM payment_bank_links WHERE payment_id = ?7 AND bank_transaction_id = ?8)",
+              binds: [p.paymentId, p.lineId],
+            },
+          ),
+        ]);
+        n += out[0]?.meta.changes ?? 0;
+      } catch {
+        // the database refused (another amount or account, a race): leave it for a person
+      }
+    }
+  }
+  return n;
+}
+
 /** A paid payment whose bank line later turned failed/reverted/declined: raised once, never reverted silently. */
 async function flagReversals(db: D1Database, nowIso: string): Promise<number> {
   const rows = await db
@@ -573,15 +851,15 @@ async function flagReversals(db: D1Database, nowIso: string): Promise<number> {
     )
     .all<{ id: number; request_id: string }>();
   for (const r of rows.results) {
-    await db.batch([
-      note(db, { kind: "payment", id: r.id }, nowIso, "reverted_after_paid", { alert: true }),
-      auditStatement(db, {
-        actorEmail: "system",
-        action: "payment.reverted_after_paid",
-        entity: "payment",
-        entityId: r.request_id,
-      }),
-    ]);
+    await db.batch(
+      alertStatements(
+        db,
+        { kind: "payment", id: r.id, requestId: r.request_id },
+        nowIso,
+        "reverted_after_paid",
+        "reverted_after_paid",
+      ),
+    );
   }
   return rows.results.length;
 }
@@ -622,6 +900,7 @@ export async function reconcilePayments(deps: ReconcileDeps): Promise<ReconcileS
     await watchExpiredDrafts(db, client, nowMs, sum);
   }
   sum.linked = await linkPaidPayments(db, nowIso);
+  sum.linked += await linkBatchItems(db, nowIso);
   sum.alerts += await flagReversals(db, nowIso);
   return sum;
 }
@@ -709,18 +988,40 @@ export type Settlement =
   | "awaiting_match"
   | "match_other_invoice"
   | "awaiting_booking"
-  | "booked";
+  | "booked"
+  /** The request expired locally, but the draft was approved in the Revolut app afterwards: money may have left. */
+  | "approved_after_expiry"
+  /** The bank line of a paid payment turned failed/reverted/declined afterwards: a person must look. */
+  | "reverted_after_paid";
 
 /**
  * CLAUDE.md 4.3: "Paid" in the full sense needs the bank's confirmation AND the match booked in Exact.
- * `payments.status = 'paid'` is the bank's word; this says how far the second fact is.
+ * `payments.status = 'paid'` is the bank's word; this says how far the second fact is. It answers
+ * honestly for the two cases where the status alone would mislead (F9a, S1): a draft approved after
+ * its request expired (status `failed`, but money may have left) and a paid payment whose bank line
+ * was reversed afterwards.
  */
 export async function paymentSettlement(db: D1Database, paymentId: number): Promise<Settlement> {
   const p = await db
-    .prepare("SELECT status, open_item_id FROM payments WHERE id = ?1")
+    .prepare("SELECT status, open_item_id, batch_id FROM payments WHERE id = ?1")
     .bind(paymentId)
-    .first<{ status: string; open_item_id: number }>();
-  if (p === null || p.status !== "paid") return "not_paid";
+    .first<{ status: string; open_item_id: number; batch_id: number | null }>();
+  if (p === null) return "not_paid";
+  const alert = await db
+    .prepare(
+      `SELECT alert_kind FROM payment_reconcile
+        WHERE ((subject_kind = 'payment' AND subject_id = ?1) OR (subject_kind = 'batch' AND subject_id = ?2))
+          AND alert_kind IN ('approved_after_expiry', 'reverted_after_paid')
+        ORDER BY alert_at DESC LIMIT 1`,
+    )
+    .bind(paymentId, p.batch_id ?? 0)
+    .first<{ alert_kind: string }>();
+  if (p.status !== "paid") {
+    return p.status === "failed" && alert?.alert_kind === "approved_after_expiry"
+      ? "approved_after_expiry"
+      : "not_paid";
+  }
+  if (alert?.alert_kind === "reverted_after_paid") return "reverted_after_paid";
   const l = await db
     .prepare("SELECT bank_transaction_id FROM payment_bank_links WHERE payment_id = ?1")
     .bind(paymentId)
@@ -738,4 +1039,70 @@ export async function paymentSettlement(db: D1Database, paymentId: number): Prom
   return m.results.some((x) => x.ours === 1 && x.exact_state === "matched_in_exact")
     ? "booked"
     : "awaiting_booking";
+}
+
+// ---- a person acknowledges an alert ---------------------------------------------------------------
+
+export type AckResult = { ok: true; kind: AlertKind } | { ok: false; code: string };
+
+/**
+ * A finance user or admin says they have looked at the OPEN alert of a payment or batch (F9a, S1).
+ * It only records who and when (audited in the same batch); it moves no payment and fixes nothing.
+ * A different kind of alert raised later is open again (see `note`). Compare-and-swap on the alert
+ * that was read, so an alert raised in between is not acknowledged unseen.
+ */
+export async function ackAlert(
+  db: D1Database,
+  a: { kind: SubjectKind; id: number; actor: string; nowMs: number; note: string | null },
+): Promise<AckResult> {
+  const s = await db
+    .prepare(`SELECT request_id FROM ${TABLE[a.kind]} WHERE id = ?1`)
+    .bind(a.id)
+    .first<{ request_id: string }>();
+  if (s === null) return { ok: false, code: "not_found" };
+  const r = await db
+    .prepare(
+      `SELECT alert_at, alert_kind, alert_ack_at FROM payment_reconcile
+        WHERE subject_kind = ?1 AND subject_id = ?2`,
+    )
+    .bind(a.kind, a.id)
+    .first<{
+      alert_at: string | null;
+      alert_kind: AlertKind | null;
+      alert_ack_at: string | null;
+    }>();
+  if (r === null || r.alert_at === null || r.alert_kind === null) {
+    return { ok: false, code: "no_alert" };
+  }
+  if (r.alert_ack_at !== null) return { ok: false, code: "already_acknowledged" };
+  const nowIso = new Date(a.nowMs).toISOString();
+  const prefix = a.kind === "payment" ? "payment" : "payment_batch";
+  const out = await db.batch([
+    db
+      .prepare(
+        `UPDATE payment_reconcile SET alert_ack_at = ?3, alert_ack_by = ?4
+          WHERE subject_kind = ?1 AND subject_id = ?2 AND alert_at = ?5 AND alert_kind = ?6
+            AND alert_ack_at IS NULL`,
+      )
+      .bind(a.kind, a.id, nowIso, a.actor.toLowerCase(), r.alert_at, r.alert_kind),
+    auditStatement(
+      db,
+      {
+        actorEmail: a.actor,
+        action: `${prefix}.alert_acknowledged`,
+        entity: prefix,
+        entityId: s.request_id,
+        before: { alertKind: r.alert_kind, alertAt: r.alert_at },
+        after: { acknowledgedAt: nowIso, ...(a.note !== null ? { note: a.note } : {}) },
+      },
+      {
+        sql: `changes() = 1 AND EXISTS (SELECT 1 FROM payment_reconcile WHERE subject_kind = ?7 AND subject_id = ?8
+                                         AND alert_ack_at = ?9 AND alert_ack_by = ?10)`,
+        binds: [a.kind, a.id, nowIso, a.actor.toLowerCase()],
+      },
+    ),
+  ]);
+  return (out[1]?.meta.changes ?? 0) === 1
+    ? { ok: true, kind: r.alert_kind }
+    : { ok: false, code: "conflict" };
 }

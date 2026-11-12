@@ -113,6 +113,10 @@ export const BLOCK_TEXT: Record<string, BlockText> = {
     what: "The supplier's bank account changed since an approver last confirmed it.",
     todo: "Check the change with the supplier by phone. Then ask an approver to confirm the new account.",
   },
+  iban_key_rotated: {
+    what: "The earlier confirmation of the supplier's bank account no longer counts, because the payment security key was replaced. The account itself may be the same.",
+    todo: "Check the account with the supplier by phone. Then ask an approver to confirm it again.",
+  },
   over_request_limit: {
     what: "The amount is above the largest single payment allowed.",
     todo: "An administrator can review the ceiling in Settings, Payments.",
@@ -410,6 +414,10 @@ export const ERROR_TEXT: Record<string, string> = {
   note_required: "Write a reason for turning this down (at least 3 characters).",
   last_four_mismatch: "The last four characters do not match the bank account shown.",
   iban_changed: "The bank account changed while this was open. Reload and check it again.",
+  requester_inactive:
+    "The person who asked for this payment can no longer do so. Nothing was paid. Ask a finance user to request it again.",
+  provisional_not_allowed:
+    "A trial verification is only possible on the Revolut sandbox with payments enabled in this deployment.",
   iban_missing: "The supplier has no bank account.",
   iban_invalid: "The supplier's bank account is not valid.",
   iban_cache_stale:
@@ -487,6 +495,10 @@ export const VERIFY_CHECK_TEXT: Record<string, string> = {
   revolut_plan_known: "The Revolut plan is known (Company or not).",
   sandbox_draft_roundtrip: "A payment draft was created and read back on the Revolut sandbox.",
   sandbox_counterparty_roundtrip: "A payee was created and read back on the Revolut sandbox.",
+  counterparty_lookup_probe:
+    "Listing payees was checked: bank accounts show in the list, its paging is known and the rate limit is written down.",
+  draft_lifecycle_probe:
+    "How a payment draft ends was checked: a refused call, a deleted draft, a late approval and a long list.",
   sandbox_pay_roundtrip:
     "A direct payment was made and read back on the Revolut sandbox (needed only for one-click pay).",
   request_id_idempotency_replay: "The same request id sent twice made one payment on the sandbox.",

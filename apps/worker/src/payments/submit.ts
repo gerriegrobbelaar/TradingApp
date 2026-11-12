@@ -19,7 +19,6 @@
 import {
   approvalStillValid,
   paymentPayloadHash,
-  verifyCoversMode,
   type PayloadItem,
   type PaymentMode,
 } from "@camelthorn/core";
@@ -27,10 +26,11 @@ import { createRevolutClient, PAYMENT_JOB_ID } from "@camelthorn/revolut";
 import type { Env } from "../env";
 import { revolutClientSleep } from "../revolut/client-timing";
 import { createRevolutGateTransport, getRevolutGate } from "../revolut/gate-transport";
-import { storedIbansMatch } from "./iban-store";
+import { markCoversMode } from "./gate-flag";
+import { storedIbansMatch, storedKeyRotated } from "./iban-store";
 import { createRevolutSubmitter } from "./revolut-submitter";
 import { ibanKeyOf, loadPaymentsState, paymentsBlockers } from "./settings";
-import { recheckBeforeSubmit } from "./store";
+import { recheckBeforeSubmit, requesterIsActiveFinance } from "./store";
 import {
   childMoveStatements,
   dbErrorCode,
@@ -104,8 +104,9 @@ export function setSubmitterForTests(s: PaymentSubmitter | null): void {
 
 /**
  * Reconciliation of an `outcome_unknown` request: ask the bank by `request_id` what happened.
- * Interface only in P9a; P9b implements it (GET /transaction/{request_id}?id_type=request_id) and a job
- * that applies the verdict. Nothing may re-submit on `not_found` automatically.
+ * The interface of P9a; the real reconciliation is payments/reconcile.ts (P9b, the job
+ * `payments.reconcile`: GET /transaction/{request_id}?id_type=request_id, or the draft). Nothing may
+ * re-submit on `not_found` automatically.
  */
 export type ReconcileVerdict =
   | { found: false }
@@ -187,6 +188,8 @@ async function whyNot(
 ): Promise<string | null> {
   if (row.status !== "ready") return "not_ready";
   if (!(nowMs < Date.parse(row.expires_at))) return "expired";
+  // F9a (S8): the person who asked for this payment must still be an active user with the finance role.
+  if (!(await requesterIsActiveFinance(db, row.requested_by))) return "requester_inactive";
   let hash: string;
   try {
     hash = paymentPayloadHash({
@@ -281,10 +284,7 @@ export async function runSubmission(
   // Review P9b: the request's own mode decides the call. A `pay` request made while the setting was
   // `pay` is refused once the mark no longer covers the pay round trip (a new drafts-only
   // verification), even if the setting has gone back to drafts meanwhile. The gate checks it too.
-  if (
-    row.mode === "pay" &&
-    (state.verified === null || !verifyCoversMode(state.verified.checks, "pay"))
-  ) {
+  if (row.mode === "pay" && (state.verified === null || !markCoversMode(state.verified, "pay"))) {
     return { status: "refused", code: "pay_mode_not_verified" };
   }
   // The pre-checks again with today's facts and today's settings (an invoice paid in Exact since, an
@@ -298,7 +298,13 @@ export async function runSubmission(
   });
   if (again !== null) return { status: "refused", code: again };
   if (!(await storedIbansMatch(db, a.kind, a.id, a.ibanKey))) {
-    return { status: "refused", code: "iban_binding_broken" };
+    // A rotated PAYMENTS_IBAN_KEY is not a tampered IBAN: say which (F9a, S5).
+    return {
+      status: "refused",
+      code: (await storedKeyRotated(db, a.kind, a.id, a.ibanKey))
+        ? "iban_key_rotated"
+        : "iban_binding_broken",
+    };
   }
 
   // Layer 2: claim BEFORE the call, in one batch with the move to `submitting`.

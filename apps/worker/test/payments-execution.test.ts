@@ -517,7 +517,11 @@ describe("duplicate delivery and concurrency", () => {
     const held = new Promise<void>((r) => (release = r));
     let inFlight = 0;
     let maxInFlight = 0;
+    // F9a (N3): the test waits for this event, not for a number of milliseconds
+    let atRevolut: () => void = () => undefined;
+    const aIsAtRevolut = new Promise<void>((r) => (atRevolut = r));
     w.fake.fail("POST /pay", async (c) => {
+      atRevolut();
       inFlight++;
       maxInFlight = Math.max(maxInFlight, inFlight);
       await held;
@@ -526,7 +530,7 @@ describe("duplicate delivery and concurrency", () => {
     });
     const first = send(w, a);
     // wait until A's payment is at Revolut, then B tries
-    while (payCalls().length === 0) await new Promise((r) => setTimeout(r, 5));
+    await aIsAtRevolut;
     const second = await send(w, b);
     expect(second).toEqual({ status: "refused", code: "busy" });
     expect((await rowOf(b)).status).toBe("ready"); // untouched, not claimed

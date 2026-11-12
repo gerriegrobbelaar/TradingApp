@@ -4,7 +4,7 @@
  * 0029's table guards.
  */
 import type { RevolutClient } from "@camelthorn/revolut";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { claimIdempotencyKey } from "../src/db/idempotency";
 import { createRevolutSubmitter, type SubmitterDeps } from "../src/payments/revolut-submitter";
 import type { SubmitRequest } from "../src/payments/submit";
@@ -232,12 +232,32 @@ describe("idempotency key and timeout", () => {
       )
       .bind(w.revolutConnectionId, id)
       .run();
-    const c = client({ pay: () => new Promise(() => undefined) });
-    const t0 = Date.now();
-    expect(await createRevolutSubmitter(deps({ client: c, timeoutMs: 50 })).submit(req)).toEqual({
-      kind: "unknown",
+    // F9a (N3): a fake clock, not a real wait. The call is started (event-driven), then time is moved.
+    let started: () => void = () => undefined;
+    const payStarted = new Promise<void>((r) => (started = r));
+    const c = client({
+      pay: () => {
+        started();
+        return new Promise(() => undefined);
+      },
     });
-    expect(Date.now() - t0).toBeLessThan(2000);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let settled = false;
+      const p = createRevolutSubmitter(deps({ client: c, timeoutMs: 50 }))
+        .submit(req)
+        .then((o) => {
+          settled = true;
+          return o;
+        });
+      await payStarted;
+      await vi.advanceTimersByTimeAsync(49);
+      expect(settled).toBe(false); // one tick before the deadline it is still waiting
+      await vi.advanceTimersByTimeAsync(2);
+      expect(await p).toEqual({ kind: "unknown" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("the request's own id is what the payment carries: never a fresh one", async () => {

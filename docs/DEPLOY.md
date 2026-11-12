@@ -248,15 +248,19 @@ Secrets live only in Workers secrets. The Worker does not exist yet before the f
 run the first `secret put` below by hand (interactive prompt) and accept; the later ones then find
 the Worker. The placeholder Worker it creates has no code until step 7.
 
-The Worker uses **five secrets**: `SESSION_SECRET`, `TOKEN_ENC_KEY`, `GOOGLE_CLIENT_SECRET`,
-`EXACT_CLIENT_SECRET` and `REVOLUT_PRIVATE_KEY` (plus `TOKEN_ENC_KEY_PREVIOUS` only while rotating).
-`REVOLUT_PRIVATE_KEY` is needed only if Revolut is used. The list matches `apps/worker/src/env.ts`
-and the deploy guard's refusal list.
+The Worker uses **seven secrets**: `SESSION_SECRET`, `TOKEN_ENC_KEY`, `GOOGLE_CLIENT_SECRET`,
+`EXACT_CLIENT_SECRET`, `REVOLUT_PRIVATE_KEY`, `PAYMENTS_IBAN_KEY` and `EMAIL_API_KEY` (plus
+`TOKEN_ENC_KEY_PREVIOUS` only while rotating). `REVOLUT_PRIVATE_KEY` is needed only if Revolut is
+used, `PAYMENTS_IBAN_KEY` only before payments are switched on (without it every payment and IBAN
+verification endpoint answers `iban_key_missing`), `EMAIL_API_KEY` only for transactional e-mail
+(ADR 0046). The list matches `apps/worker/src/env.ts` and the deploy guard's refusal list (none of the
+seven may appear in `[vars]`).
 
 Alternative that avoids the prompt per secret: put all the values in a JSON file kept **outside**
 the repo and outside any synced folder (for example `~/secrets/camelthorn.json`, mode 600, content
 `{"GOOGLE_CLIENT_SECRET":"...","SESSION_SECRET":"...","EXACT_CLIENT_SECRET":"...","TOKEN_ENC_KEY":"..."}`;
-add `"REVOLUT_PRIVATE_KEY":"<the PEM with \n for line breaks>"` if you use Revolut)
+add `"REVOLUT_PRIVATE_KEY":"<the PEM with \n for line breaks>"` if you use Revolut, and
+`"PAYMENTS_IBAN_KEY":"..."` and `"EMAIL_API_KEY":"..."` when you use payments and e-mail)
 and run `pnpm exec wrangler secret bulk ~/secrets/camelthorn.json` (`wrangler secret bulk --help`:
 JSON or `.env` file, up to 100 secrets, a `null` value deletes; with no file it reads stdin). Delete
 the file afterwards. Like `secret put`, `secret bulk` offers to create the missing Worker (same
@@ -272,6 +276,11 @@ pnpm exec wrangler secret put REVOLUT_PRIVATE_KEY < revolut-private-pkcs8.pem
 # AES-256-GCM key for stored Exact tokens: exactly 32 random bytes as standard, padded base64
 # (44 characters ending in "="). Anything else is rejected at startup.
 openssl rand -base64 32 | pnpm exec wrangler secret put TOKEN_ENC_KEY
+# Payments only (Phase 9): the key of the IBAN fingerprint, at least 32 characters. Set it ONCE before
+# the first IBAN verification and keep a copy in the password manager (see "Rotating secrets").
+openssl rand -base64 48 | pnpm exec wrangler secret put PAYMENTS_IBAN_KEY
+# E-mail only (ADR 0046): the API key of the transactional e-mail provider.
+pnpm exec wrangler secret put EMAIL_API_KEY
 pnpm exec wrangler secret list
 ```
 
@@ -854,10 +863,13 @@ Procedure: do steps 0 to 7 for staging, then 8 to 10 and the "First sync procedu
    on the sandbox certificate) and `REVOLUT_ISSUER` (the staging host). Then
    `pnpm run check:deploy:staging` (from `apps/worker`). The staging `RevolutGate` binding and
    migration `v3` are already in `[env.staging]`; the guard checks them.
-4. Step 5: every secret again for the staging Worker, with a **different** `TOKEN_ENC_KEY`:
-   `pnpm exec wrangler secret put GOOGLE_CLIENT_SECRET --env staging` and so on, including
+4. Step 5: every secret again for the staging Worker, with a **different** `TOKEN_ENC_KEY` and a
+   **different** `PAYMENTS_IBAN_KEY` (staging verifies its own test IBANs; the two environments share
+   nothing): `pnpm exec wrangler secret put GOOGLE_CLIENT_SECRET --env staging` and so on, including
    `REVOLUT_PRIVATE_KEY` (the sandbox key pair from step 0) when Revolut is used:
-   `pnpm exec wrangler secret put REVOLUT_PRIVATE_KEY --env staging < revolut-private-pkcs8.pem`.
+   `pnpm exec wrangler secret put REVOLUT_PRIVATE_KEY --env staging < revolut-private-pkcs8.pem`,
+   `PAYMENTS_IBAN_KEY` when payments are drilled, and `EMAIL_API_KEY` when e-mail is (a sandbox or
+   test key of the provider; staging must not e-mail real customers).
 5. Step 6: `pnpm exec wrangler d1 migrations apply camelthorn-finance-staging --remote --env
    staging`.
 6. Step 7: `pnpm --filter @camelthorn/web build`, then `pnpm --filter @camelthorn/worker run
@@ -1224,6 +1236,22 @@ Access in front of this path.
   delivery. While a webhook secret is unreadable every delivery fails signature verification (the
   poll and the daily backfill still catch up). Only if the key is truly lost without a copy do
   Exact and Revolut need reconnecting (Settings, Connections).
+- `PAYMENTS_IBAN_KEY`: **do not rotate it casually; it has no previous-key slot.** It keys the IBAN
+  fingerprint (HMAC-SHA-256), so a new key changes EVERY fingerprint. Consequences, all fail closed:
+  every supplier IBAN verification lapses and is reported as `iban_key_rotated` (not "IBAN changed":
+  the IBAN may be the same; each one has to be confirmed again by an approver, out of band); the
+  history "this IBAN was paid before" is lost, so every supplier is "new" again and needs a second
+  approver; requests that are `ready` fail with `iban_key_rotated` and must be made again; the payee
+  cache is orphaned (the app looks a payee up at Revolut by IBAN before it creates one, so a duplicate
+  counterparty is unlikely, but check Revolut's counterparty list after the first payment). Every
+  fingerprint carries a non-secret key id (the first 8 hex characters of HMAC(key, "key-id"), columns
+  `key_id`), which is how a rotation is told from a change; rows from before key ids carry none and
+  stay "changed". Procedure if you must: switch payments off first (`PUT /api/settings/payments/switch
+  {"enabled": false}`), wait until nothing is `submitting` or `ready`, `secret put` the new key,
+  deploy, then re-verify the suppliers. Losing the key without a copy is the same as a rotation.
+- `EMAIL_API_KEY`: create the new key at the e-mail provider, `secret put`, deploy, delete the old key
+  at the provider. A wrong key makes sends fail with a logged status (no e-mail body or key is ever
+  logged); reminders and the digest then show their e-mail as not delivered. Nothing else changes.
 - `GOOGLE_CLIENT_SECRET`: create a new secret on the Google OAuth client, `secret put`, then remove
   the old one in Google.
 - `REVOLUT_PRIVATE_KEY`: create a new key pair and certificate (step 0), upload the certificate in
@@ -1326,7 +1354,7 @@ No new migration, secret or variable. `GET /api/today` reads D1 only. The home r
 
 ## Payments foundation (Phase 9, P9a; ADR 0049): nothing is live
 
-**Migration 0028 must be applied before the code** (`wrangler d1 migrations apply`). It rebuilds `payments` and `payment_batches` (unused since 0003) and REFUSES to run if either holds a row; if it fails with a CHECK error, a row was written by something outside the app: do not delete it blindly, look at it first. One new secret, `PAYMENTS_IBAN_KEY` (review P9a): `openssl rand -base64 48 | wrangler secret put PAYMENTS_IBAN_KEY` (at least 32 characters). It keys the IBAN fingerprint (HMAC-SHA-256); without it the payment and IBAN verification endpoints answer `iban_key_missing` and the switch lists it as a blocker. Set it ONCE before the first IBAN verification and keep it: rotating it makes every fingerprint new, so every supplier IBAN has to be verified again. No new variable, queue or Durable Object.
+**Migration 0028 must be applied before the code** (`wrangler d1 migrations apply`). It rebuilds `payments` and `payment_batches` (unused since 0003) and REFUSES to run if either holds a row; if it fails with a CHECK error, a row was written by something outside the app: do not delete it blindly, look at it first. One new secret, `PAYMENTS_IBAN_KEY` (review P9a): `openssl rand -base64 48 | wrangler secret put PAYMENTS_IBAN_KEY` (at least 32 characters). It keys the IBAN fingerprint (HMAC-SHA-256); without it the payment and IBAN verification endpoints answer `iban_key_missing` and the switch lists it as a blocker. Set it ONCE before the first IBAN verification and keep it (a copy in the password manager): rotating it makes every fingerprint new, so every supplier IBAN has to be verified again (see "Rotating secrets" for all the consequences). No new variable, queue or Durable Object.
 
 Nothing moves money after this deploy, and nothing can be switched on:
 - `payments.enabled` is off and the settings route refuses to enable it (`submitter_unavailable`, because the only submitter is `DisabledSubmitter`).
@@ -1349,6 +1377,8 @@ What an operator may do now:
 3. An admin switched `payments.enabled` on (fresh sign-in, phrase `ENABLE PAYMENTS`).
 4. A finance user presses send on a confirmed (and, when needed, approved) request, with a fresh sign-in.
 
+**Phase 9 final-review fixes (F9a, ADR 0052): migration 0030 must be applied before the code.** It is additive (alert columns on `payment_reconcile`, a `key_id` column next to every IBAN fingerprint, the table `payment_draft_transactions`, five guard triggers). The protocol version changed, so any verification mark recorded before is void: payments stay off until the checklist below (now 15 checks) is verified again. The deploy guard (`pnpm run deploy`, `deploy:staging`) now refuses a `REVOLUT_PAYMENTS_EXECUTION` that is not exactly `"off"` or `"on"`, refuses `"on"` in production unless that very command carries `CF_ALLOW_PAYMENTS_ON=yes`, and prints the value on every deploy. A production deploy that really means to allow payments is `CF_ALLOW_PAYMENTS_ON=yes pnpm --filter @camelthorn/worker run deploy`, after the staging record exists.
+
 **Deploy order.** Apply migration 0029 (`wrangler d1 migrations apply`) BEFORE the code. It is additive (payee cache, bank-line links, reconcile bookkeeping, two guard triggers); nothing of 0028 is rebuilt. Redeploy; the default-jobs version becomes 7 and the job `payments.reconcile` appears, **enabled**, every 5 minutes. It is read-only towards Revolut, makes no call at all while no payment is in flight, and keeps working with payments switched off (it must not go blind to what is already in flight). No new secret. One new variable (`REVOLUT_PAYMENTS_EXECUTION`). Rolling back the code leaves the tables in place and harmless.
 
 ### Sandbox runbook (staging first, tiny amounts)
@@ -1357,75 +1387,95 @@ Use the staging environment (`wrangler deploy --env staging`) with a Revolut SAN
 
 1. On staging set `REVOLUT_PAYMENTS_EXECUTION = "on"` in `[env.staging.vars]` and redeploy staging only. Production keeps `"off"`.
 2. Connect the sandbox Revolut (Settings, Connections), choose the plan (`drafts`, or `pay` only if the sandbox has the Company features). Verify the Exact approval mapping, give two people the `approver` role, verify one test supplier's IBAN (approver, fresh sign-in).
-3. Create a test bill (1.00 EUR) for that supplier in the Exact test division, run the full sync, and create a payment request. As admin (fresh sign-in) open **Preview payment** (`POST /api/payments/preview {kind, id}`): it builds the exact bodies the app would send, with their SHA-256, without calling Revolut. Compare it field by field with what the sandbox documentation shows.
-4. With payments still OFF, record the checks one by one as you do them. Because the app cannot send until the verification exists and payments are on, the drill uses the Revolut sandbox console or `curl` with a sandbox token for the PROBES (idempotency replay, reference, amount) and the app itself for the round trips: for the round trips switch payments on for the drill only (`POST /api/settings/payments/verify` first with the checks you have, then `PUT /api/settings/payments/switch`), and switch them off again afterwards (`{"enabled": false}`, no phrase needed).
+3. Create a test bill (1.00 EUR) for that supplier in the Exact test division, run the full sync, and create a payment request. As admin (fresh sign-in) open **Preview payment** (`POST /api/payments/preview {kind, id}`): it builds the exact bodies the app would send, without calling Revolut. The payment and draft bodies come with their SHA-256; the counterparty body (it holds the supplier IBAN) is shown with the IBAN masked and WITHOUT a hash, on purpose (an unkeyed hash of a body with an IBAN in it could be brute-forced back to the IBAN). Compare the bodies field by field with what the sandbox documentation shows.
+4. **Two passes** (the app cannot send until a verification mark exists and payments are on, and the round trips need the app to send):
+   - **Pass one, no app sends.** Do the checks that use the sandbox console or `curl` with a sandbox token: `request_id_idempotency_replay`, `reference_charset_probe`, `amount_format_probe`, `counterparty_lookup_probe`, the A10 and A11 steps, and `revolut_plan_known`. Write the answers in the note of the next step.
+   - **Provisional mark for pass two.** As admin (fresh sign-in) record `POST /api/settings/payments/verify {confirm: "I VERIFIED THE PAYMENT PATH ON THE REVOLUT SANDBOX", provisional: true, checks: [the checks done in pass one], note}`. A provisional mark is the key of the drill and nothing more: the Worker accepts it ONLY when `REVOLUT_PAYMENTS_EXECUTION` is `"on"` and every active Revolut connection is a SANDBOX connection (Settings, Connections shows the environment), and the gate, the settings screen and the enabling SQL honour it only while that stays true. The moment a connection is production it counts for nothing (`not_verified`), whatever is stored. It also leaves payments OFF.
+   - **Pass two, the app sends.** `PUT /api/settings/payments/switch {"enabled": true, "confirm": "ENABLE PAYMENTS"}` on staging, then do the round trips with the app: `sandbox_counterparty_roundtrip`, `sandbox_draft_roundtrip`, `draft_lifecycle_probe`, `sandbox_pay_roundtrip` (Company plan only) and `lost_answer_lookup_drill`. Switch payments off afterwards (`{"enabled": false}`, no phrase needed).
+   - **Final mark.** Record the COMPLETE verification (step 7) on staging: it replaces the provisional mark, has no `provisional` flag and leaves payments off. A provisional mark is never a verification; production has its own database and needs its own complete mark (step 8).
 5. Do each check below. The text is printed from one constant (`PAYMENTS_VERIFY_RUNBOOK` in packages/core) and a test fails if this page and the constant differ.
 
 ```text
 1. revolut_plan_known: The Revolut plan is known
    - Open Revolut Business, Settings, Plan, and read the plan name.
    - Company plan: `pay` mode may be verified. Any other plan: stay on `drafts` and skip sandbox_pay_roundtrip.
-   Pass: The plan is written in the note, and the connection's payment mode matches it.
+   - A11, on a plan that is NOT Company: send one 1.00 `/pay` from the sandbox console or curl and write down the answer (status and error code). It must be refused; if it is accepted, the plan is not what Settings says: STOP.
+   Pass: The plan is written in the note, the connection's payment mode matches it, and (not Company) `/pay` was refused.
 2. sandbox_counterparty_roundtrip: Sandbox: a counterparty is created from a supplier IBAN
    - On staging with REVOLUT_PAYMENTS_EXECUTION on, open Preview payment for a test bill.
    - Send the first payment of a test supplier whose IBAN is verified. The app creates the counterparty once.
    - In Revolut Business (sandbox), Counterparties: the new one shows the supplier name and the SAME IBAN.
    - Send a second payment to the same supplier: no second counterparty appears.
-   Pass: One counterparty, the right IBAN, reused for the second payment.
-3. sandbox_draft_roundtrip: Sandbox: a payment draft appears in Revolut and is paid after approval
+   - Payee-name verification: pay a test supplier whose name differs slightly from the name on the IBAN, and one whose name is exactly right. Write down what Revolut shows or answers (match, close match, no match) and whether it blocks the payment.
+   Pass: One counterparty, the right IBAN, reused for the second payment; the answer to a wrong payee name is written in the note.
+3. counterparty_lookup_probe: Probe: counterparties can be listed, with IBANs, and reads are rate limited sensibly
+   - A14: in the sandbox console or curl, `GET /counterparties` and look at one external counterparty. Write down whether its account carries the full `iban`. If it does not, the app cannot find a payee it created before (after a lost answer or a key change): STOP and tell the developer.
+   - A14: write down whether the list is paged (a `limit`, a `created_before` or a next link) and how many counterparties one page holds. The app reads ONE page.
+   - A16: send 40 reads of `GET /counterparties` within one minute. Write down the first status that is not 200, its `Retry-After` header and the error body.
+   Pass: The list shows IBANs, its paging is written down, and the rate-limit answer is written down.
+4. sandbox_draft_roundtrip: Sandbox: a payment draft appears in Revolut and is paid after approval
    - Mode `drafts`. Create, confirm (and approve) a request of 1.00 and send it.
    - The request shows `submitted`. In the Revolut app a draft titled CF-<12 characters> exists with the right payee, amount and reference.
    - Approve the draft in the Revolut app. Within 10 minutes the request becomes `paid` and the bank line is linked.
    - Repeat once with two bills in one batch: ONE bulk draft with two payments.
-   Pass: Draft content equals the request; approval in the app turns the request paid; the batch is one draft.
-4. sandbox_pay_roundtrip: Sandbox: a direct payment works (pay mode, Company plan only)
+   - S13, fees: on the bank line of the paid draft look for a fee (a separate fee leg or a fee amount). Write down whether this payment type carries one. A payment with a fee line cannot be booked by the app (matching refuses fee lines): such a payment type must not be used until that is decided.
+   Pass: Draft content equals the request; approval in the app turns the request paid; the batch is one draft; whether a fee exists is written in the note.
+5. draft_lifecycle_probe: Probe: how a draft ends, is read back, and is listed
+   - A10: send `POST /payment-drafts` from the sandbox console with an invalid body (a bad currency). Then list the drafts: NO draft may exist for it. If one does, STOP: a refused call can leave a draft.
+   - A8, state words: write down the exact `state` words of a draft that is pending, approved and paid, deleted in the Revolut app, and expired. The app reads completed/failed/declined/revoked/cancelled/rejected/reverted/deleted; any other word counts as pending.
+   - A8, completed: after approving a 1.00 draft read it back (`GET /payment-drafts/{id}`) and open each payment in it. Every payment must carry the id of its transaction, and `GET /transaction/{id}` must show our amount leaving our account. If a payment has no transaction id, the app will NOT mark the request paid (it raises draft_completed_unlinked): STOP and tell the developer.
+   - A8, delete: delete a pending draft in the Revolut app, then `GET /payment-drafts/{id}`. Write down the answer (404 or a state). The app treats 404 as not found and never as failed.
+   - A8, approve late: let a 1.00 draft stay unapproved past `payments.draft_expiry_days` (set it to 1 for the drill), see the request fail as draft_expired, then approve the draft in the Revolut app. The job must raise an alert and the request must NOT become paid by itself.
+   - A8, paging: create more drafts than one page of `GET /payment-drafts` holds (write down the page size) and check whether the draft you look for is on the first page. If the list is paged and the app reads one page, a lost answer can be missed: STOP and tell the developer.
+   Pass: A refused call creates no draft, the state words and the 404 are written down, a late approval is raised, and the list paging is known.
+6. sandbox_pay_roundtrip: Sandbox: a direct payment works (pay mode, Company plan only)
    - Only for the `pay` mode. Set the connection to `pay`, confirm the loosening phrase.
    - Create, confirm (and approve) a request of 1.00 and send it.
    - The sandbox shows one transfer with our request id; the request becomes `submitted`, then `paid`.
    Pass: One transfer, right amount, right payee, state followed to paid.
-5. request_id_idempotency_replay: Sandbox: the same request id is not paid twice
+7. request_id_idempotency_replay: Sandbox: the same request id is not paid twice
    - With the sandbox, send the same /pay body twice with the SAME request id (use the Revolut sandbox console or curl with a sandbox token, not the app).
    - Read what the second call answers (status and error code) and write both in the note.
    - Confirm only ONE transfer exists. If a second one exists, STOP: do not enable payments.
    Pass: One transfer. The second answer is recorded; the app treats it as 'already used, look it up'.
-6. lost_answer_lookup_drill: Drill: a lost answer is found again by request id
-   - On staging, send a 1.00 request while the answer is made to fail (cut the Worker response after the gate sent: use the staging fault switch described in docs/DEPLOY.md, or stop the Worker during the call).
-   - The request shows `outcome_unknown`. Never resend it.
+8. lost_answer_lookup_drill: Drill: a lost answer is found again by request id
+   - On staging, send a 1.00 request and cut the Worker off after the sandbox received it: run the staging Worker with `wrangler dev --env staging --remote`, send the request, and stop the dev server (Ctrl-C) as soon as the sandbox console shows the new transfer or draft. Nothing else in the app can fake a lost answer.
+   - The request stays `submitting` until its claim runs out (10 minutes), then shows `outcome_unknown`. Never resend it.
    - Within 5 minutes the reconciliation job finds the transfer by request id (pay) or the draft by its title (drafts) and moves the request on.
    - A request nothing was sent for stays unknown; a person resolves it with the typed phrase after the lookup says not found.
    Pass: The request ends as paid or submitted by lookup, with no second payment in Revolut.
-7. reference_charset_probe: Probe: which reference characters and length Revolut accepts
+9. reference_charset_probe: Probe: which reference characters and length Revolut accepts
    - Send sandbox payments with references of 18, 35, 70 and 140 characters, and one with / - ? : ( ) . , ' + and a space.
    - Write the longest accepted length and any rejected character in the note.
    Pass: 140 characters and the SEPA set are accepted, or the limit is lowered in code (REVOLUT_REFERENCE_MAX) first.
-8. amount_format_probe: Probe: the amount format is accepted and exact
+10. amount_format_probe: Probe: the amount format is accepted and exact
    - Send sandbox payments of 0.01, 1.00, 1234.50 and 99999.99.
    - Compare the amount Revolut shows with the amount in the request, to the cent.
    - Try the amount as a JSON number (what the app sends) and note whether a string would also be accepted.
    Pass: Every amount is identical to the cent.
-9. webhook_state_sequence: Webhook: the states of a payment arrive in order and are final once
+11. webhook_state_sequence: Webhook: the states of a payment arrive in order and are final once
    - Watch the webhook events and the bank line of a sandbox payment from pending to completed.
    - Provoke a failure (a sandbox payee that is declined) and watch declined or failed.
    - Confirm the bank line is booked only in a final state and only once.
    Pass: The sequence is pending then one final state; the payment follows the line.
-10. four_eyes_approver_accounts_checked: Approver accounts are right
+12. four_eyes_approver_accounts_checked: Approver accounts are right
    - Settings, Users: the people holding the approver role are the intended ones, none of them requests payments in daily use.
    Pass: At least one approver other than the finance user who requests.
-11. first_iban_verified_out_of_band: The first supplier IBAN was confirmed outside the app
+13. first_iban_verified_out_of_band: The first supplier IBAN was confirmed outside the app
    - Call the supplier on a number you already had, or compare with a signed contract, and read the IBAN's last four characters.
    - Then verify the IBAN in the app (approver, fresh sign-in).
    Pass: A person confirmed the IBAN by a channel the invoice did not come through.
-12. approval_mapping_verified_in_exact: The Exact approval status mapping is verified
+14. approval_mapping_verified_in_exact: The Exact approval status mapping is verified
    - Settings, Approvals: the status mapping is verified against the live Exact entries.
    Pass: The mapping shows verified for the current table.
-13. limits_reviewed_by_finance_lead: The limits were reviewed
+15. limits_reviewed_by_finance_lead: The limits were reviewed
    - Read the four-eyes limit, the per-request ceiling and the daily ceiling in Settings, Payments.
    - Replace the placeholder ceilings (ADR 0049 question 3) with the real ones.
    Pass: The finance lead agrees with the values and the note says who.
 ```
 
-6. **The lost-answer drill is mandatory** (check 6): make the answer of a `/pay` call get lost AFTER Revolut received it (stop the staging Worker during the call, or run the call from the sandbox console with the app's request id and let the app time out). The request must show `outcome_unknown`, the job must find the transfer by its request id within 5 minutes, and Revolut must show exactly one transfer. For the drafts mode repeat with a draft: the job finds it by its title `CF-<12 characters>`. If a second payment ever appears, STOP: do not enable payments, write down what you saw.
-7. Record the verification: `POST /api/settings/payments/verify {confirm: "I VERIFIED THE PAYMENT PATH ON THE REVOLUT SANDBOX", checks: [...], note}`. In `drafts` mode the check `sandbox_pay_roundtrip` may be left out; the `pay` mode needs it. Any change to the payment rules, request builders, allow-list or this runbook changes `protocolVersion` and voids the mark.
+6. **The lost-answer drill is mandatory** (`lost_answer_lookup_drill`): make the answer of a call get lost AFTER Revolut received it. There is no fault switch in the app (an earlier version of this page mentioned one; it never existed): run the staging Worker locally against the sandbox with `pnpm --filter @camelthorn/worker exec wrangler dev --env staging --remote`, send the 1.00 request, and stop the dev server (Ctrl-C) as soon as the sandbox console shows the new transfer or draft. The request stays `submitting` until its claim runs out (10 minutes), then shows `outcome_unknown`; then the job must find the transfer by its request id (pay) or the draft by its title `CF-<12 characters>` (drafts) within 5 minutes, and Revolut must show exactly one. If a second payment ever appears, STOP: do not enable payments, write down what you saw. The automated tests (`payments-execution.test.ts`) prove the logic; this step proves it against the real sandbox.
+7. Record the verification: `POST /api/settings/payments/verify {confirm: "I VERIFIED THE PAYMENT PATH ON THE REVOLUT SANDBOX", checks: [...], note}` with every check except, in `drafts` mode, `sandbox_pay_roundtrip` (the `pay` mode needs it). An incomplete list without `provisional: true` is refused (`checks_incomplete`). Any change to the payment rules, request builders, allow-list, the gate's body check or this runbook changes `protocolVersion` and voids the mark.
 8. Production, later and separately: set the real ceilings (ADR 0049 question 3), keep `drafts` for the first months, set `REVOLUT_PAYMENTS_EXECUTION = "on"` in production only after the staging record exists, run the checks that need production data once with 1.00 EUR, then enable.
 
 ### Operating it
@@ -1435,9 +1485,14 @@ Use the staging environment (`wrangler deploy --env staging`) with a Revolut SAN
 - **Unknown outcome:** `outcome_unknown` is resolved by the job (it looks up by request id). If a lookup made at least 15 minutes after the request became unknown answers "not found" AND you checked the Revolut app yourself (transactions and drafts, every page of the draft list), an admin may call it unsent: `POST /api/payments/:id/resolve-not-sent {confirm: "MARK PAYMENT AS NOT SENT"}` (fresh sign-in). Never do this without looking in Revolut: a wrong answer can pay twice. The database refuses it unless a lookup found nothing.
 - **A new request is refused with `prior_attempt_live`:** an earlier request for the same invoice that was called "not sent", or whose draft expired here, still exists at Revolut. Look at it in the Revolut app: delete the old draft, or, if the old transfer exists, do NOT pay again (it was paid). `prior_attempt_unchecked` means the lookup failed; try again later.
 - **A 429 from Revolut on a send** is `outcome_unknown` (it is looked up like a lost answer), never "try again".
-- **Paid and booked:** `paid` is the bank's word. `GET /api/payments/:id/settlement` says how far the Exact side is (`awaiting_bank_line`, `awaiting_match`, `awaiting_booking`, `booked`, `match_other_invoice`). The bank line is matched by the normal matching and booked by the normal booking; this feature creates no bank entry.
+- **Paid and booked:** `paid` is the bank's word. `GET /api/payments/:id/settlement` says how far the Exact side is (`awaiting_bank_line`, `awaiting_match`, `awaiting_booking`, `booked`, `match_other_invoice`), and two more: `approved_after_expiry` (the request expired here but the draft was approved in the Revolut app afterwards: money may have left; look at Revolut before anything else) and `reverted_after_paid` (the bank line of a paid payment was reversed). The bank line is matched by the normal matching and booked by the normal booking; this feature creates no bank entry. The items of a PAID batch are linked to their bank lines through the transactions the completed draft named (table `payment_draft_transactions`); two items of the same amount are linked only when the bank line's reference tells them apart, otherwise they stay `awaiting_bank_line` and a person links them by matching.
+- **A completed draft without transactions:** a draft that says `completed` but does not name one transaction for every payment (or whose transactions are not our amounts, from our account) does NOT make the request `paid`: it stays `submitted` and raises the alert `draft_completed_unlinked` (or `mismatch`). Look at the draft in the Revolut app and at the bank line; acknowledge the alert when you have.
+- **A known draft that Revolut no longer finds** (deleted in the app, or a bad lookup) never fails the payment by itself: it stays `submitted` and raises `draft_gone`. Only when the draft is past `payments.draft_expiry_days` AND the account's bank feed is fresh (read in the last 24 hours) AND shows no line of that account with that amount since the request was made, does it become `failed` / `draft_expired`.
 - **Stop everything:** `PUT /api/settings/payments/switch {"enabled": false}` (no phrase), or set `REVOLUT_PAYMENTS_EXECUTION` back to `"off"` and redeploy. Both stop new sends at the gate immediately; the reconciliation keeps running.
-- **Alerts to watch** (audit log, no screen yet): `payment.approved_after_expiry`, `payment.reverted_after_paid`, reconcile rows with `alert_at` set (`mismatch`, `duplicate`).
+- **Alerts** (F9a, ADR 0052). Every alert is a set of columns on `payment_reconcile` (`subject_kind`, `subject_id`, `alert_at`, `alert_kind`, `alert_ack_at`, `alert_ack_by`); it is OPEN while `alert_at IS NOT NULL AND alert_ack_at IS NULL`. Kinds: `mismatch`, `duplicate`, `approved_after_expiry`, `reverted_after_paid`, `draft_gone`, `draft_completed_unlinked`. Raising one writes an audit row once (`payment.<kind>` or `payment_batch.<kind>`, actor `system`). `POST /api/payments/:id/alert/ack {note?}` (also `/api/payment-batches/:id/alert/ack`; finance or admin; audited as `payment.alert_acknowledged`) records that a person looked; it moves nothing. The same kind is not raised again after it was acknowledged; a different kind is. Until the data-quality rules and the Today queue show them, look at the table or the audit log.
+- **A request whose requester is gone:** if the person who asked for a payment is disabled or loses the finance role, their request is not confirmed, approved or sent (`requester_inactive`); an approver can still turn it down. Make the request again under a finance user.
+- **A rotated `PAYMENTS_IBAN_KEY`** shows as `iban_key_rotated` (see "Rotating secrets").
+- **Changing the draft expiry** (`PUT /api/settings/payments/draft-expiry`) needs a fresh sign-in like the other payment settings.
 
 ## Payment screens (Phase 9, P9c; ADR 0051): nothing new to deploy
 

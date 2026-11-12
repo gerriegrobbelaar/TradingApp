@@ -130,6 +130,8 @@ export const PAYMENT_BLOCK_CODES = [
   "iban_cache_stale",
   "iban_unverified",
   "iban_changed",
+  // F9a: the verification lapsed because PAYMENTS_IBAN_KEY changed, not because the IBAN did
+  "iban_key_rotated",
   // limits
   "over_request_limit",
   "over_daily_limit",

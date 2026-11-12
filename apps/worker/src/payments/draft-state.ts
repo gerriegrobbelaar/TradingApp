@@ -23,6 +23,8 @@ export type DraftVerdict =
       transactionId: string | null;
       /** Every transaction id the draft names (one per payment that has one). */
       transactionIds: string[];
+      /** How many payments the draft holds (0 when it lists none). A complete answer has one id each. */
+      paymentCount: number;
     }
   | { kind: "failed"; code: string }
   | { kind: "pending" }
@@ -37,7 +39,9 @@ export function interpretDraft(v: PaymentDraftView): DraftVerdict {
   );
   if (states.length === 0) {
     const s = v.state ?? "";
-    if (s === "completed") return { kind: "paid", transactionId: null, transactionIds: [] };
+    if (s === "completed") {
+      return { kind: "paid", transactionId: null, transactionIds: [], paymentCount: 0 };
+    }
     if (DRAFT_FAILED_WORDS.has(s)) return { kind: "failed", code: s };
     return { kind: "pending" };
   }
@@ -48,6 +52,7 @@ export function interpretDraft(v: PaymentDraftView): DraftVerdict {
       kind: "paid",
       transactionId: v.payments[0]?.transactionId ?? null,
       transactionIds,
+      paymentCount: v.payments.length,
     };
   }
   if (bad.length > 0 && done > 0) return { kind: "mixed" };

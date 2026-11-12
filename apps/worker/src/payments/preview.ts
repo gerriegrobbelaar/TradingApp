@@ -3,13 +3,16 @@
  *
  * For one payment or batch it builds the REAL request bodies with the REAL builders
  * (packages/revolut/src/payments.ts), puts them through the gate's own request validation, and
- * returns them with their SHA-256, so an admin can compare them with a sandbox call made by hand
+ * returns them with their SHA-256 (except the counterparty step, see below), so an admin can compare them with a sandbox call made by hand
  * before ticking the checklist (`amount_format_probe`, `reference_charset_probe`, ...). It makes NO
  * call: no gate, no client, no network, no lease. It needs neither the payments switch nor the
  * deploy switch, changes no state and stores nothing but one audit row (ids and hashes, no bodies).
  *
- * A body that carries an IBAN is returned with the IBAN masked (the hash is over the real bytes);
- * the full IBAN never leaves iban-store.ts.
+ * A body that carries an IBAN is returned with the IBAN masked; the full IBAN never leaves iban-store.ts.
+ * F9a (S7): that body is therefore NOT hashed. An unkeyed SHA-256 of a body that holds an IBAN would let
+ * anyone who sees the answer or the audit row brute-force the IBAN back (it has little entropy, and the
+ * masked form leaks the country, check digits and last four). The counterparty step has `sha256: null`
+ * in the answer and no hash in the audit row; compare that body with the sandbox by eye.
  */
 import { maskIban, sha256Hex } from "@camelthorn/core";
 import {
@@ -35,8 +38,8 @@ export interface PreviewCall {
   path: string;
   /** The body as it would be sent, with any IBAN masked. */
   body: string;
-  /** SHA-256 of the exact bytes that would be sent. */
-  sha256: string;
+  /** SHA-256 of the exact bytes that would be sent; null for the counterparty step (it holds an IBAN). */
+  sha256: string | null;
   /** The gate's own validation accepted this request (path, job class, body keys). */
   gateAccepts: boolean;
   /** The payee does not exist yet: this call would come after creating it. */
@@ -103,7 +106,7 @@ export async function previewPayment(
           method: "POST",
           path: cp.path,
           body: show(cp, t.iban),
-          sha256: sha256Hex(cp.body),
+          sha256: null,
           gateAccepts: gateAccepts(cp, ref),
           usesPlaceholderPayee: false,
         });
@@ -155,7 +158,12 @@ export async function previewPayment(
       action: "payment.previewed",
       entity: a.kind === "payment" ? "payment" : "payment_batch",
       entityId: head.request_id,
-      after: { mode: head.mode, hashes: calls.map((c) => ({ step: c.step, sha256: c.sha256 })) },
+      after: {
+        mode: head.mode,
+        hashes: calls
+          .filter((c) => c.sha256 !== null)
+          .map((c) => ({ step: c.step, sha256: c.sha256 })),
+      },
     }),
   ]);
   return { ok: true, mode: head.mode, requestId: head.request_id, calls };

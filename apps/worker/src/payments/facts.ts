@@ -211,7 +211,7 @@ export async function gatherPrecheck(db: D1Database, o: GatherOptions): Promise<
       .bind(o.sourceAccountId, exclude, excludeBatch),
     db
       .prepare(
-        `SELECT iban_fingerprint, kind, verified_by FROM supplier_iban_verifications
+        `SELECT iban_fingerprint, kind, verified_by, key_id FROM supplier_iban_verifications
           WHERE relation_id = ?1 ORDER BY id DESC LIMIT 1`,
       )
       .bind(supplier?.rowId ?? 0),
@@ -257,6 +257,7 @@ export async function gatherPrecheck(db: D1Database, o: GatherOptions): Promise<
               fingerprint: String(v["iban_fingerprint"]),
               verifiedBy: String(v["verified_by"]),
               revoked: v["kind"] === "revoked",
+              keyId: typeof v["key_id"] === "string" ? v["key_id"] : null,
             },
       paidBefore: Number(paid?.results?.[0]?.["n"] ?? 0) === 1,
       fingerprintKey: key,

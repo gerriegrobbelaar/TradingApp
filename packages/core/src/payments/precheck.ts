@@ -162,7 +162,7 @@ export function precheckPayment(input: PrecheckInput): PrecheckResult {
       blocks.add("iban_unverified");
       break;
     case "changed":
-      blocks.add("iban_changed");
+      blocks.add(iban.keyRotated === true ? "iban_key_rotated" : "iban_changed");
       break;
     default:
       break;

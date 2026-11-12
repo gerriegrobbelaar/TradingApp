@@ -25,7 +25,9 @@ export const PAYMENTS_VERIFIED_KEY = "payments.verified";
 export const PAYMENTS_VERIFY_CHECKS = [
   "revolut_plan_known",
   "sandbox_counterparty_roundtrip",
+  "counterparty_lookup_probe",
   "sandbox_draft_roundtrip",
+  "draft_lifecycle_probe",
   "sandbox_pay_roundtrip",
   "request_id_idempotency_replay",
   "lost_answer_lookup_drill",

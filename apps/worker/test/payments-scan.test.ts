@@ -344,6 +344,10 @@ describe("the submit boundary has one caller", () => {
       "../src/payments/tx-match.ts",
       // review P9b: the pure draft reader (a type import), shared by reconcile and the submitter
       "../src/payments/draft-state.ts",
+      // F9a (N7): the gate's own comparison of a payment body with the stored request. It is called
+      // only from the gate (a source scan below pins that), names no endpoint (it asks request.ts)
+      // and makes no call.
+      "../src/payments/gate-request.ts",
     ];
     for (const [f, t] of read(workerFiles).filter(([f]) => f.startsWith("../src/payments/"))) {
       if (!MAY_IMPORT_REVOLUT.includes(f)) {
@@ -351,6 +355,19 @@ describe("the submit boundary has one caller", () => {
       }
       expect(code(t), f).not.toMatch(/REVOLUT_GATE|\bfetch\s*\(/);
     }
+  });
+
+  it("the gate's body check (F9a, N7) is defined in gate-request.ts and called from the gate only", () => {
+    const users = read(workerFiles)
+      .filter(([f]) => !f.endsWith("/payments/gate-request.ts"))
+      .filter(([, t]) => /\bpaymentBodyMismatch\b/.test(code(t)))
+      .map(([f]) => f);
+    expect(users).toEqual(["../src/revolut/gate.ts"]);
+    // and the gate really calls it inside the payment-write assertion
+    const gate = workerFiles["../src/revolut/gate.ts"] ?? "";
+    expect(code(gate)).toMatch(
+      /#assertPaymentWrite[\s\S]*paymentBodyMismatch\(this\.env\.DB, req\)/,
+    );
   });
 
   it("the sending routes are exactly the two submit routes, and they need finance and a fresh sign-in", () => {

@@ -6,6 +6,7 @@ import {
   checkBatch,
   DEFAULT_PAYMENT_SETTINGS,
   ibanFingerprint,
+  ibanKeyId,
   loosenedFields,
   parsePaymentSettings,
   PAYMENT_BLOCK_CODES,
@@ -192,6 +193,42 @@ describe("precheckPayment", () => {
     expect(blocks({ iban: { ...iban, recordIban: "DE89370400440532013000" } })).toEqual([
       "iban_changed",
     ]);
+  });
+
+  it("a verification made under another key is reported as a rotated key, not a changed IBAN (F9a)", () => {
+    const iban = good().iban;
+    const v = iban.verification;
+    if (v === null) throw new Error("no verification in the fixture");
+    const OLD = "0123abcd"; // key id of some earlier key
+    // same IBAN, verification fingerprint made under another key: rotated
+    const oldFp = ibanFingerprint(IBAN, "an-older-key-0123456789abcdef0123456789") ?? "";
+    expect(
+      blocks({ iban: { ...iban, verification: { ...v, fingerprint: oldFp, keyId: OLD } } }),
+    ).toEqual(["iban_key_rotated"]);
+    // a verification without a key id (before key ids existed) cannot be told: stays "changed"
+    expect(
+      blocks({ iban: { ...iban, verification: { ...v, fingerprint: oldFp, keyId: null } } }),
+    ).toEqual(["iban_changed"]);
+    // a really different IBAN under the SAME key id is a change, not a rotation
+    expect(
+      blocks({
+        iban: {
+          ...iban,
+          recordIban: "DE89370400440532013000",
+          verification: { ...v, keyId: ibanKeyId(KEY) },
+        },
+      }),
+    ).toEqual(["iban_changed"]);
+  });
+
+  it("ibanKeyId is 8 hex characters, stable, different per key, null without a usable key", () => {
+    const id = ibanKeyId(KEY);
+    expect(id).toMatch(/^[0-9a-f]{8}$/);
+    expect(ibanKeyId(KEY)).toBe(id);
+    expect(ibanKeyId(`${KEY}x`)).not.toBe(id);
+    expect(ibanKeyId("short")).toBeNull();
+    expect(ibanKeyId(null)).toBeNull();
+    expect(id).not.toContain(KEY.slice(0, 4));
   });
 
   it("blocks when the invoice's own IBAN differs from the supplier record", () => {

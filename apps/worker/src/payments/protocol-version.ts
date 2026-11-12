@@ -4,7 +4,13 @@
  * builders' output on fixed samples, the failure classification, the reference and name limits, the
  * payment endpoints of the gate allow-list and the runbook. A verification mark records this value;
  * any change to any of those voids the mark and so switches payments OFF until they are verified
- * again on the sandbox. Pinned in test/payments-execution.test.ts.
+ * again on the sandbox. Pinned in test/payments-p9b-api.test.ts (PINNED_PROTOCOL_VERSION; the core
+ * half is pinned in packages/core/src/payments/protocol.test.ts).
+ *
+ * The label below is raised by hand whenever the BEHAVIOUR of the submitter or the reconciliation
+ * changes in a way the sampled outputs cannot show (v2: F9a, ADR 0052: earlier-attempt check without
+ * a cut-off, a refusal believed only after a readable list, "not found" never fails a known draft, a
+ * completed draft needs its transactions, the gate compares the body with the stored request).
  */
 import {
   paymentsProtocolVersion as coreProtocolVersion,
@@ -58,7 +64,7 @@ export function paymentsProtocolVersion(): string {
   );
   return sha256Hex(
     JSON.stringify([
-      "payments-execution-v1",
+      "payments-execution-v2",
       coreProtocolVersion(),
       buildPay({ ...leg, requestId: RID }),
       buildPaymentDraft({ requestId: RID, payments: [leg, { ...leg, receiverAccountId: CP }] }),

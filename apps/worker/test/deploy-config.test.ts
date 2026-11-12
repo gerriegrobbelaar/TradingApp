@@ -29,6 +29,7 @@ EXACT_REDIRECT_URI = "https://finance.camelthorncapital.com/api/connections/exac
 REVOLUT_CLIENT_ID = "aaaaaaaa-1111-2222-3333-444444444444"
 REVOLUT_REDIRECT_URI = "https://finance.camelthorncapital.com/api/connections/revolut/callback"
 REVOLUT_ISSUER = "finance.camelthorncapital.com"
+REVOLUT_PAYMENTS_EXECUTION = "off"
 
 [[d1_databases]]
 binding = "DB"
