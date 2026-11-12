@@ -1326,7 +1326,7 @@ No new migration, secret or variable. `GET /api/today` reads D1 only. The home r
 
 ## Payments foundation (Phase 9, P9a; ADR 0049): nothing is live
 
-**Migration 0028 must be applied before the code** (`wrangler d1 migrations apply`). It rebuilds `payments` and `payment_batches` (unused since 0003) and REFUSES to run if either holds a row; if it fails with a CHECK error, a row was written by something outside the app: do not delete it blindly, look at it first. No new secret, variable, queue or Durable Object.
+**Migration 0028 must be applied before the code** (`wrangler d1 migrations apply`). It rebuilds `payments` and `payment_batches` (unused since 0003) and REFUSES to run if either holds a row; if it fails with a CHECK error, a row was written by something outside the app: do not delete it blindly, look at it first. One new secret, `PAYMENTS_IBAN_KEY` (review P9a): `openssl rand -base64 48 | wrangler secret put PAYMENTS_IBAN_KEY` (at least 32 characters). It keys the IBAN fingerprint (HMAC-SHA-256); without it the payment and IBAN verification endpoints answer `iban_key_missing` and the switch lists it as a blocker. Set it ONCE before the first IBAN verification and keep it: rotating it makes every fingerprint new, so every supplier IBAN has to be verified again. No new variable, queue or Durable Object.
 
 Nothing moves money after this deploy, and nothing can be switched on:
 - `payments.enabled` is off and the settings route refuses to enable it (`submitter_unavailable`, because the only submitter is `DisabledSubmitter`).
@@ -1334,7 +1334,7 @@ Nothing moves money after this deploy, and nothing can be switched on:
 - `POST /api/payments` answers `422 blocked ["payments_disabled"]` for every request. The settings endpoints (`GET/PATCH /api/settings/payments`, verification, switch) and the supplier IBAN verification endpoints work and are audited, so the controls can be reviewed and the IBANs verified ahead of time.
 
 What an operator may do now:
-1. Review the controls: `GET /api/settings/payments` (admin, finance, approver). Defaults: four-eyes on, limit 2,500.00 EUR, second approver for any new or changed IBAN, hard ceilings 25,000.00 per request and 50,000.00 per rolling 24 hours, EUR only, drafts mode. Tightening needs only the admin; a loosening needs a fresh sign-in and the phrase `LOOSEN PAYMENT CONTROLS`.
+1. Review the controls: `GET /api/settings/payments` (admin, finance, approver). Defaults: four-eyes on, limit 2,500.00 EUR, second approver for any new or changed IBAN, hard ceilings 25,000.00 per request and 50,000.00 per rolling 24 hours (PLACEHOLDERS invented for safety, not from the brief: replace them with the real figures, ADR 0049 question 3), EUR only, drafts mode. Tightening needs only the admin; a loosening needs a fresh sign-in and the phrase `LOOSEN PAYMENT CONTROLS`.
 2. Give the `approver` role to the right people (Settings, Users). At least one is needed; an approver can never approve their own request.
 3. Verify supplier IBANs out of band (a phone call, a signed letter), then confirm each in the app: `GET /api/payments/ibans/:relationId`, then `POST /api/payments/ibans/verify {relationId, fingerprint, lastFour}` (approver, fresh sign-in). A first-sync IBAN is NOT trusted; an IBAN that changes in Exact becomes unverified again.
 

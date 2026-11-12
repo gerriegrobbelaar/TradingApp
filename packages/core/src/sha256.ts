@@ -47,7 +47,17 @@ function utf8(input: string): Uint8Array {
 }
 
 export function sha256Hex(input: string): string {
-  const msg = utf8(input);
+  return toHex(sha256Bytes(utf8(input)));
+}
+
+const toHex = (b: Uint8Array): string => {
+  let out = "";
+  for (const x of b) out += x.toString(16).padStart(2, "0");
+  return out;
+};
+
+/** SHA-256 of raw bytes (32 bytes out). */
+function sha256Bytes(msg: Uint8Array): Uint8Array {
   const bitLen = msg.length * 8;
   const padded = new Uint8Array((((msg.length + 9 + 63) >> 6) << 6) >>> 0);
   padded.set(msg);
@@ -104,7 +114,34 @@ export function sha256Hex(input: string): string {
     h[6] = ((h[6] as number) + g) >>> 0;
     h[7] = ((h[7] as number) + hh) >>> 0;
   }
-  let out = "";
-  for (const x of h) out += x.toString(16).padStart(8, "0");
+  const out = new Uint8Array(32);
+  const ov = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) ov.setUint32(i * 4, h[i] as number);
   return out;
+}
+
+/**
+ * HMAC-SHA-256 (RFC 2104) of a string's UTF-8 bytes under a string key's UTF-8 bytes, as lowercase
+ * hex. Synchronous so pure core rules can use it; used for the keyed IBAN fingerprint (ADR 0049),
+ * whose key is a Workers secret handed in by the caller.
+ */
+export function hmacSha256Hex(key: string, input: string): string {
+  let k = utf8(key);
+  if (k.length > 64) k = sha256Bytes(k);
+  const ipad = new Uint8Array(64);
+  const opad = new Uint8Array(64);
+  for (let i = 0; i < 64; i++) {
+    const b = i < k.length ? (k[i] as number) : 0;
+    ipad[i] = b ^ 0x36;
+    opad[i] = b ^ 0x5c;
+  }
+  const msg = utf8(input);
+  const inner = new Uint8Array(64 + msg.length);
+  inner.set(ipad);
+  inner.set(msg, 64);
+  const ih = sha256Bytes(inner);
+  const outer = new Uint8Array(64 + 32);
+  outer.set(opad);
+  outer.set(ih, 64);
+  return toHex(sha256Bytes(outer));
 }

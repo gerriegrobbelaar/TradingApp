@@ -96,7 +96,7 @@ async function confirm(p: Payment, who: Who = "finance", token?: string) {
     who,
     "POST",
     `/api/payments/${p.id}/confirm`,
-    { confirm: paymentConfirmPhrase(p.amountMinor, "EUR") },
+    { confirm: paymentConfirmPhrase(p.amountMinor, "EUR", "4300") },
     token,
   );
 }
@@ -187,7 +187,7 @@ describe("creating a request", () => {
       mode: "drafts",
       approvalsRequired: ["new_or_changed_iban"],
       requestedBy: w.emails.finance,
-      confirmPhrase: "PAY 1000.00 EUR",
+      confirmPhrase: "PAY 1000.00 EUR TO 4300",
     });
     expect(p["payloadHash"]).toMatch(/^[0-9a-f]{64}$/);
     expect(p["ibanFingerprintShort"]).toHaveLength(16);
@@ -290,7 +290,7 @@ describe("creating a request", () => {
     await putPaymentSettings({ allowPartial: true });
     const p = await created({ amount: 50_000 });
     expect(p.amountMinor).toBe(50_000);
-    expect(p.confirmPhrase).toBe("PAY 500.00 EUR");
+    expect(p.confirmPhrase).toBe("PAY 500.00 EUR TO 4300");
   });
 
   it("validates the body strictly", async () => {

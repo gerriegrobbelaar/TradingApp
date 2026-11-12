@@ -34,7 +34,7 @@ import {
 } from "@camelthorn/core";
 import { auditStatement } from "../db/audit";
 import { gatherPrecheck, type Gathered } from "./facts";
-import { insertPaymentStatement } from "./iban-store";
+import { insertPaymentStatement, maskedIbans } from "./iban-store";
 import { readBatch, readPayment, type BatchDto, type PaymentDto } from "./read";
 import { paymentsPermitted, type PaymentsState } from "./settings";
 import {
@@ -56,6 +56,9 @@ export class PaymentError extends Error {
 }
 
 const iso = (ms: number): string => new Date(ms).toISOString();
+
+const errText = (err: unknown): string =>
+  err instanceof Error ? `${err.message} ${String(err.cause)}` : String(err);
 
 // ---- expiry ---------------------------------------------------------------------------------------
 
@@ -185,6 +188,8 @@ export interface CreateArgs {
   sourceAccountId: number;
   amountMinor?: number | undefined;
   clientKey: string;
+  /** Workers secret PAYMENTS_IBAN_KEY (keyed IBAN fingerprint); null refuses every request. */
+  ibanKey: string | null;
 }
 
 export interface Blocked {
@@ -199,16 +204,8 @@ export type CreateResult =
 
 export async function createPayment(db: D1Database, a: CreateArgs): Promise<CreateResult> {
   await expireStale(db, a.nowMs);
-  const existing = await db
-    .prepare("SELECT id, open_item_id FROM payments WHERE requested_by = ?1 AND client_key = ?2")
-    .bind(a.actor, a.clientKey)
-    .first<{ id: number; open_item_id: number }>();
-  if (existing !== null) {
-    if (existing.open_item_id !== a.openItemId) throw new PaymentError("client_key_reused", 409);
-    const p = await readPayment(db, existing.id);
-    if (p === null) throw new PaymentError("not_found", 404);
-    return { blocked: false, payment: p, replayed: true, warnings: [] };
-  }
+  const replay = await replayPayment(db, a);
+  if (replay !== null) return replay;
 
   const g = await gatherPrecheck(db, {
     nowMs: a.nowMs,
@@ -217,6 +214,7 @@ export async function createPayment(db: D1Database, a: CreateArgs): Promise<Crea
     openItemId: a.openItemId,
     sourceAccountId: a.sourceAccountId,
     requestedAmountMinor: a.amountMinor,
+    ibanKey: a.ibanKey,
   });
   const pre = precheckPayment(g.input);
   if (!pre.ok || g.item === null || g.supplier === null || g.supplier.iban === null) {
@@ -238,8 +236,8 @@ export async function createPayment(db: D1Database, a: CreateArgs): Promise<Crea
   const hash = paymentPayloadHash(payload);
   const reasons = requiredApprovals({
     settings: a.state.settings,
-    items: [{ eur: pre.eur, iban: pre.ibanState }],
-    totalEur: pre.eur,
+    items: [{ eur: pre.limitEur, iban: pre.ibanState }],
+    totalEur: pre.limitEur,
     isBatch: false,
   });
   const now = iso(a.nowMs);
@@ -300,9 +298,16 @@ export async function createPayment(db: D1Database, a: CreateArgs): Promise<Crea
     ]);
   } catch (err) {
     const code = dbErrorCode(err);
+    // A concurrent create with the same client key won the race: answer with its request.
+    if (code === "client_key_reused" || code === "already_in_request") {
+      const again = await replayPayment(db, a);
+      if (again !== null) return again;
+    }
     if (code === "already_in_request") return blockedWith("already_in_request", pre);
     if (code === "payments_disabled") return blockedWith("payments_disabled", pre);
     if (code === "client_key_reused") throw new PaymentError("client_key_reused", 409);
+    // Any other refusal of the database (a changed fact between the read and the write).
+    if (code !== null) throw new PaymentError(code, 409);
     throw err;
   }
   const row = await db
@@ -312,6 +317,32 @@ export async function createPayment(db: D1Database, a: CreateArgs): Promise<Crea
   const dto = row === null ? null : await readPayment(db, row.id);
   if (dto === null) throw new PaymentError("not_found", 404);
   return { blocked: false, payment: dto, replayed: false, warnings: pre.warnings };
+}
+
+/**
+ * The request this client key already created, or null. The same key for anything else (another
+ * invoice, source account or amount) is `client_key_reused`: a replay never silently answers a
+ * different question with an old request.
+ */
+async function replayPayment(db: D1Database, a: CreateArgs): Promise<CreateResult | null> {
+  const existing = await db
+    .prepare(
+      `SELECT id, open_item_id, bank_account_id, amount_minor FROM payments
+        WHERE requested_by = ?1 AND client_key = ?2 AND batch_id IS NULL`,
+    )
+    .bind(a.actor, a.clientKey)
+    .first<{ id: number; open_item_id: number; bank_account_id: number; amount_minor: number }>();
+  if (existing === null) return null;
+  if (
+    existing.open_item_id !== a.openItemId ||
+    existing.bank_account_id !== a.sourceAccountId ||
+    (a.amountMinor !== undefined && existing.amount_minor !== a.amountMinor)
+  ) {
+    throw new PaymentError("client_key_reused", 409);
+  }
+  const p = await readPayment(db, existing.id);
+  if (p === null) throw new PaymentError("not_found", 404);
+  return { blocked: false, payment: p, replayed: true, warnings: [] };
 }
 
 const blockedWith = (code: PaymentBlockCode, pre: PrecheckResult): Blocked => ({
@@ -360,6 +391,7 @@ export interface CreateBatchArgs {
   sourceAccountId: number;
   items: { openItemId: number; amountMinor?: number | undefined }[];
   clientKey: string;
+  ibanKey: string | null;
 }
 
 export type CreateBatchResult =
@@ -385,6 +417,7 @@ async function evaluateBatch(
     sourceAccountId: number;
     items: { openItemId: number; amountMinor?: number | undefined }[];
     excludeBatchId?: number;
+    ibanKey: string | null;
   },
 ): Promise<BatchEvaluation> {
   const gathered: Gathered[] = [];
@@ -397,6 +430,7 @@ async function evaluateBatch(
       openItemId: it.openItemId,
       sourceAccountId: a.sourceAccountId,
       requestedAmountMinor: it.amountMinor,
+      ibanKey: a.ibanKey,
       ...(a.excludeBatchId !== undefined ? { excludeBatchId: a.excludeBatchId } : {}),
     });
     const pre = precheckPayment(g.input);
@@ -417,6 +451,12 @@ async function evaluateBatch(
     check.blocks.push("batch_too_large");
     check.ok = false;
   }
+  // One batch is one administration: items of two divisions are refused (the database too).
+  const divisions = new Set(gathered.map((g) => g.item?.divisionId ?? null));
+  if (divisions.size > 1 && !check.blocks.includes("batch_mixed_division")) {
+    check.blocks.push("batch_mixed_division");
+    check.ok = false;
+  }
   return { check, gathered, prechecks };
 }
 
@@ -429,14 +469,25 @@ export async function createBatch(db: D1Database, a: CreateBatchArgs): Promise<C
     .bind(a.actor, a.clientKey)
     .first<{ id: number; item_count: number }>();
   if (existing !== null) {
-    const ids = (
+    const stored = (
       await db
-        .prepare("SELECT open_item_id FROM payments WHERE batch_id = ?1 ORDER BY open_item_id")
+        .prepare(
+          "SELECT open_item_id, amount_minor, bank_account_id FROM payments WHERE batch_id = ?1 ORDER BY open_item_id",
+        )
         .bind(existing.id)
-        .all<{ open_item_id: number }>()
-    ).results.map((r) => r.open_item_id);
-    const asked = [...new Set(a.items.map((i) => i.openItemId))].sort((x, y) => x - y);
-    if (ids.length !== asked.length || ids.some((v, i) => v !== asked[i])) {
+        .all<{ open_item_id: number; amount_minor: number; bank_account_id: number }>()
+    ).results;
+    const asked = [...a.items].sort((x, y) => x.openItemId - y.openItemId);
+    // The same key for another set of invoices, other amounts or another account is a reuse.
+    if (
+      stored.length !== asked.length ||
+      stored.some(
+        (v, i) =>
+          v.open_item_id !== asked[i]?.openItemId ||
+          v.bank_account_id !== a.sourceAccountId ||
+          (asked[i]?.amountMinor !== undefined && v.amount_minor !== asked[i]?.amountMinor),
+      )
+    ) {
       throw new PaymentError("client_key_reused", 409);
     }
     const b = await readBatch(db, existing.id);
@@ -489,7 +540,7 @@ export async function createBatch(db: D1Database, a: CreateBatchArgs): Promise<C
   const hash = paymentPayloadHash(payload);
   const reasons = requiredApprovals({
     settings: a.state.settings,
-    items: items.map((i) => ({ eur: i.pre.eur, iban: i.pre.ibanState })),
+    items: items.map((i) => ({ eur: i.pre.limitEur, iban: i.pre.ibanState })),
     totalEur: check.totalEur,
     isBatch: true,
   });
@@ -608,6 +659,7 @@ export async function createBatch(db: D1Database, a: CreateBatchArgs): Promise<C
       return { blocked: true, blocks: ["payments_disabled"], itemBlocks: [] };
     }
     if (code === "client_key_reused") throw new PaymentError("client_key_reused", 409);
+    if (code !== null) throw new PaymentError(code, 409);
     throw err;
   }
   const row = await db
@@ -630,6 +682,7 @@ export interface ConfirmArgs {
   authAtMs: number;
   state: PaymentsState;
   phrase: string;
+  ibanKey: string | null;
 }
 
 /**
@@ -645,9 +698,10 @@ export async function confirmRequest(
   const row = subjectOrThrow(await loadSubject(db, a.kind, a.id), a.kind);
   if (row.requested_by !== a.actor) throw new PaymentError("not_requester", 403);
   if (row.status !== "draft") throw new PaymentError("not_draft", 409, { status: row.status });
+  const tail = a.kind === "payment" ? ((await maskedIbans(db, [row.id])).get(row.id) ?? "") : "";
   const expected =
     a.kind === "payment"
-      ? paymentConfirmPhrase(row.amount_minor, row.currency)
+      ? paymentConfirmPhrase(row.amount_minor, row.currency, tail.slice(-4))
       : batchConfirmPhrase(row.item_count ?? 0, row.amount_minor, row.currency);
   if (!phraseMatches(a.phrase, expected)) throw new PaymentError("confirmation_required", 400);
   if (!isStepUpRecent(a.authAtMs, a.nowMs)) throw new PaymentError("step_up_required", 401);
@@ -684,6 +738,44 @@ export async function confirmRequest(
   return (await readSubject(db, a.kind, row.id)) as PaymentDto | BatchDto;
 }
 
+/**
+ * The pre-checks again, right before a request is handed to the submitter (submit.ts): today's facts
+ * and TODAY's settings. Null = still good; otherwise a stable refusal code. A tightened control
+ * applies to a request that is already `ready` (it is refused, never quietly sent); a loosened one
+ * never relaxes a stored requirement (ADR 0049 "pending requests keep their rules").
+ */
+export async function recheckBeforeSubmit(
+  db: D1Database,
+  a: { kind: SubjectKind; id: number; nowMs: number; state: PaymentsState; ibanKey: string | null },
+): Promise<string | null> {
+  const row = await loadSubject(db, a.kind, a.id);
+  if (row === null) return "not_found";
+  try {
+    await recheck(
+      db,
+      {
+        kind: a.kind,
+        id: a.id,
+        nowMs: a.nowMs,
+        actor: row.requested_by,
+        authAtMs: 0,
+        state: a.state,
+        phrase: "",
+        ibanKey: a.ibanKey,
+      },
+      row,
+    );
+  } catch (err) {
+    if (err instanceof PaymentError) {
+      const blocks = err.extra["blocks"];
+      const first = Array.isArray(blocks) && typeof blocks[0] === "string" ? blocks[0] : null;
+      return first === null ? err.code : `precheck:${first}`;
+    }
+    return "precheck_failed";
+  }
+  return null;
+}
+
 /** Fresh pre-checks; returns the approval reasons now. Throws when anything is blocked or changed. */
 async function recheck(db: D1Database, a: ConfirmArgs, row: SubjectRow): Promise<ApprovalReason[]> {
   const stored = storedReasons(row.approvals_required);
@@ -702,6 +794,7 @@ async function recheck(db: D1Database, a: ConfirmArgs, row: SubjectRow): Promise
       sourceAccountId: row.bank_account_id,
       requestedAmountMinor: row.amount_minor,
       excludePaymentId: row.id,
+      ibanKey: a.ibanKey,
     });
     const pre = precheckPayment(g.input);
     if (!pre.ok)
@@ -721,8 +814,8 @@ async function recheck(db: D1Database, a: ConfirmArgs, row: SubjectRow): Promise
     return now(
       requiredApprovals({
         settings: a.state.settings,
-        items: [{ eur: pre.eur, iban: pre.ibanState }],
-        totalEur: pre.eur,
+        items: [{ eur: pre.limitEur, iban: pre.ibanState }],
+        totalEur: pre.limitEur,
         isBatch: false,
       }),
     );
@@ -742,6 +835,7 @@ async function recheck(db: D1Database, a: ConfirmArgs, row: SubjectRow): Promise
     sourceAccountId: row.bank_account_id,
     items: items.map((i) => ({ openItemId: i.open_item_id, amountMinor: i.amount_minor })),
     excludeBatchId: row.id,
+    ibanKey: a.ibanKey,
   });
   if (!ev.check.ok || ev.check.totalMinor === null || ev.check.currency === null) {
     throw new PaymentError("blocked", 422, {
@@ -770,7 +864,7 @@ async function recheck(db: D1Database, a: ConfirmArgs, row: SubjectRow): Promise
   return now(
     requiredApprovals({
       settings: a.state.settings,
-      items: ev.prechecks.map((p) => ({ eur: p.eur, iban: p.ibanState })),
+      items: ev.prechecks.map((p) => ({ eur: p.limitEur, iban: p.ibanState })),
       totalEur: ev.check.totalEur,
       isBatch: true,
     }),
@@ -894,6 +988,10 @@ export async function decideRequest(db: D1Database, a: DecideArgs): Promise<Paym
     const c = dbErrorCode(err);
     if (c === "approver_role") throw new PaymentError("approver_lacks_role", 403);
     if (c !== null) throw new PaymentError(c, 409);
+    // A second decision for the same subject (one per subject, unique index): somebody was first.
+    if (/UNIQUE constraint failed: payment_approvals/.test(errText(err))) {
+      throw new PaymentError("conflict", 409);
+    }
     throw err;
   }
   if ((out[3]?.meta.changes ?? 0) !== 1) throw new PaymentError("conflict", 409);

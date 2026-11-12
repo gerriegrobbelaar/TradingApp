@@ -14,6 +14,7 @@
  * Revolut connection is active and at least one person holds the approver role.
  */
 import {
+  isIbanFingerprintKey,
   parsePaymentSettings,
   PAYMENT_SETTINGS_KEY,
   PAYMENTS_ENABLED_KEY,
@@ -38,6 +39,7 @@ export type PaymentsBlocker =
   | "approval_mapping_unverified"
   | "no_revolut_connection"
   | "no_approver"
+  | "iban_key_missing"
   | "payments_disabled";
 
 export interface VerificationMark {
@@ -59,6 +61,14 @@ export interface PaymentsState {
   /** The Revolut plan hint on the connection: only 'pay' (Company plan) may use one-click /pay. */
   connectionMode: "drafts" | "pay" | null;
   approverCount: number;
+  /** The Workers secret PAYMENTS_IBAN_KEY is set and usable (its value is never kept here). */
+  ibanKeyPresent: boolean;
+}
+
+/** The fingerprint key, or null when the secret is missing or too short (callers fail closed). */
+export function ibanKeyOf(env: { PAYMENTS_IBAN_KEY?: string | undefined }): string | null {
+  const k = env.PAYMENTS_IBAN_KEY;
+  return isIbanFingerprintKey(k) ? k : null;
 }
 
 function parseVerified(raw: string | undefined): VerificationMark | null {
@@ -89,7 +99,10 @@ function parseVerified(raw: string | undefined): VerificationMark | null {
   return null;
 }
 
-export async function loadPaymentsState(db: D1Database): Promise<PaymentsState> {
+export async function loadPaymentsState(
+  db: D1Database,
+  ibanKey: string | null | undefined,
+): Promise<PaymentsState> {
   const [settings, revolut, approvers] = await db.batch<Record<string, unknown>>([
     db
       .prepare("SELECT key, value_json FROM settings WHERE key IN (?1, ?2, ?3)")
@@ -119,6 +132,7 @@ export async function loadPaymentsState(db: D1Database): Promise<PaymentsState> 
     revolutActive: rev?.["status"] === "active",
     connectionMode: mode === "pay" || mode === "drafts" ? mode : null,
     approverCount: Number(approvers?.results?.[0]?.["n"] ?? 0),
+    ibanKeyPresent: isIbanFingerprintKey(ibanKey),
   };
 }
 
@@ -131,14 +145,18 @@ export function paymentsBlockers(s: PaymentsState, submitterAvailable: boolean):
   if (!s.mappingVerified) out.push("approval_mapping_unverified");
   if (!s.revolutActive) out.push("no_revolut_connection");
   if (s.approverCount < 1) out.push("no_approver");
+  if (!s.ibanKeyPresent) out.push("iban_key_missing");
   if (!s.enabled) out.push("payments_disabled");
   return out;
 }
 
-/** Switch on AND a verification at the current protocol version (what a request must also see). */
+/**
+ * Switch on AND a verification at the current protocol version AND the fingerprint key (what a
+ * request must also see).
+ */
 export const paymentsPermitted = (
-  s: Pick<PaymentsState, "enabled" | "verified" | "protocolChanged">,
-): boolean => s.enabled && s.verified !== null && !s.protocolChanged;
+  s: Pick<PaymentsState, "enabled" | "verified" | "protocolChanged" | "ibanKeyPresent">,
+): boolean => s.enabled && s.verified !== null && !s.protocolChanged && s.ibanKeyPresent;
 
 export const UPSERT_SETTING = `INSERT INTO settings (key, value_json, updated_by) VALUES (?1, ?2, ?3)
   ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, updated_by = excluded.updated_by,

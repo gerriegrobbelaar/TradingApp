@@ -107,6 +107,7 @@ export const PAYMENT_BLOCK_CODES = [
   "payable_not_found",
   "not_a_payable",
   "nothing_open",
+  "open_item_stale",
   "amount_invalid",
   "amount_not_open_balance",
   "amount_exceeds_open",
@@ -119,6 +120,7 @@ export const PAYMENT_BLOCK_CODES = [
   // double payment
   "already_in_request",
   "already_in_batch",
+  "already_paid",
   "paid_since_last_sync",
   // the supplier and the IBAN
   "supplier_not_found",
@@ -185,7 +187,12 @@ export interface PaymentSettings {
   mode: PaymentMode;
 }
 
-/** Defaults for the unanswered decisions 1 and 6 (ADR 0049). Every one is a setting. */
+/**
+ * Defaults for the unanswered decisions 1 and 6 (ADR 0049). Every one is a setting.
+ * The two hard ceilings (`maxRequestMinor` 25,000.00 EUR, `maxDailyMinor` 50,000.00 EUR) are NOT
+ * from the brief: they are invented, conservative PLACEHOLDERS so a mistyped limit cannot authorise
+ * a large payment, awaiting the user's answer (ADR 0049 question 3). Raising them is a loosening.
+ */
 export const DEFAULT_PAYMENT_SETTINGS: Readonly<PaymentSettings> = {
   fourEyesEnabled: true,
   fourEyesLimitMinor: 250_000,

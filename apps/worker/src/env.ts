@@ -34,6 +34,12 @@ export interface Env {
   REVOLUT_REDIRECT_URI: string;
   /** Workers secret: PKCS#8 PEM private key whose certificate is registered with Revolut. */
   REVOLUT_PRIVATE_KEY: string;
+  /**
+   * Workers secret, optional until payments are switched on: the key of the keyed IBAN fingerprint
+   * (HMAC-SHA-256, at least 32 characters, ADR 0049). Missing = payments stay blocked
+   * (`iban_key_missing`). Rotating it voids every supplier IBAN verification (fail closed).
+   */
+  PAYMENTS_IBAN_KEY?: string;
   /** Workers secret, optional: API key of the transactional e-mail provider (ADR 0046). */
   EMAIL_API_KEY?: string;
   /** One instance per Revolut connection ("revolut:<connection id>"). */

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { sha256Hex } from "../sha256";
+import { hmacSha256Hex, sha256Hex } from "../sha256";
 import {
   APPROVAL_REASONS,
   approvalStillValid,
@@ -28,6 +28,7 @@ import {
 } from "./index";
 
 const GOOD_IBAN = "NL91ABNA0417164300";
+const FP_KEY = "core-test-iban-key-0123456789abcdef";
 const OTHER_IBAN = "DE89370400440532013000";
 const ID1 = "11111111-1111-4111-8111-111111111111";
 const ID2 = "22222222-2222-4222-9222-222222222222";
@@ -133,22 +134,53 @@ describe("reference text", () => {
 
 describe("IBAN trust", () => {
   const verified = (by: string, iban = GOOD_IBAN) => ({
-    fingerprint: ibanFingerprint(iban) as string,
+    fingerprint: ibanFingerprint(iban, FP_KEY) as string,
     verifiedBy: by,
     revoked: false,
   });
   it("fingerprints are stable across spacing and case, and differ per IBAN", () => {
-    expect(ibanFingerprint("nl91 abna 0417 1643 00")).toBe(ibanFingerprint(GOOD_IBAN));
-    expect(ibanFingerprint(GOOD_IBAN)).not.toBe(ibanFingerprint(OTHER_IBAN));
-    expect(ibanFingerprint(GOOD_IBAN)).toBe(sha256Hex(`iban-fp-v1:${GOOD_IBAN}`));
-    expect(ibanFingerprint(GOOD_IBAN)).not.toContain("NL91");
-    expect(ibanFingerprint("garbage")).toBeNull();
-    expect(ibanFingerprint(null)).toBeNull();
-    expect(ibanFingerprint(undefined)).toBeNull();
+    expect(ibanFingerprint("nl91 abna 0417 1643 00", FP_KEY)).toBe(
+      ibanFingerprint(GOOD_IBAN, FP_KEY),
+    );
+    expect(ibanFingerprint(GOOD_IBAN, FP_KEY)).not.toBe(ibanFingerprint(OTHER_IBAN, FP_KEY));
+    expect(ibanFingerprint(GOOD_IBAN, FP_KEY)).toBe(
+      hmacSha256Hex(FP_KEY, `iban-fp-v2:${GOOD_IBAN}`),
+    );
+    expect(ibanFingerprint(GOOD_IBAN, FP_KEY)).not.toContain("NL91");
+    expect(ibanFingerprint("garbage", FP_KEY)).toBeNull();
+    expect(ibanFingerprint(null, FP_KEY)).toBeNull();
+    expect(ibanFingerprint(undefined, FP_KEY)).toBeNull();
+  });
+  it("is KEYED: an unkeyed hash of the IBAN does not reproduce it, another key gives another one", () => {
+    // review P9a: an unkeyed SHA-256 next to a masked IBAN is brute-forceable (few unknown digits)
+    const fp = ibanFingerprint(GOOD_IBAN, FP_KEY);
+    expect(fp).toMatch(/^[0-9a-f]{64}$/);
+    expect(fp).not.toBe(sha256Hex(`iban-fp-v1:${GOOD_IBAN}`));
+    expect(fp).not.toBe(sha256Hex(`iban-fp-v2:${GOOD_IBAN}`));
+    expect(fp).not.toBe(ibanFingerprint(GOOD_IBAN, `${FP_KEY}x`));
+    // no key, a short key or a padded key: no fingerprint at all (callers fail closed)
+    expect(ibanFingerprint(GOOD_IBAN, "")).toBeNull();
+    expect(ibanFingerprint(GOOD_IBAN, "short-key")).toBeNull();
+    expect(ibanFingerprint(GOOD_IBAN, ` ${FP_KEY}`)).toBeNull();
+    expect(
+      assessIban(
+        { recordIban: GOOD_IBAN, verification: null, paidBefore: false, fingerprintKey: "" },
+        "r@x.nl",
+      ),
+    ).toEqual({ state: "invalid", fingerprint: null });
   });
   it("classifies every state", () => {
     const a = (f: Partial<Parameters<typeof assessIban>[0]>, who = "req@x.nl") =>
-      assessIban({ recordIban: GOOD_IBAN, verification: null, paidBefore: false, ...f }, who).state;
+      assessIban(
+        {
+          recordIban: GOOD_IBAN,
+          verification: null,
+          paidBefore: false,
+          fingerprintKey: FP_KEY,
+          ...f,
+        },
+        who,
+      ).state;
     expect(a({ recordIban: null })).toBe("missing");
     expect(a({ recordIban: "  " })).toBe("missing");
     expect(a({ recordIban: "NL00ABNA0417164300" })).toBe("invalid"); // checksum
@@ -168,11 +200,11 @@ describe("IBAN trust", () => {
   it("a changed IBAN in Exact is unverified again", () => {
     const v = verified("app@x.nl");
     const before = assessIban(
-      { recordIban: GOOD_IBAN, verification: v, paidBefore: true },
+      { recordIban: GOOD_IBAN, verification: v, paidBefore: true, fingerprintKey: FP_KEY },
       "r@x.nl",
     );
     const after = assessIban(
-      { recordIban: OTHER_IBAN, verification: v, paidBefore: true },
+      { recordIban: OTHER_IBAN, verification: v, paidBefore: true, fingerprintKey: FP_KEY },
       "r@x.nl",
     );
     expect(before.state).toBe("verified_established");
@@ -414,7 +446,7 @@ describe("payload hash", () => {
     openItemId: 7,
     amountMinor: 12_345,
     currency: "EUR",
-    ibanFingerprint: ibanFingerprint(GOOD_IBAN) as string,
+    ibanFingerprint: ibanFingerprint(GOOD_IBAN, FP_KEY) as string,
     reference: "Invoice 42",
     ...over,
   });
@@ -436,7 +468,9 @@ describe("payload hash", () => {
     const base = h(payload());
     const variants: PaymentPayload[] = [
       payload({ items: [item({ amountMinor: 12_346 })], totalMinor: 12_346 }),
-      payload({ items: [item({ ibanFingerprint: ibanFingerprint(OTHER_IBAN) as string })] }),
+      payload({
+        items: [item({ ibanFingerprint: ibanFingerprint(OTHER_IBAN, FP_KEY) as string })],
+      }),
       payload({ items: [item({ reference: "Invoice 43" })] }),
       payload({ items: [item({ openItemId: 8 })] }),
       payload({ items: [item({ requestId: ID2 })] }),

@@ -11,10 +11,23 @@ import {
   PAYMENTS_ENABLED_KEY,
   PAYMENTS_VERIFIED_KEY,
 } from "../src/payments/settings";
+import { env } from "cloudflare:test";
 import { addSession, addUser } from "./helpers";
-import { addItem, addRelation, db, resetWorld, setSetting, type World } from "./matching-helpers";
+import {
+  addItem,
+  addRelation,
+  db,
+  markOpenItemsSynced,
+  resetWorld,
+  setSetting,
+  type World,
+} from "./matching-helpers";
 
 export { db };
+/** The test value of the Workers secret PAYMENTS_IBAN_KEY (vitest.config.ts). */
+export const TEST_IBAN_KEY = env.PAYMENTS_IBAN_KEY as string;
+/** The keyed fingerprint of an IBAN under the test key. */
+export const fp = (iban: string): string => ibanFingerprint(iban, TEST_IBAN_KEY) as string;
 export const SUPPLIER_IBAN = "NL91ABNA0417164300";
 export const OTHER_IBAN = "DE89370400440532013000";
 
@@ -133,7 +146,7 @@ export async function verifyIbanRow(
       `INSERT INTO supplier_iban_verifications (division_id, relation_id, iban_fingerprint, kind, verified_by)
        VALUES (?1, ?2, ?3, 'verified', ?4)`,
     )
-    .bind(divisionId, relationRowId, ibanFingerprint(iban), by)
+    .bind(divisionId, relationRowId, fp(iban), by)
     .run();
 }
 
@@ -147,6 +160,8 @@ export async function payWorld(
 ): Promise<PayWorld> {
   const nowMs = o.nowMs ?? Date.now();
   const w = await resetWorld();
+  // The division's payables were read completely an hour before `nowMs` (open_item_stale otherwise).
+  await markOpenItemsSynced(w.divisionId, iso(nowMs - 3600_000));
   await db.prepare("DELETE FROM settings WHERE key LIKE 'payments.%'").run();
   await db.batch([
     db.prepare("DELETE FROM sessions"),

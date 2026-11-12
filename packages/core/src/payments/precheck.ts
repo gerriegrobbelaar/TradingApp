@@ -38,6 +38,12 @@ export interface PrecheckInput {
     invoiceNumber: string | null;
     /** The IBAN printed on / stored with the invoice, when there is one. */
     invoiceIban: string | null;
+    /**
+     * The division's open payables were read completely recently (sync_state `payables`, 26 h):
+     * otherwise the open balance may be out of date (paid or changed in Exact since). Not
+     * fresh = `open_item_stale`.
+     */
+    fresh: boolean;
   } | null;
   /**
    * Result of `isInvoiceApprovedForPayment` on the one purchase entry of the payable, or the
@@ -50,7 +56,17 @@ export interface PrecheckInput {
   ibanReadAtMs: number | null;
   /** The amount to pay; undefined = the open balance. */
   requestedAmountMinor?: number;
-  conflicts: { openRequest: boolean; openBatch: boolean; paidSinceSync: boolean };
+  conflicts: {
+    openRequest: boolean;
+    openBatch: boolean;
+    paidSinceSync: boolean;
+    /**
+     * Any request for this invoice was ever confirmed `paid` by the bank. Until P9b proves the
+     * booking in Exact reduced the open balance, a second payment of the same invoice is refused
+     * whatever the open balance says (review P9a).
+     */
+    paidBefore: boolean;
+  };
   source: {
     found: boolean;
     active: boolean;
@@ -75,6 +91,12 @@ export interface PrecheckResult {
   currency: string | null;
   reference: string | null;
   eur: EurAmount | null;
+  /**
+   * The EUR figure the four-eyes LIMIT is judged on: the amount's, or for a part payment the open
+   * balance's when that is larger, so splitting a large invoice into small parts cannot dodge the
+   * second approver (review P9a). Null when no rate.
+   */
+  limitEur: EurAmount | null;
   ibanState: IbanState;
   ibanFingerprint: string | null;
 }
@@ -92,6 +114,7 @@ export function precheckPayment(input: PrecheckInput): PrecheckResult {
     blocks.add("payable_not_found");
   } else {
     if (item.kind !== "bill") blocks.add("not_a_payable");
+    if (item.fresh !== true) blocks.add("open_item_stale");
     if (item.closed || !Number.isSafeInteger(item.openMinor) || item.openMinor <= 0) {
       blocks.add("nothing_open");
     } else {
@@ -120,6 +143,7 @@ export function precheckPayment(input: PrecheckInput): PrecheckResult {
   // ---- double payment --------------------------------------------------------------------
   if (input.conflicts.openRequest) blocks.add("already_in_request");
   if (input.conflicts.openBatch) blocks.add("already_in_batch");
+  if (input.conflicts.paidBefore !== false) blocks.add("already_paid");
   if (input.conflicts.paidSinceSync) blocks.add("paid_since_last_sync");
 
   // ---- supplier and IBAN -----------------------------------------------------------------
@@ -163,8 +187,13 @@ export function precheckPayment(input: PrecheckInput): PrecheckResult {
 
   // ---- limits ----------------------------------------------------------------------------
   let eur: EurAmount | null = null;
+  let limitEur: EurAmount | null = null;
   if (amount !== null && item !== null) {
     eur = eurEquivalent(amount, item.currency, input.rates);
+    limitEur =
+      eur !== null && amount < item.openMinor
+        ? eurEquivalent(item.openMinor, item.currency, input.rates)
+        : eur;
     if (eur === null) {
       blocks.add("no_eur_rate");
     } else {
@@ -217,6 +246,7 @@ export function precheckPayment(input: PrecheckInput): PrecheckResult {
     currency: item?.currency ?? null,
     reference: built.reference,
     eur,
+    limitEur,
     ibanState: iban.state,
     ibanFingerprint: iban.fingerprint,
   };

@@ -28,11 +28,21 @@ export const PAYMENTS_VERIFY_PHRASE = "I VERIFIED THE PAYMENT PATH ON THE REVOLU
 export const PAYMENTS_LOOSEN_PHRASE = "LOOSEN PAYMENT CONTROLS";
 
 /**
- * The phrase a person types to confirm one payment: it contains the amount, so a stale sheet or
- * a wrong invoice cannot be confirmed by habit. "PAY 1234.56 EUR".
+ * The phrase a person types to confirm one payment: it contains the amount AND the last four
+ * characters of the beneficiary IBAN, so a stale sheet, a wrong invoice or a changed bank account
+ * cannot be confirmed by habit. "PAY 1234.56 EUR TO 4300".
+ *
+ * It is not a secret: the sheet shows it (the API returns it with a draft) so the person can type
+ * it. Its purpose is attention, and the web must show it as text and never pre-fill the input. What
+ * protects the money is server-side: the requester's fresh sign-in, the pre-checks run again and
+ * the payload hash compared at confirmation (ADR 0049).
  */
-export function paymentConfirmPhrase(amountMinor: number, currency: string): string {
-  return `PAY ${formatMoney(money(amountMinor, currency))} ${currency}`;
+export function paymentConfirmPhrase(
+  amountMinor: number,
+  currency: string,
+  ibanLastFour: string,
+): string {
+  return `PAY ${formatMoney(money(amountMinor, currency))} ${currency} TO ${ibanLastFour.toUpperCase()}`;
 }
 
 /** The phrase for a batch: "PAY BATCH 3 INVOICES 1234.56 EUR". */

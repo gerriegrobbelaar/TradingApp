@@ -19,6 +19,8 @@ export const BATCH_BLOCK_CODES = [
   "batch_duplicate_invoice",
   "batch_mixed_currency",
   "batch_mixed_source_account",
+  // set by the worker, which knows each invoice's administration (one batch = one division)
+  "batch_mixed_division",
   "batch_item_blocked",
   "batch_total_unsafe",
   "batch_over_request_limit",

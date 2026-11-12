@@ -12,12 +12,15 @@
 -- Rules enforced by triggers (names are pinned by test/fixtures/trigger-hashes.json):
 --   * states only move forward; a final state is final; rows are never deleted
 --   * request_id, the payload hash and everything it covers never change after insert
---   * leaving 'draft' needs a recorded confirmation
+--   * leaving 'draft' needs a recorded confirmation (kept once set); a batch must hold exactly the
+--     items and total it was hashed over; straight to 'ready' is refused when the stored four-eyes
+--     settings (defaults when missing) require a second person (a backstop for the application)
+--   * pending_approval -> rejected needs a recorded 'rejected' decision by somebody else
 --   * pending_approval -> ready needs an approval by somebody else, for this payload, by a person
 --     who STILL holds the approver role and is not disabled
 --   * ready -> submitting needs the payments switch ON, an unreleased claim and (when needed) the same approval
 --   * an approval row is append-only, requester <> approver (also by CHECK), approver holds the role
---   * events and IBAN verifications are append-only
+--   * events and IBAN verifications are append-only; a claim keeps its lease, only its release is written
 -- Time (24 h validity, 15 minute sign-in) is checked in the application against the request's clock,
 -- inside the same batch as the write, because triggers cannot be tested against a frozen clock.
 
@@ -210,6 +213,8 @@ WHEN NEW.payload_hash IS NOT OLD.payload_hash
      OR NEW.expires_at IS NOT OLD.expires_at
      OR NEW.created_at IS NOT OLD.created_at
      OR NEW.client_key IS NOT OLD.client_key
+     OR (OLD.confirmed_at IS NOT NULL AND NEW.confirmed_at IS NOT OLD.confirmed_at)
+     OR (OLD.requester_auth_at IS NOT NULL AND NEW.requester_auth_at IS NOT OLD.requester_auth_at)
 BEGIN
   SELECT RAISE(ABORT, 'payment_err:payload_immutable');
 END;
@@ -236,6 +241,14 @@ BEGIN
   WHERE NEW.status = 'ready' AND NEW.approvals_required <> '[]';
   SELECT RAISE(ABORT, 'payment_err:bad_transition')
   WHERE NEW.status = 'pending_approval' AND NEW.approvals_required = '[]';
+  -- Four-eyes backstop with the stored settings (defaults when missing): straight to 'ready' is
+  -- refused for an amount above the limit, without an EUR figure, or to an IBAN never paid before
+  -- while the new-IBAN rule is on. The application decides the reasons; this catches a miss.
+  SELECT RAISE(ABORT, 'payment_err:approval_required')
+  WHERE NEW.status = 'ready' AND (
+        ((COALESCE((SELECT CASE WHEN json_valid(value_json) AND json_type(value_json, '$.fourEyesEnabled') = 'false' THEN 0 ELSE 1 END FROM settings WHERE key = 'payments.settings'), 1) = 1) AND (NEW.eur_minor IS NULL OR NEW.eur_minor > COALESCE((SELECT CASE WHEN json_valid(value_json) AND json_type(value_json, '$.fourEyesLimitMinor') = 'integer' THEN json_extract(value_json, '$.fourEyesLimitMinor') END FROM settings WHERE key = 'payments.settings'), 250000)))
+     OR ((COALESCE((SELECT CASE WHEN json_valid(value_json) AND json_type(value_json, '$.requireApprovalForNewIban') = 'false' THEN 0 ELSE 1 END FROM settings WHERE key = 'payments.settings'), 1) = 1) AND NOT EXISTS (SELECT 1 FROM payments q
+                                      WHERE q.iban_fingerprint = NEW.iban_fingerprint AND q.status = 'paid')));
 END;
 
 -- pending_approval -> ready only with an approval of someone other than the requester, for this
@@ -251,6 +264,17 @@ BEGIN
                    AND a.payload_hash = NEW.payload_hash
                    AND a.decided_by <> lower(NEW.requested_by)
                    AND u.disabled_at IS NULL));
+END;
+
+-- pending_approval -> rejected only with a recorded 'rejected' decision by somebody else (the
+-- approver's "no" is in payment_approvals, like a "yes").
+CREATE TRIGGER payments_guard_rejected BEFORE UPDATE OF status ON payments
+WHEN OLD.status = 'pending_approval' AND NEW.status = 'rejected' AND NEW.batch_id IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'payment_err:not_decided')
+  WHERE NOT EXISTS (SELECT 1 FROM payment_approvals a
+                     WHERE a.payment_id = NEW.id AND a.decision = 'rejected'
+                       AND a.payload_hash = NEW.payload_hash AND a.decided_by <> lower(NEW.requested_by));
 END;
 
 -- ready -> submitting: the switch is on, a single-writer claim exists, and an approval that was
@@ -307,6 +331,8 @@ WHEN NEW.payload_hash IS NOT OLD.payload_hash
      OR NEW.expires_at IS NOT OLD.expires_at
      OR NEW.created_at IS NOT OLD.created_at
      OR NEW.client_key IS NOT OLD.client_key
+     OR (OLD.confirmed_at IS NOT NULL AND NEW.confirmed_at IS NOT OLD.confirmed_at)
+     OR (OLD.requester_auth_at IS NOT NULL AND NEW.requester_auth_at IS NOT OLD.requester_auth_at)
 BEGIN
   SELECT RAISE(ABORT, 'payment_err:payload_immutable');
 END;
@@ -329,6 +355,18 @@ WHEN OLD.status = 'draft' AND NEW.status IN ('pending_approval', 'ready')
 BEGIN
   SELECT RAISE(ABORT, 'payment_err:not_confirmed')
   WHERE NEW.confirmed_at IS NULL OR NEW.requester_auth_at IS NULL;
+  -- The batch is exactly the items it was hashed over: count and total agree (review P9a).
+  SELECT RAISE(ABORT, 'payment_err:batch_items')
+  WHERE (SELECT COUNT(*) FROM payments WHERE batch_id = NEW.id) <> NEW.item_count
+     OR (SELECT COALESCE(SUM(amount_minor), 0) FROM payments WHERE batch_id = NEW.id) <> NEW.total_minor;
+  -- Four-eyes backstop (the application decides the reasons; this refuses the obvious miss).
+  SELECT RAISE(ABORT, 'payment_err:approval_required')
+  WHERE NEW.status = 'ready' AND (
+        ((COALESCE((SELECT CASE WHEN json_valid(value_json) AND json_type(value_json, '$.fourEyesEnabled') = 'false' THEN 0 ELSE 1 END FROM settings WHERE key = 'payments.settings'), 1) = 1) AND (NEW.eur_minor IS NULL OR NEW.eur_minor > COALESCE((SELECT CASE WHEN json_valid(value_json) AND json_type(value_json, '$.fourEyesLimitMinor') = 'integer' THEN json_extract(value_json, '$.fourEyesLimitMinor') END FROM settings WHERE key = 'payments.settings'), 250000)
+           OR EXISTS (SELECT 1 FROM payments i WHERE i.batch_id = NEW.id
+                       AND (i.eur_minor IS NULL OR i.eur_minor > COALESCE((SELECT CASE WHEN json_valid(value_json) AND json_type(value_json, '$.fourEyesLimitMinor') = 'integer' THEN json_extract(value_json, '$.fourEyesLimitMinor') END FROM settings WHERE key = 'payments.settings'), 250000)))))
+     OR ((COALESCE((SELECT CASE WHEN json_valid(value_json) AND json_type(value_json, '$.requireApprovalForNewIban') = 'false' THEN 0 ELSE 1 END FROM settings WHERE key = 'payments.settings'), 1) = 1) AND EXISTS (SELECT 1 FROM payments i WHERE i.batch_id = NEW.id
+           AND NOT EXISTS (SELECT 1 FROM payments q WHERE q.iban_fingerprint = i.iban_fingerprint AND q.status = 'paid'))));
   SELECT RAISE(ABORT, 'payment_err:approval_required')
   WHERE NEW.status = 'ready' AND NEW.approvals_required <> '[]';
   SELECT RAISE(ABORT, 'payment_err:bad_transition')
@@ -348,6 +386,15 @@ BEGIN
                    AND a.payload_hash = NEW.payload_hash
                    AND a.decided_by <> lower(NEW.requested_by)
                    AND u.disabled_at IS NULL);
+END;
+
+CREATE TRIGGER payment_batches_guard_rejected BEFORE UPDATE OF status ON payment_batches
+WHEN OLD.status = 'pending_approval' AND NEW.status = 'rejected'
+BEGIN
+  SELECT RAISE(ABORT, 'payment_err:not_decided')
+  WHERE NOT EXISTS (SELECT 1 FROM payment_approvals a
+                     WHERE a.batch_id = NEW.id AND a.decision = 'rejected'
+                       AND a.payload_hash = NEW.payload_hash AND a.decided_by <> lower(NEW.requested_by));
 END;
 
 -- ready -> submitting: the switch is on, a single-writer claim exists, and an approval that was
@@ -476,7 +523,8 @@ END;
 -- A claim keeps its facts: only the release may be written, once.
 CREATE TRIGGER payment_claims_guard_update BEFORE UPDATE ON payment_claims
 WHEN NEW.payment_id IS NOT OLD.payment_id OR NEW.batch_id IS NOT OLD.batch_id OR NEW.owner IS NOT OLD.owner
-  OR NEW.claimed_at IS NOT OLD.claimed_at OR OLD.released_at IS NOT NULL
+  OR NEW.claimed_at IS NOT OLD.claimed_at OR NEW.lease_until IS NOT OLD.lease_until
+  OR OLD.released_at IS NOT NULL OR NEW.released_at IS NULL
 BEGIN
   SELECT RAISE(ABORT, 'payment_err:append_only');
 END;

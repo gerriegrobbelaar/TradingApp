@@ -48,23 +48,32 @@ async function latest(db: D1Database, relationId: number) {
     }>();
 }
 
+/** The fingerprint key, or a refusal: without it no IBAN can be identified (fail closed). */
+function requireKey(key: string | null): string {
+  if (key === null) throw new PaymentError("iban_key_missing", 409);
+  return key;
+}
+
 export async function ibanStatus(
   db: D1Database,
   relationId: number,
   who: string,
+  ibanKey: string | null,
 ): Promise<IbanStatusDto> {
+  const key = requireKey(ibanKey);
   const s = await readSupplierById(db, relationId);
   if (s === null) throw new PaymentError("not_found", 404);
   const v = await latest(db, relationId);
+  const fpNow = s.iban === null ? null : ibanFingerprint(s.iban, key);
   const paid =
-    s.iban === null || ibanFingerprint(s.iban) === null
+    fpNow === null
       ? false
       : (
           await db
             .prepare(
               "SELECT EXISTS (SELECT 1 FROM payments WHERE iban_fingerprint = ?1 AND status = 'paid') AS n",
             )
-            .bind(ibanFingerprint(s.iban))
+            .bind(fpNow)
             .first<{ n: number }>()
         )?.n === 1;
   const a = assessIban(
@@ -79,6 +88,7 @@ export async function ibanStatus(
               revoked: v.kind === "revoked",
             },
       paidBefore: paid,
+      fingerprintKey: key,
     },
     who,
   );
@@ -97,14 +107,22 @@ export async function ibanStatus(
 
 export async function verifyIban(
   db: D1Database,
-  a: { relationId: number; fingerprint: string; lastFour: string; actor: string; nowMs: number },
+  a: {
+    relationId: number;
+    fingerprint: string;
+    lastFour: string;
+    actor: string;
+    nowMs: number;
+    ibanKey: string | null;
+  },
 ): Promise<IbanStatusDto> {
+  const key = requireKey(a.ibanKey);
   const s = await readSupplierById(db, a.relationId);
   if (s === null) throw new PaymentError("not_found", 404);
   if (!s.isSupplier) throw new PaymentError("not_a_supplier", 409);
   if (s.iban === null) throw new PaymentError("iban_missing", 409);
   const n = normalizeIban(s.iban);
-  const fp = ibanFingerprint(s.iban);
+  const fp = ibanFingerprint(s.iban, key);
   if (fp === null || !hasValidIbanChecksum(n)) throw new PaymentError("iban_invalid", 409);
   // The person looked at THIS IBAN: the fingerprint they saw is the one Exact holds now.
   if (a.fingerprint !== fp) throw new PaymentError("iban_changed", 409);
@@ -117,7 +135,7 @@ export async function verifyIban(
   }
   const cur = await latest(db, a.relationId);
   if (cur !== null && cur.kind === "verified" && cur.iban_fingerprint === fp) {
-    return ibanStatus(db, a.relationId, a.actor); // already verified: nothing to write
+    return ibanStatus(db, a.relationId, a.actor, key); // already verified: nothing to write
   }
   const at = new Date(a.nowMs).toISOString();
   await db.batch([
@@ -145,13 +163,14 @@ export async function verifyIban(
       },
     ),
   ]);
-  return ibanStatus(db, a.relationId, a.actor);
+  return ibanStatus(db, a.relationId, a.actor, key);
 }
 
 export async function revokeIban(
   db: D1Database,
-  a: { relationId: number; actor: string; nowMs: number },
+  a: { relationId: number; actor: string; nowMs: number; ibanKey: string | null },
 ): Promise<IbanStatusDto> {
+  const key = requireKey(a.ibanKey);
   const s = await readSupplierById(db, a.relationId);
   if (s === null) throw new PaymentError("not_found", 404);
   const cur = await latest(db, a.relationId);
@@ -183,5 +202,5 @@ export async function revokeIban(
       },
     ),
   ]);
-  return ibanStatus(db, a.relationId, a.actor);
+  return ibanStatus(db, a.relationId, a.actor, key);
 }

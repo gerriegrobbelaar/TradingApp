@@ -35,6 +35,13 @@ passes with a notice. If any is missing, `/api/connections/revolut/start` and `/
 `500 server_misconfigured`, `GET /api/connections` reports `revolutConfigured: false`, the card
 says Revolut is not configured, and the Revolut jobs skip with `revolut_not_configured`.
 
+Payments (ADR 0049) add the secret `PAYMENTS_IBAN_KEY` (at least 32 characters, no surrounding
+blanks): the key of the keyed IBAN fingerprint (HMAC-SHA-256) used in approval payloads, audit rows
+and API answers. `openssl rand -base64 48 | wrangler secret put PAYMENTS_IBAN_KEY`. Optional until
+payments are used: without it every payment request, every IBAN verification and the switch are
+refused (`iban_key_missing`). Never rotate it casually: a new key changes every fingerprint, so every
+supplier IBAN must be verified again (fail closed, nothing is paid to an unverified IBAN).
+
 If any is missing, `/api/connections/exact/start` and `/callback` answer
 `500 server_misconfigured`; `GET /api/connections` still works and reports `exactConfigured: false`.
 

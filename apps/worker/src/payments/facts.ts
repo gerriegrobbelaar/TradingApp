@@ -6,6 +6,7 @@
 import {
   amsterdamParts,
   findPurchaseEntryForPayable,
+  previousTargetWorkingDay,
   ibanFingerprint,
   isInvoiceApprovedForPayment,
   PAYMENT_OPEN_STATUSES,
@@ -18,7 +19,8 @@ import {
   type PrecheckResult,
 } from "@camelthorn/core";
 import { readMappingCheck } from "../read/approvals-routes";
-import { loadRateTable } from "../fx/rate-table";
+import { loadRateTableWithNewest } from "../fx/rate-table";
+import { openItemsFreshness } from "../matching/run";
 import {
   readInvoiceIban,
   readSourceAccount,
@@ -143,6 +145,28 @@ export interface GatherOptions {
   excludePaymentId?: number;
   /** Its batch does not conflict with the item either. */
   excludeBatchId?: number;
+  /** The keyed-fingerprint key (Workers secret PAYMENTS_IBAN_KEY); null = every IBAN is refused. */
+  ibanKey: string | null;
+}
+
+/**
+ * How many TARGET working days the newest ECB rate may lag today for a payment LIMIT check: the
+ * rate of the previous working day (before today's 16:00 publication) and one more for a failed
+ * import. An older feed is no rate at all (`no_eur_rate`, review P9a): a stale rate could make a
+ * foreign amount look smaller than it is.
+ */
+export const PAYMENT_RATE_MAX_LAG_TARGET_DAYS = 2;
+
+/** The rate table for today, or null when there is none or the feed is older than the lag above. */
+export async function freshRates(db: D1Database, nowMs: number) {
+  const today = amsterdamParts(nowMs).date;
+  const { table, newestDate } = await loadRateTableWithNewest(db, today);
+  if (table === null || newestDate === null) return null;
+  let oldest = today;
+  for (let k = 0; k < PAYMENT_RATE_MAX_LAG_TARGET_DAYS; k += 1) {
+    oldest = previousTargetWorkingDay(oldest);
+  }
+  return newestDate >= oldest ? table : null;
 }
 
 export async function gatherPrecheck(db: D1Database, o: GatherOptions): Promise<Gathered> {
@@ -155,7 +179,8 @@ export async function gatherPrecheck(db: D1Database, o: GatherOptions): Promise<
   const exclude = o.excludePaymentId ?? 0;
   const excludeBatch = o.excludeBatchId ?? 0;
   const since = new Date(o.nowMs - 24 * 3600_000).toISOString();
-  const fp = supplier === null ? null : ibanFingerprint(supplier.iban);
+  const key = o.ibanKey ?? "";
+  const fp = supplier === null ? null : ibanFingerprint(supplier.iban, key);
 
   const [conflict, daily, reserved, verification, paid] = await db.batch<Record<string, unknown>>([
     db
@@ -166,13 +191,14 @@ export async function gatherPrecheck(db: D1Database, o: GatherOptions): Promise<
            EXISTS (SELECT 1 FROM payments WHERE open_item_id = ?1 AND batch_id IS NOT NULL AND id <> ?2
                      AND batch_id <> ?3 AND status IN (${OPEN_LIST})) AS open_batch,
            EXISTS (SELECT 1 FROM payments p JOIN open_items oi ON oi.id = p.open_item_id
-                    WHERE p.open_item_id = ?1 AND p.status = 'paid' AND p.updated_at > oi.synced_at) AS paid_since`,
+                    WHERE p.open_item_id = ?1 AND p.status = 'paid' AND p.updated_at > oi.synced_at) AS paid_since,
+           EXISTS (SELECT 1 FROM payments WHERE open_item_id = ?1 AND id <> ?2 AND status = 'paid') AS paid_before`,
       )
       .bind(o.openItemId, exclude, excludeBatch),
     db
       .prepare(
         `SELECT COALESCE(SUM(eur_minor), 0) AS n FROM payments
-          WHERE created_at >= ?1 AND id <> ?2 AND status IN (${OPEN_LIST}, 'paid')
+          WHERE (created_at >= ?1 OR updated_at >= ?1) AND id <> ?2 AND status IN (${OPEN_LIST}, 'paid')
             AND (batch_id IS NULL OR batch_id <> ?3)`,
       )
       .bind(since, exclude, excludeBatch),
@@ -197,10 +223,9 @@ export async function gatherPrecheck(db: D1Database, o: GatherOptions): Promise<
   ]);
   const c = conflict?.results?.[0];
   const v = verification?.results?.[0];
-  const rates =
-    item !== null && item.currency !== "EUR"
-      ? await loadRateTable(db, amsterdamParts(o.nowMs).date)
-      : null;
+  const rates = item !== null && item.currency !== "EUR" ? await freshRates(db, o.nowMs) : null;
+  const fresh =
+    item === null ? false : (await openItemsFreshness(db, item.divisionId, o.nowMs)).payable;
   const approval: InvoiceApproval =
     item === null ? "unknown" : await invoiceApproval(db, item, o.nowMs);
 
@@ -219,6 +244,7 @@ export async function gatherPrecheck(db: D1Database, o: GatherOptions): Promise<
             currency: item.currency,
             invoiceNumber: item.invoiceNumber,
             invoiceIban: item.kind === "bill" ? await readInvoiceIban(db, item.id) : null,
+            fresh,
           },
     approval,
     supplier: supplier === null ? null : { found: true, isSupplier: supplier.isSupplier },
@@ -233,6 +259,7 @@ export async function gatherPrecheck(db: D1Database, o: GatherOptions): Promise<
               revoked: v["kind"] === "revoked",
             },
       paidBefore: Number(paid?.results?.[0]?.["n"] ?? 0) === 1,
+      fingerprintKey: key,
     },
     ibanReadAtMs: supplier?.ibanReadAtMs ?? null,
     ...(o.requestedAmountMinor !== undefined
@@ -242,6 +269,7 @@ export async function gatherPrecheck(db: D1Database, o: GatherOptions): Promise<
       openRequest: Number(c?.["open_request"] ?? 0) === 1,
       openBatch: Number(c?.["open_batch"] ?? 0) === 1,
       paidSinceSync: Number(c?.["paid_since"] ?? 0) === 1,
+      paidBefore: Number(c?.["paid_before"] ?? 0) === 1,
     },
     source:
       source === null

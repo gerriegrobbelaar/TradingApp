@@ -19,7 +19,9 @@ import {
   type PayloadItem,
   type PaymentMode,
 } from "@camelthorn/core";
+import { storedIbansMatch } from "./iban-store";
 import { loadPaymentsState, paymentsBlockers } from "./settings";
+import { recheckBeforeSubmit } from "./store";
 import {
   childMoveStatements,
   dbErrorCode,
@@ -223,14 +225,23 @@ async function whyNot(
 
 const SAFE_CODE = /[^a-z0-9_:.-]/gi;
 
+export interface SubmissionArgs {
+  kind: SubjectKind;
+  id: number;
+  nowMs: number;
+  owner: string;
+  /** Workers secret PAYMENTS_IBAN_KEY: binds the stored IBAN to the approved fingerprint. */
+  ibanKey: string | null;
+}
+
 export async function runSubmission(
   db: D1Database,
   submitter: PaymentSubmitter,
-  a: { kind: SubjectKind; id: number; nowMs: number; owner: string },
+  a: SubmissionArgs,
 ): Promise<SubmissionResult> {
-  // Layer 1: the switch, the verification, the approval mapping, the connection, an approver and a
-  // submitter that exists. Any gap: nothing is claimed, nothing is written.
-  const state = await loadPaymentsState(db);
+  // Layer 1: the switch, the verification, the approval mapping, the connection, an approver, the
+  // fingerprint key and a submitter that exists. Any gap: nothing is claimed, nothing is written.
+  const state = await loadPaymentsState(db, a.ibanKey);
   if (!state.enabled || paymentsBlockers(state, submitter.available).length > 0) {
     return { status: "refused", code: "payments_disabled" };
   }
@@ -246,6 +257,19 @@ export async function runSubmission(
   const items = await loadItems(db, a.kind, a.id);
   const why = await whyNot(db, a.kind, row, items, a.nowMs);
   if (why !== null) return { status: "refused", code: why };
+  // The pre-checks again with today's facts and today's settings (an invoice paid in Exact since, an
+  // IBAN changed, a tightened limit), and the stored IBAN still matches the approved fingerprint.
+  const again = await recheckBeforeSubmit(db, {
+    kind: a.kind,
+    id: a.id,
+    nowMs: a.nowMs,
+    state,
+    ibanKey: a.ibanKey,
+  });
+  if (again !== null) return { status: "refused", code: again };
+  if (!(await storedIbansMatch(db, a.kind, a.id, a.ibanKey))) {
+    return { status: "refused", code: "iban_binding_broken" };
+  }
 
   // Layer 2: claim BEFORE the call, in one batch with the move to `submitting`.
   const nowIso = new Date(a.nowMs).toISOString();
@@ -325,7 +349,7 @@ function isOutcome(o: unknown): o is SubmitOutcome {
 
 async function finish(
   db: D1Database,
-  a: { kind: SubjectKind; id: number; nowMs: number; owner: string },
+  a: SubmissionArgs,
   row: Row,
   outcome: SubmitOutcome,
 ): Promise<SubmissionResult> {
@@ -367,8 +391,9 @@ async function finish(
             )
             .bind(a.id, nowIso),
         ];
+  let out: D1Result[];
   try {
-    await db.batch([
+    out = await db.batch([
       ...moveStatements(db, move),
       ...(a.kind === "batch" ? childMoveStatements(db, move) : []),
       ...release,
@@ -377,7 +402,26 @@ async function finish(
     // The row stays `submitting`; the lease check turns it into outcome_unknown. Never re-sent.
     return { status: "done", to: "outcome_unknown", code: "finish_failed" };
   }
-  return { status: "done", to: move.to, code };
+  if ((out[2]?.meta.changes ?? 0) === 1) return { status: "done", to: move.to, code };
+  // The move did not happen: the lease ran out during the call and markStaleSubmissions already
+  // made the request `outcome_unknown`. A clear answer that arrived late is still the bank's
+  // answer: record it from outcome_unknown (a legal move), so the provider id is not lost. Never
+  // a second call.
+  if (outcome.kind === "unknown") {
+    return { status: "done", to: "outcome_unknown", code: "lease_lost" };
+  }
+  const late = { ...move, from: "outcome_unknown" as const, code: `${code}:late` };
+  try {
+    const out2 = await db.batch([
+      ...moveStatements(db, late),
+      ...(a.kind === "batch" ? childMoveStatements(db, late) : []),
+      ...release,
+    ]);
+    if ((out2[2]?.meta.changes ?? 0) === 1) return { status: "done", to: move.to, code: late.code };
+  } catch {
+    // fall through: the reconciliation resolves it by request_id
+  }
+  return { status: "done", to: "outcome_unknown", code: "lease_lost" };
 }
 
 /**

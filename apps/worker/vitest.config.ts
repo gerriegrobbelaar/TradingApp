@@ -34,6 +34,8 @@ export default defineConfig(async () => {
             REVOLUT_REDIRECT_URI: "https://app.test/api/connections/revolut/callback",
             // 32 bytes, base64. Test-only.
             TOKEN_ENC_KEY: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+            // Test-only key of the keyed IBAN fingerprint (ADR 0049).
+            PAYMENTS_IBAN_KEY: "test-payments-iban-key-0123456789abcdef",
             // Test-only API key of the transactional e-mail provider (ADR 0046).
             EMAIL_API_KEY: "test-email-api-key-0123456789",
             // Test-only "old" key, accepted for decryption like during a rotation (review S3 tests

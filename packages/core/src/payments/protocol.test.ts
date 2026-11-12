@@ -7,6 +7,6 @@ describe("paymentsProtocolVersion", () => {
     expect(v).toMatch(/^[0-9a-f]{64}$/);
     expect(paymentsProtocolVersion()).toBe(v);
     // Pinned: a change here voids every payments verification mark (docs/decisions/0049).
-    expect(v).toBe("1c638953d46244610eeb75636e0a41dd8131fdbe2c40f6a9f689d7743be130b7");
+    expect(v).toBe("985d7b696cb3a7d23db7b12cb1a7eb35e91ccb59335d1119ae64ce0ed40d8a5e");
   });
 });

@@ -182,7 +182,7 @@ function toPaymentDto(r: PaymentRowRaw, masked: Map<number, string>): PaymentDto
     providerId: r.provider_id,
     confirmPhrase:
       st === "draft" && r.batch_id === null
-        ? paymentConfirmPhrase(r.amount_minor, r.currency)
+        ? paymentConfirmPhrase(r.amount_minor, r.currency, (masked.get(r.id) ?? "????").slice(-4))
         : null,
     decision: toDecision(r),
   };

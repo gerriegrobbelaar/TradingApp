@@ -6,6 +6,7 @@
  * P9b adds the Revolut request builder's output to the samples.
  */
 import { sha256Hex } from "../sha256";
+import { BATCH_BLOCK_CODES } from "./batch";
 import { requiredApprovals } from "./four-eyes";
 import { assessIban, ibanFingerprint } from "./iban-state";
 import { paymentPayloadHash } from "./payload";
@@ -23,7 +24,9 @@ import { PAYMENTS_VERIFY_CHECKS } from "./settings";
 
 export function paymentsProtocolVersion(): string {
   const iban = "NL91ABNA0417164300";
-  const fp = ibanFingerprint(iban) ?? "";
+  // A fixed sample key: the version describes the rules, not an installation's secret.
+  const key = "payments-protocol-sample-key-0123456789";
+  const fp = ibanFingerprint(iban, key) ?? "";
   const rid = "11111111-1111-4111-8111-111111111111";
   const sampleHash = paymentPayloadHash({
     kind: "payment",
@@ -54,6 +57,7 @@ export function paymentsProtocolVersion(): string {
       currency: "EUR",
       invoiceNumber: "Ünï/1",
       invoiceIban: null,
+      fresh: true,
     },
     approval: "approved",
     supplier: { found: true, isSupplier: true },
@@ -61,9 +65,10 @@ export function paymentsProtocolVersion(): string {
       recordIban: iban,
       verification: { fingerprint: fp, verifiedBy: "b@x.nl", revoked: false },
       paidBefore: false,
+      fingerprintKey: key,
     },
     ibanReadAtMs: 0,
-    conflicts: { openRequest: false, openBatch: false, paidSinceSync: false },
+    conflicts: { openRequest: false, openBatch: false, paidSinceSync: false, paidBefore: false },
     source: {
       found: true,
       active: true,
@@ -83,9 +88,10 @@ export function paymentsProtocolVersion(): string {
   });
   return sha256Hex(
     JSON.stringify([
-      "payments-protocol-v1",
+      "payments-protocol-v2",
       PAYMENT_TRANSITIONS,
       PAYMENT_BLOCK_CODES,
+      BATCH_BLOCK_CODES,
       APPROVAL_REASONS,
       DEFAULT_PAYMENT_SETTINGS,
       PAYMENT_VALIDITY_MS,
@@ -94,7 +100,10 @@ export function paymentsProtocolVersion(): string {
       sampleHash,
       pre,
       reasons,
-      assessIban({ recordIban: iban, verification: null, paidBefore: false }, "a@x.nl"),
+      assessIban(
+        { recordIban: iban, verification: null, paidBefore: false, fingerprintKey: key },
+        "a@x.nl",
+      ),
       buildPaymentReference("A".repeat(200)),
       sanitizeSepaText("Zoë /​// 日本"),
     ]),

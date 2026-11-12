@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { sha256Hex } from "./sha256";
+import { hmacSha256Hex, sha256Hex } from "./sha256";
 
 describe("sha256Hex", () => {
   it("matches the FIPS 180-4 test vectors", () => {
@@ -21,6 +21,22 @@ describe("sha256Hex", () => {
         .update(Buffer.from(new TextEncoder().encode(s)))
         .digest("hex");
       expect(sha256Hex(s), JSON.stringify(s)).toBe(expected);
+    }
+  });
+});
+
+describe("hmacSha256Hex", () => {
+  it("matches RFC 4231 test case 2 and node:crypto for short, block-sized and long keys", () => {
+    expect(hmacSha256Hex("Jefe", "what do ya want for nothing?")).toBe(
+      "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+    );
+    for (const key of ["k", "x".repeat(63), "y".repeat(64), "z".repeat(65), "é€".repeat(40)]) {
+      for (const msg of ["", "iban-fp-v2:NL91ABNA0417164300", "m".repeat(200)]) {
+        const expected = createHmac("sha256", Buffer.from(new TextEncoder().encode(key)))
+          .update(Buffer.from(new TextEncoder().encode(msg)))
+          .digest("hex");
+        expect(hmacSha256Hex(key, msg), `${key.length}/${msg.length}`).toBe(expected);
+      }
     }
   });
 });

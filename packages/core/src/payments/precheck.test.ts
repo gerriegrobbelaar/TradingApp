@@ -22,6 +22,7 @@ import { batchConfirmPhrase, paymentConfirmPhrase, phraseMatches } from "../conf
 
 const NOW = Date.parse("2026-11-12T10:00:00Z");
 const IBAN = "NL91ABNA0417164300";
+const KEY = "core-test-iban-key-0123456789abcdef";
 const settings = (o: Partial<PaymentSettings> = {}): PaymentSettings => ({
   ...DEFAULT_PAYMENT_SETTINGS,
   allowedCurrencies: [...DEFAULT_PAYMENT_SETTINGS.allowedCurrencies],
@@ -41,20 +42,22 @@ function good(o: Partial<PrecheckInput> = {}): PrecheckInput {
       currency: "EUR",
       invoiceNumber: "2026-42",
       invoiceIban: null,
+      fresh: true,
     },
     approval: "approved",
     supplier: { found: true, isSupplier: true },
     iban: {
       recordIban: IBAN,
       verification: {
-        fingerprint: ibanFingerprint(IBAN) as string,
+        fingerprint: ibanFingerprint(IBAN, KEY) as string,
         verifiedBy: "app@x.nl",
         revoked: false,
       },
       paidBefore: true,
+      fingerprintKey: KEY,
     },
     ibanReadAtMs: NOW - 3600_000,
-    conflicts: { openRequest: false, openBatch: false, paidSinceSync: false },
+    conflicts: { openRequest: false, openBatch: false, paidSinceSync: false, paidBefore: false },
     source: {
       found: true,
       active: true,
@@ -80,7 +83,7 @@ describe("precheckPayment", () => {
     expect(r.reference).toBe("Invoice 2026-42");
     expect(r.eur).toEqual({ minor: 100_000, rate: "1", currency: "EUR" });
     expect(r.ibanState).toBe("verified_established");
-    expect(r.ibanFingerprint).toBe(ibanFingerprint(IBAN));
+    expect(r.ibanFingerprint).toBe(ibanFingerprint(IBAN, KEY));
   });
 
   it("blocks when the switch is off", () => {
@@ -122,6 +125,7 @@ describe("precheckPayment", () => {
       currency: "EUR",
       invoiceNumber: "9",
       invoiceIban: null,
+      fresh: true,
     };
     const r = precheckPayment(good({ item }));
     expect(r.blocks).toEqual(["over_request_limit", "over_daily_limit"]);
@@ -136,6 +140,7 @@ describe("precheckPayment", () => {
       currency: "USD",
       invoiceNumber: "1",
       invoiceIban: null,
+      fresh: true,
     };
     expect(blocks({ item })).toContain("currency_not_supported");
     expect(blocks({ item })).toContain("currency_mismatch_source");
@@ -164,8 +169,10 @@ describe("precheckPayment", () => {
 
   it("blocks a second request, a batch and a payment not yet visible in Exact", () => {
     expect(
-      blocks({ conflicts: { openRequest: true, openBatch: true, paidSinceSync: true } }),
-    ).toEqual(["already_in_request", "already_in_batch", "paid_since_last_sync"]);
+      blocks({
+        conflicts: { openRequest: true, openBatch: true, paidSinceSync: true, paidBefore: true },
+      }),
+    ).toEqual(["already_in_request", "already_in_batch", "already_paid", "paid_since_last_sync"]);
   });
 
   it("blocks an unknown supplier and every IBAN problem", () => {
@@ -195,6 +202,7 @@ describe("precheckPayment", () => {
       currency: "EUR",
       invoiceNumber: "1",
       invoiceIban: "DE89370400440532013000",
+      fresh: true,
     };
     expect(blocks({ item })).toEqual(["iban_mismatch_invoice"]);
     expect(blocks({ item: { ...item, invoiceIban: "garbage" } })).toEqual([
@@ -219,6 +227,7 @@ describe("precheckPayment", () => {
       currency: "EUR",
       invoiceNumber: "1",
       invoiceIban: null,
+      fresh: true,
     });
     expect(blocks({ item: item(2_500_000) })).toEqual([]);
     expect(blocks({ item: item(2_500_001) })).toEqual(["over_request_limit"]);
@@ -238,6 +247,7 @@ describe("precheckPayment", () => {
       currency: "USD",
       invoiceNumber: "1",
       invoiceIban: null,
+      fresh: true,
     };
     const s = settings({ allowedCurrencies: ["USD"] });
     const src = {
@@ -289,6 +299,7 @@ describe("precheckPayment", () => {
       currency: "EUR",
       invoiceNumber,
       invoiceIban: null,
+      fresh: true,
     });
     expect(blocks({ item: item(null) })).toEqual(["reference_empty"]);
     expect(blocks({ item: item("🙂") })).toEqual(["reference_empty"]);
@@ -306,13 +317,40 @@ describe("precheckPayment", () => {
         supplier: null,
         source: null,
         item: null,
-        conflicts: { openRequest: true, openBatch: false, paidSinceSync: false },
+        conflicts: { openRequest: true, openBatch: false, paidSinceSync: false, paidBefore: false },
       }),
     );
     const idx = r.blocks.map((b) => PAYMENT_BLOCK_CODES.indexOf(b));
     expect(idx).toEqual([...idx].sort((a, b) => a - b));
     expect(new Set(r.blocks).size).toBe(r.blocks.length);
     expect(r.ok).toBe(false);
+  });
+});
+
+describe("precheckPayment: review P9a additions", () => {
+  const item = good().item as NonNullable<PrecheckInput["item"]>;
+  it("blocks an open item whose division was not read completely recently (open_item_stale)", () => {
+    expect(blocks({ item: { ...item, fresh: false } })).toEqual(["open_item_stale"]);
+    // a missing flag is not fresh (doubt is a block)
+    const noFlag: Record<string, unknown> = { ...item };
+    delete noFlag["fresh"];
+    expect(blocks({ item: noFlag as never })).toEqual(["open_item_stale"]);
+  });
+  it("blocks a second payment of an invoice that was ever paid through us (already_paid)", () => {
+    const c = { openRequest: false, openBatch: false, paidSinceSync: false };
+    expect(blocks({ conflicts: { ...c, paidBefore: true } })).toEqual(["already_paid"]);
+    // missing flag: blocked, never assumed unpaid
+    expect(blocks({ conflicts: c as never })).toEqual(["already_paid"]);
+  });
+  it("judges the four-eyes limit of a part payment on the open balance (no splitting)", () => {
+    const big = { ...item, openMinor: 1_000_000 };
+    const s = settings({ allowPartial: true });
+    const part = precheckPayment(good({ item: big, settings: s, requestedAmountMinor: 200_000 }));
+    expect(part.ok).toBe(true);
+    expect(part.eur?.minor).toBe(200_000);
+    expect(part.limitEur?.minor).toBe(1_000_000);
+    const full = precheckPayment(good({ item: big, settings: s }));
+    expect(full.limitEur).toEqual(full.eur);
   });
 });
 
@@ -333,6 +371,7 @@ describe("checkBatch", () => {
       currency: o.cur ?? "EUR",
       reference: `Invoice ${id}`,
       eur: { minor: amount, rate: "1", currency: o.cur ?? "EUR" },
+      limitEur: { minor: amount, rate: "1", currency: o.cur ?? "EUR" },
       ibanState: "verified_established",
       ibanFingerprint: "f".repeat(64),
       ...o.pre,
@@ -528,14 +567,18 @@ describe("verification checks and phrases", () => {
       false,
     );
   });
-  it("puts the amount in the confirmation phrase", () => {
-    expect(paymentConfirmPhrase(123_456, "EUR")).toBe("PAY 1234.56 EUR");
-    expect(paymentConfirmPhrase(5, "EUR")).toBe("PAY 0.05 EUR");
-    expect(paymentConfirmPhrase(1500, "JPY")).toBe("PAY 1500 JPY");
+  it("puts the amount and the IBAN's last four in the confirmation phrase", () => {
+    expect(paymentConfirmPhrase(123_456, "EUR", "4300")).toBe("PAY 1234.56 EUR TO 4300");
+    expect(paymentConfirmPhrase(5, "EUR", "00ab")).toBe("PAY 0.05 EUR TO 00AB");
+    expect(paymentConfirmPhrase(1500, "JPY", "1234")).toBe("PAY 1500 JPY TO 1234");
     expect(batchConfirmPhrase(3, 123_456, "EUR")).toBe("PAY BATCH 3 INVOICES 1234.56 EUR");
-    expect(phraseMatches("PAY 1234.56 EUR", paymentConfirmPhrase(123_456, "EUR"))).toBe(true);
-    expect(phraseMatches("pay 1234.56 eur", paymentConfirmPhrase(123_456, "EUR"))).toBe(false);
-    expect(phraseMatches("PAY 1234.56 EUR ", paymentConfirmPhrase(123_456, "EUR"))).toBe(false);
+    const p = paymentConfirmPhrase(123_456, "EUR", "4300");
+    expect(phraseMatches("PAY 1234.56 EUR TO 4300", p)).toBe(true);
+    // the amount alone (the old phrase) or another account's tail no longer confirms
+    expect(phraseMatches("PAY 1234.56 EUR", p)).toBe(false);
+    expect(phraseMatches("PAY 1234.56 EUR TO 3000", p)).toBe(false);
+    expect(phraseMatches("pay 1234.56 eur to 4300", p)).toBe(false);
+    expect(phraseMatches("PAY 1234.56 EUR TO 4300 ", p)).toBe(false);
     expect(formatMinor(123_456)).toBe("1234.56");
   });
 });

@@ -6,7 +6,7 @@
  *
  * P9b adds one reader here: the IBAN of a request that is about to be sent (claimed `submitting`).
  */
-import { maskIban } from "@camelthorn/core";
+import { ibanFingerprint, maskIban } from "@camelthorn/core";
 
 export interface SupplierRow {
   rowId: number;
@@ -191,4 +191,26 @@ export async function maskedIbans(
     .all<{ id: number; beneficiary_iban: string }>();
   for (const r of rows.results) out.set(r.id, maskIban(r.beneficiary_iban));
   return out;
+}
+
+/**
+ * Before a request is handed to the submitter: does every stored IBAN (the one P9b will send to)
+ * still have the fingerprint the payload, and so the approval, is bound to? A row whose IBAN and
+ * fingerprint disagree (a bug, a hand edit before the triggers, a rotated key) is refused. Answers
+ * true/false only; the IBAN never leaves this function.
+ */
+export async function storedIbansMatch(
+  db: D1Database,
+  kind: "payment" | "batch",
+  id: number,
+  key: string | null,
+): Promise<boolean> {
+  if (key === null) return false;
+  const where = kind === "payment" ? "id = ?1" : "batch_id = ?1";
+  const rows = await db
+    .prepare(`SELECT beneficiary_iban, iban_fingerprint FROM payments WHERE ${where}`)
+    .bind(id)
+    .all<{ beneficiary_iban: string; iban_fingerprint: string }>();
+  if (rows.results.length === 0) return false;
+  return rows.results.every((r) => ibanFingerprint(r.beneficiary_iban, key) === r.iban_fingerprint);
 }

@@ -36,6 +36,7 @@ import {
   setVerified,
   withoutPaymentTriggers,
   type PayWorld,
+  TEST_IBAN_KEY,
 } from "./payments-helpers";
 
 const NOW = Date.parse("2026-07-15T10:00:00Z");
@@ -61,11 +62,12 @@ const fake = (
 };
 
 async function ready(o: { approval?: boolean; itemId?: number } = {}): Promise<number> {
-  const state = await loadPaymentsState(db);
+  const state = await loadPaymentsState(db, TEST_IBAN_KEY);
   const r = await createPayment(db, {
     nowMs: NOW,
     actor: w.emails.finance,
     state,
+    ibanKey: TEST_IBAN_KEY,
     openItemId: o.itemId ?? w.itemId,
     sourceAccountId: w.accountId,
     clientKey: `submit-key-${++seq}-012345`,
@@ -79,7 +81,8 @@ async function ready(o: { approval?: boolean; itemId?: number } = {}): Promise<n
     actor: w.emails.finance,
     authAtMs: NOW,
     state,
-    phrase: paymentConfirmPhrase(p.amountMinor, p.currency),
+    ibanKey: TEST_IBAN_KEY,
+    phrase: paymentConfirmPhrase(p.amountMinor, p.currency, "4300"),
   });
   if (o.approval !== false) {
     const row = await db
@@ -121,7 +124,7 @@ const row = async (id: number) =>
     submit_attempts: number;
   };
 const run = (id: number, s: PaymentSubmitter, nowMs = NOW) =>
-  runSubmission(db, s, { kind: "payment", id, nowMs, owner: "job-1" });
+  runSubmission(db, s, { kind: "payment", id, nowMs, owner: "job-1", ibanKey: TEST_IBAN_KEY });
 const claims = async (): Promise<number> =>
   (await db.prepare("SELECT COUNT(*) AS n FROM payment_claims").first<{ n: number }>())?.n ?? -1;
 const events = async (id: number): Promise<string[]> =>
@@ -428,11 +431,12 @@ describe("a crashed run", () => {
 describe("expiry", () => {
   it("drafts, waiting and ready requests expire after 24 hours and cannot be approved or confirmed then", async () => {
     const draftId = await ready({ approval: false }); // pending_approval
-    const state = await loadPaymentsState(db);
+    const state = await loadPaymentsState(db, TEST_IBAN_KEY);
     const other = await createPayment(db, {
       nowMs: NOW,
       actor: w.emails.finance,
       state,
+      ibanKey: TEST_IBAN_KEY,
       openItemId: (await addBill(w)).itemId,
       sourceAccountId: w.accountId,
       clientKey: "expiry-key-draft-0001",
@@ -472,7 +476,8 @@ describe("expiry", () => {
         actor: w.emails.finance,
         authAtMs: NOW + 25 * 3600_000,
         state,
-        phrase: paymentConfirmPhrase(100_000, "EUR"),
+        ibanKey: TEST_IBAN_KEY,
+        phrase: paymentConfirmPhrase(100_000, "EUR", "4300"),
       }),
     ).rejects.toMatchObject({ code: "not_draft" });
   });
@@ -519,7 +524,8 @@ describe("batches", () => {
     return createBatch(db, {
       nowMs: NOW,
       actor: w.emails.finance,
-      state: await loadPaymentsState(db),
+      state: await loadPaymentsState(db, TEST_IBAN_KEY),
+      ibanKey: TEST_IBAN_KEY,
       sourceAccountId,
       items,
       clientKey: `batch-key-${++seq}-0123456`,
@@ -542,7 +548,7 @@ describe("batches", () => {
     });
     expect(b.items).toHaveLength(2);
     expect(JSON.stringify(b)).not.toContain(SUPPLIER_IBAN);
-    const state = await loadPaymentsState(db);
+    const state = await loadPaymentsState(db, TEST_IBAN_KEY);
     await expect(
       confirmRequest(db, {
         ...BASE,
@@ -550,6 +556,7 @@ describe("batches", () => {
         kind: "batch",
         id: b.id,
         state,
+        ibanKey: TEST_IBAN_KEY,
         phrase: "PAY 2000.00 EUR",
       }),
     ).rejects.toMatchObject({ code: "confirmation_required" });
@@ -559,6 +566,7 @@ describe("batches", () => {
       kind: "batch",
       id: b.id,
       state,
+      ibanKey: TEST_IBAN_KEY,
       phrase: batchConfirmPhrase(2, 200_000, "EUR"),
     });
     expect(c.status).toBe("pending_approval");
@@ -620,7 +628,8 @@ describe("batches", () => {
         actor: w.emails.finance,
         kind: "payment",
         id: item.id,
-        state: await loadPaymentsState(db),
+        state: await loadPaymentsState(db, TEST_IBAN_KEY),
+        ibanKey: TEST_IBAN_KEY,
         phrase: "x",
       }),
     ).rejects.toMatchObject({ code: "not_found" });
@@ -660,7 +669,8 @@ describe("batches", () => {
       createBatch(db, {
         nowMs: NOW,
         actor: w.emails.finance,
-        state: await loadPaymentsState(db),
+        state: await loadPaymentsState(db, TEST_IBAN_KEY),
+        ibanKey: TEST_IBAN_KEY,
         sourceAccountId: source,
         items,
         clientKey: `blk-key-${++seq}-0123456789`,
@@ -700,7 +710,8 @@ describe("batches", () => {
     const again = await createBatch(db, {
       nowMs: NOW,
       actor: w.emails.finance,
-      state: await loadPaymentsState(db),
+      state: await loadPaymentsState(db, TEST_IBAN_KEY),
+      ibanKey: TEST_IBAN_KEY,
       sourceAccountId: w.accountId,
       items: [{ openItemId: (first.batch.items[0] as { openItemId: number }).openItemId }],
       clientKey: "second-batch-key-0001",
@@ -715,7 +726,8 @@ describe("batches", () => {
     const args = {
       nowMs: NOW,
       actor: w.emails.finance,
-      state: await loadPaymentsState(db),
+      state: await loadPaymentsState(db, TEST_IBAN_KEY),
+      ibanKey: TEST_IBAN_KEY,
       sourceAccountId: w.accountId,
       items: [{ openItemId: a.itemId }, { openItemId: b.itemId }],
       clientKey: "batch-replay-key-0001",
@@ -740,7 +752,8 @@ describe("batches", () => {
       const r = await createBatch(db, {
         nowMs: NOW,
         actor: w.emails.finance,
-        state: await loadPaymentsState(db),
+        state: await loadPaymentsState(db, TEST_IBAN_KEY),
+        ibanKey: TEST_IBAN_KEY,
         sourceAccountId: w.accountId,
         items,
         clientKey: `sum-key-${++seq}-0123456789`,
@@ -763,7 +776,8 @@ describe("batches", () => {
       actor: w.emails.finance,
       kind: "batch",
       id: r.batch.id,
-      state: await loadPaymentsState(db),
+      state: await loadPaymentsState(db, TEST_IBAN_KEY),
+      ibanKey: TEST_IBAN_KEY,
       phrase: r.batch.confirmPhrase as string,
     });
     const s = fake(() => ({ kind: "accepted", providerId: "bulk-1" }));
@@ -772,6 +786,7 @@ describe("batches", () => {
       id: r.batch.id,
       nowMs: NOW,
       owner: "job-1",
+      ibanKey: TEST_IBAN_KEY,
     });
     expect(out).toMatchObject({ status: "done", to: "submitted" });
     expect(s.calls).toHaveLength(1);

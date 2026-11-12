@@ -41,6 +41,7 @@ import { ibanStatus, revokeIban, verifyIban } from "./iban-verify";
 import { listBatches, listPayments, readBatch, readPayment, type ListFilter } from "./read";
 import {
   ENABLE_PHRASE,
+  ibanKeyOf,
   LOOSEN_PHRASE,
   loadPaymentsState,
   paymentsBlockers,
@@ -125,6 +126,21 @@ function optionalAmount(v: unknown): number | undefined {
 
 // ---- requests -------------------------------------------------------------------------------------
 
+/**
+ * Lazy expiry before a read, so the list shows `expired` rather than a stale `ready` (review P9a).
+ * A GET by any role (a viewer too) may therefore write: only the SAFE direction (to `expired`),
+ * attributed to 'system', with its event and audit rows in the same batch, idempotent, and never
+ * with request data. It is best effort here: a failure must not break the read, and every decision
+ * (confirm, approve, cancel, submit) re-checks expiry itself inside its own write.
+ */
+async function expireForRead(ctx: Ctx): Promise<void> {
+  try {
+    await expireStale(ctx.env.DB, ctx.nowMs);
+  } catch {
+    // the read goes on; the next decision expires the request itself
+  }
+}
+
 function registerSubject(router: Router, kind: SubjectKind, base: string): void {
   const read = kind === "payment" ? readPayment : readBatch;
   const name = kind === "payment" ? "payment" : "batch";
@@ -134,7 +150,7 @@ function registerSubject(router: Router, kind: SubjectKind, base: string): void 
     base,
     ANY,
     safely(async (ctx) => {
-      await expireStale(ctx.env.DB, ctx.nowMs);
+      await expireForRead(ctx);
       const f = listFilter(ctx);
       const r =
         kind === "payment" ? await listPayments(ctx.env.DB, f) : await listBatches(ctx.env.DB, f);
@@ -150,7 +166,7 @@ function registerSubject(router: Router, kind: SubjectKind, base: string): void 
     `${base}/:id`,
     ANY,
     safely(async (ctx) => {
-      await expireStale(ctx.env.DB, ctx.nowMs);
+      await expireForRead(ctx);
       const dto = await read(ctx.env.DB, idParam(ctx));
       // A batch item is part of its batch: it has no page of its own.
       if (dto === null || (dto.kind === "payment" && dto.batchId !== null)) {
@@ -173,8 +189,9 @@ function registerSubject(router: Router, kind: SubjectKind, base: string): void 
         nowMs: ctx.nowMs,
         actor: actor(ctx),
         authAtMs: authMs(ctx),
-        state: await loadPaymentsState(ctx.env.DB),
+        state: await loadPaymentsState(ctx.env.DB, ibanKeyOf(ctx.env)),
         phrase: b["confirm"],
+        ibanKey: ibanKeyOf(ctx.env),
       });
       return json({ [name]: dto });
     }),
@@ -235,7 +252,7 @@ function registerSubject(router: Router, kind: SubjectKind, base: string): void 
 // ---- settings -------------------------------------------------------------------------------------
 
 async function settingsView(ctx: Ctx): Promise<Record<string, unknown>> {
-  const state = await loadPaymentsState(ctx.env.DB);
+  const state = await loadPaymentsState(ctx.env.DB, ibanKeyOf(ctx.env));
   const submitter = getSubmitter();
   return {
     settings: state.settings,
@@ -271,7 +288,7 @@ async function patchSettings(ctx: Ctx): Promise<Response> {
   ]);
   const { confirm, note: rawNote, ...fields } = raw;
   const why = rawNote === undefined ? null : note(rawNote, 1, 200, "bad_note");
-  const state = await loadPaymentsState(db);
+  const state = await loadPaymentsState(db, ibanKeyOf(ctx.env));
   const r = applyPaymentSettingsPatch(state.settings, fields);
   if (!r.ok) throw new PaymentError(r.error, 400);
   if (r.changed.length === 0) return json(await settingsView(ctx));
@@ -347,7 +364,7 @@ async function verifyHandler(ctx: Ctx): Promise<Response> {
     throw new PaymentError("checks_incomplete", 400);
   }
   const text = note(b["note"], 10, 500, "bad_note");
-  const before = await loadPaymentsState(db);
+  const before = await loadPaymentsState(db, ibanKeyOf(ctx.env));
   const mark = {
     at: new Date(ctx.nowMs).toISOString(),
     by: who,
@@ -382,7 +399,7 @@ async function switchHandler(ctx: Ctx): Promise<Response> {
   const b = await readBody(ctx, ["enabled", "confirm", "note"]);
   if (typeof b["enabled"] !== "boolean") throw new PaymentError("bad_request", 400);
   const why = b["note"] === undefined ? null : note(b["note"], 1, 200, "bad_note");
-  const before = await loadPaymentsState(db);
+  const before = await loadPaymentsState(db, ibanKeyOf(ctx.env));
   if (!b["enabled"]) {
     // The safe direction: admin only, no step-up, no phrase. Audited.
     await db.batch([
@@ -453,9 +470,10 @@ async function switchHandler(ctx: Ctx): Promise<Response> {
   ]);
   if ((out[1]?.meta.changes ?? 0) !== 1) {
     throw new PaymentError("blocked", 409, {
-      blockers: paymentsBlockers(await loadPaymentsState(db), getSubmitter().available).filter(
-        (x) => x !== "payments_disabled",
-      ),
+      blockers: paymentsBlockers(
+        await loadPaymentsState(db, ibanKeyOf(ctx.env)),
+        getSubmitter().available,
+      ).filter((x) => x !== "payments_disabled"),
     });
   }
   return json(await settingsView(ctx));
@@ -470,7 +488,14 @@ export function registerPaymentRoutes(router: Router): void {
     "/api/payments/ibans/:relationId",
     READERS,
     safely(async (ctx) =>
-      json({ iban: await ibanStatus(ctx.env.DB, idParam(ctx, "relationId"), actor(ctx)) }),
+      json({
+        iban: await ibanStatus(
+          ctx.env.DB,
+          idParam(ctx, "relationId"),
+          actor(ctx),
+          ibanKeyOf(ctx.env),
+        ),
+      }),
     ),
   );
   router.add(
@@ -490,6 +515,7 @@ export function registerPaymentRoutes(router: Router): void {
           lastFour: b["lastFour"],
           actor: actor(ctx),
           nowMs: ctx.nowMs,
+          ibanKey: ibanKeyOf(ctx.env),
         }),
       });
     }),
@@ -505,6 +531,7 @@ export function registerPaymentRoutes(router: Router): void {
           relationId: positiveInt(b["relationId"], "bad_relation"),
           actor: actor(ctx),
           nowMs: ctx.nowMs,
+          ibanKey: ibanKeyOf(ctx.env),
         }),
       });
     }),
@@ -519,11 +546,12 @@ export function registerPaymentRoutes(router: Router): void {
       const r = await createPayment(ctx.env.DB, {
         nowMs: ctx.nowMs,
         actor: actor(ctx),
-        state: await loadPaymentsState(ctx.env.DB),
+        state: await loadPaymentsState(ctx.env.DB, ibanKeyOf(ctx.env)),
         openItemId: positiveInt(b["openItemId"], "bad_open_item"),
         sourceAccountId: positiveInt(b["sourceAccountId"], "bad_source_account"),
         amountMinor: optionalAmount(b["amountMinor"]),
         clientKey: clientKey(b["clientKey"]),
+        ibanKey: ibanKeyOf(ctx.env),
       });
       if (r.blocked) {
         return json({ error: "blocked", blocks: r.blocks, warnings: r.warnings }, 422);
@@ -560,10 +588,11 @@ export function registerPaymentRoutes(router: Router): void {
       const r = await createBatch(ctx.env.DB, {
         nowMs: ctx.nowMs,
         actor: actor(ctx),
-        state: await loadPaymentsState(ctx.env.DB),
+        state: await loadPaymentsState(ctx.env.DB, ibanKeyOf(ctx.env)),
         sourceAccountId: positiveInt(b["sourceAccountId"], "bad_source_account"),
         items,
         clientKey: clientKey(b["clientKey"]),
+        ibanKey: ibanKeyOf(ctx.env),
       });
       if (r.blocked) {
         return json({ error: "blocked", blocks: r.blocks, itemBlocks: r.itemBlocks }, 422);

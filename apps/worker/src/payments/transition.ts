@@ -2,7 +2,9 @@
  * One state move of a payment request or batch, as the statements of a single `db.batch` (ADR 0013,
  * ADR 0049): the conditional UPDATE, an append-only event row and the audit row. The event and the
  * audit row carry the same guard, so if the UPDATE did not happen (the row moved, the request
- * expired) NEITHER is written, and the audit statement's `meta.changes` (1/0) says which.
+ * expired) NEITHER is written, and the audit statement's `meta.changes` (1/0) says which. Each is
+ * also chained on `changes() = 1` of the statement right before it, so an identical move by somebody
+ * else in the same millisecond is not mistaken for this one.
  */
 import type { PaymentStatus } from "@camelthorn/core";
 import { auditStatement } from "../db/audit";
@@ -61,12 +63,17 @@ export function moveStatements(db: D1Database, m: Move): D1PreparedStatement[] {
       m.notExpired ? m.nowIso : null,
       ...sets.map(([, v]) => v),
     );
-  const guard = `EXISTS (SELECT 1 FROM ${table} WHERE id = ?7 AND status = ?8 AND updated_at = ?9 AND status_reason = ?10)`;
+  // `changes() = 1`: the statement just before (the UPDATE for the event, the event for the audit
+  // row) really wrote. Without it a second, identical move in the same millisecond (two approvers
+  // racing, a replay) found the first one's row and recorded a decision that never happened
+  // (review P9a). The EXISTS stays as a second fence.
+  const guard = `changes() = 1 AND EXISTS (SELECT 1 FROM ${table} WHERE id = ?7 AND status = ?8 AND updated_at = ?9 AND status_reason = ?10)`;
   const event = db
     .prepare(
       `INSERT INTO payment_events (${EVENT_COL[m.kind]}, from_status, to_status, code, actor, at)
        SELECT ?1, ?2, ?3, ?4, ?5, ?6
-        WHERE EXISTS (SELECT 1 FROM ${table} WHERE id = ?1 AND status = ?3 AND updated_at = ?6 AND status_reason = ?4)`,
+        WHERE changes() = 1
+          AND EXISTS (SELECT 1 FROM ${table} WHERE id = ?1 AND status = ?3 AND updated_at = ?6 AND status_reason = ?4)`,
     )
     .bind(m.id, m.from, m.to, m.code, m.actor, m.nowIso);
   const audit = auditStatement(
@@ -104,7 +111,7 @@ export function childMoveStatements(
       .prepare(
         `INSERT INTO payment_events (payment_id, from_status, to_status, code, actor, at)
          SELECT id, ?2, ?3, ?4, ?5, ?6 FROM payments
-          WHERE batch_id = ?1 AND status = ?3 AND updated_at = ?6 AND status_reason = ?4`,
+          WHERE changes() > 0 AND batch_id = ?1 AND status = ?3 AND updated_at = ?6 AND status_reason = ?4`,
       )
       .bind(m.id, m.from, m.to, m.code, m.actor, m.nowIso),
   ];

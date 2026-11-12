@@ -14,6 +14,7 @@ import {
   setSwitch,
   withoutPaymentTriggers,
   type PayWorld,
+  TEST_IBAN_KEY,
 } from "./payments-helpers";
 
 const NOW = Date.parse("2026-07-15T10:00:00Z");
@@ -28,7 +29,8 @@ async function draft(o: { itemId?: number; settings?: boolean } = {}): Promise<n
   const r = await createPayment(db, {
     nowMs: NOW,
     actor: w.emails.finance,
-    state: await loadPaymentsState(db),
+    state: await loadPaymentsState(db, TEST_IBAN_KEY),
+    ibanKey: TEST_IBAN_KEY,
     openItemId: o.itemId ?? w.itemId,
     sourceAccountId: w.accountId,
     clientKey: `db-key-${++seq}-0123456789`,
@@ -92,6 +94,7 @@ describe("states only move forward", () => {
     const SECONDARY = [
       "payments_guard_confirm",
       "payments_guard_approved",
+      "payments_guard_rejected",
       "payments_guard_submitting",
     ];
     const statusSql = await triggerSql(STATUS);
@@ -126,7 +129,7 @@ describe("states only move forward", () => {
       }
     }
     // the matrix left every trigger in place
-    expect((await triggerSql([...STATUS, ...SECONDARY])).length).toBe(5);
+    expect((await triggerSql([...STATUS, ...SECONDARY])).length).toBe(6);
   });
 });
 
@@ -347,8 +350,9 @@ describe("four-eyes in the database", () => {
       nowMs: NOW,
       actor: w.emails.finance,
       authAtMs: NOW,
-      state: await loadPaymentsState(db),
-      phrase: paymentConfirmPhrase(100_000, "EUR"),
+      state: await loadPaymentsState(db, TEST_IBAN_KEY),
+      ibanKey: TEST_IBAN_KEY,
+      phrase: paymentConfirmPhrase(100_000, "EUR", "4300"),
     });
     return id;
   }
@@ -526,8 +530,9 @@ describe("four-eyes in the database", () => {
       nowMs: NOW,
       actor: w.emails.finance,
       authAtMs: NOW,
-      state: await loadPaymentsState(db),
-      phrase: paymentConfirmPhrase(100_000, "EUR"),
+      state: await loadPaymentsState(db, TEST_IBAN_KEY),
+      ibanKey: TEST_IBAN_KEY,
+      phrase: paymentConfirmPhrase(100_000, "EUR", "4300"),
     });
     expect(
       (
