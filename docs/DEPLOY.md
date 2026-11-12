@@ -1323,3 +1323,19 @@ pnpm --filter @camelthorn/web dev                          # UI on :5173, proxie
 ## Today queue and Data health (Phase 8, D8c)
 
 No new migration, secret or variable. `GET /api/today` reads D1 only. The home route is now Today; Data health is at `/data-health` (footer and Overview link). "Later" on the Today queue is stored in the browser only (ADR 0047). The queue shows data issues only after the `dq.checks` job has run (see the data quality section).
+
+## Payments foundation (Phase 9, P9a; ADR 0049): nothing is live
+
+**Migration 0028 must be applied before the code** (`wrangler d1 migrations apply`). It rebuilds `payments` and `payment_batches` (unused since 0003) and REFUSES to run if either holds a row; if it fails with a CHECK error, a row was written by something outside the app: do not delete it blindly, look at it first. No new secret, variable, queue or Durable Object.
+
+Nothing moves money after this deploy, and nothing can be switched on:
+- `payments.enabled` is off and the settings route refuses to enable it (`submitter_unavailable`, because the only submitter is `DisabledSubmitter`).
+- The Revolut gate still refuses every payment endpoint (`revolut/request.ts`), `runSubmission` is not called by any route or job, and a source scan (`test/payments-scan.test.ts`) fails the build if that changes.
+- `POST /api/payments` answers `422 blocked ["payments_disabled"]` for every request. The settings endpoints (`GET/PATCH /api/settings/payments`, verification, switch) and the supplier IBAN verification endpoints work and are audited, so the controls can be reviewed and the IBANs verified ahead of time.
+
+What an operator may do now:
+1. Review the controls: `GET /api/settings/payments` (admin, finance, approver). Defaults: four-eyes on, limit 2,500.00 EUR, second approver for any new or changed IBAN, hard ceilings 25,000.00 per request and 50,000.00 per rolling 24 hours, EUR only, drafts mode. Tightening needs only the admin; a loosening needs a fresh sign-in and the phrase `LOOSEN PAYMENT CONTROLS`.
+2. Give the `approver` role to the right people (Settings, Users). At least one is needed; an approver can never approve their own request.
+3. Verify supplier IBANs out of band (a phone call, a signed letter), then confirm each in the app: `GET /api/payments/ibans/:relationId`, then `POST /api/payments/ibans/verify {relationId, fingerprint, lastFour}` (approver, fresh sign-in). A first-sync IBAN is NOT trusted; an IBAN that changes in Exact becomes unverified again.
+
+**Before P9b is switched on (all of it, in order):** verify the Exact approval status mapping (`PUT /api/approvals/mapping-verified`, ADR 0025); connect Revolut and decide the plan (`payments_mode`); run the sandbox drill of the checklist `PAYMENTS_VERIFY_CHECKS` (listed by `GET /api/settings/payments`) and record it with `POST /api/settings/payments/verify` (admin, fresh sign-in, phrase `I VERIFIED THE PAYMENT PATH ON THE REVOLUT SANDBOX`); only then `PUT /api/settings/payments/switch` (phrase `ENABLE PAYMENTS`). Any later change to the payment rules changes `protocolVersion` and voids the verification (payments stop until it is redone). The P9b runbook will be added here with its release.

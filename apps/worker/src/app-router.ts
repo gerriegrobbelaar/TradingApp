@@ -14,6 +14,7 @@ import { registerApprovalsRoutes } from "./read/approvals-routes";
 import { registerBankRoutes } from "./read/bank-routes";
 import { registerFxRoutes } from "./read/fx-routes";
 import { registerLedgerRoutes } from "./read/ledger-routes";
+import { registerPaymentRoutes } from "./payments/routes";
 import { registerMatchingRoutes } from "./matching/routes";
 import { registerReadRoutes } from "./read/routes";
 import { registerRevolutRoutes } from "./revolut/routes";
@@ -35,6 +36,7 @@ export function buildRouter(): Router {
   registerApprovalsRoutes(router);
   registerMatchingRoutes(router);
   registerBookingRoutes(router);
+  registerPaymentRoutes(router);
   registerDqRoutes(router);
   registerTodayRoutes(router);
   registerJobRoutes(router);

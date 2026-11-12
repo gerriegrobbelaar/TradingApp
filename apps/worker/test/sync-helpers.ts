@@ -1,7 +1,7 @@
 import { env } from "cloudflare:test";
 import type { ExactRequest, ExactResponse, ExactTransport } from "@camelthorn/exact";
 import type { DivisionRef, JobGate } from "../src/exact/sync";
-import { outboxWipeStatements } from "./outbox-wipe";
+import { outboxWipeStatements, paymentsWipeStatements } from "./outbox-wipe";
 
 export const db = env.DB;
 export const HOST = "start.exactonline.nl";
@@ -392,6 +392,7 @@ export async function resetSync(): Promise<void> {
     db.prepare("DELETE FROM gl_budgets"),
     db.prepare("DELETE FROM gl_accounts"),
     db.prepare("DELETE FROM gl_sync_years"),
+    ...(await paymentsWipeStatements(db)),
     ...(await outboxWipeStatements(db)),
     db.prepare("DELETE FROM match_allocations"),
     db.prepare("DELETE FROM matches"),

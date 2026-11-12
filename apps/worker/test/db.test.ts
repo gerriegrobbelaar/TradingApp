@@ -8,7 +8,7 @@ import {
   completeIdempotencyKey,
 } from "../src/db/idempotency";
 import { ensureSeeded, resetSeedMemoForTests, seedInitialAdmin } from "../src/db/seed";
-import { outboxWipeStatements } from "./outbox-wipe";
+import { outboxWipeStatements, paymentsWipeStatements } from "./outbox-wipe";
 
 const db = env.DB;
 
@@ -48,7 +48,7 @@ async function seedDomain(): Promise<void> {
 
 async function clearDomain(): Promise<void> {
   await db.batch([
-    db.prepare("DELETE FROM payments"),
+    ...(await paymentsWipeStatements(db)),
     ...(await outboxWipeStatements(db)),
     db.prepare("DELETE FROM match_allocations"),
     db.prepare("DELETE FROM matches"),
@@ -178,21 +178,7 @@ describe("schema", () => {
     await db.prepare("DELETE FROM fx_rates").run();
   });
 
-  it("allows only one in-flight payment per open item", async () => {
-    await seedDomain();
-    const pay = (req: string, status: string) =>
-      db
-        .prepare(
-          "INSERT INTO payments (open_item_id, status, amount_minor, currency, beneficiary_iban, request_id, created_by) VALUES (1, ?2, 1250, 'EUR', 'NL91ABNA0417164300', ?1, 'a@b.com')",
-        )
-        .bind(req, status)
-        .run();
-    await pay("r1", "paying");
-    await expect(pay("r2", "waiting_approval")).rejects.toThrow();
-    await expect(pay("r1", "failed")).rejects.toThrow(); // request_id is unique
-    await pay("r3", "failed");
-    await clearDomain();
-  });
+  // One in-flight payment per open item moved to test/payments-db.test.ts (migration 0028).
 
   it("allows only one live match per bank line", async () => {
     await seedDomain();

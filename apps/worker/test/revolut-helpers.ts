@@ -7,7 +7,7 @@ import { decryptToken, encryptToken } from "../src/crypto/token-crypto";
 import type { RevolutGate } from "../src/revolut/gate";
 import { getRevolutGate } from "../src/revolut/gate-transport";
 import { aad } from "../src/revolut/store";
-import { outboxWipeStatements } from "./outbox-wipe";
+import { outboxWipeStatements, paymentsWipeStatements } from "./outbox-wipe";
 
 export const db = env.DB;
 const KEYS = [env.TOKEN_ENC_KEY];
@@ -87,6 +87,7 @@ export async function resetRevolut(): Promise<void> {
     db.prepare("DELETE FROM revolut_quarantine"),
     db.prepare("DELETE FROM revolut_counterparties"),
     db.prepare("DELETE FROM match_suggestions"),
+    ...(await paymentsWipeStatements(db)),
     ...(await outboxWipeStatements(db)),
     db.prepare("DELETE FROM match_allocations"),
     db.prepare("DELETE FROM matches"),

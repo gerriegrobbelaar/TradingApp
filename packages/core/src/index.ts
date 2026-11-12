@@ -27,5 +27,8 @@ export * from "./ecb";
 export * from "./matching";
 export * from "./dq";
 
+// Payments domain (Phase 9, P9a, ADR 0049). No I/O; nothing here sends money.
+export * from "./payments";
+
 // Today queue ranking (Phase 8, D8c).
 export * from "./today";

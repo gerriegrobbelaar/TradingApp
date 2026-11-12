@@ -29,6 +29,8 @@ const files = (
 
 /** File to reason. */
 const ALLOWED_COLUMN_NAMES: Record<string, string> = {
+  "../src/payments/iban-store.ts":
+    "the one payments module that holds IBANs: stores the beneficiary IBAN of a request for sending and reads it only to mask it (ADR 0049)",
   "../src/revolut/ingest.ts":
     "stores the counterparty IBAN of a transaction and compares it on update",
   "../src/read/bank-routes.ts": "reads it only to mask it (counterpartyIbanMasked)",
@@ -43,6 +45,8 @@ const ALLOWED_COLUMN_NAMES: Record<string, string> = {
     "reads bank_accounts.iban only to mask it (ibanMasked) and counterparty_iban for the different-relation check on a manual match (in memory, never returned or logged)",
 };
 const ALLOWED_SELECT_IBAN: Record<string, string> = {
+  "../src/payments/iban-store.ts":
+    "reads relations.iban and open_items.relation_iban (in memory, to fingerprint and compare), bank_accounts.iban and payments.beneficiary_iban only to mask them (ADR 0049)",
   "../src/exact/sync.ts":
     "reconciles relation and relation_bank_accounts rows (never returned to a client)",
   "../src/read/bank-routes.ts": "reads bank_accounts.iban only to mask it (ibanMasked)",
