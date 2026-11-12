@@ -163,12 +163,41 @@ describe("payments.alert_open", () => {
     expect(subjects).toContain("bank data does not match");
     expect(subjects).toContain("possible duplicate payment");
   });
-  it("two alerts on one payment are two issues; an unknown result is not an alert", () => {
+  it("two alerts on one payment are two issues; an open alert of an unknown kind is still raised", () => {
+    // Review F9b: the loader only hands over OPEN alerts, so a kind without a label (a kind added
+    // later, or an empty alert_kind) is raised with a generic label, never skipped.
     const r = run(
-      base({ alerts: [alert(1, "mismatch"), alert(1, "duplicate"), alert(2, "pending")] }),
+      base({
+        alerts: [
+          alert(1, "mismatch"),
+          alert(1, "duplicate"),
+          alert(2, "some_new_kind"),
+          alert(3, ""),
+          alert(4, "<b>Robert'); DROP"),
+          alert(5, "__proto__"),
+          alert(6, "toString"),
+        ],
+      }),
     )[rule]!;
-    expect(r.issues).toHaveLength(2);
-    expect(r.checked).toBe(2);
+    expect(r.issues).toHaveLength(7);
+    expect(r.checked).toBe(7);
+    const by = (id: number) => r.issues.filter((i) => i.details["subjectId"] === id);
+    expect(by(2)[0]?.subject).toBe("Payment 2 · alert that needs a look");
+    expect(by(2)[0]?.details["alert"]).toBe("some_new_kind");
+    expect(by(3)[0]?.details["alert"]).toBe("unknown");
+    expect(by(4)[0]?.details["alert"]).toBe("unknown");
+    expect(by(4)[0]?.subject).not.toContain("<b>");
+    expect(by(5)[0]?.subject).toBe("Payment 5 · alert that needs a look");
+    expect(by(6)[0]?.subject).toBe("Payment 6 · alert that needs a look");
+  });
+  it("labels the alert kinds of migration 0030 (F9a)", () => {
+    const r = run(base({ alerts: [alert(1, "draft_gone"), alert(2, "draft_completed_unlinked")] }))[
+      rule
+    ]!;
+    expect(r.issues.map((i) => i.subject)).toEqual([
+      "Payment 1 · draft no longer in Revolut",
+      "Payment 2 · draft completed, bank lines not linked",
+    ]);
   });
   it("tolerates an alert whose payment has no amount", () => {
     const r = run(
@@ -190,7 +219,11 @@ describe("payments.paid_not_booked", () => {
   const paid = (
     id: number,
     ms: number | null,
-    stage: "awaiting_bank_line" | "awaiting_match" | "awaiting_booking" = "awaiting_bank_line",
+    stage:
+      | "awaiting_bank_line"
+      | "awaiting_match"
+      | "match_other_invoice"
+      | "awaiting_booking" = "awaiting_bank_line",
   ) => ({
     id,
     amountMinor: 9_900,
@@ -220,6 +253,7 @@ describe("payments.paid_not_booked", () => {
           paid(1, 4 * DAY, "awaiting_bank_line"),
           paid(2, 4 * DAY, "awaiting_match"),
           paid(3, 4 * DAY, "awaiting_booking"),
+          paid(4, 4 * DAY, "match_other_invoice"),
         ],
       }),
     )[rule]!;
@@ -227,6 +261,13 @@ describe("payments.paid_not_booked", () => {
       "awaiting_bank_line",
       "awaiting_match",
       "awaiting_booking",
+      "match_other_invoice",
+    ]);
+    expect(r.issues.map((i) => i.message.split(", but ")[1])).toEqual([
+      "the bank line has not arrived.",
+      "the bank line is not matched.",
+      "the match is not booked in Exact.",
+      "the bank line is matched to another invoice.",
     ]);
     expect(r.issues[0]?.message).toMatch(/^4 days: EUR 99\.00 paid/);
     expect(r.issues.every((i) => i.severity === "warning")).toBe(true);

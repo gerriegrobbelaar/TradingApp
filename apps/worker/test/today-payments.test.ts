@@ -166,7 +166,7 @@ describe("what an item says", () => {
     expect(item.issueId).toBeNull();
     const rid = await ready({ ageMs: 5 * HOUR });
     const f = (await get(w.tokens.finance)).body.items.find((i) => i.id === `payment_ready:${rid}`);
-    expect(f?.title).toBe("5 hours since approval, not sent");
+    expect(f?.title).toBe("5 hours since the request, approved but not sent");
     expect(f?.priority).toBe(70);
   });
 
@@ -432,5 +432,108 @@ describe("mutation self-check: the invariants fail when the guard is removed", (
     const mutated = DQ_SQL.replaceAll("'payments.ready_not_sent'", "'x.never'");
     expect(mutated).not.toBe(DQ_SQL);
     expect(await run2(mutated)).toContain(issueId);
+  });
+});
+
+describe("review F9b: the batch branch and paging while the data changes", () => {
+  async function otherDivision(): Promise<number> {
+    await db
+      .prepare(
+        "INSERT INTO divisions (connection_id, exact_division, name, sync_enabled) SELECT id, 778, 'Other', 0 FROM connections WHERE kind = 'exact' LIMIT 1",
+      )
+      .run();
+    return (await db
+      .prepare("SELECT id FROM divisions WHERE exact_division = 778")
+      .first<{ id: number }>())!.id;
+  }
+
+  it("a batch holds the same guards as a payment: own, expired, elsewhere, too old", async () => {
+    const good = await pending({ batch: true });
+    const own = await rawBatch(w, {
+      status: "pending_approval",
+      createdAt: ago(HOUR),
+      requestedBy: w.emails.approver,
+    });
+    const expired = await rawBatch(w, {
+      status: "pending_approval",
+      createdAt: ago(30 * HOUR),
+      expiresAt: ago(HOUR),
+    });
+    const elsewhere = await rawBatch(w, {
+      status: "pending_approval",
+      createdAt: ago(HOUR),
+      divisionId: await otherDivision(),
+    });
+    const r = (await get(w.tokens.approver)).body;
+    expect(ids(r, "payment_approval")).toEqual([`payment_approval:batch-${good}`]);
+    expect(r.counts.payment_approval).toBe(1);
+    for (const bad of [own, expired, elsewhere]) {
+      expect(ids(r)).not.toContain(`payment_approval:batch-${bad}`);
+    }
+    const fresh = await ready({ batch: true });
+    const old = await ready({ batch: true, ageMs: 8 * 24 * HOUR });
+    const f = (await get(w.tokens.finance)).body;
+    expect(ids(f, "payment_ready")).toEqual([`payment_ready:batch-${fresh}`]);
+    expect(f.counts.payment_ready).toBe(1);
+    expect(ids(f)).not.toContain(`payment_ready:batch-${old}`);
+  });
+
+  it("an old ready payment that is no item keeps its DQ issue for finance (it never vanishes)", async () => {
+    const old = await ready({ ageMs: 8 * 24 * HOUR });
+    const i = await addIssue({
+      rule: "payments.ready_not_sent",
+      payload: JSON.stringify({ subjectKind: "payment", subjectId: old }),
+    });
+    const f = (await get(w.tokens.finance)).body;
+    expect(ids(f, "payment_ready")).toEqual([]);
+    expect(ids(f, "dq")).toEqual([`dq:${i}`]);
+  });
+
+  it("pages across the kind boundary without gaps or repeats while requests are approved and sent", async () => {
+    const approvals: number[] = [];
+    for (let i = 0; i < 4; i++) approvals.push(await pending({ ageMs: (10 - i) * HOUR }));
+    const readies: number[] = [];
+    for (let i = 0; i < 4; i++) readies.push(await ready({ ageMs: (9 - i) * HOUR }));
+    const warn = await addIssue({ rule: "payments.paid_not_booked" });
+    const stable = [
+      ...approvals.slice(0, 3).map((id) => `payment_approval:${id}`),
+      ...readies.slice(1).map((id) => `payment_ready:${id}`),
+      `dq:${warn}`,
+    ];
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    for (let guard = 0; guard < 20; guard++) {
+      const q: string = `&limit=2${cursor === null ? "" : `&cursor=${cursor}`}`;
+      const page: TodayResponse = (await get(both, q)).body;
+      seen.push(...ids(page));
+      cursor = page.nextCursor;
+      if (guard === 0) {
+        // after the first page: the last approval is approved (it becomes a ready item) and the
+        // first ready one is sent (it leaves the queue)
+        await db
+          .prepare("UPDATE payments SET status = 'ready' WHERE id = ?1")
+          .bind(approvals[3])
+          .run()
+          .catch(async () => {
+            await withoutPaymentTriggers(["payments_guard_status", "payments_guard_approved"], () =>
+              db
+                .prepare("UPDATE payments SET status = 'ready' WHERE id = ?1")
+                .bind(approvals[3])
+                .run(),
+            );
+          });
+        await withoutPaymentTriggers(["payments_guard_submitting"], () =>
+          db
+            .prepare("UPDATE payments SET status = 'submitting' WHERE id = ?1")
+            .bind(readies[0])
+            .run(),
+        );
+      }
+      if (cursor === null) break;
+    }
+    expect(new Set(seen).size, "no repeats").toBe(seen.length);
+    for (const id of stable) expect(seen, id).toContain(id);
+    // what left the queue after the first page is not served afterwards
+    expect(seen.filter((id) => id === `payment_ready:${readies[0]}`).length).toBeLessThanOrEqual(1);
   });
 });

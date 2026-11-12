@@ -3,6 +3,7 @@
  * The state machine's insert trigger is lifted for the insert only, so a row can be put straight
  * into any status with any timestamps; nothing else of the schema is bypassed.
  */
+import { alertSchema } from "../src/dq/load-payments";
 import { SUPPLIER_IBAN, db, withoutPaymentTriggers, type PayWorld } from "./payments-helpers";
 
 let seq = 0;
@@ -105,17 +106,22 @@ export async function addEvent(
     .run();
 }
 
+/**
+ * A reconcile row. With the 0030 columns (F9a) present, an alert row also gets its `alert_kind`
+ * (the last result), so the same test means the same thing in both schemas.
+ */
 export async function addReconcile(
   kind: "payment" | "batch",
   id: number,
   lastResult: string,
   alertAt: string | null,
 ): Promise<void> {
+  const ack = (await alertSchema(db)) === "acknowledged";
   await db
     .prepare(
-      `INSERT INTO payment_reconcile (subject_kind, subject_id, first_checked_at, last_checked_at, last_result, alert_at)
-       VALUES (?1, ?2, '2026-07-15T09:00:00.000Z', '2026-07-15T09:30:00.000Z', ?3, ?4)`,
+      `INSERT INTO payment_reconcile (subject_kind, subject_id, first_checked_at, last_checked_at, last_result, alert_at${ack ? ", alert_kind" : ""})
+       VALUES (?1, ?2, '2026-07-15T09:00:00.000Z', '2026-07-15T09:30:00.000Z', ?3, ?4${ack ? ", ?5" : ""})`,
     )
-    .bind(kind, id, lastResult, alertAt)
+    .bind(kind, id, lastResult, alertAt, ...(ack ? [alertAt === null ? null : lastResult] : []))
     .run();
 }

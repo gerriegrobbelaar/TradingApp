@@ -45,6 +45,12 @@ const KIND_PLURAL: Record<TodayKind, [string, string]> = {
 };
 
 const itemId = (i: TodayItemDto): string => i.id;
+
+/** "a", "a and b", "a, b and c": with six kinds a list can have more than two parts. */
+function andList(parts: readonly string[]): string {
+  if (parts.length <= 2) return parts.join(" and ");
+  return `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+}
 const optionId = (id: string): string => `today-opt-${id.replace(/[^a-z0-9-]/gi, "-")}`;
 const TYPING = /^(INPUT|TEXTAREA|SELECT)$/;
 /** Widgets with their own letter and arrow keys: the queue's shortcuts stay out of them. */
@@ -60,7 +66,7 @@ function limitsOf(r: TodayResponse, nowMs: number): string[] {
   const out: string[] = [];
   if (r.notChecked.length > 0) {
     out.push(
-      `${r.notChecked.map((k) => KIND_PLURAL[k][1]).join(" and ")} are not included: no administration is chosen.`.replace(
+      `${andList(r.notChecked.map((k) => KIND_PLURAL[k][1]))} are not included: no administration is chosen.`.replace(
         /^./,
         (c) => c.toUpperCase(),
       ),
@@ -351,7 +357,7 @@ export function Today() {
         {status === "ready" && first && first.capped && (
           <p className="notice warn">
             {cappedKinds.length > 0
-              ? `More than 100 ${cappedKinds.map((k) => KIND_PLURAL[k][1]).join(" and ")} are waiting.`
+              ? `More than 100 ${andList(cappedKinds.map((k) => KIND_PLURAL[k][1]))} are waiting.`
               : "More than 100 items of one kind are waiting."}{" "}
             The list shows the most urgent first and stops where the unread ones would come; the
             rest appear as you handle these.

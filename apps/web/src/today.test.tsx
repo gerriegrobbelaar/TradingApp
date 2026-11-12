@@ -766,3 +766,105 @@ describe("review D8c: snooze limit", () => {
     expect(Date.parse(body.until) - NOW).toBe(90 * 86_400_000 - 5 * 60_000);
   });
 });
+
+describe("review F9b: payment items", () => {
+  const approverMe: Me = { ...FINANCE, roles: ["finance", "approver"] };
+  const pay = (over: Partial<Parameters<typeof todayItem>[0]> = {}) =>
+    todayItem({
+      kind: "payment_approval",
+      id: "payment_approval:5",
+      title: "2 hours waiting for a second approver",
+      subtitle: "Payment 5 · expires in 22 hours",
+      priority: 85,
+      severity: "warning",
+      amountMinor: 125_000,
+      currency: "EUR",
+      fix: "payment_approvals",
+      fixPath: "/purchases/approvals?tab=payments",
+      actions: ["open"],
+      issueId: null,
+      ...over,
+    });
+  const ready = pay({
+    kind: "payment_ready",
+    id: "payment_ready:batch-3",
+    title: "5 hours since the request, approved but not sent",
+    subtitle: "Batch 3 · expires in 19 hours",
+    priority: 70,
+    fix: "payments",
+    fixPath: "/treasury/bank?tab=payments",
+  });
+
+  it("labels the kinds, counts them, and A opens the Payments tab of Approvals", async () => {
+    mockFetch(
+      base(approverMe, {
+        "GET /api/today": () => ({
+          body: todayResponse([pay(), pay({ id: "payment_approval:batch-2" }), ready]),
+        }),
+      }),
+    );
+    const user = userEvent.setup();
+    const loc = withLocation("/today");
+    const list = await queue();
+    expect(within(list).getAllByText("Payment approval")).toHaveLength(2);
+    expect(within(list).getByText("Payment ready")).toBeTruthy();
+    expect(screen.getByText("2 payments to approve")).toBeTruthy();
+    expect(screen.getByText("1 payment not sent")).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /Review payment/ }).length).toBeGreaterThan(0);
+    await user.keyboard("a");
+    await waitFor(() => expect(loc.path).toBe("/purchases/approvals?tab=payments"));
+  });
+
+  it("A on a ready payment opens Treasury, Bank, Payments tab", async () => {
+    mockFetch(base(FINANCE, { "GET /api/today": () => ({ body: todayResponse([ready]) }) }));
+    const user = userEvent.setup();
+    const loc = withLocation("/today");
+    await queue();
+    await user.keyboard("a");
+    await waitFor(() => expect(loc.path).toBe("/treasury/bank?tab=payments"));
+  });
+
+  it("a payment item whose fixPath is not its own screen goes to the screen, never elsewhere", async () => {
+    mockFetch(
+      base(FINANCE, {
+        "GET /api/today": () => ({
+          body: todayResponse([
+            pay({ fixPath: "/purchases/approvals?tab=payments&next=//evil.com" }),
+          ]),
+        }),
+      }),
+    );
+    const user = userEvent.setup();
+    const loc = withLocation("/today");
+    await queue();
+    await user.keyboard("a");
+    await waitFor(() => expect(loc.path).toBe("/purchases/approvals?tab=payments"));
+  });
+
+  it("lists four unchecked kinds as one readable sentence", async () => {
+    mockFetch(
+      base(approverMe, {
+        "GET /api/today": () => ({
+          body: todayResponse([], {
+            notChecked: ["approval", "booking", "payment_approval", "payment_ready"],
+          }),
+        }),
+      }),
+    );
+    renderApp("/today");
+    expect(
+      await screen.findByText(
+        "Approvals, bookings, payments to approve and payments not sent are not included: no administration is chosen.",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("has no axe violations with payment items", async () => {
+    mockFetch(
+      base(approverMe, { "GET /api/today": () => ({ body: todayResponse([pay(), ready]) }) }),
+    );
+    const { container } = renderApp("/today");
+    await queue();
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});

@@ -7,14 +7,15 @@ import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { runAlerts } from "../src/dq/alerts";
 import {
-  ALERTS_SQL,
-  ALERT_OPEN_SQL,
-  COLS,
+  alertSchema,
+  alertsSql,
   DRAFTS_WAITING_SQL,
   IN_FLIGHT_SQL,
   OUTCOME_UNKNOWN_SQL,
   PAID_NOT_BOOKED_SQL,
+  PaymentsSchemaError,
   READY_SQL,
+  RECONCILE_COLUMNS_SQL,
   loadPayments,
 } from "../src/dq/load-payments";
 import { paymentSettlement } from "../src/payments/reconcile";
@@ -45,6 +46,8 @@ const RULES = [
   "payments.draft_waiting_long",
   "payments.disabled_with_inflight",
 ];
+/** The column read as if only migration 0029 were applied (true here, and after 0030 too). */
+const LEGACY_COLUMNS_SQL = `${RECONCILE_COLUMNS_SQL} WHERE name NOT IN ('alert_kind', 'alert_ack_at', 'alert_ack_by')`;
 const open = async (rule: string) =>
   (await issues(`rule_id = '${rule}' AND status = 'open'`)).sort((a, b) => a.id - b.id);
 
@@ -159,7 +162,8 @@ describe("payments.alert_open", () => {
     await addReconcile("payment", noAlert, "mismatch", null);
     const batch = await request("outcome_unknown", DAY, { batch: true });
     await addReconcile("batch", batch, "mismatch", at(HOUR));
-    await runDq();
+    // The 0029 meaning, also once 0030 is applied (the column read is made to see 0029 only).
+    await runDq({}, { ...env, DB: schemaDb(LEGACY_COLUMNS_SQL) });
     const rows = await open("payments.alert_open");
     expect(rows).toHaveLength(5);
     expect(rows.every((r) => r.severity === "critical")).toBe(true);
@@ -177,9 +181,117 @@ describe("payments.alert_open", () => {
     expect(JSON.stringify(rows)).not.toMatch(/[A-Z]{2}\d{2}[A-Z0-9]{10,}/);
   });
 
-  it("the acknowledged-column hook is one constant (no column exists yet)", () => {
-    expect(COLS.alertAckAt).toBeNull();
-    expect(ALERT_OPEN_SQL).not.toContain("ack");
+  it("reads the alert schema of the database", async () => {
+    expect(["legacy", "acknowledged"]).toContain(await alertSchema(db));
+    expect(await alertSchema(schemaDb(LEGACY_COLUMNS_SQL))).toBe("legacy");
+  });
+});
+
+/** The database as if a column of payment_reconcile were missing (or one were added). */
+function schemaDb(rewrite: string): D1Database {
+  return new Proxy(env.DB, {
+    get(target, prop) {
+      if (prop === "prepare") {
+        return (sql: string) => target.prepare(sql === RECONCILE_COLUMNS_SQL ? rewrite : sql);
+      }
+      const v = Reflect.get(target, prop) as unknown;
+      return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+    },
+  });
+}
+
+describe("review F9b: the alert columns are read, never assumed", () => {
+  const ACK_COLS = ["alert_kind", "alert_ack_at", "alert_ack_by"];
+  /** Adds the 0030 (F9a) columns when they are not there yet; drops them again afterwards. */
+  async function withAckColumns(fn: () => Promise<void>): Promise<void> {
+    const before = await alertSchema(db);
+    if (before === "legacy") {
+      for (const c of ACK_COLS)
+        await db.prepare(`ALTER TABLE payment_reconcile ADD COLUMN ${c} TEXT`).run();
+    }
+    try {
+      expect(await alertSchema(db)).toBe("acknowledged");
+      await fn();
+    } finally {
+      if (before === "legacy") {
+        await db.prepare("DELETE FROM payment_reconcile").run();
+        for (const c of ACK_COLS)
+          await db.prepare(`ALTER TABLE payment_reconcile DROP COLUMN ${c}`).run();
+      }
+    }
+  }
+
+  it.each([
+    ["alert_at missing", `${RECONCILE_COLUMNS_SQL} WHERE name <> 'alert_at'`],
+    ["last_result missing", `${RECONCILE_COLUMNS_SQL} WHERE name <> 'last_result'`],
+    ["the table missing", "SELECT name FROM pragma_table_info('no_such_table')"],
+    ["only one 0030 column", `${LEGACY_COLUMNS_SQL} UNION ALL SELECT 'alert_ack_at'`],
+    ["only the other 0030 column", `${LEGACY_COLUMNS_SQL} UNION ALL SELECT 'alert_kind'`],
+  ])(
+    "%s: the loader refuses, the rules are not_available and open issues stay",
+    async (_n, sql) => {
+      const id = await request("failed", DAY);
+      await addReconcile("payment", id, "mismatch", at(HOUR));
+      await runDq();
+      expect(await open("payments.alert_open")).toHaveLength(1);
+      await expect(loadPayments(schemaDb(sql), NOW)).rejects.toBeInstanceOf(PaymentsSchemaError);
+      const res = await runDq({}, { ...env, DB: schemaDb(sql) });
+      expect(res.status).toBe("partial");
+      for (const r of RULES) {
+        const s = await ruleStatus(r, 0);
+        expect(s?.status, r).toBe("not_available");
+        expect(s?.reason, r).toBe("payments_not_loaded");
+      }
+      expect(await open("payments.alert_open")).toHaveLength(1);
+    },
+  );
+
+  it("with the 0030 columns an alert is open until acknowledged, whatever the last result says", async () => {
+    await withAckColumns(async () => {
+      const gone = await request("submitted", DAY);
+      const moved = await request("submitted", DAY);
+      const acked = await request("failed", DAY);
+      const future = await request("failed", DAY);
+      const set = (id: number, last: string, kind: string | null, ack: string | null) =>
+        db
+          .prepare(
+            `INSERT INTO payment_reconcile (subject_kind, subject_id, first_checked_at, last_checked_at, last_result,
+               alert_at, alert_kind, alert_ack_at)
+             VALUES ('payment', ?1, ?2, ?2, ?3, ?2, ?4, ?5)`,
+          )
+          .bind(id, at(HOUR), last, kind, ack)
+          .run();
+      await set(gone, "not_found", "draft_gone", null); // last_result is no alert result
+      await set(moved, "error", "mismatch", null); // a later transient error does not close it
+      await set(acked, "approved_after_expiry", "approved_after_expiry", at(MIN));
+      await set(future, "mismatch", "some_new_kind", null); // a kind without a label
+      await runDq();
+      const rows = await open("payments.alert_open");
+      const text = rows.map((r) => r.subject).join("|");
+      expect(rows).toHaveLength(3);
+      expect(text).toContain(`Payment ${gone} · draft no longer in Revolut`);
+      expect(text).toContain(`Payment ${moved} · bank data does not match`);
+      expect(text).toContain(`Payment ${future} · alert that needs a look`);
+      expect(text).not.toContain(`Payment ${acked} `);
+      // acknowledging resolves the issue on the next run
+      await db
+        .prepare("UPDATE payment_reconcile SET alert_ack_at = ?2 WHERE subject_id = ?1")
+        .bind(gone, at(0))
+        .run();
+      await runDq();
+      expect((await open("payments.alert_open")).map((r) => r.subject).join("|")).not.toContain(
+        `Payment ${gone} `,
+      );
+      expect(await open("payments.alert_open")).toHaveLength(2);
+    });
+  });
+
+  it("the alert query plan is the same in both schemas (one scan of payment_reconcile only)", async () => {
+    for (const schema of ["legacy", "acknowledged"] as const) {
+      expect(alertsSql(schema)).toContain("payment_reconcile r");
+    }
+    expect(alertsSql("acknowledged")).toContain("alert_ack_at IS NULL");
+    expect(alertsSql("legacy")).not.toContain("alert_ack_at");
   });
 });
 
@@ -195,7 +307,7 @@ describe("payments.paid_not_booked", () => {
     expect(recent).toBeGreaterThan(0);
   });
 
-  it("agrees with paymentSettlement on every stage (booked is the only one left out)", async () => {
+  it("agrees with paymentSettlement on every stage, match_other_invoice included (booked is the only one left out)", async () => {
     const mk = async (): Promise<{ id: number; txId: number; item: number }> => {
       const item = await anotherBill(w);
       const id = await rawPayment(w, {
@@ -258,16 +370,26 @@ describe("payments.paid_not_booked", () => {
     const d = await mk(); // booked
     await link(d);
     await match(d, "matched_in_exact");
+    const e = await mk(); // line matched (and booked) to ANOTHER invoice (review F9b)
+    await link(e);
+    await match({ txId: e.txId, item: await anotherBill(w) }, "matched_in_exact");
     expect(await paymentSettlement(db, a.id)).toBe("awaiting_bank_line");
     expect(await paymentSettlement(db, b.id)).toBe("awaiting_match");
     expect(await paymentSettlement(db, c.id)).toBe("awaiting_booking");
     expect(await paymentSettlement(db, d.id)).toBe("booked");
+    expect(await paymentSettlement(db, e.id)).toBe("match_other_invoice");
     const loaded = await loadPayments(db, NOW);
     const byId = new Map(loaded.paidNotBooked.map((r) => [r.id, r.stage]));
     expect(byId.get(a.id)).toBe("awaiting_bank_line");
     expect(byId.get(b.id)).toBe("awaiting_match");
     expect(byId.get(c.id)).toBe("awaiting_booking");
     expect(byId.has(d.id)).toBe(false);
+    expect(byId.get(e.id)).toBe("match_other_invoice");
+    await runDq();
+    const msg = (await open("payments.paid_not_booked")).find(
+      (r) => r.subject === `Payment ${e.id}`,
+    );
+    expect(msg?.message).toContain("matched to another invoice");
   });
 });
 
@@ -412,7 +534,7 @@ describe("failure and caps", () => {
     expect(await plan(OUTCOME_UNKNOWN_SQL)).toContain("idx_payment_batches_status");
     // The one deliberate scan: payment_reconcile (one row per request that was ever sent, no index on
     // alert_at and no migration allowed); its subqueries are primary-key lookups.
-    const alerts = await plan(ALERTS_SQL);
+    const alerts = await plan(alertsSql("legacy"));
     expect(alerts).toMatch(/SCAN r\b/);
     expect(alerts).not.toMatch(/SCAN (payments|payment_batches)\b/);
   });
@@ -436,5 +558,43 @@ describe("the instant alert path", () => {
     expect(body).toContain("tab=payments");
     expect((await emailRows()).length).toBeGreaterThan(0);
     expect(id).toBeGreaterThan(0);
+  });
+});
+
+describe("review F9b: one mail per payment alert, no IBAN, keyed per issue row", () => {
+  it("reruns of the checks and the alerts never mail the same issue twice", async () => {
+    const unknown = await request("outcome_unknown", 2 * HOUR);
+    const mism = await request("submitted", DAY);
+    await addReconcile("payment", mism, "mismatch", at(HOUR));
+    await runDq();
+    const s = fakeSender();
+    await runAlerts(ctxAt(), 1, { sender: s });
+    const firstCalls = s.calls;
+    expect(firstCalls).toBeGreaterThan(0);
+    const keys = (await emailRows()).map((r) => r.idempotency_key);
+    const rows = [
+      ...(await open("payments.outcome_unknown_old")),
+      ...(await open("payments.alert_open")),
+    ];
+    expect(rows).toHaveLength(2);
+    for (const r of rows) {
+      const n = await db
+        .prepare("SELECT notified_at FROM dq_issues WHERE id = ?1")
+        .bind(r.id)
+        .first<{ notified_at: string | null }>();
+      expect(n?.notified_at, `issue ${r.id} marked`).not.toBeNull();
+      expect(keys.some((k) => k.startsWith(`dq-alert:${r.id}:`))).toBe(true);
+    }
+    for (let i = 0; i < 3; i++) {
+      await runDq();
+      await runAlerts(ctxAt(), 2 + i, { sender: s });
+    }
+    expect(s.calls).toBe(firstCalls);
+    const body = JSON.stringify(s.sent);
+    expect(body).not.toContain(SUPPLIER_IBAN);
+    expect(body).not.toMatch(/NL\d{2}[A-Z]{4}\d{6,}/);
+    expect(body).not.toContain("Acme Supplies");
+    expect(body).not.toContain("Invoice 1");
+    expect(unknown).toBeGreaterThan(0);
   });
 });

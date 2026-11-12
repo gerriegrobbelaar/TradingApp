@@ -326,7 +326,8 @@ function paymentItem(
     id: `${kind}:${r.kind === "batch" ? "batch-" : ""}${r.id}`,
     title: approval
       ? `${hours(waited)} waiting for a second approver`
-      : `${hours(waited)} since approval, not sent`,
+      : // Measured from the request (the only time this read has); the approval came later.
+        `${hours(waited)} since the request, approved but not sent`,
     subtitle: `${what} ${r.id} · ${expiryText(r.expires_at, ref.nowMs)}`,
     severity: severityOfPriority(priority),
     priority,

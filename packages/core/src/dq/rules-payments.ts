@@ -30,12 +30,18 @@ export const PAYMENT_ALERT_RESULTS = [
   "mismatch",
   "duplicate",
 ] as const;
-export const PAYMENT_ALERT_LABEL: Record<(typeof PAYMENT_ALERT_RESULTS)[number], string> = {
+/** Labels of the alert kinds: the four results above plus the kinds of migration 0030 (F9a). */
+export const PAYMENT_ALERT_LABEL: Readonly<Record<string, string>> = {
   approved_after_expiry: "approved after expiry",
   reverted_after_paid: "reverted after paid",
   mismatch: "bank data does not match",
   duplicate: "possible duplicate payment",
+  draft_gone: "draft no longer in Revolut",
+  draft_completed_unlinked: "draft completed, bank lines not linked",
 };
+/** An open alert of a kind this code has no label for is still raised (never skipped). */
+export const PAYMENT_ALERT_UNKNOWN_LABEL = "alert that needs a look";
+const ALERT_KIND_RE = /^[a-z_]{1,40}$/;
 /** Share of the draft expiry after which a waiting draft is a warning (half of it is info). */
 export const DRAFT_WARNING_SHARE = 0.8;
 
@@ -105,7 +111,7 @@ const alertOpen: DqRuleDef = {
   threshold: null,
   title: "Payment alert not yet looked at",
   description:
-    "The reconciliation found something that needs a person: a draft approved after it expired, a payment reverted after it was paid, bank data that does not match the request, or a possible duplicate.",
+    "The reconciliation found something that needs a person: a draft approved after it expired, a payment reverted after it was paid, bank data that does not match the request, a possible duplicate, or a draft that is no longer in Revolut.",
   fix: "payments",
   evaluate(input, config) {
     const p = input.payments;
@@ -113,11 +119,14 @@ const alertOpen: DqRuleDef = {
     const issues: DqIssue[] = [];
     let checked = 0;
     for (const a of p.alerts) {
-      const label = (PAYMENT_ALERT_LABEL as Record<string, string | undefined>)[a.result];
-      if (label === undefined) continue;
+      // Fail loud: an open alert whose kind has no label (a kind added later, or an empty kind) is
+      // raised with a generic label; the kind goes into the key only when it is a plain code.
+      const known = Object.hasOwn(PAYMENT_ALERT_LABEL, a.result);
+      const kind = ALERT_KIND_RE.test(a.result) ? a.result : "unknown";
+      const label = known ? (PAYMENT_ALERT_LABEL[a.result] as string) : PAYMENT_ALERT_UNKNOWN_LABEL;
       checked += 1;
       issues.push(
-        makeIssue(this, config, [a.kind, a.id, a.result], {
+        makeIssue(this, config, [a.kind, a.id, kind], {
           subject: `${subjectLabel(a)} · ${label}`,
           message:
             a.amountMinor !== null && a.currency !== null
@@ -125,7 +134,7 @@ const alertOpen: DqRuleDef = {
               : `Alert on ${subjectLabel(a).toLowerCase()}: ${label}.`,
           amountMinor: a.amountMinor,
           currency: a.currency,
-          details: { subjectKind: a.kind, subjectId: a.id, alert: a.result },
+          details: { subjectKind: a.kind, subjectId: a.id, alert: kind },
         }),
       );
     }
@@ -162,7 +171,9 @@ const paidNotBooked: DqRuleDef = {
           ? "the bank line has not arrived"
           : r.stage === "awaiting_match"
             ? "the bank line is not matched"
-            : "the match is not booked in Exact";
+            : r.stage === "match_other_invoice"
+              ? "the bank line is matched to another invoice"
+              : "the match is not booked in Exact";
       issues.push(
         makeIssue(this, config, ["payment", r.id], {
           subject: `Payment ${r.id}`,

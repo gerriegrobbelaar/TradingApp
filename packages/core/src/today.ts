@@ -203,8 +203,9 @@ export function encodeTodayCursor(item: SortKey): string {
   return b64(JSON.stringify([item.priority, sinceKey(item), item.id]));
 }
 
+/** Exactly the ids issued: `stale-` only on bookings, `batch-` only on the payment kinds. */
 const ID_RE =
-  /^(approval|match|booking|dq|payment_approval|payment_ready):(stale-|batch-)?[1-9]\d{0,12}$/;
+  /^(?:(?:approval|match|dq):|booking:(?:stale-)?|(?:payment_approval|payment_ready):(?:batch-)?)[1-9]\d{0,12}$/;
 
 /** Null for anything we did not issue (strict shape). */
 export function decodeTodayCursor(raw: string): TodayCursor | null {

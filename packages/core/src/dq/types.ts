@@ -328,7 +328,10 @@ export interface DqPaymentSubjectIn {
 export interface DqPaymentAlertIn {
   kind: DqPaymentSubjectKind;
   id: number;
-  /** The reconcile result that raised the alert (approved_after_expiry, mismatch, ...). */
+  /**
+   * What the alert is: `alert_kind` (migration 0030) or, before it, the reconcile result that raised
+   * it (approved_after_expiry, mismatch, ...). A kind without a label is still an alert.
+   */
   result: string;
   alertAt: string | null;
   amountMinor: number | null;
@@ -341,8 +344,11 @@ export interface DqPaymentUnbookedIn {
   currency: string;
   /** When the bank said paid (ISO); null = unreadable. */
   paidAt: string | null;
-  /** How far the Exact side is: no bank line yet, no match yet, or a match not yet in Exact. */
-  stage: "awaiting_bank_line" | "awaiting_match" | "awaiting_booking";
+  /**
+   * How far the Exact side is (the stages of `paymentSettlement`): no bank line yet, no match yet,
+   * the line matched to another invoice, or our match not yet in Exact.
+   */
+  stage: "awaiting_bank_line" | "awaiting_match" | "match_other_invoice" | "awaiting_booking";
 }
 
 export type DqPaymentsList =

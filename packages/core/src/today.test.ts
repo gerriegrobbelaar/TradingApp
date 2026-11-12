@@ -231,6 +231,9 @@ describe("F9b: payment kinds (Phase 9 final review S2, ADR 0053)", () => {
       "payment_approval:batch-5",
       "payment_ready:9",
       "payment_ready:batch-9",
+      "booking:stale-9",
+      "booking:9",
+      "dq:9",
     ]) {
       expect(decodeTodayCursor(enc(id))?.id).toBe(id);
     }
@@ -239,6 +242,13 @@ describe("F9b: payment kinds (Phase 9 final review S2, ADR 0053)", () => {
       "payment_ready:batch-",
       "payment_other:1",
       "payment_approval:batch-0",
+      // review F9b: each prefix only on the kind that issues it
+      "dq:batch-3",
+      "approval:stale-3",
+      "match:batch-3",
+      "payment_ready:stale-3",
+      "booking:batch-3",
+      "payment_approval:batch-batch-3",
     ]) {
       expect(decodeTodayCursor(enc(bad)), bad).toBeNull();
     }
