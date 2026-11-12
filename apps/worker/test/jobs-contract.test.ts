@@ -32,7 +32,7 @@ import { resetRevolut, seedRevolut, stubRevolut } from "./revolut-helpers";
 import { cpRecord, rawApi, rawLeg, rawTx } from "./revolut-q1-helpers";
 import { fakeRevolut, simpleTx } from "./revolut-r3-helpers";
 import { FakeExact, addDivision, fakeGate, guid, resetSync } from "./sync-helpers";
-import { outboxWipeStatements } from "./outbox-wipe";
+import { emailLogWipeStatements, outboxWipeStatements } from "./outbox-wipe";
 
 const db = env.DB;
 const NOW = Date.parse("2026-07-15T00:00:00Z"); // 02:00 CEST
@@ -322,6 +322,8 @@ const FIXTURES: Record<string, Fixture> = {
   "ecb.fx_import": { setup: ecbFixture, teardown: () => ecbStub?.restore() },
   "bank.match": { setup: matchingFixture, internal: true },
   "dq.checks": { setup: dqFixture, internal: true },
+  // No sender is configured in the contract run: the digest records one skipped row and stays stable.
+  "dq.digest": { setup: dqFixture, internal: true },
   "exact.bank_balances": { setup: bankBalancesFixture },
 };
 
@@ -335,7 +337,10 @@ function contextFor(
       ? 240
       : key === "exact.book_matches"
         ? 30
-        : key.startsWith("revolut.") || key === "bank.match" || key === "dq.checks"
+        : key.startsWith("revolut.") ||
+            key === "bank.match" ||
+            key === "dq.checks" ||
+            key === "dq.digest"
           ? 0
           : key === "exact.bank_balances"
             ? 20
@@ -384,21 +389,24 @@ describe("handler contract: every implemented handler", () => {
       describe(`${key} (${trigger})`, () => {
         beforeEach(async () => {
           const wipe = await outboxWipeStatements(db);
+          const emailWipe = await emailLogWipeStatements(db);
           await db.batch(
             DATA_TABLES.flatMap((t) =>
               t === "exact_write_outbox"
                 ? wipe
-                : t === "dq_issues"
-                  ? // Open issues cannot be deleted (guard trigger); history can.
-                    [
-                      db.prepare(
-                        "UPDATE dq_issues SET status = 'resolved', resolved_at = '2026-01-01T00:00:00.000Z', snoozed_until = NULL WHERE status <> 'resolved'",
-                      ),
-                      db.prepare("DELETE FROM dq_issues"),
-                      db.prepare("DELETE FROM dq_rule_status"),
-                      db.prepare("DELETE FROM dq_runs"),
-                    ]
-                  : [db.prepare(`DELETE FROM ${t}`)],
+                : t === "email_log"
+                  ? emailWipe
+                  : t === "dq_issues"
+                    ? // Open issues cannot be deleted (guard trigger); history can.
+                      [
+                        db.prepare(
+                          "UPDATE dq_issues SET status = 'resolved', resolved_at = '2026-01-01T00:00:00.000Z', snoozed_until = NULL WHERE status <> 'resolved'",
+                        ),
+                        db.prepare("DELETE FROM dq_issues"),
+                        db.prepare("DELETE FROM dq_rule_status"),
+                        db.prepare("DELETE FROM dq_runs"),
+                      ]
+                    : [db.prepare(`DELETE FROM ${t}`)],
             ),
           );
         });

@@ -75,6 +75,7 @@ describe("default jobs (CLAUDE.md 4.1)", () => {
       "bank.match",
       "ecb.fx_import",
       "dq.checks",
+      "dq.digest",
     ]);
     expect(sched("bank.match")).toEqual({ kind: "cron", expr: "2,12,22,32,42,52 * * * *" });
     expect(rows.every((r) => r.timezone === "Europe/Amsterdam" && r.kind === "system")).toBe(true);

@@ -18,6 +18,7 @@ import type {
   DqSeverity,
   DqThresholdSpec,
 } from "./dq/types";
+import type { DqNotificationSettings } from "./dq/notify";
 import type { BalanceSheet } from "./reports/balance-sheet";
 import type { BalanceSheetSection, ProfitLossSection } from "./reports/classify";
 import type { ProfitLoss } from "./reports/profit-loss";
@@ -1358,4 +1359,31 @@ export interface DqRulePatchRequest {
 }
 export interface DqRulePatchResponse {
   rule: DqRuleDto;
+}
+
+// ---- data quality notifications (Phase 8, D8b, ADR 0046) -------------------------------------------------
+// GET   /api/dq/notifications        admin
+// PATCH /api/dq/notifications        admin, step-up   any of the settings + rev
+// POST  /api/dq/notifications/test   admin, step-up   {}  sends one test message to the caller
+
+export interface DqNotificationsResponse {
+  settings: DqNotificationSettings;
+  /** The rev a PATCH must send (null = never saved). */
+  rev: string | null;
+  /** True when the Workers secret EMAIL_API_KEY is set (its value is never returned). */
+  apiKeyPresent: boolean;
+  /** True when messages would really be sent: provider https, host, sender and key all present. */
+  senderActive: boolean;
+  /** The domain recipients must belong to (v1: the Google Workspace domain). */
+  allowedDomain: string;
+  /** How many users would receive an alert or the digest right now. */
+  recipientCount: number;
+}
+
+export type DqNotificationsPatchRequest = Partial<DqNotificationSettings> & { rev: string | null };
+
+export interface DqNotificationsTestResponse {
+  /** What the sender answered: sent, failed, unknown or skipped_not_configured. */
+  status: "sent" | "failed" | "unknown" | "skipped_not_configured";
+  code: string | null;
 }

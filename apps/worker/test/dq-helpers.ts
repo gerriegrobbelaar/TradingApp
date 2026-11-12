@@ -2,6 +2,7 @@ import { env } from "cloudflare:test";
 import type { JobContext } from "../src/jobs/types";
 import { runDqChecks } from "../src/dq/run";
 import { jobContext, NOW } from "./matching-helpers";
+import { emailLogWipeStatements } from "./outbox-wipe";
 
 export const db = env.DB;
 export { NOW };
@@ -9,6 +10,8 @@ export { NOW };
 /** Empties the DQ tables (open issues cannot be deleted: they are resolved first). */
 export async function resetDq(): Promise<void> {
   await db.batch([
+    ...(await emailLogWipeStatements(db)),
+    db.prepare("DELETE FROM settings WHERE key = 'dq.notifications'"),
     db.prepare(
       "UPDATE dq_issues SET status = 'resolved', resolved_at = '2026-01-01T00:00:00.000Z', snoozed_until = NULL WHERE status <> 'resolved'",
     ),

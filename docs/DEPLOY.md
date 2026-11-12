@@ -983,8 +983,8 @@ Two jobs, with different risk:
   only the data quality tables (`dq_issues`, `dq_rule_status`, `dq_runs`). It is switched **on** after
   a fresh install. A database that already has the job row keeps whatever `enabled` it stored (the
   seeding never flips a row), so after the upgrade an admin switches it on in Settings, Schedules (or
-  `UPDATE jobs SET enabled = 1 WHERE name = 'dq.checks'`). Nothing alerts yet (no e-mail, no screen:
-  Phase 8 D8b); read the result through the API.
+  `UPDATE jobs SET enabled = 1 WHERE name = 'dq.checks'`). Alerts and the digest are described in the next
+  section (ADR 0046); there is no screen yet (D8c), read the result through the API.
 - **`exact.bank_balances`** reads from Exact (one `financial/ReportingBalance` call per mapped bank
   account, at most 20 calls per run and administration) and stores `bank_accounts.exact_balance_minor`.
   It ships **off** (`awaiting_live_verification`). Enable it only after the checks below.
@@ -1026,6 +1026,58 @@ First-live checks, on staging first:
    name is wrong), and the sum of the periods equals Exact's balance. Only then enable the job.
 8. Housekeeping: resolved issues are deleted after 180 days by the run itself; `dq_runs` has one row
    per run (about 9,000 a year at hourly).
+
+### Data quality notifications: alerts and the daily digest (Phase 8, D8b; ADR 0046)
+
+Two things send e-mail: an **instant alert** for each new or reopened **critical** issue (from
+`dq.checks`), and the **daily digest** (`dq.digest`, 08:00 Europe/Amsterdam, default row enabled).
+Both are silent until an e-mail provider is configured: they record `skipped_not_configured` in
+`email_log` and nothing else. The provider is **provisional** (ADR 0046, open decision 5).
+
+Existing installs: the next Worker start adds the job row `dq.digest` (enabled; it only records a
+skipped row until step 3), and migration 0027 replaces the `email_log` table (it was never written).
+
+How to enable (staging first, `--env staging` on every command):
+
+1. Pick a transactional e-mail provider with an HTTPS API that accepts `POST /emails` with
+   `Authorization: Bearer <key>` and JSON `{from, to[], subject, html, text}` (Resend does). Verify
+   the sender address or domain with the provider (SPF/DKIM) so mail from it is delivered.
+2. Store the key as a secret, never in `wrangler.toml`: `pnpm exec wrangler secret put EMAIL_API_KEY`.
+3. As an admin with a fresh sign-in set the sender and the links:
+   `PATCH /api/dq/notifications` with `{"rev": <rev from GET>, "emailProvider": "https", "emailHost":
+   "<provider host>", "emailFrom": "<verified sender>", "baseUrl": "https://<app host>"}`.
+   `GET /api/dq/notifications` must now say `apiKeyPresent: true`, `senderActive: true` and a
+   `recipientCount` equal to your admins and finance users on the camelthorncapital.com domain
+   (nobody else ever receives mail: recipients come from the users table only).
+4. **Send a test message to yourself**: `POST /api/dq/notifications/test` (fresh sign-in; answer
+   `{"status":"sent"}`). It goes to the calling admin only and is limited to one per minute. Check the
+   inbox (not spam), the sender, that the link is clickable. A `failed` answer carries a code
+   (`http_401` wrong key, `http_403`/`http_422` unverified sender or payload); `unknown` means a
+   timeout or a 5xx: check the provider dashboard before trying again.
+5. First-live checks: run `dq.digest` once by hand (Settings, Schedules, fresh sign-in). Expect one
+   mail per admin or finance user, a subject that starts with the number, counts that match
+   `GET /api/dq/summary`, links that open the right screen, and a list of rules that were not
+   evaluated with reasons. Run it again the same day: `sent: 0, already: N` and no second mail.
+6. Instant alert: with a harmless critical issue present (for example switch `payables.supplier_iban_changed`
+   threshold or wait for a real one), the next `dq.checks` run sends **one** mail and sets
+   `dq_issues.notified_at`. Check `SELECT kind, status, recipients_count, error_code FROM email_log`.
+   A second run sends nothing. `GET /api/jobs` shows `alertsSent`, `alertsFailed`, `alertsUnknown` in
+   the last result.
+7. Limits and what to watch: at most 10 single alerts per run (`maxAlertsPerRun`, 1 to 50), the rest in
+   summary mails of up to 80 issues. A row with status `unknown` means the provider's answer was unclear
+   (timeout, 5xx) or the Worker stopped between claim and send: it is **never** sent again by the code,
+   so look at the provider log. If the mail did not go out, the next daily digest still lists the issue.
+   `failed` rows are retried up to three times.
+8. Switching off: `PATCH ... {"enabled": false}` stops alerts and the digest; `{"emailProvider":
+   "disabled"}` stops sending but keeps the pending criticals for later. Removing a user's admin or
+   finance role stops mail to them at the next send.
+9. Retention: `email_log` rows older than 400 days are deleted by the alert pass and the digest job. The
+   log holds no address, subject or body (counts, codes, provider message id).
+
+Also on existing installs: from this release `dq.checks` resolves open issues of administrations that are
+no longer synchronised (`sync_enabled = 0`) with the note `division_not_synchronised` and an audit row
+`dq.unsynced_resolved`; expect a one-off batch of resolved issues if you switched an administration off
+earlier.
 
 ### Emergency stop of all jobs
 

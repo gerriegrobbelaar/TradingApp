@@ -10,7 +10,8 @@
 #   REVOLUT_PRIVATE_KEY.
 # Secrets are never in this file: GOOGLE_CLIENT_SECRET, SESSION_SECRET, EXACT_CLIENT_SECRET,
 # REVOLUT_PRIVATE_KEY (PKCS#8 PEM) and TOKEN_ENC_KEY (and TOKEN_ENC_KEY_PREVIOUS while rotating)
-# go in with `wrangler secret put`.
+# go in with `wrangler secret put`. Optional: EMAIL_API_KEY, the key of the transactional e-mail
+# provider for data quality alerts and the digest (ADR 0046; the host and sender are settings).
 # Also required and checked by the deploy guard:
 #   - [triggers] crons = ["* * * * *"]: the scheduler tick, once a minute (do not change it);
 #   - the ExactGate Durable Object binding with migration tag v1 (sqlite), the JobLock binding

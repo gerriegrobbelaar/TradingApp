@@ -100,6 +100,7 @@ describe("GET /api/jobs", () => {
       "exact.bank_balances",
       "ecb.fx_import",
       "dq.checks",
+      "dq.digest",
       "reminders.send",
       "exact.full_sync",
       "exact.incremental_sync",

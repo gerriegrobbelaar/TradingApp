@@ -95,4 +95,4 @@ Issue subject and message are cleaned (control and bidi characters out, whitespa
 
 ## Not done here
 
-The screens (Data health, Today queue), the daily digest and instant alerts (`notified_at` exists, nothing sets it), Cloudflare cron wiring beyond the existing scheduler, ING/Rabobank balances, retention of `dq_runs` (small; one row per run, add to housekeeping if it grows), and a per-user "assigned to" field.
+The screens (Data health, Today queue; D8c), the daily digest and instant alerts (done in D8b, ADR 0046), Cloudflare cron wiring beyond the existing scheduler, ING/Rabobank balances, retention of `dq_runs` (small; one row per run, add to housekeeping if it grows), and a per-user "assigned to" field.

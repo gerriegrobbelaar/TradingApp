@@ -35,10 +35,20 @@ import {
   type DescribeHandler,
   type DqDivision,
 } from "./load";
-import { applyResults, loadRuleRows, recordRun, toOverrides, type DivisionOutcome } from "./store";
+import { runAlerts, type AlertDeps, type AlertOutcome } from "./alerts";
+import {
+  applyResults,
+  loadRuleRows,
+  recordRun,
+  resolveUnsyncedDivisions,
+  toOverrides,
+  type DivisionOutcome,
+} from "./store";
 
 export interface DqRunDeps {
   describeHandler: DescribeHandler;
+  /** Test seam for the e-mail sender used by the instant alerts. */
+  alerts?: AlertDeps;
 }
 
 const SUSPENSE_RULE = "ledger.suspense_not_zero";
@@ -105,6 +115,15 @@ export async function runDqChecks(ctx: JobContext, deps: DqRunDeps): Promise<Han
   let aborted = false;
 
   const divisions = await loadDivisions(db);
+  // Housekeeping (D8a review): issues of administrations that are no longer synchronised are resolved
+  // with a reason code, so they do not stay open (and are not alerted or mailed) for ever.
+  const unsynced = await section("unsynced_divisions", () =>
+    resolveUnsyncedDivisions(
+      db,
+      divisions.map((d) => d.id),
+      startedAt,
+    ),
+  );
   for (const d of divisions) {
     if (ctx.signal.aborted) {
       aborted = true;
@@ -171,11 +190,36 @@ export async function runDqChecks(ctx: JobContext, deps: DqRunDeps): Promise<Han
     errorCode,
   });
 
+  // Instant alerts for critical issues. A failure here never fails the checks: the issues keep
+  // notified_at NULL (or a claim that becomes `unknown`), and the next run tries again.
+  let alerts: AlertOutcome | null = null;
+  let alertsError = false;
+  if (!aborted && !ctx.signal.aborted) {
+    try {
+      alerts = await runAlerts(ctx, ctx.run.id, deps.alerts);
+    } catch (e) {
+      alertsError = true;
+      ctx.log("dq_alerts_failed", { error: e instanceof Error ? e.name : "unknown" });
+    }
+  }
+
   return {
     status,
     ...(errorCode !== null ? { code: errorCode } : {}),
     summary: {
       divisions: divisions.length,
+      resolvedUnsynced: unsynced ?? 0,
+      alertsError: alertsError ? 1 : 0,
+      ...(alerts
+        ? {
+            alertCandidates: alerts.candidates,
+            alertsSent: alerts.alerted,
+            alertsFolded: alerts.folded,
+            alertsFailed: alerts.failed,
+            alertsUnknown: alerts.unknown,
+            alertsSkipped: alerts.skipped === null ? 0 : 1,
+          }
+        : {}),
       rulesEvaluated: evaluated,
       rulesUnavailable: unavailable,
       sectionFailures,

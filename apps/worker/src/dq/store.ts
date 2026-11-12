@@ -348,3 +348,58 @@ export async function recordRun(db: D1Database, s: RunSummary): Promise<number> 
     .first<{ id: number }>();
   return row?.id ?? 0;
 }
+
+/**
+ * Resolves the open and snoozed issues of administrations that are no longer synchronised (sync
+ * switched off, connection disabled or removed). Reason code `division_not_synchronised`; one audit
+ * row when anything changed; the rule status rows of those administrations are removed so the
+ * summary does not show stale verdicts. Global issues (division 0) are never touched.
+ */
+export const UNSYNCED_REASON = "division_not_synchronised";
+
+export async function resolveUnsyncedDivisions(
+  db: D1Database,
+  activeDivisionIds: readonly number[],
+  nowIso: string,
+): Promise<number> {
+  const ids = [...activeDivisionIds];
+  const notIn = (from: number): string =>
+    ids.length > 0 ? `AND division_id NOT IN (${ids.map((_, i) => `?${i + from}`).join(",")})` : "";
+  const count =
+    (
+      await db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM dq_issues WHERE division_id > 0 ${notIn(1)} AND status IN ('open', 'snoozed')`,
+        )
+        .bind(...ids)
+        .first<{ n: number }>()
+    )?.n ?? 0;
+  const cleanup = db
+    .prepare(`DELETE FROM dq_rule_status WHERE division_id > 0 ${notIn(1)}`)
+    .bind(...ids);
+  if (count === 0) {
+    await cleanup.run();
+    return 0;
+  }
+  await db.batch([
+    db
+      .prepare(
+        `UPDATE dq_issues SET status = 'resolved', resolved_at = ?1, resolved_by = 'system',
+           resolution_note = '${UNSYNCED_REASON}', snoozed_until = NULL, snoozed_by = NULL, snooze_note = NULL
+         WHERE division_id > 0 ${notIn(2)} AND status IN ('open', 'snoozed')`,
+      )
+      .bind(nowIso, ...ids),
+    auditStatement(
+      db,
+      {
+        actorEmail: "system",
+        action: "dq.unsynced_resolved",
+        entity: "dq_issue",
+        after: { reason: UNSYNCED_REASON, issues: count },
+      },
+      { sql: "changes() > 0", binds: [] },
+    ),
+    cleanup,
+  ]);
+  return count;
+}

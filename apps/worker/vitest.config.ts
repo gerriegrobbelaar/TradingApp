@@ -34,6 +34,8 @@ export default defineConfig(async () => {
             REVOLUT_REDIRECT_URI: "https://app.test/api/connections/revolut/callback",
             // 32 bytes, base64. Test-only.
             TOKEN_ENC_KEY: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+            // Test-only API key of the transactional e-mail provider (ADR 0046).
+            EMAIL_API_KEY: "test-email-api-key-0123456789",
             // Test-only "old" key, accepted for decryption like during a rotation (review S3 tests
             // encrypt under it and expect the current key afterwards).
             TOKEN_ENC_KEY_PREVIOUS: "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",

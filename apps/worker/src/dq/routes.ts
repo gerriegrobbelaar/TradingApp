@@ -39,9 +39,19 @@ import {
   type DqSeverity,
   type DqSummaryResponse,
 } from "@camelthorn/core";
+import {
+  applySettingsPatch,
+  renderTest,
+  testKey,
+  type DqNotificationsResponse,
+  type DqNotificationsTestResponse,
+} from "@camelthorn/core";
 import { auditStatement } from "../db/audit";
+import { claimPlain, deliver } from "../email/log";
+import { senderFromSettings } from "../email/sender";
 import { ANY_ROLE, BadRequest, guarded, positiveIntParam, resolveDivision } from "../read/routes";
 import { json, type Ctx, type Router } from "../router";
+import { SETTING_NOTIFICATIONS, loadNotificationSettings, loadRecipients } from "./notify-settings";
 import { loadRuleRows, thresholdToJson, toOverrides, safeText, type RuleRow } from "./store";
 
 const FINANCE = { roles: ["finance", "admin"] } as const;
@@ -605,6 +615,119 @@ async function patchRuleHandler(ctx: Ctx): Promise<Response> {
   return json({ rule: toRuleDto(rule, fresh) } satisfies DqRulePatchResponse);
 }
 
+// ---- notifications ----------------------------------------------------------------------------------
+
+const SETTING_FIELDS = [
+  "enabled",
+  "alertRecipients",
+  "baseUrl",
+  "maxAlertsPerRun",
+  "emailProvider",
+  "emailHost",
+  "emailFrom",
+] as const;
+
+async function notificationsView(ctx: Ctx): Promise<DqNotificationsResponse> {
+  const stored = await loadNotificationSettings(ctx.env.DB);
+  const recipients = await loadRecipients(
+    ctx.env.DB,
+    ctx.env.ALLOWED_HD,
+    stored.settings.alertRecipients,
+  );
+  return {
+    settings: stored.settings,
+    rev: stored.rev,
+    apiKeyPresent: (ctx.env.EMAIL_API_KEY ?? "").trim() !== "",
+    senderActive: senderFromSettings(ctx.env, stored.settings).kind === "https",
+    allowedDomain: ctx.env.ALLOWED_HD.toLowerCase(),
+    recipientCount: recipients.length,
+  };
+}
+
+async function getNotificationsHandler(ctx: Ctx): Promise<Response> {
+  return json(await notificationsView(ctx));
+}
+
+async function patchNotificationsHandler(ctx: Ctx): Promise<Response> {
+  const db = ctx.env.DB;
+  const who = actor(ctx);
+  const b = await readBody(ctx, [...SETTING_FIELDS, "rev"]);
+  if (!("rev" in b) || (b["rev"] !== null && typeof b["rev"] !== "string")) {
+    throw new ApiError("bad_rev");
+  }
+  const rev = b["rev"] as string | null;
+  const patch: Record<string, unknown> = { ...b };
+  delete patch["rev"];
+  if (Object.keys(patch).length === 0) throw new ApiError("nothing_to_change");
+  const stored = await loadNotificationSettings(db);
+  if (stored.rev !== rev) throw new ApiError("conflict", 409);
+  const r = applySettingsPatch(stored.settings, patch);
+  if (!r.ok) throw new ApiError(r.error, r.error === "provider_incomplete" ? 422 : 400);
+  if (r.changed.length > 0) {
+    const nextRev = crypto.randomUUID();
+    const nowIso = new Date(ctx.nowMs).toISOString();
+    const out = await db.batch([
+      db
+        .prepare(
+          `INSERT INTO settings (key, value_json, updated_by, updated_at) VALUES (?1, ?2, ?3, ?4)
+           ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json,
+             updated_by = excluded.updated_by, updated_at = excluded.updated_at
+           WHERE (CASE WHEN json_valid(settings.value_json)
+                       THEN json_extract(settings.value_json, '$.rev') END) IS ?5`,
+        )
+        .bind(
+          SETTING_NOTIFICATIONS,
+          JSON.stringify({ ...r.value, rev: nextRev }),
+          who,
+          nowIso,
+          rev,
+        ),
+      auditStatement(
+        db,
+        {
+          actorEmail: who,
+          action: "dq.notifications_changed",
+          entity: "setting",
+          entityId: SETTING_NOTIFICATIONS,
+          before: stored.settings,
+          after: r.value,
+        },
+        { sql: "changes() = 1", binds: [] },
+      ),
+    ]);
+    if ((out[0]?.meta.changes ?? 0) !== 1) throw new ApiError("conflict", 409);
+  }
+  return json(await notificationsView(ctx));
+}
+
+/** One test message to the caller (who must be an allowed recipient), at most one per minute. */
+async function testNotificationHandler(ctx: Ctx): Promise<Response> {
+  const db = ctx.env.DB;
+  const who = actor(ctx);
+  const userId = ctx.session?.userId ?? 0;
+  const { settings } = await loadNotificationSettings(db);
+  const sender = senderFromSettings(ctx.env, settings);
+  if (sender.kind === "disabled") {
+    return json({
+      status: "skipped_not_configured",
+      code: null,
+    } satisfies DqNotificationsTestResponse);
+  }
+  const allowed = await loadRecipients(db, ctx.env.ALLOWED_HD, "admin");
+  const me = allowed.find((r) => r.id === userId);
+  if (!me) throw new ApiError("not_an_allowed_recipient", 422);
+  const nowIso = new Date(ctx.nowMs).toISOString();
+  const key = testKey(userId, Math.floor(ctx.nowMs / 60_000));
+  if (!(await claimPlain(db, { key, kind: "test", recipients: 1 }, nowIso, who))) {
+    throw new ApiError("too_soon", 409);
+  }
+  const res = await deliver(db, sender, key, { to: [me.email], ...renderTest() }, nowIso);
+  return json({
+    status: res.status,
+    code: res.status === "failed" || res.status === "unknown" ? res.code : null,
+  } satisfies DqNotificationsTestResponse);
+}
+
 export function registerDqRoutes(router: Router): void {
   router.add("GET", "/api/dq/summary", ANY_ROLE, safely(summaryHandler));
   router.add("GET", "/api/dq/issues", ANY_ROLE, safely(issuesHandler));
@@ -612,4 +735,7 @@ export function registerDqRoutes(router: Router): void {
   router.add("POST", "/api/dq/issues/:id/resolve-note", FINANCE, safely(resolveHandler));
   router.add("GET", "/api/dq/rules", ADMIN, safely(rulesHandler));
   router.add("PATCH", "/api/dq/rules/:id", ADMIN_STEP_UP, safely(patchRuleHandler));
+  router.add("GET", "/api/dq/notifications", ADMIN, safely(getNotificationsHandler));
+  router.add("PATCH", "/api/dq/notifications", ADMIN_STEP_UP, safely(patchNotificationsHandler));
+  router.add("POST", "/api/dq/notifications/test", ADMIN_STEP_UP, safely(testNotificationHandler));
 }

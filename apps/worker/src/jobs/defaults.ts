@@ -17,7 +17,7 @@ import { MAX_CALLS_PER_RUN as BOOKING_CALL_BUDGET } from "../booking/executor";
 import { BANK_BALANCES_BUDGET } from "../exact/bank-balances";
 import { FULL_SYNC_BUDGET, INCREMENTAL_SYNC_BUDGET } from "./exact-handlers";
 
-export const DEFAULT_JOBS_VERSION = 4;
+export const DEFAULT_JOBS_VERSION = 5;
 const MARKER = "seed.default_jobs";
 
 export interface DefaultJob {
@@ -90,6 +90,15 @@ export const DEFAULT_JOBS: readonly DefaultJob[] = [
     schedule: { kind: "cron", expr: "20 * * * *" },
     // Reads D1 only (no Exact or Revolut call), so it ships ON for new installs; existing rows are
     // never flipped (an admin switches it on, docs/DEPLOY.md).
+    enabled: true,
+    exactBudget: 0,
+  },
+  {
+    name: "dq.digest",
+    handler: "dq.digest",
+    // 08:00 Europe/Amsterdam (the cron is evaluated in that zone). Ships ON but sends nothing until
+    // the e-mail provider is configured: it then records 'skipped_not_configured' (ADR 0046).
+    schedule: { kind: "cron", expr: "0 8 * * *" },
     enabled: true,
     exactBudget: 0,
   },

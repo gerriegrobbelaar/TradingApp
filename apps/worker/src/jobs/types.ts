@@ -2,6 +2,7 @@
 import type { ScheduleRules } from "@camelthorn/core";
 import type { Role } from "../auth/session";
 import type { Env } from "../env";
+import type { EmailSender } from "../email/sender";
 import type { SyncDeps } from "../exact/sync";
 
 /** Roles that may start a job by hand unless the handler says otherwise. */
@@ -55,6 +56,8 @@ export interface JobContext {
   now: () => number;
   /** Test seam: replaces the Exact transport and gate. Never set in production. */
   syncDeps?: SyncDeps;
+  /** Test seam: replaces the e-mail sender. Never set in production. */
+  emailSender?: EmailSender;
 }
 
 export interface HandlerResult {

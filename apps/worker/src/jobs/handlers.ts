@@ -11,6 +11,7 @@ import {
 } from "../fx/ecb-import";
 import { DAILY_BOOKING_CALL_CAP, runBookMatches } from "../booking/executor";
 import { runBankBalances } from "../exact/bank-balances";
+import { runDigest } from "../dq/digest";
 import { runDqChecks } from "../dq/run";
 import { runMatching } from "../matching/run";
 import { loadRevolutConfig } from "../revolut/config";
@@ -144,6 +145,20 @@ export const HANDLERS: Record<string, HandlerDef> = {
           implemented: isImplemented(h),
         }),
       }),
+  },
+  "dq.digest": {
+    title: "Data quality digest",
+    description:
+      "Sends each admin and finance user on the allowed domain one e-mail with the open data quality issues: counts by severity and area, what is new, the oldest issue, the top ten with fix links and the rules that were not evaluated. Sends nothing until the e-mail provider is configured (Settings); it then records 'skipped_not_configured'. One e-mail per person and day, never repeated.",
+    usesExact: false,
+    phase: null,
+    // A refused send (provider said no) is retried after ten minutes; an unclear outcome never is.
+    maxAttempts: 3,
+    scheduleRules: { minIntervalMinutes: 12 * 60 },
+    maxLatenessMs: 4 * HOUR,
+    // Sends e-mail: a fresh sign-in is needed to start it by hand.
+    stepUp: true,
+    run: (ctx) => runDigest(ctx),
   },
   "reminders.send": {
     title: "Payment reminders",

@@ -34,6 +34,8 @@ export interface Env {
   REVOLUT_REDIRECT_URI: string;
   /** Workers secret: PKCS#8 PEM private key whose certificate is registered with Revolut. */
   REVOLUT_PRIVATE_KEY: string;
+  /** Workers secret, optional: API key of the transactional e-mail provider (ADR 0046). */
+  EMAIL_API_KEY?: string;
   /** One instance per Revolut connection ("revolut:<connection id>"). */
   REVOLUT_GATE: DurableObjectNamespace<RevolutGate>;
   /** One instance per Exact division ("exact:<division>"), plus token authorities. */

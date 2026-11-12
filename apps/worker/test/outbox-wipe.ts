@@ -13,3 +13,19 @@ export async function outboxWipeStatements(db: D1Database): Promise<D1PreparedSt
   if (row === null) return [wipe];
   return [db.prepare("DROP TRIGGER outbox_guard_delete"), wipe, db.prepare(row.sql)];
 }
+
+/**
+ * Test setup only: empties email_log. Migration 0027 refuses to delete a row younger than 365 days
+ * (`email_log_keep_recent`), so a reset lifts that one trigger inside the same batch and puts it
+ * back unchanged.
+ */
+export async function emailLogWipeStatements(db: D1Database): Promise<D1PreparedStatement[]> {
+  const row = await db
+    .prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'email_log_keep_recent'",
+    )
+    .first<{ sql: string }>();
+  const wipe = db.prepare("DELETE FROM email_log");
+  if (row === null) return [wipe];
+  return [db.prepare("DROP TRIGGER email_log_keep_recent"), wipe, db.prepare(row.sql)];
+}
