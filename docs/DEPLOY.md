@@ -993,8 +993,7 @@ Two jobs, with different risk:
   off on an upgraded install.** That is harmless and honest: the digest only records a skipped row until
   an e-mail provider is set, and once it is, it opens with "Data quality checks have never run" (or "have
   not run since <date>") instead of "0 open issues". Switch `dq.checks` on first. Alerts and the digest
-  are described in the next section (ADR 0046); there is no screen yet (D8c), read the result through
-  the API.
+  are described in the next section (ADR 0046); the Data health screen (`/data-health`, ADR 0047) shows the result.
 - **`exact.bank_balances`** reads from Exact (one `financial/ReportingBalance` call per mapped bank
   account, at most 20 calls per run and administration) and stores `bank_accounts.exact_balance_minor`.
   It ships **off** (`awaiting_live_verification`). Enable it only after the checks below.
@@ -1069,7 +1068,7 @@ How to enable (staging first, `--env staging` on every command):
 
 1. Pick a transactional e-mail provider with an HTTPS API that accepts `POST /emails` with
    `Authorization: Bearer <key>` and JSON `{from, to[], subject, html, text}` (Resend does). Verify
-   the sender address or domain with the provider (SPF/DKIM) so mail from it is delivered.
+   the sender address or domain with the provider (SPF/DKIM) so mail from it is delivered. **Data protection:** alert and digest bodies carry supplier and customer names, invoice numbers and amounts, so they leave our EU storage for the provider. Choose a provider that processes in the EU and sign its data processing agreement (DPA) before step 2; if that is not possible, do not enable sending until the body can be reduced to counts plus a link (open decision 5, ADR 0046).
 2. Store the key as a secret, never in `wrangler.toml`: `pnpm exec wrangler secret put EMAIL_API_KEY`.
 3. As an admin with a fresh sign-in set the sender and the links:
    `PATCH /api/dq/notifications` with `{"rev": <rev from GET>, "emailProvider": "https", "emailHost":
@@ -1077,8 +1076,16 @@ How to enable (staging first, `--env staging` on every command):
    `GET /api/dq/notifications` must now say `apiKeyPresent: true`, `senderActive: true` and a
    `recipientCount` equal to your admins and finance users on the camelthorncapital.com domain
    (nobody else ever receives mail: recipients come from the users table only).
+   The same can be done on screen in Settings, Notifications (admins only, fresh sign-in on save):
+   "Sending" = "Email API", "Provider host", "From address", "App address for links", then Save.
+   A new host (or switching sending on) first asks "Send the API key to this host?" with the exact
+   `https://<host>`; check it and choose "Save and send the key there". The key itself is never on
+   the screen: "API key" only says Set or Not set, and "Sending" says Configured once the GET above
+   would say `senderActive: true`. The hour of the digest is the job "Data quality digest" in
+   Settings, Schedules.
 4. **Send a test message to yourself**: `POST /api/dq/notifications/test` (fresh sign-in; answer
-   `{"status":"sent"}`). It goes to the calling admin only and is limited to one per minute. Check the
+   `{"status":"sent"}`), or "Send test email to me" in Settings, Notifications (it is off while the
+   form has unsaved changes: the test always uses the saved settings). It goes to the calling admin only and is limited to one per minute. Check the
    inbox (not spam), the sender, that the link is clickable. A `failed` answer carries a code
    (`http_401` wrong key, `http_403`/`http_422` unverified sender or payload); `unknown` means a
    timeout or a 5xx: check the provider dashboard before trying again.
@@ -1108,7 +1115,8 @@ How to enable (staging first, `--env staging` on every command):
    (timeout, 5xx) or the Worker stopped between claim and send: it is **never** sent again by the code,
    so look at the provider log. If the mail did not go out, the next daily digest still lists the issue.
    `failed` rows are retried up to three times.
-8. Switching off: `PATCH ... {"enabled": false}` stops alerts and the digest; `{"emailProvider":
+8. Switching off: `PATCH ... {"enabled": false}` (on screen: the switch "Send alerts and the digest")
+   stops alerts and the digest; `{"emailProvider":
    "disabled"}` stops sending but keeps the pending criticals for later. Removing a user's admin or
    finance role stops mail to them at the next send.
 9. Retention: `email_log` rows older than 400 days are deleted by the alert pass and the digest job. The

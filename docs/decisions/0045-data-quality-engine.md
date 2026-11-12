@@ -1,6 +1,6 @@
 # 0045 Data quality engine: rules, fingerprints, not-available semantics, storage (Phase 8, D8a)
 
-Status: accepted for the code; **no rule has run against live data**. Code: `packages/core/src/dq/` (types, util, rules-bank, rules-relations, rules-system, registry), `apps/worker/src/dq/` (load, store, run, routes), `apps/worker/src/exact/bank-balances.ts`, migration `0026_data_quality.sql`, API types in `packages/core/src/api-types.ts` (Dq*), phrase `DQ_LOOSEN_PHRASE`. CLAUDE.md 4.6 is the brief. No screen yet (D8b).
+Status: accepted for the code; **no rule has run against live data**. Code: `packages/core/src/dq/` (types, util, rules-bank, rules-relations, rules-system, registry), `apps/worker/src/dq/` (load, store, run, routes), `apps/worker/src/exact/bank-balances.ts`, migration `0026_data_quality.sql`, API types in `packages/core/src/api-types.ts` (Dq*), phrase `DQ_LOOSEN_PHRASE`. CLAUDE.md 4.6 is the brief. The screens (Data health, Today) came in D8c, see ADR 0047.
 
 ## What was built
 
@@ -97,4 +97,4 @@ Issue subject and message are cleaned (control and bidi characters out, whitespa
 
 ## Not done here
 
-The screens (Data health, Today queue; D8c), the daily digest and instant alerts (done in D8b, ADR 0046), Cloudflare cron wiring beyond the existing scheduler, ING/Rabobank balances, retention of `dq_runs` (small; one row per run, add to housekeeping if it grows), and a per-user "assigned to" field.
+The screens (Data health, Today queue: done in D8c, ADR 0047), the daily digest and instant alerts (done in D8b, ADR 0046), Cloudflare cron wiring beyond the existing scheduler, ING/Rabobank balances, retention of `dq_runs` (small; one row per run, add to housekeeping if it grows), and a per-user "assigned to" field.

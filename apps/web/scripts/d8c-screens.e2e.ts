@@ -20,6 +20,7 @@ import {
   dqRules,
   dqSummary,
   mixedQueue,
+  notifications,
   todayResponse,
 } from "../src/test-fixtures-dq";
 
@@ -43,6 +44,7 @@ interface Page {
   evaluate<T>(fn: (() => T) | string): Promise<T>;
   waitForSelector(sel: string, o?: { timeout?: number }): Promise<unknown>;
   click(sel: string): Promise<void>;
+  fill(sel: string, value: string): Promise<void>;
   keyboard: { press(key: string): Promise<void> };
   close(): Promise<void>;
 }
@@ -120,6 +122,14 @@ function api(path: string, scene: Scene): unknown {
         : dqIssues([]);
     case "/api/dq/rules":
       return dqRules();
+    case "/api/dq/notifications":
+      // Review V2: the API key is never part of the answer, only whether it is set.
+      return scene === "empty"
+        ? notifications(
+            { apiKeyPresent: false, senderActive: false },
+            { emailProvider: "disabled", emailHost: "", emailFrom: "" },
+          )
+        : notifications();
     default:
       return null;
   }
@@ -190,7 +200,8 @@ afterEach(() => {
   expect(takeUnmocked()).toEqual([]);
 });
 
-type Step = "none" | "j" | "later" | "issue" | "rule" | "critical-rule" | "today-sheet";
+type Step =
+  "none" | "notify-confirm" | "j" | "later" | "issue" | "rule" | "critical-rule" | "today-sheet";
 interface Shot {
   name: string;
   path: string;
@@ -246,6 +257,26 @@ const SHOTS: Shot[] = [
     ready: "button[aria-label^='Settings for']:not([disabled])",
     step: "rule",
     height: 1600,
+  },
+  {
+    name: "settings-notifications",
+    path: "/settings/notifications",
+    ready: "#nt-host-hint",
+    height: 1800,
+  },
+  {
+    name: "settings-notifications-unset",
+    path: "/settings/notifications",
+    scene: "empty",
+    ready: "#nt-host-hint",
+    height: 1800,
+  },
+  {
+    name: "settings-notifications-confirm",
+    path: "/settings/notifications",
+    ready: "#nt-host-hint",
+    step: "notify-confirm",
+    height: 1800,
   },
   {
     name: "health-rule-critical",
@@ -305,12 +336,30 @@ describe("Today and Data health", () => {
             await page.click("button[aria-label^='Settings for']:not([disabled])");
             await page.waitForSelector("[role='dialog'] [role='switch']", { timeout: 5_000 });
           }
+          if (shot.step === "notify-confirm") {
+            await page.fill("input[aria-describedby='nt-host-hint']", "mail.other.example.org");
+            await page.click("button[type='submit']");
+            await page.waitForSelector("[role='dialog'] strong", { timeout: 5_000 });
+          }
           if (shot.step === "critical-rule") {
             await page.click("button[aria-label='Settings for Supplier bank details changed']");
             await page.waitForSelector("[role='dialog'] [role='switch']", { timeout: 5_000 });
             await page.click("[role='dialog'] [role='switch']");
             await page.waitForSelector("[role='dialog'] .notice.warn", { timeout: 5_000 });
           }
+          // Review V2: let sheets, focus rings and toasts finish their transitions first. On a
+          // loaded machine axe otherwise measured a button colour half-way (4.27:1, flaky).
+          await page.evaluate(
+            `Promise.race([
+              Promise.all(
+                document
+                  .getAnimations()
+                  .filter((a) => a.effect?.getComputedTiming().iterations !== Infinity)
+                  .map((a) => a.finished.catch(() => undefined)),
+              ),
+              new Promise((r) => setTimeout(r, 3000)),
+            ])`,
+          );
           const overflow = await page.evaluate<number>(
             () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
           );
@@ -351,6 +400,8 @@ describe("Today keyboard in a real browser", () => {
     expect(await count()).toBe(4);
     await page.keyboard.press("j");
     await page.waitForSelector("[role='option'][aria-selected='true'][id$='dq-4']");
+    // Focus follows in the effect after the selection renders: wait for it (flaky under load).
+    await page.waitForSelector("[role='option'][id$='dq-4']:focus", { timeout: 5_000 });
     expect(await page.evaluate<string>(() => document.activeElement?.id ?? "")).toMatch(/dq-4$/);
     await page.keyboard.press("l");
     await page.waitForSelector(".toast");

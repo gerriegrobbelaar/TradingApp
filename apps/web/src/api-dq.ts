@@ -5,6 +5,9 @@
  */
 import type {
   DqIssueResponse,
+  DqNotificationsPatchRequest,
+  DqNotificationsResponse,
+  DqNotificationsTestResponse,
   DqIssuesResponse,
   DqRulePatchRequest,
   DqRulePatchResponse,
@@ -54,3 +57,14 @@ export const patchDqRule = (id: string, body: DqRulePatchRequest) =>
     method: "PATCH",
     body,
   });
+
+// ---- notifications (admin; Phase 8 review V2) ----------------------------------------------------
+
+export const getDqNotifications = (signal?: AbortSignal) =>
+  request<DqNotificationsResponse>("/api/dq/notifications", sig(signal));
+
+export const patchDqNotifications = (body: DqNotificationsPatchRequest) =>
+  request<DqNotificationsResponse>("/api/dq/notifications", { method: "PATCH", body });
+
+export const sendDqTestEmail = () =>
+  request<DqNotificationsTestResponse>("/api/dq/notifications/test", { method: "POST", body: {} });

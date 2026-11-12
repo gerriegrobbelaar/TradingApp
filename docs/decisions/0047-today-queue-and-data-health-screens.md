@@ -42,3 +42,7 @@ Fix links: Data health maps the issue's `fix` key through `DQ_FIX_PATHS` (own ke
 Snooze: choices up to 90 days; the request stays 5 minutes inside the server's 90-day limit so a browser clock slightly ahead is not refused.
 
 Contrast: queue items have no background fill; with one, the severity chips inside fell below 4.5:1 in the dark theme (3.6 to 4.1). Selection is a thicker accent border. `health-contrast.test.ts` checks the chips inside items, the focus ring and that no fill comes back. Rule settings are admin only (step-up; typed phrase when a critical rule is loosened, decided locally with core `isLooseningChange` and again by the server).
+
+## Today has no reminders source until Phase 10
+
+The Today queue lists approvals, matches, bookings and data issues. Payment reminders and resend emails are not a source yet (Phase 10 adds one), so an empty Today never means "no reminders are due"; it only covers the kinds the queue lists.

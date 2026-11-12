@@ -6,6 +6,7 @@ import {
   dqRuleById,
   type DqIssueDto,
   type DqIssuesResponse,
+  type DqNotificationsResponse,
   type DqRuleDto,
   type DqRuleStatusDto,
   type DqRulesResponse,
@@ -234,3 +235,27 @@ export function dqRules(over: Record<string, Partial<DqRuleDto>> = {}): DqRulesR
 }
 
 export const SEVERITIES: readonly DqSeverity[] = ["critical", "warning", "info"];
+
+export function notifications(
+  over: Partial<DqNotificationsResponse> = {},
+  settings: Partial<DqNotificationsResponse["settings"]> = {},
+): DqNotificationsResponse {
+  return {
+    settings: {
+      enabled: true,
+      alertRecipients: "admin_finance",
+      baseUrl: "https://app.camelthorncapital.com",
+      maxAlertsPerRun: 10,
+      emailProvider: "https",
+      emailHost: "api.mailer.example.com",
+      emailFrom: "alerts@camelthorncapital.com",
+      ...settings,
+    },
+    rev: "rev-1",
+    apiKeyPresent: true,
+    senderActive: true,
+    allowedDomain: "camelthorncapital.com",
+    recipientCount: 3,
+    ...over,
+  };
+}
