@@ -2,8 +2,10 @@
 // (apps/worker). There is a single copy, here; the worker imports it from `@camelthorn/exact`.
 // (E1 and E2 were built on separate branches against an identical copy; that is no longer true.)
 
-/** Job ids are short and plain: they key budgets in the gate and appear in logs. */
-export const JOB_ID_RE = /^[A-Za-z0-9_.:-]{1,100}$/;
+import { JOB_ID_RE } from "@camelthorn/core";
+
+/** One definition, in @camelthorn/core (job-id.ts); re-exported for existing importers. */
+export { JOB_ID_RE };
 
 export type ExactPriority = "user" | "job";
 

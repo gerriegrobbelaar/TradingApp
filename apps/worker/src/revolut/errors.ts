@@ -7,6 +7,7 @@ import {
   RevolutAuthError,
   RevolutBudgetExhaustedError,
   RevolutRateLimitedError,
+  WRITE_AUTH_RETRY_REFUSED_CODE,
 } from "@camelthorn/revolut";
 import { IngestError } from "./ingest";
 
@@ -57,7 +58,7 @@ export function classifyRevolutError(e: unknown): Classified {
 }
 
 /** The gate's answer to a write that got a 401: not re-sent, token healed (ADR 0048). */
-export const WRITE_AUTH_RETRY_REFUSED = "write_auth_retry_refused";
+export const WRITE_AUTH_RETRY_REFUSED = WRITE_AUTH_RETRY_REFUSED_CODE;
 
 /**
  * Runs a Revolut write and, if the gate refused to re-send it after a 401, runs it ONCE more.

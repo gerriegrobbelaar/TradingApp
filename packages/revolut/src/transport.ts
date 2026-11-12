@@ -1,8 +1,10 @@
 // The interface between the Revolut client (this package) and the RevolutGate Durable Object
 // (apps/worker). One copy, here; the worker imports it from `@camelthorn/revolut`.
 
-/** Job ids are short and plain: they key budgets in the gate and appear in logs. */
-export const JOB_ID_RE = /^[A-Za-z0-9_.:-]{1,100}$/;
+import { JOB_ID_RE } from "@camelthorn/core";
+
+/** One definition, in @camelthorn/core (job-id.ts); re-exported for existing importers. */
+export { JOB_ID_RE };
 
 export type RevolutPriority = "user" | "job";
 
@@ -65,5 +67,21 @@ export class RevolutBudgetExhaustedError extends Error {
     super(`revolut call budget exhausted for job ${jobId}`);
     this.name = "RevolutBudgetExhaustedError";
     this.jobId = jobId;
+  }
+}
+
+/**
+ * A WRITE got a 401. The gate healed the token and did NOT re-send the write (ADR 0048, invariant
+ * 2). It is a RevolutApiError (503, code `write_auth_retry_refused`) so every existing caller keeps
+ * working, but it has its own wire kind: unlike `gate_unavailable` (the gate was reset, nothing is
+ * known), here Revolut ANSWERED, and refused the credentials. Callers that may repeat the write
+ * (webhook create, idempotent DELETEs) repeat it once; a payment never does (it first reads the
+ * outcome by its `request_id`).
+ */
+export const WRITE_AUTH_RETRY_REFUSED_CODE = "write_auth_retry_refused";
+export class RevolutWriteAuthRetryRefused extends RevolutApiError {
+  constructor(message = "write not re-sent after 401") {
+    super(503, message, WRITE_AUTH_RETRY_REFUSED_CODE);
+    this.name = "RevolutWriteAuthRetryRefused";
   }
 }

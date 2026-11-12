@@ -7,10 +7,8 @@
  * /transfer, /counterparty creation: payments are Phase 9, behind four-eyes controls) and every
  * webhook call except creating and deleting the subscription (and listing them, for one job id).
  */
-import { RevolutApiError, type RevolutRequest } from "@camelthorn/revolut";
+import { RevolutApiError, JOB_ID_RE, type RevolutRequest } from "@camelthorn/revolut";
 import { revolutApiHost, type RevolutEnvironment } from "./config";
-
-export const JOB_ID_RE = /^[A-Za-z0-9_.:-]{1,100}$/;
 
 const UUID = "[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}";
 /** A transaction id or a client-chosen request id (Revolut accepts both on /transaction/{id}). */

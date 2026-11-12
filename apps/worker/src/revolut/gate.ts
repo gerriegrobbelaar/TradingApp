@@ -27,6 +27,7 @@ import {
   RevolutAuthError,
   RevolutBudgetExhaustedError,
   RevolutRateLimitedError,
+  RevolutWriteAuthRetryRefused,
   type RevolutRequest,
   type RevolutResponse,
 } from "@camelthorn/revolut";
@@ -373,7 +374,7 @@ export class RevolutGate extends GateCore<
       // rejected write is not ours to guess. Heal the token for the caller's next call, then fail
       // retryably; the caller retries with its own idempotency key.
       await this.#refreshAccessToken(row.id, row.expires_at ?? undefined).catch(() => undefined);
-      throw new RevolutApiError(503, "write not re-sent after 401", "write_auth_retry_refused");
+      throw new RevolutWriteAuthRetryRefused();
     }
     if (res.status === 401 && !verifying) {
       if (item.retried) throw new RevolutAuthError("unauthorized");

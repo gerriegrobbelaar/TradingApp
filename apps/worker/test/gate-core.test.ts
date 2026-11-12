@@ -4,6 +4,7 @@
  * gate-characterization.test.ts.
  */
 import { runInDurableObject } from "cloudflare:test";
+import { JOB_ID_RE as CORE_JOB_ID_RE } from "@camelthorn/core";
 import { JOB_ID_RE as EXACT_JOB_ID_RE } from "@camelthorn/exact";
 import { JOB_ID_RE as REVOLUT_JOB_ID_RE } from "@camelthorn/revolut";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -30,9 +31,11 @@ const files = (
 ).glob("../src/**/*.ts", { query: "?raw", import: "default", eager: true });
 
 describe("shared core structure", () => {
-  it("uses the same job id pattern as both client packages", () => {
-    expect(JOB_ID_RE.source).toBe(EXACT_JOB_ID_RE.source);
-    expect(JOB_ID_RE.source).toBe(REVOLUT_JOB_ID_RE.source);
+  it("uses ONE job id pattern: the same object in core, both client packages and the gate core", () => {
+    expect(JOB_ID_RE).toBe(CORE_JOB_ID_RE);
+    expect(EXACT_JOB_ID_RE).toBe(CORE_JOB_ID_RE);
+    expect(REVOLUT_JOB_ID_RE).toBe(CORE_JOB_ID_RE);
+    expect(CORE_JOB_ID_RE.source).toBe("^[A-Za-z0-9_.:-]{1,100}$");
   });
 
   it("keeps the user burst at five", () => {
@@ -110,7 +113,7 @@ describe("divergence fixes (ADR 0048)", () => {
     const first = await create();
     expect(first).toMatchObject({
       ok: false,
-      error: { kind: "api", status: 503, code: "write_auth_retry_refused" },
+      error: { kind: "write_auth_retry_refused" },
     });
     expect(stub.apiCalls).toHaveLength(1); // not sent a second time
     expect(stub.tokenCalls).toHaveLength(1); // healed for the next call

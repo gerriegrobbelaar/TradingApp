@@ -20,6 +20,7 @@
  * Nothing in here logs request bodies, URLs, IBANs or tokens. Token-bearing results leave this
  * class only through the subclasses' own entry points.
  */
+import { JOB_ID_RE } from "@camelthorn/core";
 import { DurableObject } from "cloudflare:workers";
 import { decryptToken, encryptToken, keyring, TokenCryptoError } from "../crypto/token-crypto";
 import { auditStatement } from "../db/audit";
@@ -121,11 +122,8 @@ export interface HttpOutcome {
   body: string;
 }
 
-/**
- * Job ids are short identifiers; anything else is refused before it can reach storage keys. The
- * same pattern as `JOB_ID_RE` in @camelthorn/exact and @camelthorn/revolut (a test pins that).
- */
-export const JOB_ID_RE = /^[A-Za-z0-9_.:-]{1,100}$/;
+/** Job ids: the one definition lives in @camelthorn/core (job-id.ts). */
+export { JOB_ID_RE };
 export const CREDENTIALS_REJECTED = "token_endpoint_rejected_credentials";
 /** A refresh the token endpoint rejects (unclassifiable) is retried after these waits. */
 const REFRESH_RETRY_DELAYS_MS = [5_000, 15_000];
