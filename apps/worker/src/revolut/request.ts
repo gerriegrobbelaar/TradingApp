@@ -13,6 +13,7 @@ import {
   draftTitle,
   isPaymentJobId,
   JOB_ID_RE,
+  PAYMENT_JOB_ID,
   RevolutApiError,
   type RevolutRequest,
 } from "@camelthorn/revolut";
@@ -69,14 +70,23 @@ const ALLOWED: readonly Allowed[] = [
     re: /^\/counterparty$/,
     payment: "write",
     onlyPriority: "user",
+    onlyJobs: [PAYMENT_JOB_ID],
   },
-  { version: "1.0", methods: ["POST"], re: /^\/pay$/, payment: "write", onlyPriority: "user" },
+  {
+    version: "1.0",
+    methods: ["POST"],
+    re: /^\/pay$/,
+    payment: "write",
+    onlyPriority: "user",
+    onlyJobs: [PAYMENT_JOB_ID],
+  },
   {
     version: "1.0",
     methods: ["POST"],
     re: /^\/payment-drafts$/,
     payment: "write",
     onlyPriority: "user",
+    onlyJobs: [PAYMENT_JOB_ID],
   },
   { version: "1.0", methods: ["GET"], re: /^\/payment-drafts$/, payment: "read" },
   {
@@ -157,7 +167,7 @@ function checkPaymentBody(req: RevolutRequest): void {
 export function paymentEndpointDescriptor(): string[] {
   return ALLOWED.filter((a) => a.payment !== undefined).map(
     (a) =>
-      `${a.payment} ${a.version} ${a.methods.join(",")} ${a.re.source} ${a.onlyPriority ?? "any"}`,
+      `${a.payment} ${a.version} ${a.methods.join(",")} ${a.re.source} ${a.onlyPriority ?? "any"} ${(a.onlyJobs ?? ["any"]).join(",")}`,
   );
 }
 

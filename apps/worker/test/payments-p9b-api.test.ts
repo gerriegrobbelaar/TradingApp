@@ -476,4 +476,4 @@ describe("the enable path ships OFF and needs every layer", () => {
   });
 });
 
-const PINNED_PROTOCOL_VERSION = "2f3a966f397d17849fa205d57299c860c0b4b66e91599f0ee1f13a15821522bf";
+const PINNED_PROTOCOL_VERSION = "962f1e037d440e57ccfbb15f2ac1de46caae51535e67966fd66ac73acfe482e9";

@@ -152,7 +152,9 @@ describe("the Revolut gate reaches exactly the payment endpoints of ADR 0050", (
       body: pay.body,
     };
     expect(accepts(ok)).toBe(true);
-    expect(accepts({ ...ok, jobId: "revolut-payment:reconcile" })).toBe(true);
+    // review P9b: writes only for the exact sending job id; the reconcile class can never write
+    expect(accepts({ ...ok, jobId: "revolut-payment:reconcile" })).toBe(false);
+    expect(accepts({ ...ok, jobId: "revolut-payment:x" })).toBe(false);
     expect(accepts({ ...ok, jobId: "revolut-sync" })).toBe(false);
     expect(accepts({ ...ok, jobId: "revolut-payments" })).toBe(false);
     expect(accepts({ ...ok, priority: "job" })).toBe(false);
