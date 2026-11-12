@@ -125,7 +125,6 @@ export class RevolutGate extends GateCore<
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env, { ...DEFAULT_LIMITS });
     this.stashRefreshExpiry = true;
-    void ctx.blockConcurrencyWhile(() => this.load());
   }
 
   // ---------------------------------------------------------------------------------------
@@ -317,11 +316,17 @@ export class RevolutGate extends GateCore<
   // Executing a call
   // ---------------------------------------------------------------------------------------
 
-  /** Returns null when the request was put back in the queue for one retry after a 401. */
-  protected async execute(
+  /**
+   * Returns null when the request was put back in the queue for one retry after a 401. An instance
+   * property, not a method: it runs a request past the door checks, so it is not RPC-callable.
+   */
+  protected readonly execute = async (
     item: Queued<RevolutRequest, RevolutResponse>,
-  ): Promise<RevolutResponse | null> {
+  ): Promise<RevolutResponse | null> => {
     const { req } = item;
+    // The static allow-list once more (it is the whole write policy here): nothing reaches the
+    // network that `validateRequest` would refuse, whatever path led to this call.
+    validateRequest(req);
     const row = await loadRevolutById(this.env.DB, req.connectionId);
     // A 'pending' connection holds tokens an admin has not confirmed yet (they may belong to
     // somebody else's Revolut account, review R2). While the confirmation window is open they
@@ -344,7 +349,7 @@ export class RevolutGate extends GateCore<
     if (!environment) throw new RevolutAuthError("not_connected");
     const url = buildUrl(environment, req);
     if (req.method === "POST" && req.path === "/webhooks") this.checkWebhookTarget(req.body);
-    const token = await this.accessTokenFor(row);
+    const token = await this.#accessTokenFor(row);
 
     const headers: Record<string, string> = {};
     for (const [k, v] of Object.entries(req.headers ?? {})) headers[k.toLowerCase()] = v;
@@ -382,7 +387,7 @@ export class RevolutGate extends GateCore<
     }
     if (res.status === 401) throw new RevolutAuthError("unauthorized");
     return { status: res.status, headers: outHeaders, body: res.body };
-  }
+  };
 
   /**
    * A webhook subscription receives every transaction of the account: it may only ever point at
@@ -421,7 +426,8 @@ export class RevolutGate extends GateCore<
     return Math.min(REFRESH_MARGIN_MS, Math.floor((i.expiresAt - i.issuedAt) / 2));
   }
 
-  private async accessTokenFor(row: RevolutConnectionRow): Promise<string> {
+  // JS-private: it returns a plaintext access token, so it must not be RPC-callable.
+  async #accessTokenFor(row: RevolutConnectionRow): Promise<string> {
     const exp = row.expires_at ? Date.parse(row.expires_at) : 0;
     // While a rotated pair is stashed (D1 write failed), D1's access token is the old one: let
     // the token authority answer from the stash instead.

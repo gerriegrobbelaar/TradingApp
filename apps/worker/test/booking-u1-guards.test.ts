@@ -214,7 +214,8 @@ describe("S9b: the status transitions of an outbox row", () => {
         expect(now[0]?.status, `${from} -> ${to}`).toBe(ALLOWED[from].includes(to) ? to : from);
       }
     }
-  });
+    // Dozens of D1 round trips: 2-5 s alone, over the 5 s default under a full parallel run.
+  }, 30_000);
 
   it("a row leaves outcome_unknown or failed for pending ONLY by an admin retry", async () => {
     for (const from of ["outcome_unknown", "failed"] as const) {

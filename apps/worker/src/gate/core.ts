@@ -180,18 +180,63 @@ export abstract class GateCore<
   /** Single flight: at most one refresh per connection is ever running in this instance. */
   private refreshing: { connectionId: number; promise: Promise<TokenResult> } | null = null;
 
-  /** Single-flight token refresh for a connection; subclasses wrap it in their own entry point. */
+  /** The one load of the persisted state (see `ensureLoaded`). */
+  #loading: Promise<void> | null = null;
+
+  /**
+   * Single-flight token refresh for a connection; subclasses wrap it in their own entry point.
+   *
+   * RPC surface rule (review G9): Workers RPC exposes every PROTOTYPE method of a Durable Object
+   * (TypeScript `private`/`protected` are not enforced at runtime) and no instance property. So
+   * everything that hands out a plaintext token, sends a request past the write policy, or performs
+   * the outbound fetch is an instance property or JS-private: `refreshShared`, `send`, the
+   * subclasses' `execute` and `#accessTokenFor`. gate-rpc-surface.test.ts pins the full list of
+   * prototype methods, so a new one is a reviewed change.
+   */
   protected readonly refreshShared: (
     connectionId: number,
     role: Role,
     staleExpiresAt?: string,
   ) => Promise<TokenResult>;
 
+  /**
+   * The one outbound fetch of a gate: never follows a redirect (the bearer token must not go
+   * elsewhere), always has a timeout, and reports any failure as a retryable 502 without details.
+   * An instance property (not RPC-callable, see above).
+   */
+  protected readonly send: (
+    url: URL,
+    req: { method: string; body?: string | undefined },
+    headers: Record<string, string>,
+  ) => Promise<HttpOutcome>;
+
   constructor(ctx: DurableObjectState, env: Env, limits: L) {
     super(ctx, env);
     this.limits = limits;
     this.refreshShared = (connectionId, role, staleExpiresAt) =>
       this.#refreshOnce(connectionId, role, staleExpiresAt);
+    this.send = (url, req, headers) => this.#send(url, req, headers);
+    // The persisted state is loaded HERE, so no subclass can forget it or run a method before it.
+    // The microtask yield lets the subclass constructor (and its field initialisers) finish first;
+    // blockConcurrencyWhile keeps every RPC call and the alarm out until the load is done, and the
+    // entry points also await `ensureLoaded` (a directly constructed instance, an alarm wake).
+    void ctx.blockConcurrencyWhile(async () => {
+      await Promise.resolve();
+      await this.ensureLoaded();
+    });
+  }
+
+  /** Loads the persisted state once; every entry point awaits it before touching state. */
+  protected ensureLoaded(): Promise<void> {
+    if (this.#loading === null) {
+      const p = this.load();
+      this.#loading = p;
+      // A failed load is retried by the next entry point instead of being cached.
+      p.catch(() => {
+        if (this.#loading === p) this.#loading = null;
+      });
+    }
+    return this.#loading;
   }
 
   // ---------------------------------------------------------------------------------------
@@ -292,6 +337,8 @@ export abstract class GateCore<
    * so a refresh for connection N can only ever run in the instance named for N.
    */
   protected async claimRole(role: Role): Promise<boolean> {
+    // Never pin (and persist) a role over a stored one this instance has not read yet.
+    await this.ensureLoaded();
     if (this.role === role) return true;
     if (this.role !== null) return false;
     this.role = role;
@@ -327,6 +374,7 @@ export abstract class GateCore<
 
   async request(req: Req): Promise<Res> {
     this.validate(req);
+    await this.ensureLoaded();
     // Defence in depth: the write policy runs before anything is queued or spent.
     await this.authorize(req);
     await this.admit(req);
@@ -343,6 +391,7 @@ export abstract class GateCore<
   /** Starts (or restarts) a job run with its own call budget. */
   async startJob(jobId: string, budget?: number): Promise<{ jobId: string; budget: number }> {
     if (!JOB_ID_RE.test(jobId)) throw this.apiError(400, "invalid job id", "job_id");
+    await this.ensureLoaded();
     if (
       budget !== undefined &&
       (!Number.isInteger(budget) || budget < 1 || budget > JOB_ID_MAX_BUDGET)
@@ -363,6 +412,7 @@ export abstract class GateCore<
 
   /** Ends a job run and returns how many calls it used. */
   async endJob(jobId: string): Promise<{ used: number }> {
+    await this.ensureLoaded();
     const job = this.jobs.get(jobId) ?? (await this.ctx.storage.get<JobState>(`job:${jobId}`));
     this.jobs.delete(jobId);
     await this.ctx.storage.delete(`job:${jobId}`);
@@ -384,6 +434,7 @@ export abstract class GateCore<
    * a failing usage flush after it cannot starve it.
    */
   protected async retryStash(): Promise<void> {
+    await this.ensureLoaded(); // an alarm can be the first event after a restart
     const id = this.authorityConnectionId();
     if (id === null) return;
     try {
@@ -765,8 +816,12 @@ export abstract class GateCore<
     }
   }
 
-  /** Performs one dispatched call. Returns null when it was put back in the queue for a retry. */
-  protected abstract execute(item: Queued<Req, Res>): Promise<Res | null>;
+  /**
+   * Performs one dispatched call. Returns null when it was put back in the queue for a retry.
+   * An instance property in the subclass, never a prototype method: it runs a request past the
+   * door checks, so it must not be RPC-callable (see `refreshShared`).
+   */
+  protected abstract readonly execute: (item: Queued<Req, Res>) => Promise<Res | null>;
 
   /** 0 = go now, >0 = wait this long; throws if the request must fail instead of waiting. */
   private waitFor(item: Queued<Req, Res>): number {
@@ -883,11 +938,8 @@ export abstract class GateCore<
   // Network
   // ---------------------------------------------------------------------------------------
 
-  /**
-   * The one outbound fetch of a gate: never follows a redirect (the bearer token must not go
-   * elsewhere), always has a timeout, and reports any failure as a retryable 502 without details.
-   */
-  protected async send(
+  /** Behind the instance property `send` (JS-private: not reachable over RPC). */
+  async #send(
     url: URL,
     req: { method: string; body?: string | undefined },
     headers: Record<string, string>,

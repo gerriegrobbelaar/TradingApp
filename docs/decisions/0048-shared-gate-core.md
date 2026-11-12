@@ -31,9 +31,11 @@ reads the core and also asserts that the Exact gate no longer calls `fetch`).
 | 429: the block is clamped to at least 1 s and at most the gate's maximum, the call is failed (never retried by the gate), later calls wait | `blockAfter429` |
 | Role pin: an instance serves exactly one identity, persisted on first use | `claimRole` |
 | Single-flight token refresh per connection | `#refreshOnce` (JS-private, reached through the instance property `refreshShared`) |
+| State loaded before any use: the core's constructor loads it under `blockConcurrencyWhile` (after the subclass constructor has finished), and every entry point (`request`, `startJob`, `endJob`, `claimRole`, the alarm's `retryStash`) awaits `ensureLoaded`, so a role can never be pinned over a stored one that was not read yet | `ensureLoaded` |
+| RPC surface: nothing that returns a token, dispatches past the door or performs the fetch is a prototype method (Workers RPC exposes prototype methods, whatever their TypeScript visibility, and no instance property) | `refreshShared`, `send`, `execute` are instance properties; `#accessTokenFor`, `#send`, `#refreshOnce`, `#doRefresh` are JS-private; `gate-rpc-surface.test.ts` pins the full list of prototype methods |
 | Refresh skeleton: a still-fresh token is not refreshed again; no refresh token means `needs_reauth`; client-credential rejection backs off; only a clear `invalid_grant` wipes tokens; the new pair is stored before the new access token is used, retried once, then stashed (ciphertext only) in Durable Object storage and written by the alarm; a failure in the bookkeeping afterwards never wipes tokens; a wrong `TOKEN_ENC_KEY` is `token_unreadable`, not a revoked grant | `#doRefresh`, `flushPending`, `retryStash` |
 | One alarm per object, only ever moved earlier | `armAlarm` |
-| The one outbound `fetch`: timeout, `redirect: "manual"` (the bearer token never follows a redirect), every failure is a retryable 502 `network` without details | `send` |
+| The one outbound `fetch`: timeout, `redirect: "manual"` (the bearer token never follows a redirect), every failure is a retryable 502 `network` without details | `send` (instance property over `#send`) |
 | Error classification at the RPC edge: the gate answers with a plain envelope, an unknown error is 503 `gate_unavailable` | `call` |
 
 ### Configurable (a hook or a constant of the subclass, never a fork of the logic)
@@ -41,7 +43,7 @@ reads the core and also asserts that the Exact gate no longer calls `fetch`).
 | Difference | Exact | Revolut |
 |---|---|---|
 | Request validation (SSRF, paths, headers) | `validateRequest` (exact/request.ts) | `validateRequest` (revolut/request.ts) |
-| Write policy | `authorize`: every non-GET is refused unless it is one of the two booking writes AND the fail-closed switch, the verification mark, the connection and the division allow-list say so, re-read from D1 at the door and twice more before the call (ADR 0044) | `authorize` is a no-op: the policy is the static allow-list in `validateRequest` (default deny; every payment endpoint refused) |
+| Write policy | `authorize`: every non-GET is refused unless it is one of the two booking writes AND the fail-closed switch, the verification mark, the connection and the division allow-list say so, re-read from D1 at the door and twice more before the call (ADR 0044) | `authorize` is a no-op: the policy is the static allow-list in `validateRequest` (default deny; every payment endpoint refused), checked at the door and again at the top of `execute` |
 | Role | `division:<n>` or `authority:<id>` | `connection:<id>` |
 | Limits | 60/min, 5,000/day, 10 % user reserve, job budget from `jobs.exact_budget` (default 500) | 60/min, no daily cap, default job budget 200 |
 | Daily budget and provider headers | `checkDaily`, `onSpend`, `extraMinuteWait`: Exact's headers can only tighten the limiter | none |
@@ -66,7 +68,10 @@ that weakens one is an ADR first.
    token and fails the call with a typed, retryable refusal (`ExactWriteAuthRetryRefused`,
    Revolut 503 `write_auth_retry_refused`), a 429 or a network failure is reported, not retried.
    Only a read is re-queued once, after a forced refresh. A caller that retries a payment sends
-   the same `request_id` or first reads the outcome.
+   the same `request_id` or first reads the outcome. Whether a refused write may go once more is
+   the caller's decision per write (`retryWriteOnceAfterAuthRefusal` in revolut/errors.ts, used
+   for the webhook create and the idempotent DELETEs); it repeats the identical request at most
+   once and never loops.
 3. **Write policy is default deny and checked in the gate.** A request the policy does not name is
    refused before it is queued, spends nothing and touches no state (no role claim, no budget).
    For a write whose preconditions live in D1 (switch, verification mark, limits), the gate reads
@@ -78,8 +83,13 @@ that weakens one is an ADR first.
    fails with a typed error and nothing is sent; there is no "just this once".
 5. **Rate limit.** No more than the per-minute cap in any 60 s span, across restarts.
 6. **One token refresh at a time per connection**, and a refresh never runs in an instance that
-   is not that connection's authority. The result carries a plaintext access token, so it is never
-   an RPC-callable method (instance property and a JS-private flow).
+   is not that connection's authority. Nothing that returns a plaintext token is RPC-callable,
+   with ONE deliberate exception: `ExactGate.refreshAccessToken` on the `exact-token:<id>`
+   authority, because a division gate is a different Durable Object and can only get its token
+   over RPC (ADR 0015). RevolutGate is its own authority and exposes no token at all. A payment
+   path must not add a second exception. (Any Worker code holding `env` can read D1 and
+   `TOKEN_ENC_KEY`, so this is a guard against accidental misuse, not a boundary against code
+   in our own Worker; the boundary is that only the gate files call a provider.)
 7. **Nothing sensitive leaves the gate.** No token, key, IBAN or body in a log, an error message or
    a wire envelope.
 
@@ -94,7 +104,19 @@ Found by reading both files and `git log` of each (Exact: 9 commits, Revolut: 4)
 1. **A write was re-sent after a 401 (Revolut only). Fixed.** ExactGate never re-sends a write
    (M7c). RevolutGate re-queued any 401, including `POST /webhooks`. Now a write that gets a 401
    heals the token and fails with 503 `write_auth_retry_refused`; the caller retries. A payment
-   path must not inherit the old behaviour. Test: `gate-core.test.ts`.
+   path must not inherit the old behaviour. Test: `gate-core.test.ts`. The callers (review G9):
+   `registerWebhook` (create, and the recovery and replacement DELETEs) and the disconnect route's
+   DELETE try once more on the healed token; a second refusal is reported as before (the webhook
+   flow records `webhook_not_registered` with code `write_auth_retry_refused`, the disconnect
+   audits `webhookRemoved: false`). No queue consumer makes a Revolut write, so there is no retry
+   loop and no staged-connection state depends on it. Tests: `gate-rpc-surface.test.ts`,
+   `revolut-connect.test.ts`.
+2b. **Token-bearing and dispatch methods were RPC-callable (both gates, found in review G9).
+   Fixed.** `accessTokenFor` was a TypeScript-private prototype method in both gates, so
+   `stub.accessTokenFor({ id, access_token_enc: null })` returned a plaintext access token, and
+   `execute` / `send` would have run a request past `validateRequest` (for Revolut that is a
+   `/pay` past the allow-list). They are JS-private or instance properties now; a test calls
+   each through a real stub and pins the remaining prototype methods.
 2. **Alarm could be pushed back (Revolut only). Fixed.** The G2 review made ExactGate arm its one
    alarm only ever earlier (`armAlarm`); RevolutGate called `setAlarm` directly and could replace
    an earlier alarm with a later one. Both now use `armAlarm`. Test: `gate-core.test.ts`.
@@ -116,9 +138,13 @@ Found by reading both files and `git log` of each (Exact: 9 commits, Revolut: 4)
 
 - A change to the queue, the limiter, budgets or token refresh is made once, in `gate/core.ts`,
   and both gates' tests exercise it. The two gate files keep only provider-specific code.
-- A subclass must call `this.load()` from its constructor after `super()` (the core cannot,
-  because subclass fields are not initialised yet) and must not re-implement a core rule; a source
-  scan in `gate-core.test.ts` fails if it does.
-- Line counts (worker gates): before 1,210 + 929 = 2,139; after core 912 + Exact 718 +
-  Revolut 440 = 2,070. The saving is small because the hook surface is explicit; the point is that
+- The core loads the persisted state itself (review G9; a subclass does not call `load()`): its
+  constructor yields one microtask, so the subclass constructor and field initialisers have run,
+  then loads under `blockConcurrencyWhile`; every entry point also awaits `ensureLoaded`, which
+  covers an alarm as the first event after a restart and a directly constructed instance. A
+  subclass must not re-implement a core rule; a source scan in `gate-core.test.ts` fails if it
+  does. A subclass implements `execute` as an instance property (an arrow function), never a
+  method, and keeps anything token-bearing JS-private.
+- Line counts (worker gates): before 1,210 + 929 = 2,139; after core 967 + Exact 721 +
+  Revolut 446 = 2,134 (after the review G9 fixes). The saving is small because the hook surface is explicit; the point is that
   the safeguards exist once.

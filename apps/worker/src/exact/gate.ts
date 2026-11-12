@@ -164,7 +164,6 @@ export class ExactGate extends GateCore<
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env, { ...DEFAULT_LIMITS });
-    void ctx.blockConcurrencyWhile(() => this.load());
   }
 
   // ---------------------------------------------------------------------------------------
@@ -553,10 +552,13 @@ export class ExactGate extends GateCore<
   // Executing a call
   // ---------------------------------------------------------------------------------------
 
-  /** Returns null when the request was put back in the queue for one retry after a 401. */
-  protected async execute(
+  /**
+   * Returns null when the request was put back in the queue for one retry after a 401. An instance
+   * property, not a method: it runs a request past the door checks, so it is not RPC-callable.
+   */
+  protected readonly execute = async (
     item: Queued<ExactRequest, ExactResponse>,
-  ): Promise<ExactResponse | null> {
+  ): Promise<ExactResponse | null> => {
     const { req } = item;
     const row = await loadExactConnection(this.env.DB);
     // A 'pending' connection holds tokens the connect callback has not verified yet (ADR 0019):
@@ -574,7 +576,7 @@ export class ExactGate extends GateCore<
     const url = buildUrl(row.region_host, req);
     // A write may have waited in the queue: the switch is read again right before the call.
     if (isWrite(req)) await this.assertMethodAllowed(req);
-    const token = await this.accessTokenFor(row);
+    const token = await this.#accessTokenFor(row);
     // ...and once more after the (possibly slow) token step, immediately before the network call.
     if (isWrite(req)) await this.assertMethodAllowed(req);
 
@@ -632,7 +634,7 @@ export class ExactGate extends GateCore<
       return null;
     }
     return { status: res.status, headers: outHeaders, body: res.body };
-  }
+  };
 
   private authority(connectionId: number): DurableObjectStub<ExactGate> {
     return getExactGate(this.env, `exact-token:${connectionId}`);
@@ -650,7 +652,8 @@ export class ExactGate extends GateCore<
       : new ExactAuthError(r.code);
   }
 
-  private async accessTokenFor(row: ExactConnectionRow): Promise<string> {
+  // JS-private: it returns a plaintext access token, so it must not be RPC-callable.
+  async #accessTokenFor(row: ExactConnectionRow): Promise<string> {
     const exp = row.expires_at ? Date.parse(row.expires_at) : 0;
     if (row.access_token_enc && exp - this.now() > REFRESH_MARGIN_MS) {
       try {
