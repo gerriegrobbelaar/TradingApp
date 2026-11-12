@@ -819,6 +819,24 @@ describe("POST /api/connections/revolut/disconnect", () => {
     expect(a?.after_json).toContain('"webhookRemoved":false');
   });
 
+  it("a 401 on the webhook DELETE: the gate does not re-send, the route tries once more (review G9)", async () => {
+    const id = await seedRevolut({ webhookId: WEBHOOK });
+    stub.api = (c) =>
+      c.headers.authorization === "Bearer racc-0"
+        ? new Response("", { status: 401 })
+        : new Response(null, { status: 204 });
+    expect((await post()).status).toBe(200);
+    expect((await storedRevolut(id)).status).toBe("disabled");
+    expect(stub.apiCalls.map((c) => c.method)).toEqual(["DELETE", "DELETE"]);
+    expect(stub.tokenCalls).toHaveLength(1);
+    const a = await db
+      .prepare(
+        "SELECT after_json FROM audit_log WHERE action = 'connection.revolut_disconnected' ORDER BY id DESC",
+      )
+      .first<{ after_json: string }>();
+    expect(a?.after_json).toContain('"webhookRemoved":true');
+  });
+
   it("skips the webhook call for a connection that needs re-authorisation", async () => {
     await seedRevolut({ status: "needs_reauth", webhookId: WEBHOOK });
     expect((await post()).status).toBe(200);

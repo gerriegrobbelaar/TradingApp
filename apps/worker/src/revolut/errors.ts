@@ -55,3 +55,22 @@ export function classifyRevolutError(e: unknown): Classified {
   // Anything else (a D1 hiccup, a bug): retry a bounded number of times, then give up.
   return { retryable: true, code: "internal", delaySeconds: 60 };
 }
+
+/** The gate's answer to a write that got a 401: not re-sent, token healed (ADR 0048). */
+export const WRITE_AUTH_RETRY_REFUSED = "write_auth_retry_refused";
+
+/**
+ * Runs a Revolut write and, if the gate refused to re-send it after a 401, runs it ONCE more.
+ * The gate never decides that a write may go twice; the caller does, per write: only for a write
+ * that is safe to repeat with the same request (a 401 means Revolut refused the bearer token and
+ * did nothing; DELETE is idempotent; a payment repeats only with its own unchanged `request_id`).
+ * A second refusal is returned to the caller as is (no loop).
+ */
+export async function retryWriteOnceAfterAuthRefusal<T>(write: () => Promise<T>): Promise<T> {
+  try {
+    return await write();
+  } catch (e) {
+    if (e instanceof RevolutApiError && e.code === WRITE_AUTH_RETRY_REFUSED) return write();
+    throw e;
+  }
+}

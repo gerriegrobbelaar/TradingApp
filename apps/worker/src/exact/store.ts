@@ -64,7 +64,7 @@ export async function markNeedsReauth(
         after: { status: "needs_reauth", reason },
       },
       {
-        sql: "EXISTS (SELECT 1 FROM connections WHERE id = ?7 AND status = 'active')",
+        sql: "EXISTS (SELECT 1 FROM connections WHERE id = ?7 AND kind = 'exact' AND status = 'active')",
         binds: [connectionId],
       },
     ),
@@ -74,7 +74,7 @@ export async function markNeedsReauth(
          SET status = 'needs_reauth', last_error = ?2, access_token_enc = NULL,
              refresh_token_enc = NULL, token_ref = NULL, expires_at = NULL,
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-         WHERE id = ?1 AND status = 'active'`,
+         WHERE id = ?1 AND kind = 'exact' AND status = 'active'`,
       )
       .bind(connectionId, reason),
   ]);

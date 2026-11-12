@@ -33,6 +33,7 @@ import { encryptToken } from "../crypto/token-crypto";
 import { json, type Ctx, type Router } from "../router";
 import { inspectAccounts } from "./accounts-probe";
 import { isRevolutEnvironment, loadRevolutConfig, type RevolutConfig } from "./config";
+import { retryWriteOnceAfterAuthRefusal } from "./errors";
 import { createRevolutGateTransport } from "./gate-transport";
 import { queueInitialBackfill } from "./initial-backfill";
 import { registerWebhook } from "./webhooks";
@@ -506,17 +507,18 @@ export function registerRevolutRoutes(router: Router): void {
       UUID_RE.test(before.webhook_id)
     ) {
       try {
-        const res = await createRevolutGateTransport(
-          ctx.env,
-          before.id,
-        )({
-          method: "DELETE",
+        const send = createRevolutGateTransport(ctx.env, before.id);
+        const del = {
+          method: "DELETE" as const,
           path: `/webhooks/${before.webhook_id}`,
-          apiVersion: "2.0",
+          apiVersion: "2.0" as const,
           connectionId: before.id,
-          priority: "user",
+          priority: "user" as const,
           jobId: "revolut-disconnect",
-        });
+        };
+        // DELETE is idempotent: after a 401 the gate heals the token without re-sending (ADR
+        // 0048), and one more try here is safe.
+        const res = await retryWriteOnceAfterAuthRefusal(() => send(del));
         webhookRemoved = res.status >= 200 && res.status < 300;
       } catch {
         webhookRemoved = false;

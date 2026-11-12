@@ -3,6 +3,11 @@
  * goes through, plus one "token authority" instance per connection ("exact-token:<id>") that is
  * the only place an OAuth refresh ever happens (docs/decisions/0015-exactgate-design.md).
  *
+ * The queue, limiter, budgets, role pin and token refresh skeleton are the shared GateCore
+ * (../gate/core.ts, docs/decisions/0048-shared-gate-core.md). This file holds only what is Exact's
+ * own: the daily budget with a user reserve and Exact's rate-limit headers, the minimum token age,
+ * the write policy re-read from D1, the XML/REST request shape and the 401 rules for writes.
+ *
  * Why two kinds of instance: Exact refresh tokens are single use and one connection serves all
  * its divisions. If each division gate refreshed on its own, two gates could refresh at once and
  * the second would burn the first one's new token (a double refresh logs us out). Division gates
@@ -15,21 +20,28 @@
  *
  * Nothing in here logs request bodies, URLs or tokens.
  */
-import { DurableObject } from "cloudflare:workers";
 import {
   ExactApiError,
   ExactAuthError,
   ExactBudgetExhaustedError,
   ExactRateLimitedError,
   ExactWriteAuthRetryRefused,
-  JOB_ID_RE,
   parseRateLimitHeaders,
   retryAfterFromHeaders,
   type ExactRequest,
   type ExactResponse,
 } from "@camelthorn/exact";
-import { decryptToken, encryptToken, keyring, TokenCryptoError } from "../crypto/token-crypto";
+import { decryptToken, keyring } from "../crypto/token-crypto";
 import type { Env } from "../env";
+import {
+  CREDENTIALS_REJECTED,
+  GateCore,
+  type Queued,
+  type RefreshedTokens,
+  type SavedPair,
+  type ThrottleContext,
+  type TokenResult,
+} from "../gate/core";
 import { loadExactConfig } from "./config";
 import { getExactGate } from "./gate-transport";
 import { refreshTokens, TokenEndpointError } from "./oauth";
@@ -42,8 +54,10 @@ import {
   markNeedsReauth,
   type ExactConnectionRow,
 } from "./store";
-import { auditStatement } from "../db/audit";
-import { toWire, type GateResult } from "./wire";
+import { toWire, type WireError } from "./wire";
+
+export { CREDENTIALS_REJECTED };
+export type { TokenResult };
 
 export interface GateLimits {
   /** Exact allows about 60 calls per minute per division. */
@@ -91,32 +105,11 @@ export const TOKEN_LIFETIME_MS = 600_000;
 export const MIN_REFRESH_AGE_MS = 570_000;
 export const REFRESH_MARGIN_MS = TOKEN_LIFETIME_MS - MIN_REFRESH_AGE_MS;
 const MAX_AGE_WAIT_MS = 30_000;
-/** A refresh the token endpoint rejects (premature or unclassifiable) is retried after these waits. */
-const REFRESH_RETRY_DELAYS_MS = [5_000, 15_000];
-/** After a failed refresh with a still-valid token, do not try again for this long. */
-const REFRESH_COOLDOWN_MS = 10_000;
-/** Wait before retrying a call whose 401 came from a token too young to refresh. */
 /** Longest daily window an X-RateLimit-Reset header may announce (24 h plus clock slack). */
 const MAX_DAY_WINDOW_MS = 25 * 3600 * 1000;
+/** Wait before retrying a call whose 401 came from a token too young to refresh. */
 const YOUNG_401_WAIT_MS = 2_000;
-/** Retry persisting a stashed token pair this often (alarm). */
-const PENDING_RETRY_MS = 30_000;
-/**
- * The token endpoint rejecting our client credentials (invalid_client) this many times in a row,
- * over at least this long, marks the connection with CREDENTIALS_REJECTED (ADR 0016 item 20).
- */
-const CLIENT_REJECT_ATTEMPTS = 3;
-const CLIENT_REJECT_SPAN_MS = 60_000;
-/** After that, no new attempt for this long (a wrong secret does not fix itself in seconds). */
-const CLIENT_REJECT_COOLDOWN_MS = 60_000;
-export const CREDENTIALS_REJECTED = "token_endpoint_rejected_credentials";
 const MAX_BLOCK_MS = 24 * 3600 * 1000;
-const JOB_TTL_MS = 24 * 3600 * 1000;
-/**
- * Fairness: after this many user calls in a row while a job call is waiting, the oldest job call
- * goes next. Users still jump the queue, but a steady stream of UI clicks cannot starve a job.
- */
-const USER_BURST = 5;
 /** Instance roles; an instance takes one on first use and refuses the other (see `claimRole`). */
 type GateRole = `division:${number}` | `authority:${number}`;
 
@@ -148,130 +141,76 @@ interface LimiterState {
   remote: RemoteDay | null;
 }
 
-interface JobState {
-  budget: number;
-  used: number;
-  startedAt: number;
-}
-
-interface Queued {
-  req: ExactRequest;
-  enqueuedAt: number;
-  retried: boolean;
-  /** The retry was granted because the 401 token was too young to refresh (not a rotation). */
-  youngRetry?: boolean;
-  resolve: (r: ExactResponse) => void;
-  reject: (e: unknown) => void;
-}
-
-export type TokenResult =
-  | { ok: true; accessToken: string; expiresAt: number }
-  | { ok: false; code: string; retryable: boolean };
-
-interface PendingTokens {
-  /** The refresh token D1 still holds (the WHERE guard of the eventual write). */
-  baseRefreshEnc: string;
-  accessEnc: string;
-  refreshEnc: string;
-  expiresAt: number;
-}
-const pendingKey = (connectionId: number): string => `pending:${connectionId}`;
 const issuedKey = (connectionId: number): string => `issued:${connectionId}`;
-const clientRejectsKey = (connectionId: number): string => `client-rejects:${connectionId}`;
 
-interface ClientRejects {
-  /** Consecutive client_rejected answers from the token endpoint. */
-  count: number;
-  firstAt: number;
-}
-
-const dayOf = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
-
-export class ExactGate extends DurableObject<Env> {
-  /** Mutable so tests can tighten them; production uses the defaults. */
-  limits: GateLimits = { ...DEFAULT_LIMITS };
-  /** Clock and sleeper are replaceable for deterministic tests. */
-  now: () => number = () => Date.now();
-  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms));
-
-  private st!: LimiterState;
-  private jobs = new Map<string, JobState>();
-  private queue: Queued[] = [];
-  private pumping = false;
-  private refreshing: { connectionId: number; promise: Promise<TokenResult> } | null = null;
+export class ExactGate extends GateCore<
+  ExactRequest,
+  ExactResponse,
+  WireError,
+  LimiterState,
+  GateLimits,
+  ExactConnectionRow,
+  GateRole
+> {
   private dirty = false;
   private alarmScheduled = false;
-  private role: GateRole | null = null;
-  /** User calls dispatched in a row while a job call was waiting (see USER_BURST). */
-  private userStreak = 0;
-  /** No refresh attempt before this time after a failed one that left a usable token. */
-  private refreshCooldownUntil = 0;
-  /** No refresh attempt at all before this time once our client credentials were rejected. */
-  private clientRejectedUntil = 0;
+  protected readonly maxBlockMs = MAX_BLOCK_MS;
+  protected readonly unreachableMessage = "exact unreachable";
+  protected readonly noRetryFailure = "bad_host";
+  protected readonly credentialsAudit = {
+    action: "connection.exact_credentials_rejected",
+    scope: "kind = 'exact' AND ",
+  };
 
   constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    void ctx.blockConcurrencyWhile(() => this.load());
+    super(ctx, env, { ...DEFAULT_LIMITS });
   }
 
-  /** Loads the persisted limiter state (the sliding window included) and role. */
-  private async load(): Promise<void> {
-    const saved = await this.ctx.storage.get<LimiterState>("rl");
-    this.st = saved ?? this.freshState(Date.now());
-    // State saved by an older build (token bucket) has no window.
-    if (!Array.isArray(this.st.window)) this.st.window = [];
-    if (this.st.remoteMinute === undefined) this.st.remoteMinute = null;
-    this.role = (await this.ctx.storage.get<GateRole>("role")) ?? null;
-  }
+  // ---------------------------------------------------------------------------------------
+  // Hooks of the shared core
+  // ---------------------------------------------------------------------------------------
 
-  /**
-   * An instance is either a division gate or a connection's token authority, never both. The
-   * role is persisted on first use, so a refresh can only ever run in the one instance that
-   * first acted as the authority for that connection (`exact-token:<id>`), and a division gate
-   * that is (wrongly) asked to refresh refuses instead of racing the authority.
-   */
-  private async claimRole(role: GateRole): Promise<boolean> {
-    if (this.role === role) return true;
-    if (this.role !== null) return false;
-    this.role = role;
-    await this.ctx.storage.put("role", role);
-    return true;
-  }
-
-  private freshState(now: number): LimiterState {
+  protected freshExtra(): Omit<
+    LimiterState,
+    "day" | "used" | "userUsed" | "jobUsed" | "limited" | "window" | "blockedUntil"
+  > {
     return {
       division: null,
-      day: dayOf(now),
-      used: 0,
-      userUsed: 0,
-      jobUsed: 0,
-      limited: 0,
-      window: [],
       capacity: this.limits.perMinute,
       remoteMinute: null,
-      blockedUntil: 0,
       remote: null,
     };
   }
 
-  // ---------------------------------------------------------------------------------------
-  // Public RPC
-  // ---------------------------------------------------------------------------------------
-
-  /** RPC entry point: always resolves with an envelope (errors lose their class over RPC). */
-  async call(req: ExactRequest): Promise<GateResult> {
-    try {
-      return { ok: true, response: await this.request(req) };
-    } catch (e) {
-      return { ok: false, error: toWire(e) };
-    }
+  protected migrateState(): void {
+    if (this.st.remoteMinute === undefined) this.st.remoteMinute = null;
   }
 
-  async request(req: ExactRequest): Promise<ExactResponse> {
+  protected rateLimited(retryAfterMs: number, message?: string): Error {
+    return new ExactRateLimitedError(retryAfterMs, message);
+  }
+  protected budgetExhausted(jobId: string): Error {
+    return new ExactBudgetExhaustedError(jobId);
+  }
+  protected apiError(status: number, message: string, code: string): Error {
+    return new ExactApiError(status, message, code);
+  }
+  protected wireError(e: unknown): WireError {
+    return toWire(e);
+  }
+  protected validate(req: ExactRequest): void {
     validateRequest(req);
-    // Defence in depth (ADR 0044): the gate refuses every write except the two booking writes, and
-    // those only while the fail-closed switch and the verification mark say so, read from D1 NOW.
+  }
+
+  /**
+   * Defence in depth (ADR 0044): the gate refuses every write except the two booking writes, and
+   * those only while the fail-closed switch and the verification mark say so, read from D1 NOW.
+   */
+  protected async authorize(req: ExactRequest): Promise<void> {
     await this.assertMethodAllowed(req);
+  }
+
+  protected async admit(req: ExactRequest): Promise<void> {
     if (!(await this.claimRole(`division:${req.division}`))) {
       throw new ExactApiError(400, "wrong gate for division", "division_mismatch");
     }
@@ -281,14 +220,6 @@ export class ExactGate extends DurableObject<Env> {
     } else if (this.st.division !== req.division) {
       throw new ExactApiError(400, "wrong gate for division", "division_mismatch");
     }
-    if (req.priority === "job") {
-      const job = await this.ensureJob(req.jobId);
-      if (job.used >= job.budget) throw new ExactBudgetExhaustedError(req.jobId);
-    }
-    return new Promise<ExactResponse>((resolve, reject) => {
-      this.queue.push({ req, enqueuedAt: this.now(), retried: false, resolve, reject });
-      void this.pump();
-    });
   }
 
   private async assertMethodAllowed(req: ExactRequest): Promise<void> {
@@ -301,31 +232,77 @@ export class ExactGate extends DurableObject<Env> {
     if (refusal !== null) throw new ExactApiError(403, "exact write refused", refusal);
   }
 
-  /** Starts (or restarts) a job run with its own call budget. */
-  async startJob(jobId: string, budget?: number): Promise<{ jobId: string; budget: number }> {
-    if (!JOB_ID_RE.test(jobId)) throw new ExactApiError(400, "invalid job id", "job_id");
-    if (budget !== undefined && (!Number.isInteger(budget) || budget < 1 || budget > 100_000)) {
-      throw new ExactApiError(400, "invalid budget", "budget");
-    }
-    const now = this.now();
-    const job: JobState = {
-      budget: budget ?? (await this.defaultBudget(jobId)),
-      used: 0,
-      startedAt: now,
-    };
-    this.jobs.set(jobId, job);
-    await this.ctx.storage.put(`job:${jobId}`, job);
-    await this.purgeOldJobs(now);
-    return { jobId, budget: job.budget };
+  protected authorityConnectionId(): number | null {
+    return this.role?.startsWith("authority:")
+      ? Number(this.role.slice("authority:".length))
+      : null;
   }
 
-  /** Ends a job run and returns how many calls it used. */
-  async endJob(jobId: string): Promise<{ used: number }> {
-    const job = this.jobs.get(jobId) ?? (await this.ctx.storage.get<JobState>(`job:${jobId}`));
-    this.jobs.delete(jobId);
-    await this.ctx.storage.delete(`job:${jobId}`);
-    return { used: job?.used ?? 0 };
+  protected minuteCap(): number {
+    return Math.max(1, Math.min(this.st.capacity, this.limits.perMinute));
   }
+
+  /** Exact's own minute count (remoteMinute) can only make the wait longer. */
+  protected extraMinuteWait(now: number): number {
+    const r = this.st.remoteMinute;
+    return r && r.left < 1 ? r.until - now : 0;
+  }
+
+  protected checkDaily(req: ExactRequest, now: number): void {
+    const remaining = this.dayRemaining(now);
+    if (remaining <= 0)
+      throw new ExactRateLimitedError(this.untilDayReset(now), "daily budget used");
+    if (req.priority === "job" && remaining <= this.reserve()) {
+      // The last slice of the day is kept for people using the UI.
+      throw new ExactRateLimitedError(this.untilDayReset(now), "daily budget reserved");
+    }
+  }
+
+  protected onSpend(): void {
+    if (this.st.remoteMinute) this.st.remoteMinute.left--;
+    if (this.st.remote) this.st.remote.dayRemaining = Math.max(0, this.st.remote.dayRemaining - 1);
+    this.markDirty();
+  }
+
+  protected afterPrune(now: number): void {
+    const r = this.st.remoteMinute;
+    if (r && now >= r.until) this.st.remoteMinute = null;
+  }
+
+  protected onSameDay(now: number): void {
+    if (this.st.remote?.dayResetMs != null && now >= this.st.remote.dayResetMs) {
+      this.st.remote = null;
+    }
+  }
+
+  protected onNewDay(now: number): Partial<LimiterState> {
+    if (this.dirty) void this.flushUsage().catch(() => undefined); // yesterday's final numbers
+    // Exact's own window may end later than UTC midnight; keep its numbers until it says reset.
+    const r = this.st.remote;
+    return { remote: r && r.dayResetMs !== null && now < r.dayResetMs ? r : null };
+  }
+
+  protected onBlocked(): void {
+    this.markDirty();
+  }
+
+  protected async defaultBudget(jobId: string): Promise<number> {
+    try {
+      const row = await this.env.DB.prepare("SELECT exact_budget FROM jobs WHERE name = ?1")
+        .bind(jobId)
+        .first<{ exact_budget: number }>();
+      if (row && Number.isInteger(row.exact_budget) && row.exact_budget > 0) {
+        return row.exact_budget;
+      }
+    } catch {
+      /* fall through to the default */
+    }
+    return this.limits.defaultJobBudget;
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // Usage, alarm
+  // ---------------------------------------------------------------------------------------
 
   /** Snapshot for the UI and data-quality rules. */
   usage(): {
@@ -374,31 +351,11 @@ export class ExactGate extends DurableObject<Env> {
       .run();
   }
 
-  /**
-   * A Durable Object has ONE alarm, shared by the usage flush (division gates) and the stash retry
-   * (token authorities). Both arm it through here, which only ever moves it earlier, so neither
-   * use can push the other's back or cancel it; `alarm()` does both jobs whenever it fires.
-   */
-  private async armAlarm(at: number): Promise<void> {
-    const current = await this.ctx.storage.getAlarm();
-    if (current === null || current > at) await this.ctx.storage.setAlarm(at);
-  }
-
   async alarm(): Promise<void> {
     this.alarmScheduled = false;
     // A token authority with a stashed token pair keeps trying to write it to D1 (review N2).
     // Done first and never throws, so a failing usage flush cannot starve it.
-    if (this.role?.startsWith("authority:")) {
-      const id = Number(this.role.slice("authority:".length));
-      try {
-        await this.flushPending(id);
-      } catch {
-        /* D1 still down: the check below re-arms the alarm */
-      }
-      if ((await this.ctx.storage.get(pendingKey(id))) !== undefined) {
-        await this.armAlarm(this.now() + PENDING_RETRY_MS);
-      }
-    }
+    await this.retryStash();
     if (this.dirty) await this.flushUsage();
   }
 
@@ -412,22 +369,7 @@ export class ExactGate extends DurableObject<Env> {
    * refresh is forced only if the stored token is still that one.
    */
   refreshAccessToken(connectionId: number, staleExpiresAt?: string): Promise<TokenResult> {
-    if (this.refreshing && this.refreshing.connectionId === connectionId) {
-      return this.refreshing.promise;
-    }
-    const promise = (async (): Promise<TokenResult> => {
-      if (!Number.isSafeInteger(connectionId) || connectionId < 1) {
-        return { ok: false, code: "not_connected", retryable: false };
-      }
-      if (!(await this.claimRole(`authority:${connectionId}`))) {
-        return { ok: false, code: "wrong_token_authority", retryable: false };
-      }
-      return this.doRefresh(connectionId, staleExpiresAt);
-    })().finally(() => {
-      if (this.refreshing?.promise === promise) this.refreshing = null;
-    });
-    this.refreshing = { connectionId, promise };
-    return promise;
+    return this.refreshShared(connectionId, `authority:${connectionId}`, staleExpiresAt);
   }
 
   /**
@@ -446,34 +388,39 @@ export class ExactGate extends DurableObject<Env> {
       `UPDATE connections
        SET access_token_enc = ?3, refresh_token_enc = ?4, expires_at = ?5, last_error = NULL,
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-       WHERE id = ?1 AND status = 'active' AND refresh_token_enc = ?2`,
+       WHERE id = ?1 AND kind = 'exact' AND status = 'active' AND refresh_token_enc = ?2`,
     )
       .bind(connectionId, oldRefreshEnc, accessEnc, refreshEnc, new Date(expiresAtMs).toISOString())
       .run();
     return r.meta.changes === 1;
   }
 
-  /**
-   * Writes a stashed token pair (kept in DO storage after two failed D1 writes) to D1. Returns
-   * the stash that is still pending, or null. The stash holds ciphertext only.
-   */
-  private async flushPending(connectionId: number): Promise<PendingTokens | null> {
-    const pending = await this.ctx.storage.get<PendingTokens>(pendingKey(connectionId));
-    if (!pending) return null;
-    try {
-      await this.persistTokens(
-        connectionId,
-        pending.baseRefreshEnc,
-        pending.accessEnc,
-        pending.refreshEnc,
-        pending.expiresAt,
-      );
-    } catch {
-      return pending; // D1 still failing: keep it
-    }
-    // Written, or the row changed meanwhile (disconnect or re-authorise): either way done.
-    await this.ctx.storage.delete(pendingKey(connectionId));
-    return null;
+  protected loadConnection(id: number): Promise<ExactConnectionRow | null> {
+    return loadConnectionById(this.env.DB, id);
+  }
+  protected markNeedsReauth(id: number, reason: string): Promise<unknown> {
+    return markNeedsReauth(this.env.DB, id, reason);
+  }
+  protected aad(id: number, kind: "access" | "refresh"): string {
+    return aad(id, kind);
+  }
+  protected freshMargin(): number {
+    return REFRESH_MARGIN_MS;
+  }
+
+  protected persistPair(id: number, baseRefreshEnc: string, p: SavedPair): Promise<boolean> {
+    return this.persistTokens(id, baseRefreshEnc, p.accessEnc, p.refreshEnc, p.expiresAt);
+  }
+
+  protected async afterTokensSaved(
+    row: ExactConnectionRow,
+    issuedAt: number,
+    expiresAt: number,
+  ): Promise<void> {
+    await this.ctx.storage.put(issuedKey(row.id), {
+      expiresAt: new Date(expiresAt).toISOString(),
+      issuedAt,
+    });
   }
 
   /**
@@ -507,434 +454,63 @@ export class ExactGate extends DurableObject<Env> {
     return Math.min(issuedAt + MIN_REFRESH_AGE_MS, parsed - REFRESH_MARGIN_MS);
   }
 
-  /** Counts a client_rejected answer; true once it has repeated long enough to report. */
-  private async noteClientRejected(connectionId: number): Promise<boolean> {
-    const now = this.now();
-    const key = clientRejectsKey(connectionId);
-    const prev = await this.ctx.storage.get<ClientRejects>(key);
-    const next: ClientRejects = prev
-      ? { count: prev.count + 1, firstAt: prev.firstAt }
-      : { count: 1, firstAt: now };
-    await this.ctx.storage.put(key, next);
-    return next.count >= CLIENT_REJECT_ATTEMPTS && now - next.firstAt >= CLIENT_REJECT_SPAN_MS;
-  }
-
-  /**
-   * Records that Exact rejects the app's client credentials: `last_error` on the still-active
-   * connection plus one audit row, both only if not already recorded. Tokens are not touched: the
-   * grant is fine, the fix is EXACT_CLIENT_ID / EXACT_CLIENT_SECRET (an admin's job, not a
-   * re-authorisation). A successful refresh clears `last_error` again (persistTokens).
-   */
-  private async markCredentialsRejected(connectionId: number): Promise<void> {
-    const guard = `status = 'active' AND (last_error IS NULL OR last_error <> '${CREDENTIALS_REJECTED}')`;
-    const db = this.env.DB;
-    await db.batch([
-      auditStatement(
-        db,
-        {
-          actorEmail: "system",
-          action: "connection.exact_credentials_rejected",
-          entity: "connection",
-          entityId: connectionId,
-          after: { status: "active", reason: CREDENTIALS_REJECTED },
-        },
-        {
-          sql: `EXISTS (SELECT 1 FROM connections WHERE id = ?7 AND ${guard})`,
-          binds: [connectionId],
-        },
-      ),
-      db
-        .prepare(
-          `UPDATE connections SET last_error = ?2,
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-           WHERE id = ?1 AND ${guard}`,
-        )
-        .bind(connectionId, CREDENTIALS_REJECTED),
-    ]);
-  }
-
-  private async doRefresh(connectionId: number, staleExpiresAt?: string): Promise<TokenResult> {
-    const db = this.env.DB;
-    try {
-      await this.flushPending(connectionId);
-      const dbRow = await loadConnectionById(db, connectionId);
-      if (!dbRow || dbRow.status !== "active") {
-        await this.ctx.storage.delete(pendingKey(connectionId));
-        return {
-          ok: false,
-          code: dbRow?.status === "needs_reauth" ? "needs_reauth" : "not_connected",
-          retryable: false,
-        };
+  /** Never refresh a token younger than the minimum age (B2); then the failure cooldown. */
+  protected async throttle(ctx: ThrottleContext<ExactConnectionRow>): Promise<TokenResult | null> {
+    const { row, now, forced, usableOld } = ctx;
+    const earliest = await this.earliestRefreshAt(row.id, row.expires_at, now);
+    if (now < earliest) {
+      if (forced) {
+        // Exact rejected a token we may not refresh yet: the caller waits and retries once.
+        return { ok: false, code: "token_too_young", retryable: true };
       }
-      // While a rotated pair is stashed, D1 still holds the dead refresh token: use the stash.
-      const pending = await this.ctx.storage.get<PendingTokens>(pendingKey(connectionId));
-      const row: ExactConnectionRow = pending
-        ? {
-            ...dbRow,
-            access_token_enc: pending.accessEnc,
-            refresh_token_enc: pending.refreshEnc,
-            expires_at: new Date(pending.expiresAt).toISOString(),
-          }
-        : dbRow;
-      const baseRefreshEnc = pending ? pending.baseRefreshEnc : dbRow.refresh_token_enc;
-      const keys = keyring(this.env);
-      const now = this.now();
-      const exp = row.expires_at ? Date.parse(row.expires_at) : 0;
-      const forced = staleExpiresAt !== undefined && row.expires_at === staleExpiresAt;
-      const usableOld = async (): Promise<TokenResult | null> =>
-        row.access_token_enc && exp - this.now() > 2_000
-          ? {
-              ok: true,
-              accessToken: await decryptToken(keys, row.access_token_enc, aad(row.id, "access")),
-              expiresAt: exp,
-            }
-          : null;
-      const stillFresh =
-        row.access_token_enc !== null &&
-        exp - now > REFRESH_MARGIN_MS &&
-        (staleExpiresAt === undefined || row.expires_at !== staleExpiresAt);
-      if (stillFresh) {
-        // Another refresh (or a reconnect) already produced a good token: do not burn the
-        // single-use refresh token again.
-        const t = await usableOld();
-        if (t) return t;
+      if (earliest - now <= MAX_AGE_WAIT_MS) {
+        await this.sleep(earliest - now);
+      } else {
+        return (await usableOld()) ?? { ok: false, code: "token_refresh_retry", retryable: true };
       }
-      if (!row.refresh_token_enc || !baseRefreshEnc) {
-        await markNeedsReauth(db, row.id, "no_refresh_token");
-        return { ok: false, code: "needs_reauth", retryable: false };
-      }
-
-      // Never refresh a token younger than the minimum age (B2).
-      const earliest = await this.earliestRefreshAt(row.id, row.expires_at, now);
-      if (now < earliest) {
-        if (forced) {
-          // Exact rejected a token we may not refresh yet: the caller waits and retries once.
-          return { ok: false, code: "token_too_young", retryable: true };
-        }
-        if (earliest - now <= MAX_AGE_WAIT_MS) {
-          await this.sleep(earliest - now);
-        } else {
-          return (await usableOld()) ?? { ok: false, code: "token_refresh_retry", retryable: true };
-        }
-      } else if (!forced && this.refreshCooldownUntil > now) {
-        const t = await usableOld();
-        if (t) return t;
-      }
-      if (this.clientRejectedUntil > this.now()) {
-        // Exact keeps rejecting our client credentials: do not hammer the token endpoint.
-        return (await usableOld()) ?? { ok: false, code: CREDENTIALS_REJECTED, retryable: true };
-      }
-
-      const refreshToken = await decryptToken(keys, row.refresh_token_enc, aad(row.id, "refresh"));
-      let origin: string;
-      try {
-        origin = new URL(this.env.EXACT_REDIRECT_URI).origin;
-      } catch {
-        return { ok: false, code: "server_misconfigured", retryable: false };
-      }
-      const cfg = loadExactConfig(this.env, origin);
-      if (!cfg.ok) return { ok: false, code: "server_misconfigured", retryable: false };
-
-      let tokens;
-      let lastFailure = "unavailable";
-      let credentialsRejected = false;
-      for (let attempt = 0; ; attempt++) {
-        try {
-          tokens = await refreshTokens(
-            {
-              host: row.region_host,
-              clientId: cfg.config.clientId,
-              clientSecret: cfg.config.clientSecret,
-            },
-            refreshToken,
-          );
-          break;
-        } catch (e) {
-          const failure = e instanceof TokenEndpointError ? e.failure : "unavailable";
-          lastFailure = failure;
-          // Only a clear invalid_grant means the grant is gone. Everything else, including a
-          // premature-refresh rejection whose body we cannot classify and a 2xx we cannot read,
-          // keeps the tokens (a spent refresh token answers invalid_grant on the next try).
-          if (failure === "invalid_grant") {
-            await markNeedsReauth(db, row.id, failure);
-            await this.ctx.storage.delete([
-              pendingKey(connectionId),
-              clientRejectsKey(connectionId),
-            ]);
-            return { ok: false, code: "needs_reauth", retryable: false };
-          }
-          if (failure === "client_rejected" && (await this.noteClientRejected(row.id))) {
-            credentialsRejected = true;
-            break; // retrying with the same wrong credentials cannot help
-          }
-          const delay = REFRESH_RETRY_DELAYS_MS[attempt];
-          if (failure === "bad_host" || delay === undefined) break;
-          await this.sleep(delay);
-        }
-      }
-      if (!tokens) {
-        this.refreshCooldownUntil = this.now() + REFRESH_COOLDOWN_MS;
-        if (credentialsRejected) {
-          this.clientRejectedUntil = this.now() + CLIENT_REJECT_COOLDOWN_MS;
-          try {
-            await this.markCredentialsRejected(row.id);
-          } catch {
-            /* D1 down: reported on the next attempt */
-          }
-        }
-        if (!forced) {
-          const t = await usableOld(); // the old token still works: keep using it
-          if (t) return t;
-        }
-        return {
-          ok: false,
-          code: credentialsRejected
-            ? CREDENTIALS_REJECTED
-            : lastFailure === "unavailable"
-              ? "token_endpoint_unavailable"
-              : "token_refresh_retry",
-          retryable: true,
-        };
-      }
-
-      // The old refresh token is spent. Persist the new one BEFORE the new access token is used;
-      // if D1 fails twice, stash the encrypted pair in DO storage instead (review N2).
-      const issuedAt = this.now();
-      const expiresAt = issuedAt + tokens.expiresInS * 1000;
-      let persisted = false;
-      let stashed = false;
-      try {
-        const accessEnc = await encryptToken(
-          this.env.TOKEN_ENC_KEY,
-          tokens.accessToken,
-          aad(row.id, "access"),
-        );
-        const refreshEnc = await encryptToken(
-          this.env.TOKEN_ENC_KEY,
-          tokens.refreshToken,
-          aad(row.id, "refresh"),
-        );
-        try {
-          try {
-            persisted = await this.persistTokens(
-              row.id,
-              baseRefreshEnc,
-              accessEnc,
-              refreshEnc,
-              expiresAt,
-            );
-          } catch {
-            persisted = await this.persistTokens(
-              row.id,
-              baseRefreshEnc,
-              accessEnc,
-              refreshEnc,
-              expiresAt,
-            );
-          }
-        } catch {
-          const stash: PendingTokens = { baseRefreshEnc, accessEnc, refreshEnc, expiresAt };
-          await this.ctx.storage.put(pendingKey(row.id), stash);
-          persisted = true;
-          stashed = true;
-        }
-      } catch {
-        try {
-          await markNeedsReauth(db, row.id, "token_persist_failed");
-        } catch {
-          /* D1 is down; the next refresh attempt will hit invalid_grant and mark it then */
-        }
-        return { ok: false, code: "needs_reauth", retryable: false };
-      }
-      if (!persisted) {
-        // Row changed under us (disconnect or re-authorise). Do not use or keep these tokens.
-        return { ok: false, code: "connection_changed", retryable: true };
-      }
-      // The new pair is safe (D1 or stash). Everything below is bookkeeping: a failure here must
-      // never turn into needs_reauth, which would wipe the tokens that were just saved.
-      this.clientRejectedUntil = 0;
-      try {
-        await this.ctx.storage.put(issuedKey(row.id), {
-          expiresAt: new Date(expiresAt).toISOString(),
-          issuedAt,
-        });
-        // A direct write supersedes any older stash (same base refresh token in D1).
-        if (!stashed) await this.ctx.storage.delete(pendingKey(row.id));
-        await this.ctx.storage.delete(clientRejectsKey(row.id));
-        if (stashed) await this.armAlarm(this.now() + PENDING_RETRY_MS);
-      } catch {
-        /* without the issued record the age falls back to expires_at - 600 s (same answer) */
-      }
-      return { ok: true, accessToken: tokens.accessToken, expiresAt };
-    } catch (e) {
-      if (e instanceof TokenCryptoError) {
-        // Wrong or missing TOKEN_ENC_KEY: our configuration, not a revoked grant.
-        return { ok: false, code: "token_unreadable", retryable: false };
-      }
-      return { ok: false, code: "refresh_failed", retryable: true };
+    } else if (!forced && this.refreshCooldownUntil > now) {
+      const t = await usableOld();
+      if (t) return t;
     }
+    return null;
+  }
+
+  protected openEndpoint(
+    row: ExactConnectionRow,
+  ): TokenResult | ((refreshToken: string) => Promise<RefreshedTokens>) {
+    let origin: string;
+    try {
+      origin = new URL(this.env.EXACT_REDIRECT_URI).origin;
+    } catch {
+      return { ok: false, code: "server_misconfigured", retryable: false };
+    }
+    const cfg = loadExactConfig(this.env, origin);
+    if (!cfg.ok) return { ok: false, code: "server_misconfigured", retryable: false };
+    return (refreshToken) =>
+      refreshTokens(
+        {
+          host: row.region_host,
+          clientId: cfg.config.clientId,
+          clientSecret: cfg.config.clientSecret,
+        },
+        refreshToken,
+      );
+  }
+
+  protected classifyFailure(e: unknown): string {
+    return e instanceof TokenEndpointError ? e.failure : "unavailable";
+  }
+
+  protected failureResult(lastFailure: string): { code: string; retryable: boolean } {
+    return {
+      code: lastFailure === "unavailable" ? "token_endpoint_unavailable" : "token_refresh_retry",
+      retryable: true,
+    };
   }
 
   // ---------------------------------------------------------------------------------------
-  // Queue and limiter
+  // Daily budget, Exact's headers
   // ---------------------------------------------------------------------------------------
-
-  /**
-   * User calls first, oldest first, except that after USER_BURST user calls in a row with a job
-   * call waiting the oldest job call goes (so jobs are delayed, never starved).
-   */
-  private pickNext(): Queued | undefined {
-    const user = this.queue.find((q) => q.req.priority === "user");
-    const job = this.queue.find((q) => q.req.priority === "job");
-    if (user && job && this.userStreak >= USER_BURST) return job;
-    return user ?? job;
-  }
-
-  /** Fails every waiting call that has been queued longer than maxQueueWaitMs. */
-  private expireWaiting(): void {
-    const now = this.now();
-    for (const q of [...this.queue]) {
-      if (now - q.enqueuedAt > this.limits.maxQueueWaitMs) {
-        this.unqueue(q);
-        q.reject(new ExactRateLimitedError(1000, "queued too long"));
-      }
-    }
-  }
-
-  private noteDispatch(item: Queued): void {
-    if (item.req.priority === "job") this.userStreak = 0;
-    else if (this.queue.some((q) => q.req.priority === "job")) this.userStreak++;
-    else this.userStreak = 0;
-  }
-
-  private unqueue(item: Queued): void {
-    const i = this.queue.indexOf(item);
-    if (i >= 0) this.queue.splice(i, 1);
-  }
-
-  private async pump(): Promise<void> {
-    if (this.pumping) return;
-    this.pumping = true;
-    try {
-      // Let requests enqueued in the same tick all be visible before choosing the first.
-      await Promise.resolve();
-      for (;;) {
-        this.expireWaiting();
-        const item = this.pickNext();
-        if (!item) break;
-        try {
-          const wait = this.waitFor(item);
-          if (wait > 0) {
-            await this.sleep(wait);
-            continue; // re-pick: a user request may have arrived meanwhile
-          }
-          this.unqueue(item);
-          this.noteDispatch(item);
-          this.spend(item.req);
-          await this.persist(item.req);
-          const res = await this.execute(item);
-          if (res) item.resolve(res);
-        } catch (e) {
-          this.unqueue(item);
-          item.reject(e);
-        }
-      }
-    } finally {
-      this.pumping = false;
-      if (this.queue.length > 0) void this.pump();
-    }
-  }
-
-  /** 0 = go now, >0 = wait this long; throws if the request must fail instead of waiting. */
-  private waitFor(item: Queued): number {
-    const now = this.now();
-    this.rollover(now);
-    this.pruneWindow(now);
-    const { req } = item;
-    if (req.priority === "job") {
-      const job = this.jobs.get(req.jobId);
-      if (job && job.used >= job.budget) throw new ExactBudgetExhaustedError(req.jobId);
-    }
-    let wait = 0;
-    if (this.st.blockedUntil > now) {
-      wait = this.st.blockedUntil - now;
-    } else {
-      const remaining = this.dayRemaining(now);
-      if (remaining <= 0)
-        throw new ExactRateLimitedError(this.untilDayReset(now), "daily budget used");
-      if (req.priority === "job" && remaining <= this.reserve()) {
-        // The last slice of the day is kept for people using the UI.
-        throw new ExactRateLimitedError(this.untilDayReset(now), "daily budget reserved");
-      }
-      wait = this.minuteWait(now);
-      if (wait <= 0) return 0;
-    }
-    if (now - item.enqueuedAt + wait > this.limits.maxQueueWaitMs) {
-      throw new ExactRateLimitedError(wait);
-    }
-    return wait;
-  }
-
-  private spend(req: ExactRequest): void {
-    const at = this.now();
-    this.st.window.push(at);
-    if (this.st.remoteMinute) this.st.remoteMinute.left--;
-    this.st.used++;
-    if (req.priority === "user") this.st.userUsed++;
-    else {
-      this.st.jobUsed++;
-      const job = this.jobs.get(req.jobId);
-      if (job) job.used++;
-    }
-    if (this.st.remote) this.st.remote.dayRemaining = Math.max(0, this.st.remote.dayRemaining - 1);
-    this.markDirty();
-  }
-
-  /** Drops calls older than 60 s. Entries at exactly now-60s are out: any 60 s span is [t, t+60s). */
-  private pruneWindow(now: number): void {
-    const w = this.st.window;
-    let n = 0;
-    while (n < w.length && (w[n] as number) <= now - 60_000) n++;
-    if (n > 0) w.splice(0, n);
-    // A clock that went backwards must not let the log grow or lock the gate for long.
-    if (w.length > 0 && (w[w.length - 1] as number) > now) {
-      for (let i = 0; i < w.length; i++) w[i] = Math.min(w[i] as number, now);
-    }
-    const r = this.st.remoteMinute;
-    if (r && now >= r.until) this.st.remoteMinute = null;
-  }
-
-  /**
-   * Sliding-window limiter (review S1): never more than `cap` calls in any 60 s, with or without
-   * rate-limit headers. Returns 0 to go now, else ms until a slot frees. Exact's own minute count
-   * (remoteMinute) can only make this stricter.
-   */
-  private minuteWait(now: number): number {
-    const w = this.st.window;
-    const cap = Math.max(1, Math.min(this.st.capacity, this.limits.perMinute));
-    let wait = 0;
-    if (w.length >= cap) {
-      wait = (w[w.length - cap] as number) + 60_000 - now;
-    }
-    const r = this.st.remoteMinute;
-    if (r && r.left < 1) wait = Math.max(wait, r.until - now);
-    return wait > 0 ? Math.ceil(wait) : 0;
-  }
-
-  private rollover(now: number): void {
-    const day = dayOf(now);
-    if (day === this.st.day) {
-      if (this.st.remote?.dayResetMs != null && now >= this.st.remote.dayResetMs) {
-        this.st.remote = null;
-      }
-      return;
-    }
-    if (this.dirty) void this.flushUsage().catch(() => undefined); // yesterday's final numbers
-    // Exact's own window may end later than UTC midnight; keep its numbers until it says reset.
-    const r = this.st.remote;
-    const remote = r && r.dayResetMs !== null && now < r.dayResetMs ? r : null;
-    Object.assign(this.st, { day, used: 0, userUsed: 0, jobUsed: 0, limited: 0, remote });
-  }
 
   /**
    * The smaller of Exact's own remaining count (while its window is current) and the local
@@ -972,63 +548,17 @@ export class ExactGate extends DurableObject<Env> {
     }
   }
 
-  /** Saves the limiter state, plus the budget of the job the request belongs to (if any). */
-  private async persist(req?: ExactRequest): Promise<void> {
-    const job = req?.priority === "job" ? this.jobs.get(req.jobId) : undefined;
-    if (req && job) {
-      await this.ctx.storage.put({ rl: this.st, [`job:${req.jobId}`]: job });
-    } else {
-      await this.ctx.storage.put("rl", this.st);
-    }
-  }
-
-  // ---------------------------------------------------------------------------------------
-  // Jobs
-  // ---------------------------------------------------------------------------------------
-
-  private async defaultBudget(jobId: string): Promise<number> {
-    try {
-      const row = await this.env.DB.prepare("SELECT exact_budget FROM jobs WHERE name = ?1")
-        .bind(jobId)
-        .first<{ exact_budget: number }>();
-      if (row && Number.isInteger(row.exact_budget) && row.exact_budget > 0) {
-        return row.exact_budget;
-      }
-    } catch {
-      /* fall through to the default */
-    }
-    return this.limits.defaultJobBudget;
-  }
-
-  private async ensureJob(jobId: string): Promise<JobState> {
-    const known = this.jobs.get(jobId);
-    if (known) return known;
-    const saved = await this.ctx.storage.get<JobState>(`job:${jobId}`);
-    if (saved) {
-      this.jobs.set(jobId, saved);
-      return saved;
-    }
-    // A job that never called startJob still gets a budget, so it cannot run unbounded.
-    await this.startJob(jobId);
-    return this.jobs.get(jobId) as JobState;
-  }
-
-  private async purgeOldJobs(now: number): Promise<void> {
-    const all = await this.ctx.storage.list<JobState>({ prefix: "job:" });
-    for (const [key, job] of all) {
-      if (now - job.startedAt > JOB_TTL_MS) {
-        this.jobs.delete(key.slice(4));
-        await this.ctx.storage.delete(key);
-      }
-    }
-  }
-
   // ---------------------------------------------------------------------------------------
   // Executing a call
   // ---------------------------------------------------------------------------------------
 
-  /** Returns null when the request was put back in the queue for one retry after a 401. */
-  private async execute(item: Queued): Promise<ExactResponse | null> {
+  /**
+   * Returns null when the request was put back in the queue for one retry after a 401. An instance
+   * property, not a method: it runs a request past the door checks, so it is not RPC-callable.
+   */
+  protected readonly execute = async (
+    item: Queued<ExactRequest, ExactResponse>,
+  ): Promise<ExactResponse | null> => {
     const { req } = item;
     const row = await loadExactConnection(this.env.DB);
     // A 'pending' connection holds tokens the connect callback has not verified yet (ADR 0019):
@@ -1046,7 +576,7 @@ export class ExactGate extends DurableObject<Env> {
     const url = buildUrl(row.region_host, req);
     // A write may have waited in the queue: the switch is read again right before the call.
     if (isWrite(req)) await this.assertMethodAllowed(req);
-    const token = await this.accessTokenFor(row);
+    const token = await this.#accessTokenFor(row);
     // ...and once more after the (possibly slow) token step, immediately before the network call.
     if (isWrite(req)) await this.assertMethodAllowed(req);
 
@@ -1055,24 +585,8 @@ export class ExactGate extends DurableObject<Env> {
     if (req.api === "rest" && headers.accept === undefined) headers.accept = "application/json";
     headers.authorization = `Bearer ${token}`;
 
-    let res: Response;
-    let body: string;
-    try {
-      res = await fetch(url.toString(), {
-        method: req.method,
-        headers,
-        ...(req.body !== undefined && req.method !== "GET" ? { body: req.body } : {}),
-        redirect: "manual", // never forward the bearer token to a redirect target
-        signal: AbortSignal.timeout(this.limits.fetchTimeoutMs),
-      });
-      body = await res.text();
-    } catch {
-      throw new ExactApiError(502, "exact unreachable", "network");
-    }
-    const outHeaders: Record<string, string> = {};
-    res.headers.forEach((v, k) => {
-      outHeaders[k.toLowerCase()] = v;
-    });
+    const res = await this.send(url, req, headers);
+    const outHeaders = res.headers;
     this.readRateHeaders(outHeaders, this.now());
     await this.persist(req);
 
@@ -1119,8 +633,8 @@ export class ExactGate extends DurableObject<Env> {
       this.queue.unshift(item);
       return null;
     }
-    return { status: res.status, headers: outHeaders, body };
-  }
+    return { status: res.status, headers: outHeaders, body: res.body };
+  };
 
   private authority(connectionId: number): DurableObjectStub<ExactGate> {
     return getExactGate(this.env, `exact-token:${connectionId}`);
@@ -1138,7 +652,8 @@ export class ExactGate extends DurableObject<Env> {
       : new ExactAuthError(r.code);
   }
 
-  private async accessTokenFor(row: ExactConnectionRow): Promise<string> {
+  // JS-private: it returns a plaintext access token, so it must not be RPC-callable.
+  async #accessTokenFor(row: ExactConnectionRow): Promise<string> {
     const exp = row.expires_at ? Date.parse(row.expires_at) : 0;
     if (row.access_token_enc && exp - this.now() > REFRESH_MARGIN_MS) {
       try {
@@ -1201,10 +716,6 @@ export class ExactGate extends DurableObject<Env> {
     const ms = retryAfterFromHeaders(h, now, {
       dailyExhausted: this.st.remote !== null && this.st.remote.dayRemaining <= 0,
     });
-    const wait = Math.min(MAX_BLOCK_MS, Math.max(1000, ms));
-    this.st.blockedUntil = now + wait;
-    this.st.limited++;
-    this.markDirty();
-    return wait;
+    return this.blockAfter429(ms, now);
   }
 }

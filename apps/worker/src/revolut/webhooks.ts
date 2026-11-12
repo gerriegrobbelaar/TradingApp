@@ -22,7 +22,7 @@ import { createRevolutClient, type RevolutClient } from "@camelthorn/revolut";
 import { auditStatement } from "../db/audit";
 import type { Env } from "../env";
 import { revolutWebhookUrl } from "./config";
-import { classifyRevolutError } from "./errors";
+import { classifyRevolutError, retryWriteOnceAfterAuthRefusal } from "./errors";
 import { createRevolutGateTransport } from "./gate-transport";
 import { WEBHOOK_RECOVER_JOB_ID } from "./request";
 import { saveWebhookSecret, type RevolutConnectionRow } from "./store";
@@ -83,7 +83,9 @@ export async function registerWebhook(
         const list = await clientFor(env, conn.id, WEBHOOK_RECOVER_JOB_ID).listWebhooks();
         for (const wh of list) {
           if (wh.url !== url || !UUID_RE.test(wh.id)) continue;
-          await clientFor(env, conn.id, "revolut-webhook").deleteWebhook(wh.id);
+          await retryWriteOnceAfterAuthRefusal(() =>
+            clientFor(env, conn.id, "revolut-webhook").deleteWebhook(wh.id),
+          );
           await auditStatement(db, {
             actorEmail,
             action: "connection.revolut_webhook_deleted",
@@ -97,7 +99,12 @@ export async function registerWebhook(
       }
     }
 
-    const created = await clientFor(env, conn.id, "revolut-webhook").createWebhook(url);
+    // A 401 is answered by the gate without a re-send (ADR 0048). A 401 means Revolut refused the
+    // bearer token before doing anything, so one more try on the healed token cannot create a
+    // second subscription; a second refusal is reported below as a failed registration.
+    const created = await retryWriteOnceAfterAuthRefusal(() =>
+      clientFor(env, conn.id, "revolut-webhook").createWebhook(url),
+    );
     try {
       await saveWebhookSecret(env, conn.id, created.id, created.signingSecret, actorEmail);
     } catch {
@@ -107,7 +114,10 @@ export async function registerWebhook(
     if (opts.replace === true && stored?.webhook_id && UUID_RE.test(stored.webhook_id)) {
       // Old subscription: best effort. If it stays, both deliver, and both secrets verify.
       try {
-        await clientFor(env, conn.id, "revolut-webhook").deleteWebhook(stored.webhook_id);
+        const oldId = stored.webhook_id;
+        await retryWriteOnceAfterAuthRefusal(() =>
+          clientFor(env, conn.id, "revolut-webhook").deleteWebhook(oldId),
+        );
         await auditStatement(db, {
           actorEmail,
           action: "connection.revolut_webhook_deleted",
