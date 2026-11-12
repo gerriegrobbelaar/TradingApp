@@ -60,7 +60,12 @@ type Step =
   | "decision_moved"
   | "iban"
   | "payment_detail"
-  | "loosen";
+  | "loosen"
+  | "send_open"
+  | "send_done"
+  | "verify_open"
+  | "enable_open"
+  | "preview_run";
 interface Shot {
   name: string;
   path: string;
@@ -164,6 +169,92 @@ const SHOTS: Shot[] = [
     ready: "table tbody tr td button",
     step: "payment_detail",
     height: 2200,
+  },
+  {
+    name: "send-confirm",
+    path: "/treasury/bank?tab=payments",
+    scene: { me: "finance", status: "ready" },
+    ready: "table tbody tr td button",
+    step: "send_open",
+    height: 2200,
+  },
+  {
+    name: "send-done",
+    path: "/treasury/bank?tab=payments",
+    scene: { me: "finance", status: "ready" },
+    ready: "table tbody tr td button",
+    step: "send_done",
+    height: 2200,
+  },
+  {
+    name: "send-unknown",
+    path: "/treasury/bank?tab=payments",
+    scene: { me: "finance", status: "ready", send: "unknown" },
+    ready: "table tbody tr td button",
+    step: "send_done",
+    height: 2200,
+  },
+  {
+    name: "send-refused",
+    path: "/treasury/bank?tab=payments",
+    scene: { me: "finance", status: "ready", send: "refused" },
+    ready: "table tbody tr td button",
+    step: "send_done",
+    height: 2200,
+  },
+  {
+    name: "paid-booking-pending",
+    path: "/treasury/bank?tab=payments",
+    scene: { me: "viewer", status: "paid_pending" },
+    ready: "table tbody tr td button",
+    step: "payment_detail",
+    height: 2200,
+  },
+  {
+    name: "paid-booked",
+    path: "/treasury/bank?tab=payments",
+    scene: { me: "viewer", status: "paid_booked" },
+    ready: "table tbody tr td button",
+    step: "payment_detail",
+    height: 2200,
+  },
+  {
+    name: "waiting-in-revolut",
+    path: "/treasury/bank?tab=payments",
+    scene: { me: "viewer", status: "ready", send: "ok" },
+    ready: "table tbody tr td button",
+    height: 1400,
+  },
+  {
+    name: "settings-admin-tools",
+    path: "/settings/payments",
+    scene: { me: "admin", enabled: false, adminReady: true },
+    ready: ".pay-unknown",
+    height: 4200,
+  },
+  {
+    name: "settings-verify",
+    path: "/settings/payments",
+    scene: { me: "admin", enabled: false },
+    ready: ".pay-form",
+    step: "verify_open",
+    height: 3600,
+  },
+  {
+    name: "settings-enable",
+    path: "/settings/payments",
+    scene: { me: "admin", enabled: false, adminReady: true },
+    ready: ".pay-unknown",
+    step: "enable_open",
+    height: 1600,
+  },
+  {
+    name: "settings-preview",
+    path: "/settings/payments",
+    scene: { me: "admin", enabled: false, adminReady: true },
+    ready: ".pay-unknown",
+    step: "preview_run",
+    height: 4600,
   },
   {
     name: "settings-payments",
@@ -280,7 +371,9 @@ describe("Payment screens", () => {
           const seen: string[] = [];
           page.on("console", (m) => {
             // A refused request (the 422 of a blocked payment) is logged by the browser itself.
-            const refused = scene.create.endsWith("blocked") && /status of 422/.test(m.text());
+            const refused =
+              (scene.create.endsWith("blocked") && /status of 422/.test(m.text())) ||
+              (scene.send === "refused" && /status of 409/.test(m.text()));
             if (m.type() === "error" && !refused) seen.push(m.text());
           });
           await page.addInitScript((t) => {
@@ -360,6 +453,34 @@ describe("Payment screens", () => {
             case "payment_detail":
               await page.click("table tbody tr td button");
               await page.waitForSelector(`${D} .pay-timeline`, { timeout: 15_000 });
+              break;
+            case "send_open":
+            case "send_done":
+              await page.click("table tbody tr td button");
+              await page.waitForSelector(`${D} button:has-text('Send to bank')`, {
+                timeout: 15_000,
+              });
+              await page.click(`${D} button:has-text('Send to bank')`);
+              await page.waitForSelector(`${D} [data-testid='send-next']`, { timeout: 15_000 });
+              if (shot.step === "send_done") {
+                await page.click(`${D} button:has-text('Create the draft in Revolut')`);
+                await page.waitForSelector(`${D} [data-testid='send-result']`, {
+                  timeout: 15_000,
+                });
+              }
+              break;
+            case "verify_open":
+              await page.click("button:has-text('Record the verification')");
+              await page.waitForSelector(`${D} .pay-verify`, { timeout: 15_000 });
+              break;
+            case "enable_open":
+              await page.click("button:has-text('Switch payments on')");
+              await page.waitForSelector(`${D} input.input`, { timeout: 15_000 });
+              break;
+            case "preview_run":
+              await page.fill("label:has-text('Request number') input", "11");
+              await page.click("button:has-text('Preview')");
+              await page.waitForSelector("[data-testid='preview-result']", { timeout: 15_000 });
               break;
             case "loosen":
               await page.fill("input[inputmode='decimal']", "3000");

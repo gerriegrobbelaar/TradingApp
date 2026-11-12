@@ -79,7 +79,7 @@ export function PaymentRows({
         align: "right",
         render: (r) => <Money minor={r.amountMinor} currency={r.currency} />,
       },
-      { key: "status", header: "Status", render: (r) => <StatusChip status={r.status} /> },
+      { key: "status", header: "Status", render: (r) => <StatusChip dto={r} /> },
       { key: "by", header: "Requested by", render: (r) => r.requestedBy },
       {
         key: "when",
@@ -147,7 +147,7 @@ export function BatchRows({
         align: "right",
         render: (r) => <Money minor={r.totalMinor} currency={r.currency} />,
       },
-      { key: "status", header: "Status", render: (r) => <StatusChip status={r.status} /> },
+      { key: "status", header: "Status", render: (r) => <StatusChip dto={r} /> },
       { key: "by", header: "Requested by", render: (r) => r.requestedBy },
       {
         key: "when",

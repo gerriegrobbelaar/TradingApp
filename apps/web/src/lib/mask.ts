@@ -29,6 +29,7 @@ const CURSOR = /^[A-Za-z0-9_:-]{1,200}$/;
 export const IDENTIFIER_SHAPES: Readonly<Record<string, RegExp>> = {
   payloadHash: HEX64,
   ibanFingerprint: HEX64,
+  sha256: HEX64,
   protocolVersion: HEX64,
   bankEntryHash: HEX64,
   matchSetHash: HEX64,

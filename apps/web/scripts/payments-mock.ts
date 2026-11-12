@@ -3,7 +3,11 @@
  * Treasury payments list and Settings, Payments. Method-aware (a POST differs from a GET on the
  * same path). A path nobody answers returns undefined, which the suite records and fails on.
  */
-import { DEFAULT_PAYMENT_SETTINGS } from "@camelthorn/core";
+import {
+  DEFAULT_PAYMENT_SETTINGS,
+  PAYMENTS_VERIFY_CHECKS,
+  PAYMENTS_VERIFY_RUNBOOK,
+} from "@camelthorn/core";
 import { approval, approvals, listResponse, row } from "../src/test-fixtures";
 import {
   APPROVER,
@@ -21,7 +25,18 @@ export interface PayScene {
   /** What POST /api/payments (and the batch route) answers. */
   create: "draft" | "blocked" | "batch" | "batch_blocked";
   /** The status of the request the detail sheets show. */
-  status: "pending_approval" | "outcome_unknown" | "paid" | "draft";
+  status:
+    | "pending_approval"
+    | "outcome_unknown"
+    | "paid"
+    | "draft"
+    | "ready"
+    | "paid_pending"
+    | "paid_booked";
+  /** What POST .../submit answers (F9c): handled, unknown outcome, or a refusal (busy). */
+  send: "ok" | "unknown" | "refused";
+  /** Settings, Payments with a complete verification, so the admin tools are all enabled. */
+  adminReady: boolean;
   /** Stale sign-in: the step-up notice shows. */
   stale: boolean;
   /** The second read of the request returns another payload (the approver must re-read it). */
@@ -33,12 +48,16 @@ export const DEFAULT_PAY_SCENE: PayScene = {
   enabled: true,
   create: "draft",
   status: "pending_approval",
+  send: "ok",
+  adminReady: false,
   stale: false,
   payloadMoves: false,
 };
 
 /** Reads of the request detail per scene (one scene object per screenshot). */
 const detailReads = new WeakMap<PayScene, number>();
+/** Scenes whose request was sent in this page (the next read shows what the send led to). */
+const sent = new WeakSet<PayScene>();
 
 const ADMIN = {
   email: "gerrie.grobbelaar@camelthorncapital.com",
@@ -84,19 +103,46 @@ const BILLS = [
 ];
 
 function current(scene: PayScene, moved = false) {
+  const status = sent.has(scene)
+    ? scene.send === "unknown"
+      ? "outcome_unknown"
+      : "submitted"
+    : scene.status === "paid_pending" || scene.status === "paid_booked"
+      ? "paid"
+      : scene.status;
   return payment({
-    status: scene.status,
+    status,
     approvalsRequired: ["above_limit"],
     requestedBy: FINANCE.email,
-    ...(scene.status === "paid" ? { providerId: "tx-1" } : {}),
+    ...(status === "ready"
+      ? {
+          decision: {
+            decision: "approved" as const,
+            by: APPROVER.email,
+            at: "2026-11-11T11:00:00.000Z",
+            note: null,
+          },
+        }
+      : {}),
+    ...(status === "paid" ? { providerId: "tx-1" } : {}),
+    ...(scene.status === "paid_pending" ? { settlement: "awaiting_match" as const } : {}),
+    ...(scene.status === "paid_booked" ? { settlement: "booked" as const } : {}),
     ...(moved ? { amountMinor: 132456, payloadHash: `be68539007547034${"b".repeat(48)}` } : {}),
   });
 }
 
+const verifiedMark = () => ({
+  at: "2026-11-10T10:00:00.000Z",
+  by: "gerrie.grobbelaar@camelthorncapital.com",
+  note: "Sandbox run of 10 November",
+  protocolVersion: "f".repeat(64),
+  checks: [...PAYMENTS_VERIFY_CHECKS],
+});
+
 export function paymentsApi(
   method: string,
   path: string,
-  _search: URLSearchParams,
+  search: URLSearchParams,
   scene: PayScene,
 ): unknown {
   const key = `${method} ${path}`;
@@ -110,8 +156,13 @@ export function paymentsApi(
         enabled: scene.enabled,
         blockers: scene.enabled
           ? []
-          : ["not_verified", "submitter_unavailable", "payments_disabled"],
+          : scene.adminReady
+            ? ["payments_disabled"]
+            : ["not_verified", "submitter_unavailable", "payments_disabled"],
         settings: { ...DEFAULT_PAYMENT_SETTINGS },
+        draftExpiryDays: 5,
+        verifyRunbook: PAYMENTS_VERIFY_RUNBOOK as never,
+        ...(scene.adminReady ? { verified: verifiedMark() } : {}),
       });
     case "GET /api/users":
       return {
@@ -149,11 +200,61 @@ export function paymentsApi(
           }
         : { batch: batch({ approvalsRequired: ["batch_total_above_limit"] }), replayed: false };
     case "GET /api/payments":
+      if (search.get("status") === "outcome_unknown") {
+        return {
+          items: [
+            payment({
+              id: 14,
+              invoiceNumber: "BILL-95",
+              status: "outcome_unknown",
+              updatedAt: new Date(Date.now() - 45 * 60_000).toISOString(),
+            }),
+          ],
+          nextCursor: null,
+        };
+      }
       return {
-        items: [current(scene), payment({ id: 12, invoiceNumber: "BILL-90", status: "paid" })],
+        items: [
+          current(scene),
+          payment({ id: 12, invoiceNumber: "BILL-90", status: "paid", settlement: "booked" }),
+          payment({
+            id: 13,
+            invoiceNumber: "BILL-91",
+            status: "paid",
+            settlement: "awaiting_bank_line",
+          }),
+        ],
         nextCursor: null,
       };
+    case "POST /api/payments/11/submit":
+      if (scene.send === "refused") return { __status: 409, error: "busy" };
+      sent.add(scene);
+      return {
+        result:
+          scene.send === "unknown"
+            ? { to: "outcome_unknown", code: "outcome_unknown" }
+            : { to: "submitted", code: "accepted" },
+        payment: current(scene),
+      };
+    case "POST /api/payments/preview":
+      return {
+        ok: true,
+        mode: "drafts",
+        requestId: "5d0f2c0a-0000-4000-8000-000000000011",
+        calls: [
+          {
+            step: "draft",
+            method: "POST",
+            path: "/payment-drafts",
+            body: '{"title":"CF-5d0f2c0a-000","payments":[{"account_id":"3b1c","receiver":{"counterparty_id":"7e2a","account_id":"NL91****4300"},"amount":1234.56,"currency":"EUR","reference":"Invoice BILL-77"}]}',
+            sha256: "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+            gateAccepts: true,
+            usesPlaceholderPayee: false,
+          },
+        ],
+      };
     case "GET /api/payment-batches":
+      if (search.get("status") === "outcome_unknown") return { items: [], nextCursor: null };
       return {
         items: [
           batch({ status: "pending_approval", approvalsRequired: ["batch_total_above_limit"] }),

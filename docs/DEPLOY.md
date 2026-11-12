@@ -1442,3 +1442,22 @@ Use the staging environment (`wrangler deploy --env staging`) with a Revolut SAN
 ## Payment screens (Phase 9, P9c; ADR 0051): nothing new to deploy
 
 No migration, secret, variable, queue or binding. The web build gains lazy chunks (`PaySheet`, `PaymentParts`, `PaymentsList`, `PaymentApprovals`, `IbanVerifySheet`, `PaymentsSettings`) and one stylesheet; `GET /api/payments/:id` and `GET /api/payment-batches/:id` now also return `events` (additive). Payments stay OFF in production until P9b and its verification: every screen then says "Payments are switched off, so nothing can be paid from this app yet" and makes no request that creates anything. Where to look after a deploy: Settings, Payments (admin: the switch, what blocks it, the checklist, who approves), Purchases, Approvals, Payments tab (approvers), Treasury, Bank, Payments tab (everyone), Purchases, Payables (finance: Pay and the tick boxes; finance, approvers and admins: Bank details). The two ceilings on the settings screen are marked "Placeholder" until the user answers ADR 0049 question 3.
+
+## Payments in the web: Send to bank, honest "Paid", admin tools (F9c; ADR 0054): nothing new to deploy
+
+No migration, secret, variable, queue or binding. `GET /api/payments`, `/api/payment-batches` and their detail reads now carry `settlement` on every payment and batch item (additive; the value comes from the same function as `GET /api/payments/:id/settlement`). The web build only changes lazy chunks.
+
+**What changed for people.** "Paid" is shown only when the bank confirmed AND the match is booked in Exact; until then the screens say "Paid at the bank, booking pending" with the step it waits at. A draft sent in drafts mode reads "Waiting for approval in Revolut". `ready` reads "Approved, not sent yet", and finance users get a **Send to bank** button with a confirmation (this is the only web path to `POST /api/payments/:id/submit` and `/api/payment-batches/:id/submit`). After an answer the screen could not read, the button disappears and the page says "Do not send it again"; an administrator then checks Revolut.
+
+**The admin tools are now in the UI (Settings, Payments, admin only).** The curl steps in the runbook above still work, but you no longer need them:
+
+| Task | Where in Settings, Payments | Needs |
+|---|---|---|
+| Record the verification | Verification card, "Record the verification" (one tick box per check of the API list, each with its steps) | all checks ticked, a note of 10 or more characters, fresh sign-in, phrase `I VERIFIED THE PAYMENT PATH ON THE REVOLUT SANDBOX` |
+| Switch payments on | top card, "Switch payments on" (disabled while a blocker is listed) | fresh sign-in, phrase `ENABLE PAYMENTS`; the server re-checks every blocker |
+| Switch payments off | top card | admin only, no phrase |
+| Draft expiry days | "Draft expiry" card | admin, 1 to 30 |
+| Mark an unknown outcome as not sent | "Unknown outcomes" card | admin, fresh sign-in, phrase `MARK PAYMENT AS NOT SENT`, and the server's own "a lookup 15 or more minutes after it became unknown, in the last 30 minutes, found nothing" rule. Look in the Revolut app first. |
+| Preview payment | "Preview payment" card (payment or batch, request number) | admin, fresh sign-in; no call is made; the bank account is shown masked |
+
+Still curl-only by decision: nothing in this list. Not built in the web: a saved partial verification (the ticks live in the open sheet only and nothing is stored in the browser), the staging fault switch for the lost-answer drill, and acknowledging payment alerts.

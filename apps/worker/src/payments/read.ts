@@ -12,9 +12,11 @@ import {
   type PaymentDto,
   type PaymentEventDto,
   type PaymentMode,
+  type PaymentSettlement,
   type PaymentStatus,
 } from "@camelthorn/core";
 import { maskedIbans } from "./iban-store";
+import { paymentSettlement } from "./reconcile";
 
 // The DTO types live in core (api-types.ts) so the web shares them; re-exported for the worker's own imports.
 export type { BatchDto, DecisionDto, PaymentDto } from "@camelthorn/core";
@@ -87,7 +89,11 @@ function toDecision(r: {
     : { decision: r.decision, by: r.decided_by, at: r.decided_at, note: r.note };
 }
 
-function toPaymentDto(r: PaymentRowRaw, masked: Map<number, string>): PaymentDto {
+function toPaymentDto(
+  r: PaymentRowRaw,
+  masked: Map<number, string>,
+  settlement: PaymentSettlement,
+): PaymentDto {
   const st = status(r.status);
   return {
     kind: "payment",
@@ -123,7 +129,32 @@ function toPaymentDto(r: PaymentRowRaw, masked: Map<number, string>): PaymentDto
         ? paymentConfirmPhrase(r.amount_minor, r.currency, (masked.get(r.id) ?? "????").slice(-4))
         : null,
     decision: toDecision(r),
+    settlement,
   };
+}
+
+/**
+ * How far each payment is booked (F9c, CLAUDE.md 4.3). Only a bank-paid payment has anything to
+ * look up; every other status is `not_paid` without a query. An unreadable answer is NOT "booked":
+ * it falls back to `awaiting_bank_line`, which reads as "paid at the bank, booking pending".
+ */
+async function settlements(
+  db: D1Database,
+  rows: readonly PaymentRowRaw[],
+): Promise<Map<number, PaymentSettlement>> {
+  const out = new Map<number, PaymentSettlement>();
+  for (const r of rows) {
+    if (r.status !== "paid") {
+      out.set(r.id, "not_paid");
+      continue;
+    }
+    try {
+      out.set(r.id, await paymentSettlement(db, r.id));
+    } catch {
+      out.set(r.id, "awaiting_bank_line");
+    }
+  }
+  return out;
 }
 
 export async function readPayments(db: D1Database, ids: readonly number[]): Promise<PaymentDto[]> {
@@ -134,7 +165,8 @@ export async function readPayments(db: D1Database, ids: readonly number[]): Prom
     .bind(...ids)
     .all<PaymentRowRaw>();
   const masked = await maskedIbans(db, ids);
-  return rows.results.map((r) => toPaymentDto(r, masked));
+  const settled = await settlements(db, rows.results);
+  return rows.results.map((r) => toPaymentDto(r, masked, settled.get(r.id) ?? "not_paid"));
 }
 
 export async function readPayment(db: D1Database, id: number): Promise<PaymentDto | null> {

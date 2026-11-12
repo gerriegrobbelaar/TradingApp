@@ -152,6 +152,85 @@
   gap: 8px;
   align-items: flex-start;
 }
+/* F9c: Send to bank, the verification record, unknown outcomes and Preview payment. Same tokens. */
+.app .pay-send {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.app .pay-send p {
+  margin: 0;
+}
+.app .pay-send-confirm {
+  padding: 14px;
+  border: 1px solid var(--accent-text);
+  border-radius: 18px;
+}
+.app .pay-verify li {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.app .pay-runbook {
+  margin-left: 26px;
+  color: var(--muted);
+}
+.app .pay-runbook summary {
+  cursor: pointer;
+  color: var(--accent-text);
+}
+.app .pay-runbook ol {
+  margin: 6px 0 0;
+  padding-left: 20px;
+}
+.app .pay-unknown li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: center;
+}
+.app .pay-kind {
+  border: 1px solid var(--control-line);
+  border-radius: 14px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+}
+.app .pay-preview,
+.app .pay-preview-call {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.app .pay-preview p {
+  margin: 0;
+}
+.app .pay-preview-call {
+  padding: 12px;
+  border: 1px solid var(--control-line);
+  border-radius: 14px;
+}
+.app .pay-hash,
+.app .pay-body {
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--ink);
+}
+.app .pay-body {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--fill);
+  border-radius: 12px;
+  white-space: pre-wrap;
+  max-height: 14em;
+  overflow: auto;
+}
+.app .pay-body:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 2px;
+}
 @media (max-width: 560px) {
   .app .pay-bar {
     flex-direction: column;

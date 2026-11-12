@@ -496,7 +496,9 @@ describe("Settings, Payments sends only what this person changed", () => {
     renderApp("/settings/payments");
     await screen.findByLabelText(/Four-eyes limit/);
     expect(screen.queryByRole("button", { name: "Switch payments off" })).toBeNull();
-    expect(screen.queryByRole("button", { name: /switch payments on|enable/i })).toBeNull();
+    // Switching ON exists (F9c) but is disabled while something still stops payments.
+    const on = screen.getByRole("button", { name: "Switch payments on" }) as HTMLButtonElement;
+    expect(on.disabled).toBe(true);
   });
 });
 

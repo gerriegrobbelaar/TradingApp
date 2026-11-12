@@ -112,7 +112,7 @@ describe("unknown codes are never blank", () => {
     expect(warningText("brand_new_code").length).toBeGreaterThan(10);
     expect(approvalReasonText("brand_new_code")).toBe(APPROVAL_REASON_FALLBACK);
     expect(statusText("brand_new").label).toBe("Unknown");
-    expect(eventText("brand_new", "paid")).toBe("Status changed to paid");
+    expect(eventText("brand_new", "paid")).toBe("Status changed to paid at the bank");
     expect(reasonText("brand_new")).toBe("No further reason was recorded.");
     expect(blockText("__proto__")).toBe(BLOCK_FALLBACK);
     expect(describePaymentError(new ApiError(500, "brand_new"))).toBe(ERROR_FALLBACK);
@@ -136,9 +136,10 @@ describe("wording rules", () => {
   it("§4.3 status words", () => {
     expect(statusText("draft").label).toBe("Open");
     expect(statusText("pending_approval").label).toBe("Waiting for approval");
-    for (const s of ["ready", "submitting", "submitted"])
-      expect(statusText(s).label).toBe("Paying");
-    expect(statusText("paid").label).toBe("Paid");
+    for (const s of ["submitting", "submitted"]) expect(statusText(s).label).toBe("Paying");
+    expect(statusText("ready").label).toBe("Approved, not sent yet");
+    // The bank's word alone is never "Paid" (CLAUDE.md 4.3); displayStatus decides, from the settlement.
+    expect(statusText("paid").label).toBe("Paid at the bank, booking pending");
     expect(statusText("failed").label).toBe("Failed");
   });
 });

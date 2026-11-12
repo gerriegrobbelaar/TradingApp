@@ -11,6 +11,13 @@ import { ApiError, listUsers } from "../api";
 import { patchPaymentsSettings, getPaymentsSettings, switchPaymentsOff } from "../api-payments";
 import { ErrorNotice } from "../components/EmptyState";
 import { ConfirmButton, ErrorLine, StepUpNotice } from "../components/matching/MatchParts";
+import {
+  DraftExpiryCard,
+  EnableControls,
+  PreviewCard,
+  UnknownOutcomesCard,
+  VerifyControls,
+} from "../components/payments/PaymentAdminTools";
 import { TypedPhraseSheet } from "../components/matching/TypedPhraseSheet";
 import { amountErrorText, amountText, parseAmount, toSafeNumber } from "../lib/allocation";
 import { describeLoadError } from "../lib/errors";
@@ -129,8 +136,8 @@ function Money2({ minor }: { minor: number }) {
 
 /**
  * Settings, Payments (admin; ADR 0051). Shows the switch, why it cannot go on yet, the
- * verification checklist (read-only: verifying and switching on are not in this screen yet), the
- * approvers and the controls. Tightening a control saves at once; a loosening needs the typed
+ * verification checklist and its record, the switch (off, and on with the typed phrase), the
+ * approvers, the controls and the admin tools: draft expiry, unknown outcomes, preview payment. Tightening a control saves at once; a loosening needs the typed
  * phrase and a fresh sign-in. The two ceilings are placeholders (ADR 0049) and say so.
  */
 export function PaymentsSettings() {
@@ -289,10 +296,7 @@ export function PaymentsSettings() {
             onConfirm={() => void switchOff()}
           />
         )}
-        <p className="cap">
-          Verifying the payment path and switching payments on are not available in this screen yet.
-          They are done after the Revolut sandbox checks, as the runbook describes.
-        </p>
+        <EnableControls data={data} onChanged={res.refresh} />
       </Card>
 
       <Card>
@@ -316,6 +320,7 @@ export function PaymentsSettings() {
             </li>
           ))}
         </ul>
+        <VerifyControls data={data} onChanged={res.refresh} />
         <dl className="dl pay-dl">
           <div className="dl-row">
             <dt>Revolut plan</dt>
@@ -329,7 +334,7 @@ export function PaymentsSettings() {
           </div>
           <div className="dl-row">
             <dt>Payment preview</dt>
-            <dd>Not available yet.</dd>
+            <dd>Below, under Preview payment.</dd>
           </div>
           <div className="dl-row">
             <dt>Sending to the bank</dt>
@@ -518,6 +523,14 @@ export function PaymentsSettings() {
           </Button>
         </div>
       </Card>
+
+      <DraftExpiryCard
+        key={data.draftExpiryDays ?? "default"}
+        data={data}
+        onChanged={res.refresh}
+      />
+      <UnknownOutcomesCard />
+      <PreviewCard />
 
       <TypedPhraseSheet
         open={phraseOpen}

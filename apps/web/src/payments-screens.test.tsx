@@ -385,13 +385,15 @@ describe("Treasury, Bank, Payments", () => {
 
   it("lists payments with their status and an Updated stamp", async () => {
     bankBase(VIEWER, [
-      payment({ status: "paid" }),
+      payment({ status: "paid", settlement: "booked" }),
+      payment({ id: 13, invoiceNumber: "BILL-91", status: "paid", settlement: "awaiting_match" }),
       payment({ id: 12, invoiceNumber: "BILL-90", status: "failed" }),
     ]);
     renderApp("/treasury/bank?tab=payments");
     const t = await screen.findByRole("table", { name: "Payments" });
     await waitFor(() => expect(t.querySelector(".sk-row")).toBeNull());
-    expect(within(t).getByText("Paid")).toBeTruthy();
+    expect(within(t).getAllByText("Paid")).toHaveLength(1);
+    expect(within(t).getByText("Paid at the bank, booking pending")).toBeTruthy();
     expect(within(t).getByText("Failed")).toBeTruthy();
     expect(screen.getAllByText(/Updated /).length).toBeGreaterThan(0);
   });

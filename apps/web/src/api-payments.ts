@@ -1,7 +1,7 @@
 /**
  * Payments API calls (Phase 9, P9c). Shapes: packages/core api-types (Payment*, Batch*). Every
  * write waits for the server and the screen re-reads afterwards: no optimistic UI, and "Paid" is
- * shown only when the server's status says `paid`. Every answer has each string IBAN-masked again
+ * shown only when the server's settlement says `booked` (lib/payment-labels displayStatus). Every answer has each string IBAN-masked again
  * before a component sees it (the worker masks too; ADR 0043 privacy rule).
  */
 import type {
@@ -13,7 +13,10 @@ import type {
   PaymentCreateResponse,
   PaymentDetailResponse,
   PaymentListResponse,
+  PaymentPreviewResponse,
   PaymentsSettingsResponse,
+  BatchSubmitResponse,
+  PaymentSubmitResponse,
   SupplierIbanStatusDto,
 } from "@camelthorn/core";
 import { queryString, request as rawRequest, type QueryParams } from "./api";
@@ -129,4 +132,47 @@ export const switchPaymentsOff = () =>
   request<PaymentsSettingsResponse>("/api/settings/payments/switch", {
     method: "PUT",
     body: { enabled: false },
+  });
+
+// ---- sending (finance, fresh sign-in) ---------------------------------------------------------
+
+type Submit<K extends SubjectKind> = K extends "payment"
+  ? PaymentSubmitResponse
+  : BatchSubmitResponse;
+
+/**
+ * Sends a `ready` request to the bank. Never repeated from here: the server's claim makes a second
+ * call a refusal (`already_claimed`), and a screen calls it once per decision. A 409 is a refusal
+ * made before anything was sent; any other failure is "unsure" (see payment-send-labels).
+ */
+export const submitRequest = <K extends SubjectKind>(kind: K, id: number) =>
+  request<Submit<K>>(`${base(kind)}/${id}/submit`, { method: "POST", body: {} });
+
+// ---- admin tools (Settings, Payments) ---------------------------------------------------------
+
+/** An unknown outcome was NOT sent: admin, fresh sign-in, typed phrase, a fresh "not found" lookup. */
+export const resolveNotSent = <K extends SubjectKind>(kind: K, id: number, confirm: string) =>
+  request<Action<K>>(`${base(kind)}/${id}/resolve-not-sent`, {
+    method: "POST",
+    body: { confirm },
+  });
+
+/** A dry run of the real bank request bodies: no call is made. Admin, fresh sign-in. */
+export const previewPayment = (kind: SubjectKind, id: number) =>
+  request<PaymentPreviewResponse>("/api/payments/preview", { method: "POST", body: { kind, id } });
+
+export const verifyPaymentPath = (body: { confirm: string; checks: string[]; note: string }) =>
+  request<PaymentsSettingsResponse>("/api/settings/payments/verify", { method: "POST", body });
+
+/** Switching ON: fresh sign-in, the typed phrase, a verification and no blockers. */
+export const switchPaymentsOn = (body: { confirm: string; note?: string }) =>
+  request<PaymentsSettingsResponse>("/api/settings/payments/switch", {
+    method: "PUT",
+    body: { enabled: true, ...body },
+  });
+
+export const setDraftExpiryDays = (days: number) =>
+  request<PaymentsSettingsResponse>("/api/settings/payments/draft-expiry", {
+    method: "PUT",
+    body: { days },
   });

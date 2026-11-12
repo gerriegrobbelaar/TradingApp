@@ -1400,6 +1400,20 @@ export interface DecisionDto {
   note: string | null;
 }
 
+/**
+ * How far a payment is settled (CLAUDE.md 4.3): "paid" needs the bank's word AND the match booked
+ * in Exact. `not_paid` is any status other than `paid`. Only `booked` is "Paid" to a person.
+ */
+export const PAYMENT_SETTLEMENTS = [
+  "not_paid",
+  "awaiting_bank_line",
+  "awaiting_match",
+  "match_other_invoice",
+  "awaiting_booking",
+  "booked",
+] as const;
+export type PaymentSettlement = (typeof PAYMENT_SETTLEMENTS)[number];
+
 export interface PaymentDto {
   kind: "payment";
   id: number;
@@ -1434,6 +1448,8 @@ export interface PaymentDto {
   /** Shown while the request is a draft: the phrase to type to confirm. */
   confirmPhrase: string | null;
   decision: DecisionDto | null;
+  /** F9c: how far the booking is. A batch item carries its own; a batch is as far as its least advanced item. */
+  settlement: PaymentSettlement;
 }
 
 export interface BatchDto {
@@ -1516,6 +1532,49 @@ export interface BatchActionResponse {
   batch: BatchDto;
 }
 
+/**
+ * POST /api/payments/:id/submit and /api/payment-batches/:id/submit (finance, fresh sign-in).
+ * 200 only when the request was handled: `result.to` says where it went. A refusal is a 409 (or
+ * 404) whose `error` is a stable code; the request is then unchanged and nothing was sent.
+ */
+export interface PaymentSubmitResult {
+  to: "submitted" | "rejected" | "outcome_unknown";
+  code: string;
+}
+export interface PaymentSubmitResponse {
+  result: PaymentSubmitResult;
+  payment: PaymentDto;
+}
+export interface BatchSubmitResponse {
+  result: PaymentSubmitResult;
+  batch: BatchDto;
+}
+
+/** One call of POST /api/payments/preview: the real body with any IBAN masked, and hashes. */
+export interface PaymentPreviewCall {
+  step: "counterparty" | "pay" | "draft";
+  method: "POST";
+  path: string;
+  body: string;
+  /** SHA-256 of the bytes that would be sent; may be absent for a step that carries an IBAN. */
+  sha256?: string | null;
+  gateAccepts: boolean;
+  usesPlaceholderPayee: boolean;
+}
+export interface PaymentPreviewResponse {
+  ok: true;
+  mode: PaymentMode;
+  requestId: string;
+  calls: PaymentPreviewCall[];
+}
+
+/** One step of the verification runbook (core PAYMENTS_VERIFY_RUNBOOK). */
+export interface PaymentRunbookEntry {
+  title: string;
+  steps: string[];
+  pass: string;
+}
+
 /** GET /api/payments/ibans/:relationId and the answers of verify and revoke (`iban`). */
 export interface SupplierIbanStatusDto {
   relationId: number;
@@ -1550,6 +1609,10 @@ export interface PaymentsSettingsResponse {
   approverCount: number;
   submitterAvailable: boolean;
   blockers: string[];
+  /** Days before an unapproved Revolut draft expires here (1 to 30). */
+  draftExpiryDays?: number;
   verifyChecks: string[];
+  /** The runbook text per check code; render checks from `verifyChecks`, text from here when present. */
+  verifyRunbook?: Record<string, PaymentRunbookEntry>;
   blockCodes: string[];
 }

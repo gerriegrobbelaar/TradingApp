@@ -5,7 +5,12 @@
  * warning or approval code without a sentence here. An unknown code gets one fixed generic
  * sentence, never the server's text and never a blank.
  */
-import type { PaymentStatus } from "@camelthorn/core";
+import {
+  PAYMENT_SETTLEMENTS,
+  type PaymentMode,
+  type PaymentSettlement,
+  type PaymentStatus,
+} from "@camelthorn/core";
 import type { ChipTone } from "@camelthorn/ui";
 import { ApiError } from "../api";
 
@@ -255,9 +260,10 @@ export const STATUS_TEXT: Record<PaymentStatus, StatusText> = {
     meaning: "A second person must approve this before it can be sent. Nothing has been sent.",
   },
   ready: {
-    label: "Paying",
+    label: "Approved, not sent yet",
     tone: "gold",
-    meaning: "Confirmed and queued. It has not been sent to the bank yet.",
+    meaning:
+      "All approvals are in, but nothing has been sent to the bank. Someone in finance must use Send to bank.",
   },
   submitting: {
     label: "Paying",
@@ -274,15 +280,17 @@ export const STATUS_TEXT: Record<PaymentStatus, StatusText> = {
     tone: "warn",
     meaning: "We could not confirm whether the bank received this payment.",
   },
+  // `paid` is the bank's word only. "Paid" in full also needs the booking in Exact (CLAUDE.md 4.3):
+  // displayStatus() says "Paid" for a settlement of `booked` and for nothing else.
   paid: {
-    label: "Paid",
-    tone: "ok",
-    meaning: "The bank confirmed the payment.",
+    label: "Paid at the bank, booking pending",
+    tone: "gold",
+    meaning: "The bank confirmed the payment. It is not booked in Exact yet.",
   },
   failed: {
     label: "Failed",
     tone: "warn",
-    meaning: "The bank did not make this payment.",
+    meaning: "The payment was not made.",
   },
   rejected: {
     label: "Rejected",
@@ -307,6 +315,134 @@ export function statusText(s: string): StatusText {
     : { label: "Unknown", tone: "neutral", meaning: "This status is not known to this version." };
 }
 
+// ---- how far a bank-paid payment is booked (the ONE place "Paid" is decided) -----------------------
+
+/** The wire value of the bank-paid status: named here and nowhere else in the screens (scan-tested). */
+export const PAID_STATUS: PaymentStatus = "paid";
+
+/** What each settlement code means for a payment the bank has paid. */
+export interface SettlementText {
+  label: string;
+  tone: ChipTone;
+  /** The step it waits at, in words. */
+  step: string;
+}
+
+export const SETTLEMENT_TEXT: Record<PaymentSettlement, SettlementText> = {
+  not_paid: {
+    label: "Paid at the bank, booking pending",
+    tone: "gold",
+    step: "The bank confirmed the payment, but we cannot yet say how far the booking in Exact is.",
+  },
+  awaiting_bank_line: {
+    label: "Paid at the bank, booking pending",
+    tone: "gold",
+    step: "Waiting for the bank line of this payment to arrive from Revolut.",
+  },
+  awaiting_match: {
+    label: "Paid at the bank, booking pending",
+    tone: "gold",
+    step: "The bank line has arrived. Waiting for it to be matched to this bill.",
+  },
+  match_other_invoice: {
+    label: "Paid at the bank, matched elsewhere",
+    tone: "warn",
+    step: "The bank line was matched to another bill. Check the match in Treasury, Bank before anything else is paid.",
+  },
+  awaiting_booking: {
+    label: "Paid at the bank, booking pending",
+    tone: "gold",
+    step: "The match is made but not yet booked in Exact. It stays here while booking in Exact is switched off.",
+  },
+  booked: {
+    label: "Paid",
+    tone: "ok",
+    step: "The bank confirmed it and the match is booked in Exact.",
+  },
+};
+
+/** One fixed sentence for a settlement code this version does not know. Never "Paid". */
+export const SETTLEMENT_FALLBACK: SettlementText = {
+  label: "Paid at the bank, booking pending",
+  tone: "gold",
+  step: "The bank confirmed the payment. We cannot tell yet whether it is booked in Exact.",
+};
+
+export function settlementText(code: string | null | undefined): SettlementText {
+  return typeof code === "string" && own(SETTLEMENT_TEXT, code)
+    ? SETTLEMENT_TEXT[code as PaymentSettlement]
+    : SETTLEMENT_FALLBACK;
+}
+
+/** True only when the bank confirmed AND the match is booked in Exact. */
+export const isBooked = (status: string, settlement: string | null | undefined): boolean =>
+  status === PAID_STATUS && settlement === "booked";
+
+/**
+ * A batch is as far as its least advanced item. No items, or one this version cannot read: the
+ * fixed "cannot tell" answer, never booked.
+ */
+export function batchSettlement(items: readonly { settlement?: string | undefined }[]): string {
+  if (items.length === 0) return "unreadable";
+  let least: number = PAYMENT_SETTLEMENTS.length;
+  for (const i of items) {
+    const at = (PAYMENT_SETTLEMENTS as readonly string[]).indexOf(i.settlement ?? "");
+    if (at < 0) return "unreadable";
+    least = at < least ? at : least;
+  }
+  return PAYMENT_SETTLEMENTS[least] ?? "unreadable";
+}
+
+/** What the chip, the detail sheet and the toasts say about a request. Takes the whole picture. */
+export interface StatusSubject {
+  status: string;
+  mode?: PaymentMode | string | undefined;
+  /** A payment's own settlement, or a batch's (batchSettlement of its items). */
+  settlement?: string | null | undefined;
+}
+
+export function displayStatus(s: StatusSubject): StatusText & { step: string | null } {
+  if (s.status === PAID_STATUS) {
+    const t = settlementText(s.settlement);
+    return {
+      label: t.label,
+      tone: t.tone,
+      meaning: isBooked(s.status, s.settlement)
+        ? "The bank confirmed the payment and it is booked in Exact."
+        : "The bank confirmed the payment. It is not booked in Exact yet.",
+      step: t.step,
+    };
+  }
+  if (s.status === "submitted" && s.mode === "drafts") {
+    return {
+      label: "Waiting for approval in Revolut",
+      tone: "gold",
+      meaning:
+        "A draft is waiting in the Revolut app. Open the Revolut app and approve it there. Nothing is paid until you do.",
+      step: null,
+    };
+  }
+  return { ...statusText(s.status), step: null };
+}
+
+/** The status subject of a payment or a batch DTO (a batch takes the least advanced item). */
+export function subjectOf(
+  dto:
+    | { kind: "payment"; status: string; mode: string; settlement?: string | undefined }
+    | {
+        kind: "batch";
+        status: string;
+        mode: string;
+        items: readonly { settlement?: string | undefined }[];
+      },
+): StatusSubject {
+  return {
+    status: dto.status,
+    mode: dto.mode,
+    settlement: dto.kind === "payment" ? dto.settlement : batchSettlement(dto.items),
+  };
+}
+
 /** Said whenever a request is in `outcome_unknown` (ADR 0049: never retried automatically). */
 export const OUTCOME_UNKNOWN_TEXT =
   "We could not confirm whether the bank received this payment. Do not pay again. An administrator can check it.";
@@ -319,30 +455,62 @@ export const DRAFTS_MODE_TEXT =
 export const CANCEL_FINAL_TEXT =
   "Cancelling is final and cannot be undone. To pay the bill later, request a new payment.";
 
-/** Why a request ended, from `statusReason` (a stable code, sometimes with a bank code after a colon). */
+/** Why a request ended, per stable code of `statusReason` (a bank code may follow a colon). */
+export const REASON_TEXT: Record<string, string> = {
+  approver_rejected: "An approver turned it down.",
+  expired: "It was not finished within 24 hours.",
+  cancelled: "It was cancelled.",
+  outcome_unknown: "The answer from the bank did not arrive or could not be read.",
+  lease_lost: "The answer from the bank did not arrive or could not be read.",
+  lease_expired: "The answer from the bank did not arrive or could not be read.",
+  finish_failed: "The answer from the bank did not arrive or could not be read.",
+  bank_failed: "The bank reported that the payment failed.",
+  failed: "The bank reported that the payment failed.",
+  bank_declined: "The bank declined the payment. Nothing was paid.",
+  bank_reverted:
+    "The bank reversed the payment. Check Revolut before you pay this bill again, because the money may have come back.",
+  draft_expired:
+    "The draft was not approved in time. If it is still in the Revolut app, delete it there before asking for a new payment.",
+  resolved_not_sent:
+    "An administrator confirmed that this was never sent to the bank. Nothing was paid.",
+};
+
+/** The bank-side words after `provider_rejected:`. A prefix rule covers the rest. */
+export const PROVIDER_REJECT_TEXT: Record<string, string> = {
+  prior_attempt_live:
+    "An earlier attempt for this bill is still alive at Revolut, so this one was not sent. Check Revolut, and do not pay again.",
+  prior_attempt_unchecked:
+    "We could not check Revolut for an earlier attempt for this bill, so this one was not sent. Try again later.",
+  counterparty_account_ambiguous:
+    "The supplier has more than one account at Revolut and we could not tell which one was confirmed, so nothing was sent.",
+  counterparty_iban_unconfirmed:
+    "Revolut did not show the bank account an approver confirmed for this supplier, so nothing was sent.",
+  payload_mismatch: "The request no longer matched what was approved, so nothing was sent.",
+  mode_not_allowed:
+    "One-click pay is not available on this Revolut connection, so nothing was sent.",
+  batch_pay_unsupported: "A batch can only be sent as drafts, so nothing was sent.",
+  iban_binding_broken:
+    "The stored bank account no longer matches the one an approver confirmed, so nothing was sent.",
+  payments_disabled: "Sending is not available right now, so nothing was sent.",
+  no_lease: "Sending is not available right now, so nothing was sent.",
+};
+export const PROVIDER_REJECT_FALLBACK = "The bank refused the payment.";
+export const PROVIDER_COUNTERPARTY_TEXT =
+  "The supplier could not be set up at Revolut, so nothing was sent.";
+
+export function providerRejectText(sub: string): string {
+  if (own(PROVIDER_REJECT_TEXT, sub)) return PROVIDER_REJECT_TEXT[sub] as string;
+  if (sub.startsWith("counterparty_")) return PROVIDER_COUNTERPARTY_TEXT;
+  return PROVIDER_REJECT_FALLBACK;
+}
+
+/** Why a request ended, from `statusReason`; an unknown code gets one fixed generic sentence. */
 export function reasonText(reason: string | null): string | null {
   if (reason === null || reason === "") return null;
-  const head = reason.split(":")[0] ?? "";
-  switch (head) {
-    case "approver_rejected":
-      return "An approver turned it down.";
-    case "provider_rejected":
-      return "The bank refused the payment.";
-    case "expired":
-      return "It was not finished within 24 hours.";
-    case "cancelled":
-      return "It was cancelled.";
-    case "outcome_unknown":
-    case "lease_lost":
-    case "lease_expired":
-    case "finish_failed":
-      return "The answer from the bank did not arrive or could not be read.";
-    case "bank_failed":
-    case "failed":
-      return "The bank reported that the payment failed.";
-    default:
-      return "No further reason was recorded.";
-  }
+  const parts = reason.split(":");
+  const head = parts[0] ?? "";
+  if (head === "provider_rejected") return providerRejectText(parts[1] ?? "");
+  return own(REASON_TEXT, head) ? (REASON_TEXT[head] as string) : "No further reason was recorded.";
 }
 
 /** Timeline words for payment_events.code. */
@@ -374,8 +542,21 @@ export function eventText(code: string | null, to: string): string {
     case "lease_expired":
     case "finish_failed":
       return "Could not confirm whether the bank received it";
+    case "reconciled_pending":
+      return "Found at the bank, waiting for it to finish";
+    case "bank_completed":
+      return "The bank confirmed the payment";
+    case "bank_failed":
+    case "bank_declined":
+      return "The bank did not make the payment";
+    case "bank_reverted":
+      return "The bank reversed the payment";
+    case "draft_expired":
+      return "The draft expired without approval";
+    case "resolved_not_sent":
+      return "An administrator confirmed it was not sent";
     default:
-      return `Status changed to ${statusText(to).label.toLowerCase()}`;
+      return `Status changed to ${to === PAID_STATUS ? "paid at the bank" : statusText(to).label.toLowerCase()}`;
   }
 }
 
@@ -425,6 +606,20 @@ export const ERROR_TEXT: Record<string, string> = {
   bad_currencies: "That currency list is not valid.",
   bad_mode: "That payment mode is not valid.",
   bad_field: "One of the values is not valid.",
+  // Admin tools: resolve-not-sent and preview payment.
+  not_unknown: "This request is not waiting on an unknown outcome, so there is nothing to resolve.",
+  lookup_not_fresh:
+    "Revolut was not asked recently enough whether it has this payment. Wait for the next check, then try again.",
+  too_soon:
+    "This request became unknown less than 15 minutes ago. Revolut can be slow to show a payment, so wait.",
+  lookup_too_early:
+    "The last check was made too soon after the request became unknown. Wait for a later check, then try again.",
+  refused: "The change was refused. Reload the page and look at the request again.",
+  batch_pay_unsupported: "A batch can only be sent as drafts, so there is nothing to preview.",
+  builder_refused:
+    "The payment data could not be turned into a bank request. That is a finding: check the reference, name and amount.",
+  iban_binding_broken:
+    "The stored bank account no longer matches the one an approver confirmed. Nothing can be sent.",
   forbidden: "You do not have the role for this.",
   unauthenticated: "You are signed out. Sign in again.",
 };

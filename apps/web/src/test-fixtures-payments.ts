@@ -59,6 +59,7 @@ export function payment(over: Partial<PaymentDto> = {}): PaymentDto {
     providerId: null,
     confirmPhrase: null,
     decision: null,
+    settlement: "not_paid",
     ...over,
   };
   return {

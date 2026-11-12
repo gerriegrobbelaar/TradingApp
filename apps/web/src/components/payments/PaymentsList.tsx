@@ -1,21 +1,23 @@
 import { useCallback, useState } from "react";
 import { Segmented } from "@camelthorn/ui";
 import type { SubjectKind } from "../../api-payments";
+import { PAID_STATUS } from "../../lib/payment-labels";
 import { PaymentDetailSheet } from "./PaymentDetailSheet";
 import { BatchRows, PaymentRows, UpdatedStamp } from "./RequestTable";
 
-type View = "open" | "pending_approval" | "paid" | "failed" | "all";
+/** `bank_paid` lists what the bank paid; each row says whether it is also booked in Exact. */
+type View = "open" | "pending_approval" | "bank_paid" | "failed" | "all";
 const VIEWS: { value: View; label: string }[] = [
   { value: "open", label: "Open" },
   { value: "pending_approval", label: "Waiting for approval" },
-  { value: "paid", label: "Paid" },
+  { value: "bank_paid", label: "Paid at the bank" },
   { value: "failed", label: "Failed" },
   { value: "all", label: "All" },
 ];
 const EMPTY: Record<View, string> = {
   open: "0 payments are open.",
   pending_approval: "0 payments are waiting for approval.",
-  paid: "0 payments have been paid through this app.",
+  bank_paid: "0 payments have been paid at the bank through this app.",
   failed: "0 payments have failed.",
   all: "No payment has been requested yet.",
 };
@@ -30,6 +32,7 @@ export function PaymentsList() {
   const [reload, setReload] = useState(0);
   const [open, setOpen] = useState<{ kind: SubjectKind; id: number } | null>(null);
   const [at, setAt] = useState<number | null>(null);
+  const statusParam = view === "bank_paid" ? PAID_STATUS : view;
   const onOpen = useCallback((kind: SubjectKind, id: number) => setOpen({ kind, id }), []);
   return (
     <div className="pay-list-wrap">
@@ -46,15 +49,21 @@ export function PaymentsList() {
         </label>
         <UpdatedStamp at={at} />
       </div>
+      {view === "bank_paid" && (
+        <p className="cap">
+          Payments the bank has paid. Each says whether it is also booked in Exact; only those
+          marked Paid are.
+        </p>
+      )}
       <PaymentRows
-        status={view}
+        status={statusParam}
         mine={mine}
         reloadKey={reload}
         empty={EMPTY[view]}
         onOpen={onOpen}
         onLoaded={setAt}
       />
-      <BatchRows status={view} mine={mine} reloadKey={reload} onOpen={onOpen} />
+      <BatchRows status={statusParam} mine={mine} reloadKey={reload} onOpen={onOpen} />
       {open && (
         <PaymentDetailSheet
           kind={open.kind}

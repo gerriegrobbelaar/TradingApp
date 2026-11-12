@@ -26,7 +26,13 @@ describe("matching api types", () => {
 
 // ---- payments DTOs: the shapes moved from the worker's read.ts must stay byte-identical (P9c) ----------
 import type { ApprovalReason, PaymentMode, PaymentStatus } from "./payments/types";
-import type { BatchDto, DecisionDto, PaymentDto } from "./api-types";
+import {
+  PAYMENT_SETTLEMENTS,
+  type BatchDto,
+  type DecisionDto,
+  type PaymentDto,
+  type PaymentSettlement,
+} from "./api-types";
 
 type Equal<A, B> =
   (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
@@ -71,6 +77,10 @@ interface P9aPaymentDto {
   confirmPhrase: string | null;
   decision: P9aDecisionDto | null;
 }
+/** F9c adds exactly one field to a payment, and so to a batch's items: how far the booking is. */
+interface F9cPaymentDto extends P9aPaymentDto {
+  settlement: PaymentSettlement;
+}
 interface P9aBatchDto {
   kind: "batch";
   id: number;
@@ -94,14 +104,28 @@ interface P9aBatchDto {
   providerId: string | null;
   confirmPhrase: string | null;
   decision: P9aDecisionDto | null;
-  items: P9aPaymentDto[];
+  items: F9cPaymentDto[];
 }
 
 describe("payments DTO shapes", () => {
   it("are identical to what P9a returned (compile-time check)", () => {
     assertTrue<Equal<DecisionDto, P9aDecisionDto>>();
-    assertTrue<Equal<PaymentDto, P9aPaymentDto>>();
+    assertTrue<Equal<PaymentDto, F9cPaymentDto>>();
+    assertTrue<Equal<Omit<PaymentDto, "settlement">, P9aPaymentDto>>();
     assertTrue<Equal<BatchDto, P9aBatchDto>>();
     expect(true).toBe(true);
+  });
+});
+
+describe("payment settlement codes", () => {
+  it("are the six the worker's paymentSettlement can return, in order of progress", () => {
+    expect([...PAYMENT_SETTLEMENTS]).toEqual([
+      "not_paid",
+      "awaiting_bank_line",
+      "awaiting_match",
+      "match_other_invoice",
+      "awaiting_booking",
+      "booked",
+    ]);
   });
 });

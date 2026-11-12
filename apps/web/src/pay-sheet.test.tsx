@@ -297,21 +297,30 @@ describe("a single payment, from request to result", () => {
     const dlg = await review(user);
     await user.type(within(dlg).getByLabelText("Confirmation text"), "PAY 1234.56 EUR TO 4300");
     await user.click(within(dlg).getByRole("button", { name: "Confirm payment" }));
-    await within(dlg).findByText("Confirmed and queued. It has not been sent to the bank yet.");
+    await within(dlg).findByText(
+      "All approvals are in, but nothing has been sent to the bank. Someone in finance must use Send to bank.",
+    );
     expect(within(dlg).queryByText("Paid")).toBeNull();
-    expect(within(dlg).getAllByText("Paying").length).toBeGreaterThan(0);
-    expect(norm(dlg.textContent)).toContain("waits as a draft in the Revolut app");
-    // the server now reports paid
+    expect(within(dlg).getAllByText("Approved, not sent yet").length).toBeGreaterThan(0);
+    expect(within(dlg).getByRole("button", { name: "Send to bank" })).toBeTruthy();
+    // the bank says paid, the booking is not there yet: not "Paid"
     calls.length = 0;
+    let settlement: "awaiting_bank_line" | "booked" = "awaiting_bank_line";
     mockFetch({
       "GET /api/auth/me": () => ({ body: FINANCE }),
       "GET /api/divisions": () => ({ body: ONE_DIVISION }),
       "GET /api/payments/11": () => ({
-        body: { payment: payment({ status: "paid" }), events: [] },
+        body: { payment: payment({ status: "paid", settlement }), events: [] },
       }),
     });
     await user.click(within(dlg).getByRole("button", { name: "Check status again" }));
-    await within(dlg).findByText("The bank confirmed the payment.");
+    await within(dlg).findByText("It is not booked in Exact yet.", { exact: false });
+    expect(within(dlg).queryByText("Paid")).toBeNull();
+    expect(within(dlg).getAllByText("Paid at the bank, booking pending").length).toBeGreaterThan(0);
+    // the booking is done: now, and only now, "Paid"
+    settlement = "booked";
+    await user.click(within(dlg).getByRole("button", { name: "Check status again" }));
+    await within(dlg).findByText("The bank confirmed the payment and it is booked in Exact.");
     expect(within(dlg).getAllByText("Paid").length).toBeGreaterThan(0);
   });
 
@@ -325,7 +334,7 @@ describe("a single payment, from request to result", () => {
     const dlg = await review(user);
     await user.type(within(dlg).getByLabelText("Confirmation text"), "PAY 1234.56 EUR TO 4300");
     await user.click(within(dlg).getByRole("button", { name: "Confirm payment" }));
-    await within(dlg).findByText("The bank did not make this payment.");
+    await within(dlg).findByText("The payment was not made.");
     expect(within(dlg).getByText("The bank reported that the payment failed.")).toBeTruthy();
   });
 

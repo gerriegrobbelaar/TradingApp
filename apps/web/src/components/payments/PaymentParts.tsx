@@ -18,15 +18,18 @@ import {
   DRAFTS_MODE_TEXT,
   OUTCOME_UNKNOWN_TEXT,
   approvalReasonText,
+  displayStatus,
+  isBooked,
+  subjectOf,
   blockText,
   blocksOf,
   describePaymentError,
   eventText,
   itemBlocksOf,
   reasonText,
-  statusText,
   warningText,
 } from "../../lib/payment-labels";
+import { SendPanel, type SendNote } from "./SendPanel";
 import { formatDateTime, formatEcbRate, NO_VALUE } from "../../lib/format";
 import { useAction } from "../../lib/useAction";
 import { ConfirmButton, ErrorLine, StepUpNotice } from "../matching/MatchParts";
@@ -41,17 +44,23 @@ export const hasRole = (me: Me, role: string): boolean => (me.roles as string[])
 
 const IN_FLIGHT: readonly PaymentStatus[] = ["ready", "submitting", "submitted"];
 const CANCELLABLE: readonly PaymentStatus[] = ["draft", "pending_approval", "ready"];
-const FINAL: readonly PaymentStatus[] = ["paid", "failed", "rejected", "cancelled", "expired"];
+const FINAL: readonly PaymentStatus[] = ["failed", "rejected", "cancelled", "expired"];
 
-export const isFinalStatus = (s: PaymentStatus): boolean => FINAL.includes(s);
+/**
+ * Nothing more will change. A request the bank paid is NOT final until the payment is booked in
+ * Exact (CLAUDE.md 4.3), so its screen keeps checking.
+ */
+export const isFinalRequest = (dto: RequestDto): boolean =>
+  FINAL.includes(dto.status) || isBooked(dto.status, subjectOf(dto).settlement);
 
 /** The first 12 characters of the payload hash: enough to compare two screens, not the whole 64. */
 export const shortHash = (h: string): string => h.slice(0, 12);
 
 // ---- small pieces -----------------------------------------------------------------------------
 
-export function StatusChip({ status }: { status: string }) {
-  const t = statusText(status);
+/** The one status chip: "Paid" only when the bank confirmed AND the payment is booked in Exact. */
+export function StatusChip({ dto }: { dto: RequestDto }) {
+  const t = displayStatus(subjectOf(dto));
   return <Chip tone={t.tone}>{t.label}</Chip>;
 }
 
@@ -282,30 +291,26 @@ export function BatchSummary({ dto, account }: { dto: BatchDto; account: BankAcc
 // ---- status and history -----------------------------------------------------------------------
 
 export function StatusPanel({ dto }: { dto: RequestDto }) {
-  const t = statusText(dto.status);
+  const t = displayStatus(subjectOf(dto));
   const why = reasonText(dto.statusReason);
+  const sent = dto.status === "submitting" || dto.status === "submitted";
   return (
     <div className="pay-status" role="status">
       <p>
-        <StatusChip status={dto.status} /> <span>{t.meaning}</span>
+        <StatusChip dto={dto} /> <span>{t.meaning}</span>
       </p>
+      {t.step !== null && <p className="cap">{t.step}</p>}
       {dto.status === "outcome_unknown" && (
         <p role="alert" className="notice warn">
           {OUTCOME_UNKNOWN_TEXT}
         </p>
       )}
       {(dto.status === "failed" || dto.status === "rejected") && why && (
-        <p className="cap">{why}</p>
+        <p className={dto.statusReason === "draft_expired" ? "notice warn" : "cap"}>{why}</p>
       )}
-      {dto.status === "paid" && (
-        <p className="cap">
-          The bank confirmed it. Matching it to the bill in Exact is a separate step.
-        </p>
+      {dto.mode === "drafts" && sent && dto.status === "submitting" && (
+        <p className="cap">{DRAFTS_MODE_TEXT}</p>
       )}
-      {dto.mode === "drafts" &&
-        (dto.status === "ready" || dto.status === "submitting" || dto.status === "submitted") && (
-          <p className="cap">{DRAFTS_MODE_TEXT}</p>
-        )}
       {dto.decision && (
         <p className="cap">
           {dto.decision.decision === "approved" ? "Approved" : "Turned down"} by {dto.decision.by}{" "}
@@ -439,7 +444,7 @@ export function ConfirmPanel({
       <p className="cap">
         {needsApproval
           ? "Nothing is sent to the bank until an approver has approved it."
-          : "After you confirm, the payment is queued to be sent to the bank. It shows as Paid only when the bank confirms it."}
+          : "After you confirm, the payment is approved but not sent. Someone in finance must still use Send to bank. It shows as Paid only when the bank confirms it and it is booked in Exact."}
       </p>
     </div>
   );
@@ -665,13 +670,16 @@ export function RequestView({
   // Requests on their way are re-read now and then; a final one is not.
   const refreshRef = useRef(onRefresh);
   refreshRef.current = onRefresh;
-  const inFlight = IN_FLIGHT.includes(dto.status) || dto.status === "pending_approval";
+  const inFlight =
+    IN_FLIGHT.includes(dto.status) || dto.status === "pending_approval" || !isFinalRequest(dto);
   useEffect(() => {
     if (!inFlight) return;
     const id = setInterval(() => refreshRef.current(), 15_000);
     return () => clearInterval(id);
   }, [inFlight]);
   const mine = sameUser(dto.requestedBy, me.email);
+  // What the last Send to bank said; it outlives the panel, which goes when the status moves on.
+  const [sendNote, setSendNote] = useState<SendNote | null>(null);
   return (
     <div className="pay-view">
       <p className="lede">
@@ -686,6 +694,15 @@ export function RequestView({
         )}
       </p>
       <StatusPanel dto={dto} />
+      {sendNote !== null && (
+        <p
+          role={sendNote.kind === "result" ? "status" : "alert"}
+          className={sendNote.kind === "result" && sendNote.good ? "notice" : "notice warn"}
+          data-testid="send-result"
+        >
+          {sendNote.text}
+        </p>
+      )}
       {dto.kind === "payment" ? (
         <PaymentSummary dto={dto} account={account} />
       ) : (
@@ -711,7 +728,19 @@ export function RequestView({
           <p className="cap">Only the person who prepared this can confirm it.</p>
         ))}
       {showApprove && <DecisionPanel dto={dto} me={me} onDone={onChanged} onRefresh={onRefresh} />}
-      {!isFinalStatus(dto.status) && dto.status !== "draft" && (
+      {dto.status === "ready" && hasRole(me, "finance") && (sendNote?.final ?? false) === false && (
+        <SendPanel
+          // A changed payload is a new decision: the confirmation of the old one is dropped.
+          key={dto.payloadHash}
+          dto={dto}
+          me={me}
+          onNote={setSendNote}
+          onDone={onChanged}
+          onRefresh={onRefresh}
+          {...(onDirty ? { onDirty } : {})}
+        />
+      )}
+      {!isFinalRequest(dto) && dto.status !== "draft" && (
         <div className="stack-row">
           <Button size="sm" onClick={onRefresh}>
             Check status again
