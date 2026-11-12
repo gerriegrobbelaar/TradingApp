@@ -1,0 +1,35 @@
+# Phase 9 final review (condensed)
+
+Reviewed 3d00d81. Default config: no path sends a payment (12 gates listed in the review; var `REVOLUT_PAYMENTS_EXECUTION`="off", D1 switch, verification mark, protocol version, job class, lease, send ledger, DB triggers). Sign-off: NOT done.
+
+Blocking
+- B1 Web cannot send a payment: no UI/API call for `/submit`, `/settlement`, `/resolve-not-sent`, `/preview`, `/verify`, switch enable, draft expiry. `ready` is worded "Confirmed and queued" (payment-labels.ts, PaymentParts.tsx) but nothing queues it; request expires after 24 h. P9b reason codes (`draft_expired`, `bank_declined`, `bank_reverted`, `resolved_not_sent`) have no sentence; expired draft shows "The bank did not make this payment" though the draft is still approvable in the Revolut app. Need: "Send to bank" for `ready` (step-up, every refusal code worded: busy, prior_attempt_live, payment_lease, ...), reword `ready` "Approved, not sent yet", word every status reason, admin screens (resolve-not-sent, preview, verify, enable) or ADR 0051/DEPLOY state curl-only by decision.
+- B2 "Paid" shown on the bank's word alone (CLAUDE.md 4.3: only after bank confirms AND match booked in Exact). PaymentDto has no settlement; web never calls settlement; batch items never linked to bank lines (reconcile.ts ~524). Need: `settlement` in PaymentDto and batch items (pinned by type test); "Paid" only for `booked`, else "Paid at the bank, booking pending" (or "matched to another invoice"); `submitted` in drafts mode = "Waiting for approval in Revolut"; link batch items via the draft's transaction ids; scan test: no screen reads `status === "paid"` alone.
+- B3 Double-payment guards fail open on doubt (drafts path, A7):
+  (a) earlier-attempt check cut at 20 rows (`revolut-submitter.ts` ~302-366, `ORDER BY p.id LIMIT 20`, no overflow check): dedupe by draft before lookup; answer `prior_attempt_unchecked` when rows exceed the cap.
+  (b) 4xx on POST /payment-drafts believed when the confirming lookup fails (`adoptDraft` ~206-214 returns null on list error and on ≥2 hits, then `rejected` at ~285-288): list error or >1 hit must be `unknown` (payDirect already does this).
+  (c) known draft answering 404 after the expiry days becomes failed/draft_expired (`reconcile.ts` ~336-342), breaking "not found never moves anything": keep `submitted` + alert; fail only with positive evidence (no bank line of that account, amount, reference).
+  Fault-injection tests for each; re-pin protocol version.
+
+Should fix (before the deploy var is "on" anywhere but staging)
+- S1 Payment alerts visible nowhere (`payment_reconcile.alert_at` only; `mismatch`/`duplicate` write no audit row, reconcile.ts ~263-271, 321-325, 393-396; settlement endpoint answers `not_paid` for late approval though DEPLOY says otherwise). Need DQ rules/Today items for alerts, `outcome_unknown` > 30 min, paid-not-booked after N days, `ready` not sent; critical → instant alert; acknowledge action.
+- S2 Payment approvals not in the Today queue (today/routes.ts reads only Exact approvals): add pending_approval (approvers) and ready (finance) sources.
+- S3 Runbook cannot be followed as written: step 4 records "checks you have" but verify refuses an incomplete list; runbook.ts:68 refers to a non-existent staging fault switch; "web dialog" does not exist. Add a staging-only provisional mark or document a two-pass procedure; remove or build the fault switch.
+- S4 A-items untested by the runbook: A8 (draft list paging, completed/deleted draft readability, state words), A10 (4xx really creates nothing), A11 (/pay on non-Company plan), A14 (GET /counterparties returns IBANs?), A16 (rate limit), payee-name verification, transfer fees (S13). Add checks e.g. `draft_lifecycle_probe`, `counterparty_lookup_probe`.
+- S5 DEPLOY secrets stale: step 5 "five secrets" lacks PAYMENTS_IBAN_KEY and EMAIL_API_KEY (also in "Staging first" step 4 and "Rotating secrets"). Rotating PAYMENTS_IBAN_KEY: all IBAN verifications lapse, paid-before history lost, `ready` requests fail `iban_binding_broken`, payee cache orphaned (duplicate counterparties). No key id stored: add key id next to fingerprints.
+- S6 Deploy guard (`apps/worker/scripts/check-deploy-config.mjs`) ignores REVOLUT_PAYMENTS_EXECUTION: refuse values other than on/off; require an explicit flag for production on; print value at deploy.
+- S7 Preview returns/audits an unkeyed SHA-256 of the counterparty body (preview.ts ~106,158): brute-forceable IBAN. Do not hash/store the counterparty step or use the keyed HMAC.
+- S8 `whyNot` (submit.ts ~181-245) does not re-check the requester is still active with finance role: add `requester_inactive`.
+- S9 Structuring under the limit (four-eyes per payment/batch; in pay mode one finance user can send many just under 2,500). USER DECISION: cumulative per-supplier or per-requester threshold.
+- S10 Paid-outside-the-app window up to 26 h (cached open items); Exact payment run/SEPA batch not read; "one SEPA batch (Exact)" of 4.3 not built, no ADR. Need a user-priority Exact read of the invoice before the claim + ADR.
+- S11 Settings PATCH compare-and-swap compares against a value re-read just before write, not the value the patch was computed on (routes.ts ~379-422): carry the raw value from loadPaymentsState.
+- S12 Counterparty creation has no audit row (payees.ts recordPayee): add `payee.created`/`payee.adopted`.
+- S13 Transfer fees: Phase 7 refuses fee lines for booking; a fee-carrying payment could never reach `booked`: runbook + decision.
+- S14 Stale docs: ADR 0049 says late rejection recorded `provider_rejected:<code>:late` but trigger `payments_guard_unknown_reject` refuses it (row stays outcome_unknown); file headers of routes.ts/store.ts say "nothing here moves money"; protocol-version.ts names the wrong pin test.
+
+Nice to have
+N1 lease owner pattern refuses emails with + or '; N2 `ORDER BY id LIMIT 1` picks the Revolut connection; N3 real-time tests (payments-submitter.test.ts:240, payments-review-p9b.test.ts:388-399, payments-execution.test.ts:529); N4 beneficiary name not in the payload hash; N5 resolve-not-sent has no positive control for a lookup that always 404s; N6 PUT draft-expiry needs no fresh sign-in; N7 gate checks body keys only, not that amount/account equal the stored request; N8 draft "completed" without transaction ids becomes paid with no bank-line link; N9 `already_paid` blocks a second part for good.
+
+Decisions that block going live (user): Revolut plan (and who can approve drafts in the Revolut app); four-eyes limit, who holds approver, whether one person may hold finance+approver; hard ceilings (25,000/request, 50,000/day are invented); currencies (EUR only?); who may press send; expired drafts (delete by hand vs allow DELETE /payment-drafts/{id}); new: S9 cumulative threshold, S10 Exact SEPA batch scope, S1 how alerts reach people.
+
+Conditions: B1–B3 fixed via builder+reviewer then short re-review; S1–S7 closed before the deploy var is "on" outside staging; decisions 1–6 recorded as ADRs.
