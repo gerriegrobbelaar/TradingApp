@@ -98,7 +98,7 @@ function SignedInShell() {
           <TopNav />
           <main ref={mainRef} id="main" tabIndex={-1} className="main">
             <PageErrorBoundary path={pathname}>
-              <Lazy>
+              <Lazy resetKey={pathname}>
                 <Routes>
                   <Route path="/" element={<Navigate to="/overview" replace />} />
                   <Route path="/overview" element={<Overview />} />

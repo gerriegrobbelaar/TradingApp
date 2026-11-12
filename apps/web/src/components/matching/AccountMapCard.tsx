@@ -3,15 +3,17 @@ import type { MatchAccountMapDto, MatchAccountMapResponse } from "@camelthorn/co
 import { Button, Card, Chip, Skeleton } from "@camelthorn/ui";
 import { getAccountMap, putAccountMap } from "../../api-matching";
 import { describeLoadError } from "../../lib/errors";
-import { amountErrorText } from "../../lib/allocation";
 import {
   CONTROL_ACCOUNTS_HELP,
   controlAccountsMissing,
+  openingBalanceErrorText,
+  openingBalanceRequest,
   openingBalanceText,
   parseOpeningBalance,
 } from "../../lib/account-map";
 import { blockerText } from "../../lib/matching-labels";
 import { JOURNAL_CODE, LEDGER_CODE } from "../../lib/matching-settings";
+import { formatMoney } from "../../lib/format";
 import { useAction } from "../../lib/useAction";
 import { useResource } from "../../lib/useResource";
 import { useToast } from "../../toasts";
@@ -90,8 +92,11 @@ function Row({
               receivableGlAccountCode:
                 draft.receivable.trim() === "" ? null : draft.receivable.trim(),
               payableGlAccountCode: draft.payable.trim() === "" ? null : draft.payable.trim(),
-              openingBalanceMinor:
-                opening.ok && opening.minor !== null ? opening.minor.toString() : null,
+              // Sent only when edited: absent keeps the stored value (a value the screen could not
+              // show is never cleared by saving another field).
+              ...(draft.opening !== saved.opening
+                ? { openingBalanceMinor: openingBalanceRequest(opening) }
+                : {}),
             },
       ),
     );
@@ -211,9 +216,15 @@ function Row({
           {CONTROL_ACCOUNTS_HELP}
         </p>
       )}
+      {draft.division !== "" && opening.ok && opening.minor !== null && (
+        <p className="cap" id={`${id}-opening-reads`}>
+          Opening balance reads as {formatMoney(opening.minor, account.currency)}. Used only for the
+          first bank entry of a journal that has none in Exact yet.
+        </p>
+      )}
       {draft.division !== "" && !opening.ok && (
         <p className="cap bad" role="alert">
-          {amountErrorText(opening.error, account.currency)}
+          {openingBalanceErrorText(opening.error, account.currency)}
         </p>
       )}
       {draft.division !== "" && (!receivableOk || !payableOk) && (

@@ -23,6 +23,7 @@ import {
   OUTBOX_ACTIONABLE,
   blockerText,
   bookingState,
+  isRunBlocker,
   verifyCheckLabel,
 } from "../../lib/matching-labels";
 import { maskIbanLike } from "../../lib/mask";
@@ -32,7 +33,7 @@ import { useResource } from "../../lib/useResource";
 import { useToast } from "../../toasts";
 import { DataTable, LoadMore, type Column } from "../DataTable";
 import { EmptyState, ErrorNotice } from "../EmptyState";
-import { EnableSheet } from "./EnableSheet";
+import { EnableSheet, backlogIfEnabledNow, enableBlockers } from "./EnableSheet";
 import { ErrorLine, StepUpNotice } from "./MatchParts";
 import { PreviewSheet } from "./PreviewSheet";
 import { TypedPhraseSheet } from "./TypedPhraseSheet";
@@ -41,12 +42,6 @@ import { VerifySheet } from "./VerifySheet";
 /** The phrases live in core (one source for the worker, the web and the tests). */
 export const VERIFY_PHRASE = BOOKING_VERIFY_PHRASE;
 export const ENABLE_PHRASE = BOOKING_ENABLE_PHRASE;
-
-/**
- * Blockers the enable dialog itself fixes (it asks for the administrations), so they must not keep
- * the Enable button disabled.
- */
-const FIXED_BY_ENABLE_DIALOG: readonly string[] = ["no_division_allowed"];
 
 export type BookingChip = "off" | "blocked" | "ready";
 
@@ -323,6 +318,21 @@ export function BookingCard({ isAdmin }: { isAdmin: boolean }) {
 
   const s = res.data;
   const chip = s ? bookingChip(s) : null;
+  // While booking is off, "switched off" is what the chip already says; the Enable dialog fixes the
+  // allow-list itself. Everything else is listed.
+  const shownBlockers = s
+    ? s.enabled
+      ? s.blockers
+      : s.blockers.filter((b) => b !== "writes_disabled")
+    : [];
+  const enableStop = s ? enableBlockers(s) : [];
+  const canEnable =
+    s !== undefined &&
+    s !== null &&
+    enableStop.length === 0 &&
+    !s.protocolChanged &&
+    s.verified !== null;
+  const notBookedNow = s ? backlogIfEnabledNow(s) : undefined;
   return (
     <Card>
       <div className="row-between">
@@ -353,12 +363,21 @@ export function BookingCard({ isAdmin }: { isAdmin: boolean }) {
               administration before booking.
             </p>
           )}
-          {s.blockers.length > 0 && (
+          {shownBlockers.length > 0 && (
             <div role="note" className="notice warn">
-              <p>Booking is blocked until this is fixed:</p>
+              <p>
+                {s.enabled
+                  ? "Booking is on, but this needs fixing:"
+                  : "Booking cannot be switched on until this is fixed:"}
+              </p>
               <ul>
-                {s.blockers.map((b) => (
-                  <li key={b}>{blockerText(b)}</li>
+                {shownBlockers.map((b) => (
+                  <li key={b}>
+                    {blockerText(b)}
+                    {s.enabled && !isRunBlocker(b)
+                      ? " Matches it affects wait with a “cannot be booked yet” note; the others are still booked."
+                      : ""}
+                  </li>
                 ))}
               </ul>
             </div>
@@ -418,12 +437,21 @@ export function BookingCard({ isAdmin }: { isAdmin: boolean }) {
                 <dd>Only matches made after {formatDateTime(s.bookingFrom)} are booked</dd>
               </div>
             )}
-            {s.backlogCount !== undefined && s.backlogCount > 0 && (
+            {s.enabled && s.backlogCount !== undefined && s.backlogCount > 0 && (
               <div className="dl-row">
                 <dt>Not booked</dt>
                 <dd>
-                  {formatCount(s.backlogCount, "existing match", "existing matches")} will NOT be
-                  booked
+                  {formatCount(s.backlogCount, "existing match", "existing matches")} made before
+                  that will NOT be booked
+                </dd>
+              </div>
+            )}
+            {!s.enabled && notBookedNow !== undefined && notBookedNow > 0 && (
+              <div className="dl-row">
+                <dt>Not booked</dt>
+                <dd>
+                  {formatCount(notBookedNow, "existing match", "existing matches")} would NOT be
+                  booked if booking were switched on now
                 </dd>
               </div>
             )}
@@ -462,11 +490,8 @@ export function BookingCard({ isAdmin }: { isAdmin: boolean }) {
               ) : (
                 <Button
                   variant="primary"
-                  disabled={
-                    s.blockers.some((b) => !FIXED_BY_ENABLE_DIALOG.includes(b)) ||
-                    s.protocolChanged ||
-                    s.verified === null
-                  }
+                  disabled={!canEnable}
+                  aria-describedby={canEnable ? undefined : "booking-enable-why"}
                   onClick={() => setSheet("enable")}
                 >
                   Enable booking…
@@ -474,9 +499,11 @@ export function BookingCard({ isAdmin }: { isAdmin: boolean }) {
               )}
             </div>
           )}
-          {isAdmin && !s.enabled && s.verified === null && (
-            <p className="cap">
-              Verify the write path first. Booking cannot be enabled before that.
+          {isAdmin && !s.enabled && !canEnable && (
+            <p className="cap" id="booking-enable-why">
+              {s.verified === null
+                ? "Verify the write path first. Booking cannot be enabled before that."
+                : "Enable is available once everything listed above is fixed."}
             </p>
           )}
         </>
@@ -485,6 +512,7 @@ export function BookingCard({ isAdmin }: { isAdmin: boolean }) {
         <>
           <VerifySheet
             open={sheet === "verify"}
+            settings={s ?? null}
             onClose={() => setSheet(null)}
             onDone={() => {
               setSheet(null);
@@ -497,11 +525,16 @@ export function BookingCard({ isAdmin }: { isAdmin: boolean }) {
               open={sheet === "enable"}
               settings={s}
               onClose={() => setSheet(null)}
-              onDone={() => {
+              onDone={(after) => {
                 setSheet(null);
-                toast.show("Booking in Exact is on.");
+                toast.show(
+                  after.bookingFrom
+                    ? `Booking in Exact is on for matches made from ${formatDateTime(after.bookingFrom)}.`
+                    : "Booking in Exact is on.",
+                );
                 res.reload();
               }}
+              onStale={res.reload}
             />
           )}
           <PreviewSheet open={sheet === "preview"} onClose={() => setSheet(null)} />

@@ -189,7 +189,6 @@ describe("account map", () => {
       bankGlAccountCode: "1220",
       receivableGlAccountCode: null,
       payableGlAccountCode: null,
-      openingBalanceMinor: null,
     });
     await waitFor(() => expect(of(calls, "/api/matching/account-map").length).toBeGreaterThan(1));
   });
@@ -286,10 +285,12 @@ describe("thresholds", () => {
         amountToleranceMinor: 0,
         blockAutoOnRecentIbanChangeDays: 90,
         autoLedgerPatterns: false,
+        autoIncomingUnknownIban: false,
         autoTxTypes: ["transfer", "topup", "card_payment"],
         noMatchTxTypes: ["exchange"],
         internalAccountTypes: ["self"],
       },
+      rev: "rev-1",
     });
   });
 
@@ -630,7 +631,9 @@ describe("booking in Exact", () => {
 
   it("Ready: shows who verified it and offers Disable", async () => {
     await open({
-      "GET /api/booking/settings": () => ({ body: booking({ enabled: true, verified }) }),
+      "GET /api/booking/settings": () => ({
+        body: booking({ enabled: true, verified, divisions: [1] }),
+      }),
     });
     const c = card("Booking in Exact");
     expect(await within(c).findByText("Ready")).toBeTruthy();
@@ -674,11 +677,14 @@ describe("booking in Exact", () => {
   it("enabling needs ENABLE EXACT BOOKING typed exactly; disabling is immediate", async () => {
     const user = userEvent.setup();
     let enabled = false;
+    let divisions: number[] = [];
     const { calls } = await open({
-      "GET /api/booking/settings": () => ({ body: booking({ enabled, verified }) }),
+      "GET /api/booking/settings": () => ({ body: booking({ enabled, verified, divisions }) }),
       "PUT /api/booking/settings": (c) => {
-        enabled = (c.body as { enabled: boolean }).enabled;
-        return { body: booking({ enabled, verified }) };
+        const b = c.body as { enabled?: boolean; divisions?: number[] };
+        if (b.enabled !== undefined) enabled = b.enabled;
+        if (b.divisions !== undefined) divisions = b.divisions;
+        return { body: booking({ enabled, verified, divisions }) };
       },
     });
     const c = card("Booking in Exact");
@@ -704,18 +710,17 @@ describe("booking in Exact", () => {
     expect((go as HTMLButtonElement).disabled).toBe(false);
     await user.click(go);
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    expect(of(calls, "/api/booking/settings", "PUT")[0]?.body).toMatchObject({
-      enabled: true,
-      confirm: BOOKING_ENABLE_PHRASE,
-      divisions: [1],
-      maxPerRun: 1,
-    });
+    // the limits first (their own shape), then the switch; the server sets the watermark
+    expect(of(calls, "/api/booking/settings", "PUT").map((x) => x.body)).toEqual([
+      { divisions: [1] },
+      { enabled: true, confirm: BOOKING_ENABLE_PHRASE },
+    ]);
     expect(await within(c).findByText("Ready")).toBeTruthy();
     await user.click(within(c).getByRole("button", { name: "Disable booking" }));
     expect(screen.queryByRole("dialog")).toBeNull();
-    await waitFor(() => expect(of(calls, "/api/booking/settings", "PUT")).toHaveLength(2));
+    await waitFor(() => expect(of(calls, "/api/booking/settings", "PUT")).toHaveLength(3));
     // Switching off sends no phrase and needs no fresh sign-in (orchestrator decision M7d).
-    expect(of(calls, "/api/booking/settings", "PUT")[1]?.body).toEqual({ enabled: false });
+    expect(of(calls, "/api/booking/settings", "PUT")[2]?.body).toEqual({ enabled: false });
     expect(await within(c).findByText("Off", { selector: ".chip" })).toBeTruthy();
   });
 

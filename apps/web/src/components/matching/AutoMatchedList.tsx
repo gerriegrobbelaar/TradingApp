@@ -131,8 +131,10 @@ export function AutoMatchedList({
               {review && m.status === "live" && <Chip tone="warn">Needs a check</Chip>}
               {m.status === "live" &&
                 m.exactState === NOT_BOOKED &&
-                typeof m.deferredCode === "string" &&
-                m.deferredCode !== "" && <Chip>{deferredChipText(m.deferredCode)}</Chip>}
+                typeof m.bookingDeferredCode === "string" &&
+                m.bookingDeferredCode !== "" && (
+                  <Chip>{deferredChipText(m.bookingDeferredCode)}</Chip>
+                )}
             </span>
           );
         },

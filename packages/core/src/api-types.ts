@@ -976,6 +976,12 @@ export interface MatchPatternRequest {
   direction?: "in" | "out" | null;
   maxAmountMinor?: number | null;
   enabled?: boolean;
+  /**
+   * U2: the typed phrase (AUTO_MATCH_CONFIRM_PHRASE), needed while automatic matching AND automatic
+   * ledger patterns are on for a new enabled pattern or a change to the match fields of one
+   * (422 `confirmation_required` otherwise).
+   */
+  confirm?: string;
 }
 
 /**
@@ -1119,6 +1125,12 @@ export interface BookingSettingsResponse {
    */
   bookingFrom?: string | null;
   backlogCount?: number;
+  /**
+   * U3: live not-booked matches that would stay untouched if booking were switched on NOW (every
+   * enable moves the watermark to now, so this is every live not-booked match). The enable dialog
+   * shows it; `backlogCount` describes the watermark in force.
+   */
+  backlogIfEnabledNow?: number;
   divisions?: number[];
   maxPerRun?: number;
 }

@@ -162,6 +162,8 @@ describe("migration 0024 on a populated database", () => {
       ],
     ).toBe("unmatched");
     // Match 2 stays a (correct) invariant finding: manual_required, its row was never sent but a person decides.
+    // The invariant checks read the CURRENT schema (0025 added open_before_minor): apply the rest.
+    await applyD1Migrations(mdb, all.slice(idx + 1));
     expect((await checkMatchingInvariants(mdb)).map((v) => v.code)).not.toContain(
       "outbox_of_undone_match",
     );

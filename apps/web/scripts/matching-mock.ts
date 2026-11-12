@@ -156,7 +156,7 @@ export function matchingApi(
                 ...(scene.auto === "deferred"
                   ? [
                       autoItem(
-                        { id: 52, deferredCode: "control_account_unknown" },
+                        { id: 52, bookingDeferredCode: "control_account_unknown" },
                         { id: 6, counterpartyName: "Gamma Ltd" },
                       ),
                     ]
@@ -198,7 +198,13 @@ export function matchingApi(
       return {
         items: [
           previewItem(),
-          previewItem({ matchId: 51, wouldDefer: { code: "bank_balance_unknown" } }),
+          previewItem({
+            matchId: 51,
+            wouldDefer: { code: "bank_balance_unknown" },
+            bankEntryBody: null,
+            bankEntryHash: null,
+            matchSetBankLinePlaceholder: true,
+          }),
         ],
       };
     case "/api/matching/patterns":
@@ -218,7 +224,7 @@ export function matchingApi(
         return booking({
           verified: { ...VERIFIED, checks: [...BOOKING_VERIFY_CHECKS], createsBankEntries: true },
           backlogCount: 12,
-          blockers: ["no_division_allowed"],
+          backlogIfEnabledNow: 12,
         });
       }
       if (scene.booking === "blocked") {

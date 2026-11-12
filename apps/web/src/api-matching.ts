@@ -137,21 +137,23 @@ export const deletePattern = (id: number) =>
 export const getBookingSettings = (signal?: AbortSignal) =>
   request<BookingSettingsResponse>("/api/booking/settings", sig(signal));
 /**
- * Switching booking ON needs the typed phrase (and a fresh sign-in); switching it OFF is the safe
- * direction and sends `{enabled: false}` only: no phrase, no step-up (orchestrator decision M7d).
+ * The two shapes the server takes, never mixed (worker booking/routes.ts putSettingsHandler):
+ *  - the switch: `{enabled: false}` (safe direction: no phrase, no step-up) or `{enabled: true,
+ *    confirm, note?}` (fresh sign-in, the typed phrase; the SERVER sets the watermark to now);
+ *  - the limits: `{divisions?, maxPerRun?, bookingFrom?, note?}` without `enabled` (widening any of
+ *    them needs a fresh sign-in; narrowing does not).
  */
 export type BookingSettingsPut =
-  | { enabled: false }
+  | { enabled: false; note?: string }
+  | { enabled: true; confirm: string; note?: string }
   | {
-      enabled: true;
-      confirm: string;
-      note?: string;
-      /** UTC ISO: only matches created at or after it are booked. */
-      bookingFrom?: string;
-      /** Divisions (divisions.id) booking is allowed for; at least one. */
+      /** Divisions (divisions.id) booking may write to. */
       divisions?: number[];
-      /** Matches booked per run (1 = canary); raising it needs a fresh sign-in. */
+      /** Matches the job may start per run, 1 to 10. */
       maxPerRun?: number;
+      /** UTC ISO; moving it earlier widens what is booked. */
+      bookingFrom?: string;
+      note?: string;
     };
 export const putBookingSettings = (body: BookingSettingsPut) =>
   request<BookingSettingsResponse>("/api/booking/settings", { method: "PUT", body });

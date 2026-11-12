@@ -8,9 +8,9 @@ import { Button, Chip } from "@camelthorn/ui";
 import { getMatchAuto, previewBooking } from "../../api-matching";
 import { magnitude } from "../../lib/allocation";
 import { describeLoadError } from "../../lib/errors";
-import { NO_VALUE, formatDateTime, formatMoney } from "../../lib/format";
-import { NOT_BOOKED, deferredChipText } from "../../lib/matching-labels";
-import { maskDeep } from "../../lib/mask";
+import { NO_VALUE, formatCount, formatDateTime, formatMoney } from "../../lib/format";
+import { NOT_BOOKED, previewOutcomeReason, previewReadErrorText } from "../../lib/matching-labels";
+import { maskDeep, maskIbanLike } from "../../lib/mask";
 import { useAction } from "../../lib/useAction";
 import { useResource } from "../../lib/useResource";
 import { useToast } from "../../toasts";
@@ -21,95 +21,205 @@ import { ErrorLine, StepUpNotice } from "./MatchParts";
 /** At most this many matches per preview (the server enforces the same limit). */
 export const PREVIEW_MAX = 3;
 
-/** The body as shown: pretty JSON for objects, the text itself for XML. IBAN-masked again here. */
-export function bodyText(body: unknown): string {
-  const safe = maskDeep(body);
-  return typeof safe === "string" ? safe : JSON.stringify(safe, null, 2);
+/** Longer text is cut for display (the server caps each body at 20,000 characters already). */
+export const PREVIEW_DISPLAY_CAP = 40_000;
+
+/** The worker's placeholder bank entry number (booking/preview.ts PREVIEW_PLACEHOLDER_ENTRY_NUMBER). */
+export const PLACEHOLDER_ENTRY_NUMBER = "999999999";
+
+/**
+ * A body as shown: the server's exact text, so it can be compared and copied byte for byte. IBAN-
+ * like text is masked again here (defence in depth; the server already masks bank text), and the
+ * result says whether that changed anything, because a masked copy is no longer byte-identical.
+ */
+export function bodyText(body: unknown): { text: string; masked: boolean; cut: boolean } {
+  const raw = typeof body === "string" ? body : (JSON.stringify(maskDeep(body), null, 2) ?? "");
+  const safe = maskIbanLike(raw);
+  const cut = safe.length > PREVIEW_DISPLAY_CAP;
+  return {
+    text: cut ? safe.slice(0, PREVIEW_DISPLAY_CAP) : safe,
+    // Answers are masked at the API boundary already, so a mask may predate this function: look
+    // for the mask's own shape too ("NL91****4300").
+    masked: safe !== raw || /[A-Z]{2}[0-9]{2}[A-Z0-9]{0,4}\*{4}/.test(safe),
+    cut,
+  };
 }
 
-function CodeBlock({ title, text }: { title: string; text: string }) {
+function CodeBlock({ id, title, body }: { id: string; title: string; body: unknown }) {
   const toast = useToast();
+  const { text, masked, cut } = bodyText(body);
+  const [said, setSaid] = useState("");
   async function copy() {
     try {
       await navigator.clipboard.writeText(text);
+      setSaid(`Copied the ${title.toLowerCase()}.`);
       toast.show("Copied.");
     } catch {
-      toast.show("Could not copy. Select the text and copy it yourself.");
+      setSaid("Could not copy. Select the text and copy it yourself.");
     }
   }
   return (
     <div className="mt-code">
       <div className="row-between">
-        <h4 className="h4">{title}</h4>
-        <Button size="sm" aria-label={`Copy ${title}`} onClick={() => void copy()}>
+        <h4 className="h4" id={`${id}-h`}>
+          {title}
+        </h4>
+        <Button size="sm" aria-label={`Copy ${title}`} disabled={cut} onClick={() => void copy()}>
           Copy
         </Button>
       </div>
       <pre className="mt-pre" tabIndex={0} aria-label={title}>
         {text}
       </pre>
+      {masked && (
+        <p className="cap" role="note">
+          Something that looks like an account number was masked here, so this text is not byte for
+          byte what would be sent. Compare the SHA-256 instead.
+        </p>
+      )}
+      {cut && (
+        <p className="cap" role="note">
+          This body is too long to show in full; only the start is shown and Copy is off. Compare
+          the SHA-256 instead.
+        </p>
+      )}
+      <span className="sr-only" aria-live="polite">
+        {said}
+      </span>
     </div>
   );
 }
 
-function PreviewItem({ item }: { item: BookingPreviewItem }) {
-  const hashes = Object.entries(item.hashes).filter(([, v]) => typeof v === "string");
+const MODE_TEXT: Record<"ledger" | "matched", string> = {
+  ledger: "One bank entry on the ledger account (no invoice is matched).",
+  matched:
+    "A bank entry (unless another integration creates it), then a match of the bank line against the invoices in Exact.",
+};
+
+const PREFLIGHT_TEXT: Record<string, string> = {
+  open_as_expected: "open as expected",
+  already_settled: "already settled in Exact",
+  changed: "changed in Exact since the match",
+  inconclusive: "could not be checked",
+};
+
+const SOURCE_TEXT: Record<string, string> = {
+  exact: "the latest entry in Exact",
+  admin_opening_balance: "the opening balance from the account map",
+};
+
+function PreviewItem({
+  item,
+  currency,
+}: {
+  item: BookingPreviewItem;
+  currency?: string | undefined;
+}) {
+  const reads = item.reads;
+  const id = `pv-${item.matchId}`;
   return (
     <section className="mt-preview-item" aria-label={`Preview of match ${item.matchId}`}>
       <h3 className="h3">Match {item.matchId}</h3>
       {item.wouldDefer ? (
         <p role="note" className="notice warn">
-          <Chip tone="warn">{deferredChipText(item.wouldDefer.code)}</Chip> It would wait and
-          nothing would be booked.
+          <Chip tone="warn">Would not be booked now</Chip>{" "}
+          {capitalise(previewOutcomeReason(item.wouldDefer.code))}. Nothing would be sent for it.
         </p>
       ) : (
         <p role="note" className="cap">
           Nothing blocks this match right now.
         </p>
       )}
-      {item.plan.length > 0 && (
-        <>
-          <h4 className="h4">What would happen, in order</h4>
-          <ol className="mt-plan">
-            {item.plan.map((step, i) => (
-              <li key={i}>{step}</li>
-            ))}
-          </ol>
-        </>
-      )}
-      {item.bankEntryBody !== null && item.bankEntryBody !== undefined ? (
-        <CodeBlock title="Bank entry body" text={bodyText(item.bankEntryBody)} />
+      {item.mode !== null && <p>{MODE_TEXT[item.mode]}</p>}
+      {item.bankEntryBody !== null ? (
+        <CodeBlock id={`${id}-be`} title="Bank entry body" body={item.bankEntryBody} />
       ) : (
-        <p className="cap">No bank entry would be created for this match.</p>
+        <p className="cap">No bank entry body: none would be created for this match.</p>
       )}
-      {item.matchSetXml ? (
-        <CodeBlock title="Match body (XML)" text={bodyText(item.matchSetXml)} />
+      {item.matchSetXml !== null ? (
+        <>
+          {item.matchSetBankLinePlaceholder && (
+            <p role="note" className="notice warn">
+              The bank line is not in Exact yet, so the match body uses the placeholder number{" "}
+              {PLACEHOLDER_ENTRY_NUMBER}. Replace it with the real entry number before you upload it
+              by hand; the SHA-256 below is of the body WITH the placeholder.
+            </p>
+          )}
+          <CodeBlock id={`${id}-ms`} title="Match body (XML)" body={item.matchSetXml} />
+        </>
       ) : (
         <p className="cap">No match body could be built yet.</p>
       )}
-      {hashes.length > 0 && (
+      {(item.bankEntryHash !== null || item.matchSetHash !== null) && (
         <dl className="dl">
-          {hashes.map(([k, v]) => (
-            <div className="dl-row" key={k}>
-              <dt>{k === "bankEntry" ? "Bank entry SHA-256" : "Match SHA-256"}</dt>
+          {item.bankEntryHash !== null && (
+            <div className="dl-row">
+              <dt>Bank entry SHA-256</dt>
               <dd>
-                <code className="mt-mono">{String(v)}</code>
+                <code className="mt-mono">{item.bankEntryHash}</code>
               </dd>
             </div>
-          ))}
+          )}
+          {item.matchSetHash !== null && (
+            <div className="dl-row">
+              <dt>Match SHA-256</dt>
+              <dd>
+                <code className="mt-mono">{item.matchSetHash}</code>
+              </dd>
+            </div>
+          )}
         </dl>
       )}
-      {Object.keys(item.reads).length > 0 && (
-        <details>
-          <summary>What was read from Exact</summary>
-          <pre className="mt-pre" tabIndex={0} aria-label="What was read from Exact">
-            {bodyText(item.reads)}
-          </pre>
-        </details>
-      )}
+      <details>
+        <summary>What was read from Exact</summary>
+        <dl className="dl">
+          <div className="dl-row">
+            <dt>Duplicate probe</dt>
+            <dd>
+              {reads.probeHits === null
+                ? "Not read"
+                : formatCount(reads.probeHits, "line found", "lines found")}
+            </dd>
+          </div>
+          <div className="dl-row">
+            <dt>Latest closing balance</dt>
+            <dd>
+              {reads.closingBalanceMinor === null
+                ? "Not known"
+                : currency
+                  ? formatMoney(reads.closingBalanceMinor, currency)
+                  : `${reads.closingBalanceMinor} (minor units)`}
+            </dd>
+          </div>
+          <div className="dl-row">
+            <dt>Opening balance from</dt>
+            <dd>
+              {reads.openingBalanceSource === null
+                ? NO_VALUE
+                : (SOURCE_TEXT[reads.openingBalanceSource] ?? NO_VALUE)}
+            </dd>
+          </div>
+          <div className="dl-row">
+            <dt>Invoices in Exact</dt>
+            <dd>
+              {reads.preflight === null
+                ? "Not read"
+                : (PREFLIGHT_TEXT[reads.preflight] ?? NO_VALUE)}
+            </dd>
+          </div>
+          {reads.readError !== null && (
+            <div className="dl-row">
+              <dt>Read problem</dt>
+              <dd>{capitalise(previewReadErrorText(reads.readError))}.</dd>
+            </div>
+          )}
+        </dl>
+      </details>
     </section>
   );
 }
+
+const capitalise = (t: string): string => (t === "" ? t : t[0]?.toUpperCase() + t.slice(1));
 
 /**
  * Preview booking (admin, fresh sign-in): builds the real request bodies and their hashes for up
@@ -120,11 +230,14 @@ export function PreviewSheet({
   open,
   onClose,
   fixedMatchId,
+  fixedCurrency,
 }: {
   open: boolean;
   onClose: () => void;
   /** Preview exactly this match (opened from a match's detail); no list. */
   fixedMatchId?: number;
+  /** The bank line's currency for that match (amounts read from Exact are shown in it). */
+  fixedCurrency?: string;
 }) {
   const list = useResource<MatchAutoResponse>(
     open && fixedMatchId === undefined ? "booking-preview-matches" : null,
@@ -224,7 +337,15 @@ export function PreviewSheet({
             </p>
             {result.items.length === 0 && <p className="cap">The server returned no preview.</p>}
             {result.items.map((it) => (
-              <PreviewItem key={it.matchId} item={it} />
+              <PreviewItem
+                key={it.matchId}
+                item={it}
+                currency={
+                  fixedMatchId !== undefined
+                    ? fixedCurrency
+                    : live.find((r) => r.match.id === it.matchId)?.transaction.currency
+                }
+              />
             ))}
           </div>
         )}

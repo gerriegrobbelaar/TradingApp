@@ -5,6 +5,9 @@
  */
 import {
   DEFAULT_MATCH_CONFIG,
+  MIN_AUTO_GAP,
+  MIN_RECENT_IBAN_DAYS,
+  isLoosening,
   type RegexProblemCode,
   safeRegexTest,
   unsafeRegexReason,
@@ -33,7 +36,7 @@ export const NUMBER_FIELDS: readonly { key: TunableNumberKey; label: string; hin
   {
     key: "autoMatchMinGap",
     label: "Gap to the next candidate",
-    hint: "From 10 to 100. The runner-up must score at least this far behind.",
+    hint: `From ${MIN_AUTO_GAP} to 100 (never below ${MIN_AUTO_GAP}). The runner-up must score at least this far behind.`,
   },
   {
     key: "suggestMinScore",
@@ -49,7 +52,7 @@ export const NUMBER_FIELDS: readonly { key: TunableNumberKey; label: string; hin
   {
     key: "blockAutoOnRecentIbanChangeDays",
     label: "Days after a supplier account change",
-    hint: "From 30 to 3650. Payments to a recently changed account are never automatic.",
+    hint: `From ${MIN_RECENT_IBAN_DAYS} to 3650 (never below ${MIN_RECENT_IBAN_DAYS}). Payments to a recently changed account are never automatic.`,
   },
 ];
 
@@ -74,6 +77,8 @@ export const LIST_FIELDS: readonly { key: TunableListKey; label: string; hint: s
 export interface TunablesForm {
   numbers: Record<TunableNumberKey, string>;
   autoLedgerPatterns: boolean;
+  /** Incoming payments from an account not known for the customer may be automatic (loosening). */
+  autoIncomingUnknownIban: boolean;
   lists: Record<TunableListKey, string>;
 }
 
@@ -88,6 +93,7 @@ export function toForm(t: MatchTunablesDto): TunablesForm {
       blockAutoOnRecentIbanChangeDays: String(t.blockAutoOnRecentIbanChangeDays),
     },
     autoLedgerPatterns: t.autoLedgerPatterns,
+    autoIncomingUnknownIban: t.autoIncomingUnknownIban ?? false,
     lists: {
       autoTxTypes: t.autoTxTypes.join(", "),
       noMatchTxTypes: t.noMatchTxTypes.join(", "),
@@ -154,6 +160,7 @@ export function checkTunables(form: TunablesForm): TunablesCheck {
   const value: MatchTunablesDto = {
     ...nums,
     autoLedgerPatterns: form.autoLedgerPatterns,
+    autoIncomingUnknownIban: form.autoIncomingUnknownIban,
     ...lists,
   };
   const problems = validateMatchConfig({
@@ -165,6 +172,7 @@ export function checkTunables(form: TunablesForm): TunablesCheck {
     amountToleranceMinor: BigInt(value.amountToleranceMinor),
     blockAutoOnRecentIbanChangeDays: value.blockAutoOnRecentIbanChangeDays,
     autoLedgerPatterns: value.autoLedgerPatterns,
+    autoIncomingUnknownIban: value.autoIncomingUnknownIban ?? false,
     autoTxTypes: value.autoTxTypes,
     noMatchTxTypes: value.noMatchTxTypes,
     internalAccountTypes: value.internalAccountTypes,
@@ -186,6 +194,18 @@ export function checkTunables(form: TunablesForm): TunablesCheck {
 // ---- ledger patterns ---------------------------------------------------------------------------
 
 /** Every core reason has a sentence (the Record type fails the build when core adds one). */
+/**
+ * Would saving `next` over `prev` let automatic matching do more (core isLoosening, the rule the
+ * server applies)? While automatic matching is on, such a save needs the typed phrase again.
+ */
+export function tunablesLoosen(prev: MatchTunablesDto, next: MatchTunablesDto): boolean {
+  const f = (t: MatchTunablesDto) => ({
+    ...t,
+    autoIncomingUnknownIban: t.autoIncomingUnknownIban ?? false,
+  });
+  return isLoosening(f(prev), f(next));
+}
+
 export const REGEX_PROBLEM: Record<RegexProblemCode, string> = {
   empty: "Type a pattern, or leave this empty.",
   too_long: "The pattern is too long (200 characters at most).",

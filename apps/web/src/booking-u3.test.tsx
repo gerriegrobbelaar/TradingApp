@@ -103,7 +103,10 @@ describe("verify dialog: one tick box per check", () => {
       within(dialog).getByLabelText(`Type “${BOOKING_VERIFY_PHRASE}” to confirm`),
       BOOKING_VERIFY_PHRASE,
     );
-    await user.type(within(dialog).getByLabelText(/What did you check/), "All seven done");
+    await user.type(
+      within(dialog).getByLabelText(/What did you check/),
+      "All seven done on the test division",
+    );
     const boxes = within(dialog).getAllByRole("checkbox");
     for (const [i, box] of boxes.entries()) {
       expect(go.disabled, `after ${i} boxes`).toBe(true);
@@ -131,11 +134,11 @@ describe("verify dialog: one tick box per check", () => {
       within(dialog).getByLabelText(`Type “${BOOKING_VERIFY_PHRASE}” to confirm`),
       BOOKING_VERIFY_PHRASE,
     );
-    await user.type(within(dialog).getByLabelText(/What did you check/), "Done");
+    await user.type(within(dialog).getByLabelText(/What did you check/), "Done on test division");
     await user.click(within(dialog).getByRole("button", { name: "Record the verification" }));
     await waitFor(() => expect(of(calls, "/api/booking/verify", "POST")).toHaveLength(1));
     expect(of(calls, "/api/booking/verify", "POST")[0]?.body).toEqual({
-      note: "Done",
+      note: "Done on test division",
       confirm: BOOKING_VERIFY_PHRASE,
       checks: [...BOOKING_VERIFY_CHECKS],
     });
@@ -150,7 +153,7 @@ describe("verify dialog: one tick box per check", () => {
       within(dialog).getByLabelText(`Type “${BOOKING_VERIFY_PHRASE}” to confirm`),
       BOOKING_VERIFY_PHRASE,
     );
-    await user.type(within(dialog).getByLabelText(/What did you check/), "Done");
+    await user.type(within(dialog).getByLabelText(/What did you check/), "Done on test division");
     await user.click(within(dialog).getByRole("button", { name: "Record the verification" }));
     expect(await within(dialog).findByText(/Tick every check first/)).toBeTruthy();
     expect(dialog.textContent).not.toContain("checks_incomplete");
@@ -159,6 +162,67 @@ describe("verify dialog: one tick box per check", () => {
   it("has no axe violations", async () => {
     const { dialog } = await openVerify();
     expect(await axe(dialog)).toHaveNoViolations();
+  });
+
+  it("says what verifying means and which mode it is for", async () => {
+    const { dialog } = await openVerify();
+    expect(dialog.textContent).toContain(
+      "You are confirming that you posted the same bodies that Preview booking shows by hand on a TEST administration",
+    );
+    expect(dialog.textContent).toContain("Nothing is sent to Exact by this dialog");
+    expect(dialog.textContent).toContain(
+      "Verified for: this app creates the bank entries in Exact, then matches them",
+    );
+  });
+
+  it("needs a note of at least 10 characters (the server's bound) and allows up to 500", async () => {
+    const { user, dialog } = await openVerify();
+    for (const box of within(dialog).getAllByRole("checkbox")) await user.click(box);
+    await user.type(within(dialog).getByLabelText(/to confirm/), BOOKING_VERIFY_PHRASE);
+    const go = within(dialog).getByRole("button", {
+      name: "Record the verification",
+    }) as HTMLButtonElement;
+    const note = within(dialog).getByLabelText(/What did you check/) as HTMLTextAreaElement;
+    await user.type(note, "Too short");
+    expect(go.disabled).toBe(true);
+    expect(within(dialog).getByText("Write at least 10 characters.")).toBeTruthy();
+    await user.type(note, "!");
+    expect(go.disabled).toBe(false);
+    expect(note.maxLength).toBe(500);
+  });
+
+  it("cannot verify while the mode is undecided, and warns about another mode, a new format and a running switch", async () => {
+    const a = await openVerify({
+      "GET /api/booking/settings": () => ({ body: booking({ createsBankEntries: null }) }),
+    });
+    for (const box of within(a.dialog).getAllByRole("checkbox")) await a.user.click(box);
+    await a.user.type(within(a.dialog).getByLabelText(/to confirm/), BOOKING_VERIFY_PHRASE);
+    await a.user.type(
+      within(a.dialog).getByLabelText(/What did you check/),
+      "Done on test division",
+    );
+    expect(a.dialog.textContent).toContain("Decide first who creates the bank entries");
+    expect(
+      (
+        within(a.dialog).getByRole("button", {
+          name: "Record the verification",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    a.view.unmount();
+    const b = await openVerify({
+      "GET /api/booking/settings": () => ({
+        body: booking({
+          enabled: true,
+          protocolChanged: true,
+          divisions: [1],
+          verified: { ...VERIFIED, checks: [...BOOKING_VERIFY_CHECKS], createsBankEntries: false },
+        }),
+      }),
+    });
+    expect(b.dialog.textContent).toContain("The earlier verification was done for another mode");
+    expect(b.dialog.textContent).toContain("The Exact write format changed");
+    expect(b.dialog.textContent).toContain("Recording a verification switches it off");
   });
 
   it("the verification card shows the ticked checks and the mode it was verified for", async () => {
@@ -219,7 +283,7 @@ describe("booking blockers in plain words", () => {
       }),
     });
     const c = card("Booking in Exact");
-    await within(c).findByText(/Booking is blocked until this is fixed/);
+    await within(c).findByText(/Booking cannot be switched on until this is fixed/);
     expect(within(c).getByText(/no debtors or creditors control account/)).toBeTruthy();
     expect(within(c).getByText(/no Exact journal or bank ledger account/)).toBeTruthy();
     expect(within(c).getByText(/No administration is allowed for booking/)).toBeTruthy();
@@ -232,7 +296,8 @@ describe("booking blockers in plain words", () => {
 // ---- S8, B2: enable dialog ---------------------------------------------------------------------
 
 describe("enable dialog: watermark, backlog, administrations, matches per run", () => {
-  async function openEnable(over: H = {}, settings = booking({ verified: VERIFIED })) {
+  const READY = () => booking({ verified: VERIFIED });
+  async function openEnable(over: H = {}, settings = READY()) {
     const user = userEvent.setup();
     const r = await openSettings({
       "GET /api/booking/settings": () => ({ body: settings }),
@@ -244,84 +309,250 @@ describe("enable dialog: watermark, backlog, administrations, matches per run", 
     const dialog = await screen.findByRole("dialog", { name: "Enable booking in Exact" });
     return { user, dialog, ...r };
   }
+  async function fill(
+    user: ReturnType<typeof userEvent.setup>,
+    dialog: HTMLElement,
+    names: string[],
+  ) {
+    for (const n of names)
+      await user.click(await within(dialog).findByRole("checkbox", { name: n }));
+    await user.type(within(dialog).getByLabelText(/to confirm/), BOOKING_ENABLE_PHRASE);
+  }
 
-  it("states the watermark and the backlog before anything is typed", async () => {
-    const { dialog } = await openEnable({}, booking({ verified: VERIFIED, backlogCount: 12 }));
-    expect(within(dialog).getByText(/Only matches made after .+ are booked/)).toBeTruthy();
+  it("states that the server sets the watermark at the switch-on, and what stays behind", async () => {
+    const { dialog } = await openEnable(
+      {},
+      booking({ verified: VERIFIED, backlogIfEnabledNow: 12 }),
+    );
+    expect(
+      within(dialog).getByText(
+        /Only matches made from the moment you press Enable booking are booked/,
+      ),
+    ).toBeTruthy();
     expect(dialog.textContent).toContain("12 existing matches will NOT be booked");
+    expect(dialog.textContent).toContain("The server records that moment");
+  });
+
+  it("uses what switching on NOW leaves behind, not the backlog of an older watermark", async () => {
+    const { dialog } = await openEnable(
+      {},
+      booking({
+        verified: VERIFIED,
+        bookingFrom: "2026-11-01T00:00:00.000Z",
+        backlogCount: 1,
+        backlogIfEnabledNow: 7,
+      }),
+    );
+    expect(dialog.textContent).toContain("7 existing matches will NOT be booked");
   });
 
   it("says when nothing is left behind, and uses the singular", async () => {
-    const a = await openEnable({}, booking({ verified: VERIFIED, backlogCount: 0 }));
+    const a = await openEnable({}, booking({ verified: VERIFIED, backlogIfEnabledNow: 0 }));
     expect(a.dialog.textContent).toContain("no existing matches that stay behind");
+    a.view.unmount();
+    const b = await openEnable({}, booking({ verified: VERIFIED, backlogIfEnabledNow: 1 }));
+    expect(b.dialog.textContent).toContain("1 existing match will NOT be booked");
   });
 
-  it("uses the singular for one existing match", async () => {
-    const { dialog } = await openEnable({}, booking({ verified: VERIFIED, backlogCount: 1 }));
-    expect(dialog.textContent).toContain("1 existing match will NOT be booked");
-  });
-
-  it("requires at least one administration, defaults to one match per run and sends everything", async () => {
+  it("requires an administration, defaults to one per run, saves the limits, re-reads, then switches on", async () => {
+    let enabled = false;
     const { user, dialog, calls } = await openEnable({
-      "PUT /api/booking/settings": () => ({ body: booking({ enabled: true, verified: VERIFIED }) }),
+      "GET /api/booking/settings": () => ({
+        body: enabled
+          ? booking({
+              enabled: true,
+              verified: VERIFIED,
+              divisions: [1, 2],
+              maxPerRun: 5,
+              bookingFrom: "2026-11-11T09:00:00.000Z",
+            })
+          : READY(),
+      }),
+      "PUT /api/booking/settings": (c) => {
+        if ((c.body as { enabled?: boolean }).enabled === true) enabled = true;
+        return {
+          body: booking({
+            enabled,
+            verified: VERIFIED,
+            divisions: [1, 2],
+            maxPerRun: 5,
+            ...(enabled ? { bookingFrom: "2026-11-11T09:00:00.000Z" } : {}),
+          }),
+        };
+      },
     });
     const go = within(dialog).getByRole("button", { name: "Enable booking" }) as HTMLButtonElement;
-    await user.type(
-      within(dialog).getByLabelText(`Type “${BOOKING_ENABLE_PHRASE}” to confirm`),
-      BOOKING_ENABLE_PHRASE,
-    );
+    await user.type(within(dialog).getByLabelText(/to confirm/), BOOKING_ENABLE_PHRASE);
     expect(go.disabled).toBe(true); // phrase typed, but no administration picked
     expect(await within(dialog).findByText("Pick at least one administration.")).toBeTruthy();
     const perRun = within(dialog).getByLabelText("Matches booked per run") as HTMLSelectElement;
     expect(perRun.value).toBe("1");
+    expect([...perRun.options].map((o) => o.value)).toEqual(["1", "2", "3", "5", "10"]);
     await user.click(await within(dialog).findByRole("checkbox", { name: "Camelthorn Holding" }));
     await user.click(within(dialog).getByRole("checkbox", { name: "Camelthorn B.V." }));
     expect(go.disabled).toBe(false);
     await user.selectOptions(perRun, "5");
-    expect(within(dialog).getByText(/Raising this needs a Google sign-in/)).toBeTruthy();
+    expect(within(dialog).getByText(/Raising this from 1 to 5/)).toBeTruthy();
+    const getsBefore = of(calls, "/api/booking/settings").length;
     await user.click(go);
-    await waitFor(() => expect(of(calls, "/api/booking/settings", "PUT")).toHaveLength(1));
-    const body = of(calls, "/api/booking/settings", "PUT")[0]?.body as Record<string, unknown>;
-    expect(body).toMatchObject({
-      enabled: true,
-      confirm: BOOKING_ENABLE_PHRASE,
-      divisions: [1, 2],
-      maxPerRun: 5,
-    });
-    expect(Date.parse(body["bookingFrom"] as string)).not.toBeNaN();
-    expect(body["bookingFrom"]).toMatch(/Z$/);
+    await waitFor(() => expect(of(calls, "/api/booking/settings", "PUT")).toHaveLength(2));
+    const puts = of(calls, "/api/booking/settings", "PUT").map((c) => c.body);
+    // the two shapes the server takes, never mixed, limits first; no client-chosen watermark
+    expect(puts).toEqual([
+      { divisions: [1, 2], maxPerRun: 5 },
+      { enabled: true, confirm: BOOKING_ENABLE_PHRASE },
+    ]);
+    // a fresh read happened between opening and the first write
+    const order = calls.filter((c) => c.url.split("?")[0] === "/api/booking/settings");
+    const firstPut = order.findIndex((c) => c.method === "PUT");
+    expect(order.slice(getsBefore, firstPut).some((c) => c.method === "GET")).toBe(true);
+    expect(await screen.findByText(/Booking in Exact is on for matches made from/)).toBeTruthy();
   });
 
-  it("keeps Enable available when the only blocker is the missing administration", async () => {
-    await openSettings({
-      "GET /api/booking/settings": () => ({
-        body: booking({ verified: VERIFIED, blockers: ["no_division_allowed"] }),
-      }),
-    });
-    const btn = await within(card("Booking in Exact")).findByRole("button", {
-      name: "Enable booking…",
-    });
-    expect((btn as HTMLButtonElement).disabled).toBe(false);
-  });
-
-  it("keeps Enable disabled for any other blocker", async () => {
-    await openSettings({
-      "GET /api/booking/settings": () => ({
-        body: booking({ verified: VERIFIED, blockers: ["control_accounts_missing"] }),
-      }),
-    });
-    const btn = await within(card("Booking in Exact")).findByRole("button", {
-      name: "Enable booking…",
-    });
-    expect((btn as HTMLButtonElement).disabled).toBe(true);
-  });
-
-  it("a missing fresh sign-in is explained and nothing changes", async () => {
-    const { user, dialog } = await openEnable({ "PUT /api/booking/settings": STEP_UP });
-    await user.click(await within(dialog).findByRole("checkbox", { name: "Camelthorn B.V." }));
+  it("sends no limits call when they are unchanged", async () => {
+    const { user, dialog, calls } = await openEnable(
+      {
+        "PUT /api/booking/settings": () => ({
+          body: booking({ enabled: true, verified: VERIFIED, divisions: [1] }),
+        }),
+      },
+      booking({ verified: VERIFIED, divisions: [1] }),
+    );
+    // the saved allow-list is pre-ticked
+    expect(
+      (
+        (await within(dialog).findByRole("checkbox", {
+          name: "Camelthorn B.V.",
+        })) as HTMLInputElement
+      ).checked,
+    ).toBe(true);
     await user.type(within(dialog).getByLabelText(/to confirm/), BOOKING_ENABLE_PHRASE);
     await user.click(within(dialog).getByRole("button", { name: "Enable booking" }));
-    expect(await within(dialog).findByText(/needs a Google sign-in/)).toBeTruthy();
+    await waitFor(() => expect(of(calls, "/api/booking/settings", "PUT")).toHaveLength(1));
+    expect(of(calls, "/api/booking/settings", "PUT")[0]?.body).toEqual({
+      enabled: true,
+      confirm: BOOKING_ENABLE_PHRASE,
+    });
+  });
+
+  it("drops a saved administration that is not shown, and says so", async () => {
+    const { dialog } = await openEnable({}, booking({ verified: VERIFIED, divisions: [1, 99] }));
+    expect(
+      await within(dialog).findByText(/1 administration on the saved list is not available/),
+    ).toBeTruthy();
+  });
+
+  it("refuses to enable from a stale form when a blocker appeared meanwhile", async () => {
+    let reads = 0;
+    const { user, dialog, calls } = await openEnable({
+      "GET /api/booking/settings": () => {
+        reads += 1;
+        return {
+          body:
+            reads <= 1
+              ? READY()
+              : booking({
+                  verified: VERIFIED,
+                  blockers: ["no_exact_connection", "writes_disabled"],
+                }),
+        };
+      },
+    });
+    await fill(user, dialog, ["Camelthorn B.V."]);
+    await user.click(within(dialog).getByRole("button", { name: "Enable booking" }));
+    expect(
+      await within(dialog).findByText(/Something changed since this dialog opened/),
+    ).toBeTruthy();
+    expect(of(calls, "/api/booking/settings", "PUT")).toHaveLength(0);
+  });
+
+  it("a server refusal (blocked) is explained and the card is refreshed", async () => {
+    const { user, dialog, calls } = await openEnable({
+      "PUT /api/booking/settings": (c) =>
+        (c.body as { enabled?: boolean }).enabled === true
+          ? { status: 409, body: { error: "blocked", blockers: ["no_exact_connection"] } }
+          : { body: booking({ verified: VERIFIED, divisions: [1] }) },
+    });
+    await fill(user, dialog, ["Camelthorn B.V."]);
+    const getsBefore = of(calls, "/api/booking/settings").length;
+    await user.click(within(dialog).getByRole("button", { name: "Enable booking" }));
+    expect(await within(dialog).findByText(/until the listed blockers are fixed/)).toBeTruthy();
+    await waitFor(() =>
+      expect(of(calls, "/api/booking/settings").length).toBeGreaterThan(getsBefore + 1),
+    );
+  });
+
+  it("the Enable button is available when only the switch and the allow-list are missing", async () => {
+    await openSettings({ "GET /api/booking/settings": () => ({ body: READY() }) });
+    const c = card("Booking in Exact");
+    const btn = await within(c).findByRole("button", { name: "Enable booking…" });
+    expect(READY().blockers).toEqual(["no_division_allowed", "writes_disabled"]);
+    expect((btn as HTMLButtonElement).disabled).toBe(false);
+    // "switched off" is not listed as something to fix while it is off
+    expect(c.textContent).not.toContain("Booking in Exact is switched off.");
+  });
+
+  it("keeps Enable disabled for any other blocker and says why", async () => {
+    for (const blocker of [
+      "control_accounts_missing",
+      "journal_unmapped",
+      "no_exact_connection",
+      "something_new",
+    ]) {
+      const { view } = await openSettings({
+        "GET /api/booking/settings": () => ({
+          body: booking({ verified: VERIFIED, blockers: [blocker, "writes_disabled"] }),
+        }),
+      });
+      const c = card("Booking in Exact");
+      const btn = (await within(c).findByRole("button", {
+        name: "Enable booking…",
+      })) as HTMLButtonElement;
+      expect(btn.disabled, blocker).toBe(true);
+      expect(btn.getAttribute("aria-describedby")).toBe("booking-enable-why");
+      expect(c.textContent).toContain("Enable is available once everything listed above is fixed.");
+      view.unmount();
+    }
+  });
+
+  it("while on, an enable-only blocker is shown as affecting single matches, not as stopping booking", async () => {
+    await openSettings({
+      "GET /api/booking/settings": () => ({
+        body: booking({
+          enabled: true,
+          verified: VERIFIED,
+          divisions: [1],
+          bookingFrom: "2026-11-10T08:00:00.000Z",
+          blockers: ["control_accounts_missing"],
+        }),
+      }),
+    });
+    const c = card("Booking in Exact");
+    expect(await within(c).findByText("Ready")).toBeTruthy();
+    expect(c.textContent).toContain("Booking is on, but this needs fixing:");
+    expect(c.textContent).toContain("the others are still booked");
+  });
+
+  it("a missing fresh sign-in is explained and nothing is switched on", async () => {
+    const { user, dialog, calls } = await openEnable({ "PUT /api/booking/settings": STEP_UP });
+    await fill(user, dialog, ["Camelthorn B.V."]);
+    await user.click(within(dialog).getByRole("button", { name: "Enable booking" }));
+    expect((await within(dialog).findByRole("alert")).textContent).toMatch(
+      /needs a Google sign-in/,
+    );
+    // the limits call asked for the sign-in; the switch was never sent
+    expect(
+      of(calls, "/api/booking/settings", "PUT").filter(
+        (c) => (c.body as { enabled?: boolean }).enabled === true,
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("asks before closing once something was picked (Escape)", async () => {
+    const { user, dialog } = await openEnable();
+    await user.click(await within(dialog).findByRole("checkbox", { name: "Camelthorn B.V." }));
+    await user.keyboard("{Escape}");
+    expect(screen.getByRole("dialog", { name: "Enable booking in Exact" })).toBeTruthy();
   });
 
   it("shows the watermark, backlog, administrations and per-run number on the card when set", async () => {
@@ -339,7 +570,7 @@ describe("enable dialog: watermark, backlog, administrations, matches per run", 
     });
     const c = card("Booking in Exact");
     expect(await within(c).findByText(/Only matches made after .+ are booked/)).toBeTruthy();
-    expect(c.textContent).toContain("3 existing matches will NOT be booked");
+    expect(c.textContent).toContain("3 existing matches made before that will NOT be booked");
     expect(c.textContent).toContain("1 administration");
   });
 
@@ -401,7 +632,7 @@ describe("preview booking", () => {
     expect((boxes[3] as HTMLInputElement).disabled).toBe(false);
   });
 
-  it("shows the plan, both bodies with Copy, the hashes and the note, and sends only match ids", async () => {
+  it("shows both exact bodies with Copy, the hashes, the reads and the note, and sends only match ids", async () => {
     const { user, dialog, calls } = await openPreview({
       "POST /api/booking/preview": () => ({
         body: {
@@ -409,11 +640,12 @@ describe("preview booking", () => {
             previewItem({ matchId: 51 }),
             previewItem({
               matchId: 52,
+              mode: "matched",
               matchSetXml: null,
               bankEntryBody: null,
-              hashes: {},
+              bankEntryHash: null,
+              matchSetHash: null,
               wouldDefer: { code: "control_account_unknown" },
-              plan: [],
             }),
           ],
         },
@@ -427,37 +659,48 @@ describe("preview booking", () => {
     await user.click(within(dialog).getByRole("button", { name: "Preview booking" }));
     const first = await within(dialog).findByRole("region", { name: "Preview of match 51" });
     expect(of(calls, "/api/booking/preview", "POST")[0]?.body).toEqual({ matchIds: [51, 52] });
-    expect(within(first).getByText("Post one bank entry")).toBeTruthy();
     const bank = within(first).getByLabelText("Bank entry body");
     expect(bank.tagName).toBe("PRE");
-    expect(bank.textContent).toContain('"Journal": "RB1"');
+    // byte for byte what the server sent (no pretty printing)
+    expect(bank.textContent).toBe(previewItem().bankEntryBody);
     expect(within(first).getByLabelText("Match body (XML)").textContent).toContain("<MatchSet>");
     expect(first.textContent).toContain("a".repeat(64));
     expect(first.textContent).toContain("b".repeat(64));
     expect(within(first).getByText(/Nothing blocks this match/)).toBeTruthy();
+    expect(first.textContent).toContain("a match of the bank line against the invoices");
+    expect(first.textContent).toContain("0 lines found");
+    expect(first.textContent).toContain("open as expected");
+    expect(first.textContent).toMatch(/1[.,]000[.,]00/);
     await user.click(within(first).getByRole("button", { name: "Copy Bank entry body" }));
-    expect(write).toHaveBeenCalledWith(bank.textContent);
+    expect(write).toHaveBeenCalledWith(previewItem().bankEntryBody);
+    expect(await within(first).findByText("Copied the bank entry body.")).toBeTruthy();
     expect(within(dialog).getAllByText("Nothing was sent to Exact.").length).toBeGreaterThanOrEqual(
       2,
     );
-    // the second match would wait: a calm chip with the plain reason, no raw code
     const second = within(dialog).getByRole("region", { name: "Preview of match 52" });
     expect(second.textContent).toContain(
-      "Cannot be booked yet: the debtors or creditors control account is not filled in",
+      "Would not be booked now The debtors or creditors control account is not filled in",
     );
     expect(second.textContent).not.toContain("control_account_unknown");
-    expect(second.textContent).toContain("No bank entry would be created");
+    expect(second.textContent).toContain("No bank entry body");
   });
 
-  it("masks a full IBAN that a body would contain", async () => {
+  it("warns about the placeholder bank line number and explains read problems and v1 rules", async () => {
     const { user, dialog } = await openPreview({
       "POST /api/booking/preview": () => ({
         body: {
           items: [
             previewItem({
-              bankEntryBody: { Description: "Payment from NL91ABNA0417164300" },
-              matchSetXml: "<Note>GB29NWBK60161331926819</Note>",
-              reads: { counterparty: "DE89370400440532013000" },
+              matchSetBankLinePlaceholder: true,
+              matchSetXml: "<MatchSet><BankEntryLine>999999999</BankEntryLine></MatchSet>",
+              wouldDefer: { code: "part_payment_not_supported_v1" },
+              reads: {
+                probeHits: null,
+                closingBalanceMinor: null,
+                openingBalanceSource: null,
+                preflight: "inconclusive",
+                readError: "rate_limited",
+              },
             }),
           ],
         },
@@ -465,11 +708,50 @@ describe("preview booking", () => {
     });
     await user.click((await within(dialog).findAllByRole("checkbox"))[0] as HTMLElement);
     await user.click(within(dialog).getByRole("button", { name: "Preview booking" }));
-    await within(dialog).findByRole("region", { name: "Preview of match 50" });
-    expect(dialog.textContent).not.toMatch(
-      /NL91ABNA0417164300|GB29NWBK60161331926819|DE89370400440532013000/,
-    );
+    const r = await within(dialog).findByRole("region", { name: "Preview of match 50" });
+    expect(r.textContent).toContain("uses the placeholder number 999999999");
+    expect(r.textContent).toContain("A part payment is not booked automatically yet");
+    expect(r.textContent).toContain("Exact asked us to slow down");
+    expect(r.textContent).toContain("could not be checked");
+    expect(r.textContent).not.toMatch(/rate_limited|part_payment/);
+  });
+
+  it("cuts a huge body for display, turns Copy off and points at the hash", async () => {
+    const { user, dialog } = await openPreview({
+      "POST /api/booking/preview": () => ({
+        body: { items: [previewItem({ matchSetXml: `<X>${"y".repeat(60_000)}</X>` })] },
+      }),
+    });
+    await user.click((await within(dialog).findAllByRole("checkbox"))[0] as HTMLElement);
+    await user.click(within(dialog).getByRole("button", { name: "Preview booking" }));
+    const r = await within(dialog).findByRole("region", { name: "Preview of match 50" });
+    expect(within(r).getByLabelText("Match body (XML)").textContent?.length).toBe(40_000);
+    expect(
+      (within(r).getByRole("button", { name: "Copy Match body (XML)" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(r.textContent).toContain("too long to show in full");
+  });
+
+  it("masks a full IBAN that a body would contain, and says the copy is no longer byte for byte", async () => {
+    const { user, dialog } = await openPreview({
+      "POST /api/booking/preview": () => ({
+        body: {
+          items: [
+            previewItem({
+              bankEntryBody: JSON.stringify({ Description: "Payment from NL91ABNA0417164300" }),
+              matchSetXml: "<Note>GB29NWBK60161331926819</Note>",
+            }),
+          ],
+        },
+      }),
+    });
+    await user.click((await within(dialog).findAllByRole("checkbox"))[0] as HTMLElement);
+    await user.click(within(dialog).getByRole("button", { name: "Preview booking" }));
+    const r = await within(dialog).findByRole("region", { name: "Preview of match 50" });
+    expect(dialog.textContent).not.toMatch(/NL91ABNA0417164300|GB29NWBK60161331926819/);
     expect(dialog.textContent).toContain("4300");
+    expect(within(r).getAllByText(/was masked here/)).toHaveLength(2);
   });
 
   it("asks for a fresh sign-in and shows nothing as sent", async () => {
@@ -554,11 +836,11 @@ describe("deferred matches", () => {
         "GET /api/matching/auto": () => ({
           body: {
             items: [
-              autoItem({ id: 50, deferredCode: "control_account_unknown" }),
-              autoItem({ id: 51, deferredCode: "brand_new_code" }, { id: 5 }),
+              autoItem({ id: 50, bookingDeferredCode: "control_account_unknown" }),
+              autoItem({ id: 51, bookingDeferredCode: "brand_new_code" }, { id: 5 }),
               autoItem({ id: 52 }, { id: 6 }),
               autoItem(
-                { id: 53, deferredCode: "fee_not_supported_v1", exactState: "booked" },
+                { id: 53, bookingDeferredCode: "fee_not_supported_v1", exactState: "booked" },
                 { id: 7 },
               ),
             ],
@@ -586,7 +868,7 @@ describe("deferred matches", () => {
         {
           "GET /api/bank/accounts": () => ({ body: accounts() }),
           "GET /api/matching/transactions/1": () => ({
-            body: detail({}, [], match({ id: 50, deferredCode: "bank_balance_unknown" })),
+            body: detail({}, [], match({ id: 50, bookingDeferredCode: "bank_balance_unknown" })),
           }),
         },
         FINANCE,
@@ -643,7 +925,7 @@ describe("account map: control accounts and opening balance", () => {
           accounts: [
             {
               ...accountMap().accounts[0]!,
-              openingBalanceMinor: "123450",
+              openingBalanceMinor: 123450,
             },
           ],
         }),
@@ -716,7 +998,7 @@ describe("account map: control accounts and opening balance", () => {
       bankGlAccountCode: "1220",
       receivableGlAccountCode: "1300",
       payableGlAccountCode: "1600",
-      openingBalanceMinor: "1234567",
+      openingBalanceMinor: 1234567,
     });
   });
 
@@ -737,7 +1019,21 @@ describe("account map: control accounts and opening balance", () => {
     await user.type(receivable, "1300x");
     expect(save().disabled).toBe(false);
     const opening = within(row).getByLabelText(/Opening balance of an empty journal/);
-    for (const bad of ["1,234.50", "12.345", "-5", "1e3", "abc"]) {
+    for (const bad of [
+      "1,234.50",
+      "12.345",
+      "1e3",
+      "abc",
+      "+5",
+      "5-",
+      "--5",
+      "- 5",
+      "\u22125",
+      "\u0661\u0662",
+      "\uff11\uff12",
+      "100000000000,01",
+      "1 000",
+    ]) {
       await user.clear(opening);
       await user.type(opening, bad);
       expect(save().disabled, bad).toBe(true);
@@ -746,6 +1042,10 @@ describe("account map: control accounts and opening balance", () => {
     await user.clear(opening);
     await user.type(opening, "0");
     expect(save().disabled).toBe(false); // an empty journal may open at zero
+    await user.clear(opening);
+    await user.type(opening, "-250,5");
+    expect(save().disabled).toBe(false); // an overdrawn journal: one minus sign in front
+    expect(row.textContent).toMatch(/reads as .*-.*250[.,]50/);
     expect(of(calls, "/api/matching/account-map", "PUT")).toHaveLength(0);
   });
 
@@ -754,7 +1054,7 @@ describe("account map: control accounts and opening balance", () => {
     const { calls } = await openSettings({
       "GET /api/matching/account-map": () => ({
         body: accountMap({
-          accounts: [{ ...accountMap().accounts[0]!, openingBalanceMinor: "500" }],
+          accounts: [{ ...accountMap().accounts[0]!, openingBalanceMinor: 500 }],
         }),
       }),
       "PUT /api/matching/account-map": () => ({ body: accountMap() }),
@@ -766,6 +1066,68 @@ describe("account map: control accounts and opening balance", () => {
     await waitFor(() => expect(of(calls, "/api/matching/account-map", "PUT")).toHaveLength(1));
     expect(of(calls, "/api/matching/account-map", "PUT")[0]?.body).toMatchObject({
       openingBalanceMinor: null,
+    });
+  });
+
+  it("sends a negative opening balance as a signed integer, and leaves an untouched one out", async () => {
+    const user = userEvent.setup();
+    const { calls } = await openSettings({
+      "GET /api/matching/account-map": () => ({
+        body: accountMap({
+          accounts: [{ ...accountMap().accounts[0]!, openingBalanceMinor: -2550 }],
+        }),
+      }),
+      "PUT /api/matching/account-map": () => ({ body: accountMap() }),
+    });
+    const row = await rowOf(0);
+    const opening = within(row).getByLabelText(
+      /Opening balance of an empty journal/,
+    ) as HTMLInputElement;
+    expect(opening.value).toBe("-25.50");
+    // another field changes: the opening balance is not sent (absent keeps the stored value)
+    await user.type(within(row).getByLabelText("Debtors control account"), "9");
+    await user.click(within(row).getByRole("button", { name: "Save the mapping of Main EUR" }));
+    await waitFor(() => expect(of(calls, "/api/matching/account-map", "PUT")).toHaveLength(1));
+    expect(of(calls, "/api/matching/account-map", "PUT")[0]?.body).not.toHaveProperty(
+      "openingBalanceMinor",
+    );
+  });
+
+  it("an opening balance in JPY has no decimals and in KWD three", async () => {
+    const user = userEvent.setup();
+    const { calls } = await openSettings({
+      "GET /api/matching/account-map": () => ({
+        body: accountMap({
+          accounts: [
+            { ...accountMap().accounts[0]!, bankAccountId: 7, accountName: "Yen", currency: "JPY" },
+            {
+              ...accountMap().accounts[0]!,
+              bankAccountId: 8,
+              accountName: "Dinar",
+              currency: "KWD",
+            },
+          ],
+        }),
+      }),
+      "PUT /api/matching/account-map": () => ({ body: accountMap() }),
+    });
+    const yen = await rowOf(0);
+    const o1 = within(yen).getByLabelText(/Opening balance of an empty journal \(JPY/);
+    await user.type(o1, "12,5");
+    expect(within(yen).getByText(/JPY has no decimals/)).toBeTruthy();
+    await user.clear(o1);
+    await user.type(o1, "-1250");
+    await user.click(within(yen).getByRole("button", { name: "Save the mapping of Yen" }));
+    await waitFor(() => expect(of(calls, "/api/matching/account-map", "PUT")).toHaveLength(1));
+    expect(of(calls, "/api/matching/account-map", "PUT")[0]?.body).toMatchObject({
+      openingBalanceMinor: -1250,
+    });
+    const dinar = await rowOf(1);
+    await user.type(within(dinar).getByLabelText(/\(KWD/), "1,234");
+    await user.click(within(dinar).getByRole("button", { name: "Save the mapping of Dinar" }));
+    await waitFor(() => expect(of(calls, "/api/matching/account-map", "PUT")).toHaveLength(2));
+    expect(of(calls, "/api/matching/account-map", "PUT")[1]?.body).toMatchObject({
+      openingBalanceMinor: 1234,
     });
   });
 

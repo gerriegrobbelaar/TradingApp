@@ -297,8 +297,14 @@ describe("matching a candidate", () => {
       ],
       [
         "ready",
-        () => ({ body: booking({ enabled: true }) }),
-        bookingSentence(booking({ enabled: true })),
+        () => ({ body: booking({ enabled: true, blockers: [] }) }),
+        bookingSentence(booking({ enabled: true, blockers: [] })),
+      ],
+      [
+        // an enable-only blocker defers single matches; booking itself still runs
+        "ready with an enable-only blocker",
+        () => ({ body: booking({ enabled: true, blockers: ["control_accounts_missing"] }) }),
+        bookingSentence(booking({ enabled: true, blockers: [] })),
       ],
       [
         "blocked",
@@ -307,7 +313,7 @@ describe("matching a candidate", () => {
       ],
       [
         "protocol changed",
-        () => ({ body: booking({ enabled: true, protocolChanged: true }) }),
+        () => ({ body: booking({ enabled: true, protocolChanged: true, blockers: [] }) }),
         bookingSentence(booking({ enabled: true, blockers: ["x"] })),
       ],
       ["unreadable", () => ({ status: 500, body: { error: "boom" } }), bookingSentence(null)],
@@ -325,7 +331,7 @@ describe("matching a candidate", () => {
         );
         const promisesBooking =
           /then booked in Exact automatically afterwards and cannot be undone here/;
-        if (name === "ready") expect(text).toMatch(promisesBooking);
+        if (name.startsWith("ready")) expect(text).toMatch(promisesBooking);
         else expect(text, name).not.toMatch(promisesBooking);
         expect(text).toContain("No money is paid or moved.");
         unmount();

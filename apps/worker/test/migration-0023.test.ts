@@ -77,7 +77,6 @@ describe("migration 0023 on a populated database", () => {
     expect(
       (await mdb.prepare("SELECT COUNT(*) AS n FROM exact_write_outbox").first<{ n: number }>())?.n,
     ).toBe(0);
-    expect(await checkMatchingInvariants(mdb)).toEqual([]);
 
     const mapCols = (
       await mdb.prepare("PRAGMA table_info(bank_account_exact_map)").all<{ name: string }>()
@@ -123,5 +122,9 @@ describe("migration 0023 on a populated database", () => {
         )
         .run(),
     ).rejects.toThrow(/CHECK/);
+    // The invariant checks read the CURRENT schema (0025 added match_allocations.open_before_minor):
+    // apply the later migrations, then the migrated data must still be consistent.
+    await applyD1Migrations(mdb, all.slice(idx + 1));
+    expect(await checkMatchingInvariants(mdb)).toEqual([]);
   });
 });

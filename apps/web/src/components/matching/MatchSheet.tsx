@@ -60,7 +60,8 @@ export function MatchedPanel({
   const review = reviewReasonLabel(match.reviewReason);
   const { isAdmin } = useMatchRole();
   const [previewing, setPreviewing] = useState(false);
-  const deferred = typeof match.deferredCode === "string" && match.deferredCode !== "";
+  const deferred =
+    typeof match.bookingDeferredCode === "string" && match.bookingDeferredCode !== "";
   return (
     <section className="mt-matched" aria-labelledby="mt-matched-h">
       <h3 id="mt-matched-h" className="h3">
@@ -84,7 +85,7 @@ export function MatchedPanel({
           {deferred && match.status === "live" && match.exactState === NOT_BOOKED && (
             <>
               {" "}
-              <Chip>{deferredChipText(match.deferredCode as string)}</Chip>
+              <Chip>{deferredChipText(match.bookingDeferredCode as string)}</Chip>
             </>
           )}
         </Row>
@@ -118,6 +119,7 @@ export function MatchedPanel({
           <PreviewSheet
             open={previewing}
             fixedMatchId={match.id}
+            fixedCurrency={currency}
             onClose={() => setPreviewing(false)}
           />
         </>
