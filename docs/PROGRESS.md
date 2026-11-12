@@ -12,7 +12,7 @@ Orchestrator log. Update after every merge and every direct (trivial) edit.
 | 5 | Revolut connection | Done (R1-R3b, review fixes Q1-Q3 merged). NOT verified against real Revolut. Jobs revolut.sync / revolut.backfill ship DISABLED. Revolut is optional for a first deploy |
 | 6 | ECB FX | Done (F1-F3, review fixes T1 booked amount/rate tables/rate conflicts, T2 error boundaries/wording/stale handling). ecb.fx_import ON by default. Unrealised difference is dormant until the Exact booked-amount source is verified live (ADR 0038, DEPLOY.md item 17). Decision 4 still open |
 | 7 | Matching | Done: M7a–M7e built, final review fixes U1 (booking path), U2 (matching safety), U3 (web/docs/tests) merged on 2026-11-12; full suite green (ui 257, core 854, exact 258, revolut 151, web 1358, worker 2001). Booking and automatic matching are OFF by default; NOT verified against real Exact |
-| 8 | Data quality | In progress (D8a rules engine + bank balances job, D8b alerts + digest, D8c Data health + Today screens). Also owns the `exact.bank_balances` job (ING/Rabobank balances from Exact, needed for the rule 'Exact balance differs from bank balance'; review S12). Its handler is not built; the job stays off |
+| 8 | Data quality | Built and merged on 2026-11-12 (D8a engine + exact.bank_balances job, D8b alerts + digest + email sender, D8c Today + Data health), each reviewed PASS; final review pending. dq.checks and dq.digest ON by default (digest sends nothing until an email sender is configured); exact.bank_balances OFF. NOT verified against real Exact; ING/Rabobank balances not covered (no table) |
 | 9 | Payments | Not started |
 | 10 | Reminders and resend emails | Not started |
 | 11 | Cash forecast and Close checklist | Not started |

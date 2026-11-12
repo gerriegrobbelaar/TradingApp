@@ -91,7 +91,7 @@ export const DEFAULT_NOTIFICATION_SETTINGS: DqNotificationSettings = {
 export const MAX_ALERTS_LIMIT = 50;
 
 /** Where summary alerts point: the Data health view. A single place to change when the screen lands. */
-export const DQ_HEALTH_PATH = "/overview";
+export const DQ_HEALTH_PATH = "/data-health";
 
 /** Suffixes that never name a public service (RFC 6761, RFC 8375 and common private zones). */
 const PRIVATE_SUFFIXES = [
