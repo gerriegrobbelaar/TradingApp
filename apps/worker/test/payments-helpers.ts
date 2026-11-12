@@ -2,6 +2,7 @@ import {
   approvalMappingHash,
   APPROVAL_MAPPING_VERIFIED_SETTING,
   ibanFingerprint,
+  ibanKeyId,
   PAYMENTS_VERIFY_CHECKS,
   type PaymentSettings,
 } from "@camelthorn/core";
@@ -143,10 +144,10 @@ export async function verifyIbanRow(
 ): Promise<void> {
   await db
     .prepare(
-      `INSERT INTO supplier_iban_verifications (division_id, relation_id, iban_fingerprint, kind, verified_by)
-       VALUES (?1, ?2, ?3, 'verified', ?4)`,
+      `INSERT INTO supplier_iban_verifications (division_id, relation_id, iban_fingerprint, kind, verified_by, key_id)
+       VALUES (?1, ?2, ?3, 'verified', ?4, ?5)`,
     )
-    .bind(divisionId, relationRowId, fp(iban), by)
+    .bind(divisionId, relationRowId, fp(iban), by, ibanKeyId(TEST_IBAN_KEY))
     .run();
 }
 

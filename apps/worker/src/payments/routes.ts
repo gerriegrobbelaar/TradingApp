@@ -1,7 +1,9 @@
 /**
- * Payments API (Phase 9, P9a, ADR 0049). NOTHING HERE MOVES MONEY: a confirmed request ends at
- * `ready` and waits for P9b's submitter. Every write is audited in the same batch, every state move is
- * repeated by a database trigger, and no response carries a full IBAN (masked + a fingerprint only).
+ * Payments API (Phase 9, P9a, ADR 0049; P9b, ADR 0050; F9a, ADR 0052). Most routes only move a request
+ * through its states and end at `ready`. EXACTLY ONE route can send money: `POST .../submit`, which
+ * calls `submitPayment` and so, behind the deploy var, the D1 switch, the verification mark and the
+ * gate's lease, the bank. Every write is audited in the same batch, every state move is repeated by a
+ * database trigger, and no response carries a full IBAN (masked + a fingerprint only).
  *
  * Requests
  *  GET  /api/payments?status=open|all|<status>&mine=1&limit=&cursor=   any role
@@ -15,10 +17,12 @@
  *  the same under /api/payment-batches (create takes {sourceAccountId, items:[{openItemId, amountMinor?}], clientKey})
  * Sending (P9b, ADR 0050; every one answers 409 with a stable code while the switches are off)
  *  POST /api/payments/:id/submit            finance, fresh sign-in: sends a `ready` request (also /api/payment-batches/:id/submit)
- *  POST /api/payments/:id/resolve-not-sent  {confirm}  admin, fresh sign-in: an unknown outcome was NOT sent (after a lookup said so)
- *  GET  /api/payments/:id/settlement        any role: bank-confirmed and booked in Exact?
+ *  POST /api/payments/:id/resolve-not-sent  {confirm}  admin, fresh sign-in: an unknown outcome was NOT sent (after a lookup said so);
+ *       also a `submitted` draft Revolut no longer shows (`draft_gone`), past the expiry and with bank-feed evidence -> failed
+ *  GET  /api/payments/:id/settlement        any role: bank-confirmed and booked in Exact? (also: approved after expiry, reverted after paid)
+ *  POST /api/payments/:id/alert/ack         {note?}  finance, admin: "I looked at this alert" (audited; moves nothing; also under /api/payment-batches)
  *  POST /api/payments/preview               {kind, id}  admin, fresh sign-in: the real request bodies and hashes, no call
- *  PUT  /api/settings/payments/draft-expiry {days}      admin: days before an unapproved Revolut draft expires
+ *  PUT  /api/settings/payments/draft-expiry {days}      admin, fresh sign-in: days before an unapproved Revolut draft expires
  * Supplier IBANs
  *  GET  /api/payments/ibans/:relationId                       finance, approver, admin
  *  POST /api/payments/ibans/verify  {relationId, fingerprint, lastFour}   approver, fresh sign-in
@@ -26,7 +30,7 @@
  * Settings (admin)
  *  GET  /api/settings/payments                                admin, finance, approver
  *  PATCH /api/settings/payments     {fields..., confirm?}     admin; a loosening needs a fresh sign-in AND the phrase
- *  POST /api/settings/payments/verify {confirm, checks, note} admin, fresh sign-in
+ *  POST /api/settings/payments/verify {confirm, checks, note, provisional?} admin, fresh sign-in; provisional = the sandbox drill key (S3)
  *  PUT  /api/settings/payments/switch {enabled, confirm?}     admin; enabling: fresh sign-in, phrase, verification
  */
 import {
@@ -39,12 +43,12 @@ import {
   phraseMatches,
   PAYMENTS_VERIFY_RUNBOOK,
   sameVerifyChecks,
-  verifyCoversMode,
 } from "@camelthorn/core";
 import { isStepUpFresh } from "../auth/session";
 import { auditStatement } from "../db/audit";
 import { json, type Ctx, type Router } from "../router";
 import { actor, idParam, note, readBody, safely } from "./http";
+import { markCoversMode, revolutIsSandboxOnly } from "./gate-flag";
 import { ibanStatus, revokeIban, verifyIban } from "./iban-verify";
 import {
   listBatches,
@@ -81,6 +85,7 @@ import {
   loadDraftExpiryDays,
   MAX_DRAFT_EXPIRY_DAYS,
   paymentSettlement,
+  ackAlert,
   resolveNotSent,
 } from "./reconcile";
 import { getSubmitter, submitPayment } from "./submit";
@@ -259,6 +264,26 @@ function registerSubject(router: Router, kind: SubjectKind, base: string): void 
     }),
   );
 
+  // F9a (S1): "I looked at this alert". Records who and when, audited; moves nothing, fixes nothing.
+  router.add(
+    "POST",
+    `${base}/:id/alert/ack`,
+    { roles: ["finance", "admin"] },
+    safely(async (ctx) => {
+      const b = await readBody(ctx, ["note"]);
+      const text = b["note"] === undefined ? null : note(b["note"], 1, 200, "bad_note");
+      const r = await ackAlert(ctx.env.DB, {
+        kind,
+        id: idParam(ctx),
+        actor: actor(ctx),
+        nowMs: ctx.nowMs,
+        note: text,
+      });
+      if (!r.ok) throw new PaymentError(r.code, r.code === "not_found" ? 404 : 409);
+      return json({ acknowledged: true, alertKind: r.kind });
+    }),
+  );
+
   for (const decision of ["approve", "reject"] as const) {
     router.add(
       "POST",
@@ -321,6 +346,7 @@ async function settingsView(ctx: Ctx): Promise<Record<string, unknown>> {
     defaults: DEFAULT_PAYMENT_SETTINGS,
     enabled: state.enabled,
     verified: state.verified,
+    verifiedProvisional: state.verified?.provisional === true,
     protocolVersion: state.protocolVersion,
     protocolChanged: state.protocolChanged,
     connectionMode: state.connectionMode,
@@ -370,23 +396,24 @@ async function patchSettings(ctx: Ctx): Promise<Response> {
     if (
       state.verified === null ||
       state.protocolChanged ||
-      !verifyCoversMode(state.verified.checks, "pay")
+      !markCoversMode(state.verified, "pay")
     ) {
       throw new PaymentError("mode_pay_requires_verification", 409);
     }
     if (state.connectionMode !== "pay") throw new PaymentError("plan_not_company", 409);
   }
-  const before = JSON.stringify(state.settings);
+  // Compare-and-swap against the RAW value this patch was computed on (loadPaymentsState above), not a
+  // value re-read just before the write: a change by somebody else in between makes this a 409 (S11).
   const after = JSON.stringify(r.next);
   const out = await db.batch([
     db
       .prepare(
         `INSERT INTO settings (key, value_json, updated_by)
-         SELECT ?1, ?2, ?3 WHERE COALESCE((SELECT value_json FROM settings WHERE key = ?1), ?4) = ?4
+         SELECT ?1, ?2, ?3 WHERE (SELECT value_json FROM settings WHERE key = ?1) IS ?4
          ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, updated_by = excluded.updated_by,
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
       )
-      .bind(PAYMENT_SETTINGS_KEY, after, who, await storedOrDefault(db, before)),
+      .bind(PAYMENT_SETTINGS_KEY, after, who, state.settingsRaw),
     auditStatement(
       db,
       {
@@ -412,23 +439,32 @@ async function patchSettings(ctx: Ctx): Promise<Response> {
   return json(await settingsView(ctx));
 }
 
-/** The raw stored value (compare-and-swap), or the serialised defaults when nothing is stored. */
-async function storedOrDefault(db: D1Database, fallback: string): Promise<string> {
-  const r = await db
-    .prepare("SELECT value_json FROM settings WHERE key = ?1")
-    .bind(PAYMENT_SETTINGS_KEY)
-    .first<{ value_json: string }>();
-  return r?.value_json ?? fallback;
-}
-
 async function verifyHandler(ctx: Ctx): Promise<Response> {
   const db = ctx.env.DB;
   const who = actor(ctx);
-  const b = await readBody(ctx, ["confirm", "checks", "note"]);
+  const b = await readBody(ctx, ["confirm", "checks", "note", "provisional"]);
   if (typeof b["confirm"] !== "string" || !phraseMatches(b["confirm"], VERIFY_PHRASE)) {
     throw new PaymentError("confirmation_required", 400);
   }
-  if (!Array.isArray(b["checks"]) || !sameVerifyChecks(b["checks"])) {
+  if (b["provisional"] !== undefined && typeof b["provisional"] !== "boolean") {
+    throw new PaymentError("bad_request", 400);
+  }
+  const provisional = b["provisional"] === true;
+  if (provisional) {
+    // The staging drill key (S3): any subset of known checks, and ONLY where no money can move: the deploy
+    // var is on AND every active Revolut connection is a sandbox one. It is never a verification.
+    const known: readonly string[] = PAYMENTS_VERIFY_CHECKS;
+    if (
+      !Array.isArray(b["checks"]) ||
+      new Set(b["checks"]).size !== b["checks"].length ||
+      !b["checks"].every((c) => typeof c === "string" && known.includes(c))
+    ) {
+      throw new PaymentError("bad_checks", 400);
+    }
+    if (ctx.env.REVOLUT_PAYMENTS_EXECUTION !== "on" || !(await revolutIsSandboxOnly(db))) {
+      throw new PaymentError("provisional_not_allowed", 409);
+    }
+  } else if (!Array.isArray(b["checks"]) || !sameVerifyChecks(b["checks"])) {
     throw new PaymentError("checks_incomplete", 400);
   }
   const text = note(b["note"], 10, 500, "bad_note");
@@ -439,6 +475,7 @@ async function verifyHandler(ctx: Ctx): Promise<Response> {
     note: text,
     protocolVersion: before.protocolVersion,
     checks: [...(b["checks"] as string[])],
+    ...(provisional ? { provisional: true } : {}),
   };
   await db.batch([
     db.prepare(UPSERT_SETTING).bind(PAYMENTS_VERIFIED_KEY, JSON.stringify(mark), who),
@@ -446,14 +483,19 @@ async function verifyHandler(ctx: Ctx): Promise<Response> {
     db.prepare(UPSERT_SETTING).bind(PAYMENTS_ENABLED_KEY, "false", who),
     auditStatement(db, {
       actorEmail: who,
-      action: "payments.verified",
+      action: provisional ? "payments.verified_provisional" : "payments.verified",
       entity: "settings",
       entityId: PAYMENTS_VERIFIED_KEY,
-      before: { verifiedAt: before.verified?.at ?? null, enabled: before.enabled },
+      before: {
+        verifiedAt: before.verified?.at ?? null,
+        provisional: before.verified?.provisional ?? false,
+        enabled: before.enabled,
+      },
       after: {
         protocolVersion: mark.protocolVersion,
         note: text,
         checks: mark.checks,
+        provisional,
         enabled: false,
       },
     }),
@@ -503,6 +545,9 @@ async function switchHandler(ctx: Ctx): Promise<Response> {
           WHERE ?5 = ?1 AND EXISTS (SELECT 1 FROM settings WHERE key = ?3 AND json_extract(value_json, '$.protocolVersion') = ?4)
             AND EXISTS (SELECT 1 FROM settings WHERE key = ?6)
             AND EXISTS (SELECT 1 FROM connections WHERE kind = 'revolut' AND status = 'active')
+            AND (NOT EXISTS (SELECT 1 FROM settings WHERE key = ?3 AND json_extract(value_json, '$.provisional') = 1)
+                 OR NOT EXISTS (SELECT 1 FROM connections WHERE kind = 'revolut' AND status = 'active'
+                                  AND revolut_environment IS NOT 'sandbox'))
             AND EXISTS (SELECT 1 FROM users u JOIN user_roles r ON r.user_id = u.id
                          WHERE r.role = 'approver' AND u.disabled_at IS NULL)
          ON CONFLICT (key) DO UPDATE SET value_json = 'true', updated_by = excluded.updated_by,
@@ -680,7 +725,7 @@ export function registerPaymentRoutes(router: Router): void {
   router.add(
     "PUT",
     "/api/settings/payments/draft-expiry",
-    ADMIN,
+    ADMIN_STEP_UP,
     safely(async (ctx) => {
       const b = await readBody(ctx, ["days"]);
       const d = b["days"];

@@ -471,9 +471,9 @@ describe("the enable path ships OFF and needs every layer", () => {
     const v = paymentsProtocolVersion();
     expect(v).toMatch(/^[0-9a-f]{64}$/);
     expect(paymentsProtocolVersion()).toBe(v);
-    // pinned: a change here switches payments OFF everywhere until verified again (ADR 0050)
+    // pinned: a change here switches payments OFF everywhere until verified again (ADR 0050; re-pinned by F9a, ADR 0052: v2)
     expect(v).toBe(PINNED_PROTOCOL_VERSION);
   });
 });
 
-const PINNED_PROTOCOL_VERSION = "962f1e037d440e57ccfbb15f2ac1de46caae51535e67966fd66ac73acfe482e9";
+const PINNED_PROTOCOL_VERSION = "501f9a43f80b471df6be7a1b10e04fee4c3a05a065c2effd3297b5b259206787";

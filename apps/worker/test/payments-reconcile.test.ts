@@ -394,10 +394,16 @@ describe("drafts: approval in the Revolut app, lost answers, expiry", () => {
   it("a bulk draft: all approved -> the batch and every item are paid; mixed results alert and wait", async () => {
     const batch = await readyBatch(w, [w.itemId, await anotherBill(w)]);
     await toState(batch, { kind: "accepted", providerId: "bd-1" }, "batch");
+    // F9a (N8): a completed draft must name one transaction per payment, in our amounts
     const two = (a: string, b: string): PaymentDraftView => ({
       id: "bd-1",
-      payments: [{ state: a }, { state: b }],
+      payments: [
+        { state: a, transactionId: "bulk-tx-0001" },
+        { state: b, transactionId: "bulk-tx-0002" },
+      ],
     });
+    client.byId.set("bulk-tx-0001", txFor("", "completed", { id: "bulk-tx-0001" }));
+    client.byId.set("bulk-tx-0002", txFor("", "completed", { id: "bulk-tx-0002" }));
     client.drafts.set("bd-1", two("completed", "failed"));
     const s = await run();
     expect(s.alerts).toBeGreaterThanOrEqual(1);

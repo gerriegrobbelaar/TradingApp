@@ -40,6 +40,7 @@ import {
   readyPayment,
   rowOf,
   send,
+  stageSubmitting,
   TEST_IBAN_KEY,
   type ExecWorld,
 } from "./payments-exec-helpers";
@@ -51,15 +52,19 @@ import { setSetting } from "./matching-helpers";
 let w: ExecWorld;
 afterEach(() => w.fake.restore());
 
-const RID = "3f2b8c1e-5d4a-4e7b-9a10-0c6d2e8f1a42";
+const RID0 = "3f2b8c1e-5d4a-4e7b-9a10-0c6d2e8f1a42";
+// Section 2 stages a real `submitting` request (the gate compares a payment body with the stored
+// request, F9a N7) and points RID and leg at it; every other section keeps the synthetic ones.
+let RID = RID0;
 const CP = "5138f3e7-b2d1-4d16-a8e0-6a7c1f0d9b11";
-const leg = {
+const LEG0 = {
   accountId: SOURCE_ACCOUNT_UUID,
   counterpartyId: CP,
   amountMinor: 100,
   currency: "EUR",
   reference: "Invoice 1",
 };
+let leg = LEG0;
 const RESOLVE = "MARK PAYMENT AS NOT SENT";
 const MIN = 60_000;
 
@@ -131,6 +136,13 @@ describe("1. default safety: the deploy var as shipped (wrangler.toml 'off')", (
 describe("2. every gate layer on its own blocks a payment write (zero network calls)", () => {
   beforeEach(async () => {
     w = await execWorld({ mode: "pay" });
+    const s = await stageSubmitting(w, CP);
+    RID = s.requestId;
+    leg = { ...LEG0, accountId: s.accountUuid, amountMinor: s.amountMinor, reference: s.reference };
+  });
+  afterEach(() => {
+    RID = RID0;
+    leg = LEG0;
   });
 
   const cases: [string, (lease: string) => Promise<RevolutRequest>][] = [
@@ -364,6 +376,8 @@ describe("4/8/9. pay mode: 429 after the send, the deadline, ambiguous payees", 
     let release: () => void = () => undefined;
     const held = new Promise<void>((r) => (release = r));
     const calls: string[] = [];
+    let reached: () => void = () => undefined;
+    const reachedPay = new Promise<void>((r) => (reached = r));
     const client = {
       listCounterparties: () => Promise.resolve([]),
       async createCounterparty() {
@@ -380,7 +394,14 @@ describe("4/8/9. pay mode: 429 after the send, the deadline, ambiguous payees", 
     const submitter = createRevolutSubmitter({
       db,
       client,
-      gate: { paymentSendState: () => Promise.resolve("never_attempted") },
+      // asked only by a run that went on after the deadline, tried the payment and was stopped by the
+      // deadline guard (F9a, N3: this is the event the test waits for; no real time passes)
+      gate: {
+        paymentSendState: () => {
+          reached();
+          return Promise.resolve("never_attempted" as const);
+        },
+      },
       connectionId: w.revolutConnectionId,
       lease: "lease-token-x",
       ibanKey: TEST_IBAN_KEY,
@@ -396,7 +417,7 @@ describe("4/8/9. pay mode: 429 after the send, the deadline, ambiguous payees", 
     });
     expect(r).toMatchObject({ status: "done", to: "outcome_unknown" });
     release();
-    await new Promise((res) => setTimeout(res, 50));
+    await reachedPay;
     expect(calls).toEqual(["cp"]); // the payee call was in flight; the payment never started
   });
 

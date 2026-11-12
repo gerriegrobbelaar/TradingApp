@@ -188,6 +188,11 @@ export function isDirectPayment(req: RevolutRequest): boolean {
   return paymentKindOf(req) === "write" && req.path === "/pay";
 }
 
+/** True for the payment-draft write (`POST /payment-drafts`): the gate compares its body with the stored request (F9a, N7). */
+export function isDraftWrite(req: RevolutRequest): boolean {
+  return paymentKindOf(req) === "write" && req.path === "/payment-drafts";
+}
+
 /** The API version of a request (default 1.0). */
 export const versionOf = (req: Pick<RevolutRequest, "apiVersion">): "1.0" | "2.0" =>
   req.apiVersion ?? "1.0";

@@ -15,7 +15,6 @@
  */
 import {
   isIbanFingerprintKey,
-  verifyCoversMode,
   parsePaymentSettings,
   PAYMENT_SETTINGS_KEY,
   PAYMENTS_ENABLED_KEY,
@@ -23,7 +22,12 @@ import {
   type PaymentSettings,
 } from "@camelthorn/core";
 import { readMappingCheck } from "../read/approvals-routes";
-import { parseVerificationMark, type VerificationMark } from "./gate-flag";
+import {
+  markCoversMode,
+  parseVerificationMark,
+  revolutIsSandboxOnly,
+  type VerificationMark,
+} from "./gate-flag";
 import { paymentsProtocolVersion } from "./protocol-version";
 
 export { PAYMENT_SETTINGS_KEY, PAYMENTS_ENABLED_KEY, PAYMENTS_VERIFIED_KEY };
@@ -49,6 +53,12 @@ export type { VerificationMark };
 export interface PaymentsState {
   enabled: boolean;
   settings: PaymentSettings;
+  /** The raw stored settings JSON (null = nothing stored): what a compare-and-swap must compare to (S11). */
+  settingsRaw: string | null;
+  /**
+   * The mark in force. A PROVISIONAL mark outside the sandbox is not "in force": it reads as null
+   * (not verified) here, in the gate and in the enabling SQL (F9a, S3).
+   */
   verified: VerificationMark | null;
   protocolVersion: string;
   protocolChanged: boolean;
@@ -86,13 +96,16 @@ export async function loadPaymentsState(
   const byKey = new Map(
     (settings?.results ?? []).map((r) => [String(r["key"]), String(r["value_json"])]),
   );
-  const verified = parseVerificationMark(byKey.get(PAYMENTS_VERIFIED_KEY));
+  const parsed = parseVerificationMark(byKey.get(PAYMENTS_VERIFIED_KEY));
+  const verified =
+    parsed !== null && parsed.provisional && !(await revolutIsSandboxOnly(db)) ? null : parsed;
   const protocolVersion = paymentsProtocolVersion();
   const rev = revolut?.results?.[0];
   const mode = rev?.["payments_mode"];
   return {
     enabled: byKey.get(PAYMENTS_ENABLED_KEY) === "true",
     settings: parsePaymentSettings(byKey.get(PAYMENT_SETTINGS_KEY)),
+    settingsRaw: byKey.get(PAYMENT_SETTINGS_KEY) ?? null,
     verified,
     protocolVersion,
     protocolChanged: verified !== null && verified.protocolVersion !== protocolVersion,
@@ -112,10 +125,7 @@ export function paymentsBlockers(s: PaymentsState, submitterAvailable: boolean):
   if (!submitterAvailable) out.push("submitter_unavailable");
   // The direct-payment mode needs its own sandbox round trip in the mark (checklist item
   // sandbox_pay_roundtrip); drafts mode does not.
-  if (
-    s.settings.mode === "pay" &&
-    (s.verified === null || !verifyCoversMode(s.verified.checks, "pay"))
-  ) {
+  if (s.settings.mode === "pay" && (s.verified === null || !markCoversMode(s.verified, "pay"))) {
     out.push("pay_mode_not_verified");
   }
   if (!s.mappingVerified) out.push("approval_mapping_unverified");

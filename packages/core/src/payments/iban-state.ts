@@ -28,6 +28,15 @@ export function ibanFingerprint(iban: string | null | undefined, key: string): s
   return hmacSha256Hex(key, `iban-fp-v2:${n}`);
 }
 
+/**
+ * A short, NON-secret name of the fingerprint key in force (first 8 hex of HMAC(key, 'key-id')), stored
+ * next to every fingerprint so a rotation of PAYMENTS_IBAN_KEY can be told from a changed IBAN (F9a,
+ * ADR 0052). Eight hex characters give no useful handle on the key itself. Null for a missing or short key.
+ */
+export function ibanKeyId(key: string | null | undefined): string | null {
+  return isIbanFingerprintKey(key) ? hmacSha256Hex(key, "key-id").slice(0, 8) : null;
+}
+
 export type IbanState =
   | "missing"
   | "invalid"
@@ -48,7 +57,13 @@ export interface IbanFacts {
   /** The supplier's IBAN as Exact holds it (full, in memory only). */
   recordIban: string | null | undefined;
   /** The latest verification entry of this supplier, whatever it covers. */
-  verification: { fingerprint: string; verifiedBy: string; revoked: boolean } | null;
+  verification: {
+    fingerprint: string;
+    verifiedBy: string;
+    revoked: boolean;
+    /** Key id the fingerprint was made under; null/undefined for a row from before key ids existed. */
+    keyId?: string | null;
+  } | null;
   /** A payment to this very fingerprint was confirmed `paid` by the bank before. */
   paidBefore: boolean;
   /** The fingerprint key (Workers secret PAYMENTS_IBAN_KEY). Missing or short: state `invalid`. */
@@ -59,6 +74,11 @@ export interface IbanAssessment {
   state: IbanState;
   /** Null for missing or invalid. */
   fingerprint: string | null;
+  /**
+   * True when the state is `changed` only because the fingerprint key is not the one the
+   * verification was made under: the IBAN may be the same. Never true for a verification without a key id.
+   */
+  keyRotated?: boolean;
 }
 
 const same = (a: string, b: string): boolean => a.trim().toLowerCase() === b.trim().toLowerCase();
@@ -76,7 +96,13 @@ export function assessIban(facts: IbanFacts, requesterEmail: string): IbanAssess
   if (fingerprint === null) return { state: "invalid", fingerprint: null };
   const v = facts.verification;
   if (v === null || v.revoked) return { state: "unverified", fingerprint };
-  if (v.fingerprint !== fingerprint) return { state: "changed", fingerprint };
+  if (v.fingerprint !== fingerprint) {
+    const rotated =
+      typeof v.keyId === "string" && v.keyId !== "" && v.keyId !== ibanKeyId(facts.fingerprintKey);
+    return rotated
+      ? { state: "changed", fingerprint, keyRotated: true }
+      : { state: "changed", fingerprint };
+  }
   if (facts.paidBefore) return { state: "verified_established", fingerprint };
   return {
     state: same(v.verifiedBy, requesterEmail) ? "verified_by_requester" : "verified_new",

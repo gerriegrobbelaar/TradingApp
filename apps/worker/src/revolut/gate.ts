@@ -47,6 +47,7 @@ import {
   type TokenResult,
 } from "../gate/core";
 import { paymentWritesOpen } from "../payments/gate-flag";
+import { paymentBodyMismatch } from "../payments/gate-request";
 import { loadRevolutConfig, revolutWebhookUrl } from "./config";
 import { refreshTokens, TokenEndpointError } from "./oauth";
 import { buildUrl, isDirectPayment, paymentKindOf, validateRequest, versionOf } from "./request";
@@ -284,6 +285,11 @@ export class RevolutGate extends GateCore<
     const lease = await this.#readLease();
     if (lease === null || lease.token !== req.paymentLease || lease.expiresAt <= this.now()) {
       throw new RevolutApiError(409, "payment lease is not current", "payment_lease");
+    }
+    // F9a (N7): the body must say what the STORED request says (account, amount, currency, payee).
+    const mismatch = await paymentBodyMismatch(this.env.DB, req);
+    if (mismatch !== null) {
+      throw new RevolutApiError(409, "payment does not match the stored request", mismatch);
     }
   }
 

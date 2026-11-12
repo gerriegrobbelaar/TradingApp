@@ -6,7 +6,7 @@ describe("paymentsProtocolVersion", () => {
     const v = paymentsProtocolVersion();
     expect(v).toMatch(/^[0-9a-f]{64}$/);
     expect(paymentsProtocolVersion()).toBe(v);
-    // Pinned: a change here voids every payments verification mark (docs/decisions/0049, 0050: P9b changed the checklist).
-    expect(v).toBe("a1eca92c9b79d6198bfee4d4f329c4067a39c82cefb3c4819fa0f558f33f3668");
+    // Pinned: a change here voids every payments verification mark (docs/decisions/0049, 0050, 0052: F9a added the checks counterparty_lookup_probe and draft_lifecycle_probe and the block code iban_key_rotated).
+    expect(v).toBe("db5c8f2419be48264b6d515a162fc7c13f117bfe038269cf64fda60f4f3cf367");
   });
 });

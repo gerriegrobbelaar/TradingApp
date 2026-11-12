@@ -21,7 +21,7 @@
  *     transaction that is exactly ours, else unknown.
  * The whole call is bounded by SUBMITTER_TIMEOUT_MS (well under the claim lease); a timeout is unknown.
  */
-import { normalizeIban } from "@camelthorn/core";
+import { ibanKeyId, normalizeIban } from "@camelthorn/core";
 import {
   classifyPaymentFailure,
   PAYMENT_JOB_ID,
@@ -35,9 +35,13 @@ import {
 import { claimIdempotencyKey, completeIdempotencyKey } from "../db/idempotency";
 import { draftIsLive } from "./draft-state";
 import { readSendTargets, type SendTarget } from "./iban-store";
-import { findPayee, recordPayee, type Payee } from "./payees";
+import { findPayee, hasPayeesFromOtherKey, recordPayee, type Payee } from "./payees";
 import type { PaymentSubmitter, SubmitOutcome, SubmitRequest } from "./submit";
 import { transactionMatchesPayment } from "./tx-match";
+
+/** The earlier-attempt check looks at no more than this many earlier rows / distinct drafts (B3a). */
+export const MAX_PRIOR_ROWS = 200;
+export const MAX_PRIOR_DRAFTS = 20;
 
 /** Well under SUBMIT_LEASE_MS (10 min) and the gate's payment lease (5 min). */
 export const SUBMITTER_TIMEOUT_MS = 150_000;
@@ -107,17 +111,23 @@ export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
   ): Promise<{ ok: true; payee: Payee } | { ok: false; code: string }> {
     const cached = await findPayee(deps.db, deps.connectionId, t.ibanFingerprint);
     if (cached) return { ok: true, payee: cached };
+    const keyId = ibanKeyId(deps.ibanKey);
     const claim = await claimIdempotencyKey(
       deps.db,
       `${deps.connectionId}:${t.ibanFingerprint}`,
       "revolut.payee",
     );
-    if (claim.status === "duplicate") {
-      // An earlier attempt began and may have created the payee: look before creating another.
+    // Look before creating when an earlier attempt began (the claim exists), or when payees of an
+    // OLDER fingerprint key exist: after a rotation of PAYMENTS_IBAN_KEY this supplier's payee is in
+    // the cache under a fingerprint we can no longer compute (F9a, S5).
+    if (
+      claim.status === "duplicate" ||
+      (await hasPayeesFromOtherKey(deps.db, deps.connectionId, keyId))
+    ) {
       try {
         const found = await findAtRevolut(t);
         if (found) {
-          await recordPayee(deps.db, deps.connectionId, t, found, requestId);
+          await recordPayee(deps.db, deps.connectionId, t, found, requestId, "adopted", keyId);
           return { ok: true, payee: found };
         }
       } catch {
@@ -137,7 +147,7 @@ export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
       try {
         const found = await findAtRevolut(t);
         if (found) {
-          await recordPayee(deps.db, deps.connectionId, t, found, requestId);
+          await recordPayee(deps.db, deps.connectionId, t, found, requestId, "adopted", keyId);
           return { ok: true, payee: found };
         }
       } catch {
@@ -157,7 +167,7 @@ export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
       return { ok: false, code: "counterparty_account_ambiguous" };
     }
     const payee: Payee = { counterpartyId: created.id, accountId: acc.id ?? null };
-    await recordPayee(deps.db, deps.connectionId, t, payee, requestId);
+    await recordPayee(deps.db, deps.connectionId, t, payee, requestId, "created", keyId);
     try {
       await completeIdempotencyKey(
         deps.db,
@@ -203,13 +213,21 @@ export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
     return adoptTransaction(tx);
   }
 
-  async function adoptDraft(requestId: string): Promise<SubmitOutcome | null> {
+  /**
+   * Is a draft with OUR title at Revolut? `one`: exactly one (adopt it). `none`: the list was read and
+   * holds no such draft. `unsure`: the list could not be read, or holds more than one (F9a, B3b): the
+   * caller must treat that as "unknown", never as "refused".
+   */
+  async function adoptDraft(
+    requestId: string,
+  ): Promise<{ kind: "one"; id: string } | { kind: "none" } | { kind: "unsure" }> {
     try {
       const title = draftTitle(requestId);
       const hits = (await deps.client.listPaymentDrafts()).filter((d) => d.title === title);
-      return hits.length === 1 && hits[0] ? { kind: "accepted", providerId: hits[0].id } : null;
+      if (hits.length === 0) return { kind: "none" };
+      return hits.length === 1 && hits[0] ? { kind: "one", id: hits[0].id } : { kind: "unsure" };
     } catch {
-      return null;
+      return { kind: "unsure" };
     }
   }
 
@@ -282,8 +300,11 @@ export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
       if (f.kind === "not_executed") return rejected(f.code);
       // Review P9b: a draft has no request_id, so even a refusal by Revolut is checked against the
       // draft list by our title before it is believed (A10 is an assumption). Exactly one = ours.
+      // F9a (B3b): a list that cannot be read, or that shows two drafts with our title, is NOT
+      // "Revolut refused": the draft may exist, so the answer is unknown (reconciliation looks again).
       const found = await adoptDraft(req.requestId);
-      if (found !== null) return found;
+      if (found.kind === "one") return { kind: "accepted", providerId: found.id };
+      if (found.kind === "unsure") return unknown();
       if (f.kind === "rejected") return rejected(f.code);
       return unknown();
     }
@@ -305,6 +326,7 @@ export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
     const own = req.items.map((i) => i.requestId);
     const marks = ids.map((_, i) => `?${i + 1}`).join(", ");
     const ownMarks = own.map((_, i) => `?${ids.length + i + 1}`).join(", ");
+    // One row more than the cap: seeing it means "there are more than we are willing to look at".
     const rows = await deps.db
       .prepare(
         `SELECT p.request_id, p.mode, p.provider_id, b.request_id AS batch_request_id,
@@ -313,7 +335,7 @@ export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
           WHERE p.open_item_id IN (${marks}) AND p.request_id NOT IN (${ownMarks})
             AND ((p.status = 'rejected' AND p.status_reason = 'resolved_not_sent')
               OR (p.status = 'failed' AND p.status_reason = 'draft_expired'))
-          ORDER BY p.id LIMIT 20`,
+          ORDER BY p.id LIMIT ${MAX_PRIOR_ROWS + 1}`,
       )
       .bind(...ids, ...own)
       .all<{
@@ -323,26 +345,36 @@ export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
         batch_request_id: string | null;
         batch_provider_id: string | null;
       }>();
-    let list: { title?: string; view: Parameters<typeof draftIsLive>[0] }[] | null = null;
-    const seen = new Set<string>();
+    // F9a (B3a): never decide on a cut-off list. More rows than the cap is "unchecked".
+    if (rows.results.length > MAX_PRIOR_ROWS) return "prior_attempt_unchecked";
+    // One lookup per DRAFT, not per row: the items of one bulk draft share it.
+    const drafts = new Map<
+      string,
+      { mode: string; requestId: string; titleId: string; providerId: string | null }
+    >();
     for (const r of rows.results) {
       const titleId = r.batch_request_id ?? r.request_id;
       const providerId = r.batch_request_id !== null ? r.batch_provider_id : r.provider_id;
-      const key = `${r.mode}:${titleId}:${r.request_id}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
+      const key = `${r.mode}:${titleId}`;
+      if (!drafts.has(key)) {
+        drafts.set(key, { mode: r.mode, requestId: r.request_id, titleId, providerId });
+      }
+    }
+    if (drafts.size > MAX_PRIOR_DRAFTS) return "prior_attempt_unchecked";
+    let list: { title?: string; view: Parameters<typeof draftIsLive>[0] }[] | null = null;
+    for (const d of drafts.values()) {
       try {
-        if (r.mode === "pay") {
-          const tx = await deps.client.getTransactionByRequestId(r.request_id);
+        if (d.mode === "pay") {
+          const tx = await deps.client.getTransactionByRequestId(d.requestId);
           if (tx !== null && !["failed", "declined", "reverted"].includes(tx.state)) {
             return "prior_attempt_live";
           }
           continue;
         }
-        if (providerId !== null) {
+        if (d.providerId !== null) {
           let view;
           try {
-            view = await deps.client.getPaymentDraft(providerId);
+            view = await deps.client.getPaymentDraft(d.providerId);
           } catch (e) {
             if ((e as { status?: number } | null)?.status === 404) continue; // gone
             throw e;
@@ -356,8 +388,8 @@ export function createRevolutSubmitter(deps: SubmitterDeps): PaymentSubmitter {
             view: v,
           }));
         }
-        const title = draftTitle(titleId);
-        if (list.some((d) => d.title === title && draftIsLive(d.view))) return "prior_attempt_live";
+        const title = draftTitle(d.titleId);
+        if (list.some((x) => x.title === title && draftIsLive(x.view))) return "prior_attempt_live";
       } catch {
         return "prior_attempt_unchecked";
       }

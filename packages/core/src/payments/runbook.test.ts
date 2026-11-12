@@ -13,7 +13,9 @@ describe("payments verification checklist (P9b)", () => {
     expect([...PAYMENTS_VERIFY_CHECKS]).toEqual([
       "revolut_plan_known",
       "sandbox_counterparty_roundtrip",
+      "counterparty_lookup_probe",
       "sandbox_draft_roundtrip",
+      "draft_lifecycle_probe",
       "sandbox_pay_roundtrip",
       "request_id_idempotency_replay",
       "lost_answer_lookup_drill",
@@ -37,6 +39,15 @@ describe("payments verification checklist (P9b)", () => {
     }
     const text = paymentsRunbookText();
     for (const c of PAYMENTS_VERIFY_CHECKS) expect(text).toContain(c);
+  });
+
+  it("covers every A-item the review found untested (A8, A10, A11, A14, A16, payee name, fees)", () => {
+    const text = paymentsRunbookText();
+    for (const w of ["A8", "A10", "A11", "A14", "A16", "Payee-name verification", "S13"]) {
+      expect(text, w).toContain(w);
+    }
+    // the staging fault switch never existed: the drill must not point at it
+    expect(text).not.toMatch(/fault switch/i);
   });
 
   it("the pay roundtrip is optional in a mark but required to cover the pay mode", () => {

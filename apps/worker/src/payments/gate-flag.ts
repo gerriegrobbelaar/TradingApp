@@ -8,11 +8,14 @@
  *   2. settings.payments.enabled is exactly the JSON value `true` (the one stored form: the P9a
  *      triggers read the same string; the task text said '1', the stored form is 'true')
  *   3. settings.payments.verified is a complete verification mark whose protocolVersion equals the
- *      CURRENT paymentsProtocolVersion() (any rule or request-builder change voids it)
+ *      CURRENT paymentsProtocolVersion() (any rule or request-builder change voids it).
+ *      F9a (S3): a PROVISIONAL mark (`provisional: true`, any subset of the checks) is the staging
+ *      drill's key: it counts only while EVERY active Revolut connection is in the sandbox, so it can
+ *      never let a payment out of a production connection, whatever is stored.
  * Reads of payment state (transaction lookup, draft view) do NOT need this: switching payments off
  * must never blind the reconciliation of what is already in flight.
  */
-import { sameVerifyChecks, verifyCoversMode } from "@camelthorn/core";
+import { PAYMENTS_VERIFY_CHECKS, sameVerifyChecks, verifyCoversMode } from "@camelthorn/core";
 import { paymentsProtocolVersion } from "./protocol-version";
 
 export const PAYMENTS_EXECUTION_VAR_ON = "on";
@@ -23,6 +26,28 @@ export interface VerificationMark {
   note: string;
   protocolVersion: string;
   checks: string[];
+  /** A staging drill mark: valid only against sandbox Revolut connections (F9a, S3). */
+  provisional: boolean;
+}
+
+/** Does the mark cover the mode? A provisional mark covers both (it exists only on the sandbox). */
+export function markCoversMode(mark: VerificationMark, mode: "drafts" | "pay"): boolean {
+  return mark.provisional || verifyCoversMode(mark.checks, mode);
+}
+
+/**
+ * True when at least one Revolut connection is active and EVERY active one is in the sandbox
+ * environment. Anything else (production, unknown, none) is false: a provisional mark then counts
+ * for nothing. Read from D1 each time (the connection can change under a stored mark).
+ */
+export async function revolutIsSandboxOnly(db: D1Database): Promise<boolean> {
+  const r = await db
+    .prepare(
+      `SELECT COUNT(*) AS n, SUM(CASE WHEN revolut_environment IS 'sandbox' THEN 0 ELSE 1 END) AS other
+         FROM connections WHERE kind = 'revolut' AND status = 'active'`,
+    )
+    .first<{ n: number; other: number | null }>();
+  return r !== null && r.n >= 1 && (r.other ?? 1) === 0;
 }
 
 /** The mark from its stored JSON, or null when missing, malformed or incomplete. */
@@ -31,6 +56,8 @@ export function parseVerificationMark(raw: string | undefined): VerificationMark
   try {
     const v = JSON.parse(raw) as Record<string, unknown>;
     const checks = v["checks"];
+    const provisional = v["provisional"] === true;
+    const known: readonly string[] = PAYMENTS_VERIFY_CHECKS;
     if (
       typeof v["at"] === "string" &&
       typeof v["by"] === "string" &&
@@ -38,7 +65,10 @@ export function parseVerificationMark(raw: string | undefined): VerificationMark
       typeof v["protocolVersion"] === "string" &&
       /^[0-9a-f]{64}$/.test(v["protocolVersion"]) &&
       Array.isArray(checks) &&
-      sameVerifyChecks(checks)
+      (provisional
+        ? new Set(checks).size === checks.length &&
+          checks.every((c) => typeof c === "string" && known.includes(c))
+        : sameVerifyChecks(checks))
     ) {
       return {
         at: v["at"],
@@ -46,6 +76,7 @@ export function parseVerificationMark(raw: string | undefined): VerificationMark
         note: v["note"],
         protocolVersion: v["protocolVersion"],
         checks: checks as string[],
+        provisional,
       };
     }
   } catch {
@@ -84,7 +115,11 @@ export async function paymentWritesOpen(
   if (mark.protocolVersion !== paymentsProtocolVersion()) {
     return { open: false, reason: "protocol_changed" };
   }
-  if (forPay && !verifyCoversMode(mark.checks, "pay")) {
+  // A provisional (staging drill) mark opens nothing outside the sandbox.
+  if (mark.provisional && !(await revolutIsSandboxOnly(env.DB))) {
+    return { open: false, reason: "not_verified" };
+  }
+  if (forPay && !markCoversMode(mark, "pay")) {
     return { open: false, reason: "pay_not_verified" };
   }
   return { open: true };

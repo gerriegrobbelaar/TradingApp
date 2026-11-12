@@ -9,6 +9,7 @@ import {
   assessIban,
   hasValidIbanChecksum,
   ibanFingerprint,
+  ibanKeyId,
   maskIban,
   normalizeIban,
   PAYMENT_IBAN_MAX_AGE_MS,
@@ -36,7 +37,7 @@ export interface IbanStatusDto {
 async function latest(db: D1Database, relationId: number) {
   return db
     .prepare(
-      `SELECT iban_fingerprint, kind, verified_by, verified_at FROM supplier_iban_verifications
+      `SELECT iban_fingerprint, kind, verified_by, verified_at, key_id FROM supplier_iban_verifications
         WHERE relation_id = ?1 ORDER BY id DESC LIMIT 1`,
     )
     .bind(relationId)
@@ -45,6 +46,7 @@ async function latest(db: D1Database, relationId: number) {
       kind: "verified" | "revoked";
       verified_by: string;
       verified_at: string;
+      key_id: string | null;
     }>();
 }
 
@@ -86,6 +88,7 @@ export async function ibanStatus(
               fingerprint: v.iban_fingerprint,
               verifiedBy: v.verified_by,
               revoked: v.kind === "revoked",
+              keyId: v.key_id,
             },
       paidBefore: paid,
       fingerprintKey: key,
@@ -141,10 +144,10 @@ export async function verifyIban(
   await db.batch([
     db
       .prepare(
-        `INSERT INTO supplier_iban_verifications (division_id, relation_id, iban_fingerprint, kind, verified_by, verified_at)
-         VALUES (?1, ?2, ?3, 'verified', ?4, ?5)`,
+        `INSERT INTO supplier_iban_verifications (division_id, relation_id, iban_fingerprint, kind, verified_by, verified_at, key_id)
+         VALUES (?1, ?2, ?3, 'verified', ?4, ?5, ?6)`,
       )
-      .bind(s.divisionId, a.relationId, fp, a.actor, at),
+      .bind(s.divisionId, a.relationId, fp, a.actor, at, ibanKeyId(key)),
     auditStatement(
       db,
       {
@@ -179,10 +182,10 @@ export async function revokeIban(
   await db.batch([
     db
       .prepare(
-        `INSERT INTO supplier_iban_verifications (division_id, relation_id, iban_fingerprint, kind, verified_by, verified_at)
-         VALUES (?1, ?2, ?3, 'revoked', ?4, ?5)`,
+        `INSERT INTO supplier_iban_verifications (division_id, relation_id, iban_fingerprint, kind, verified_by, verified_at, key_id)
+         VALUES (?1, ?2, ?3, 'revoked', ?4, ?5, ?6)`,
       )
-      .bind(s.divisionId, a.relationId, cur.iban_fingerprint, a.actor, at),
+      .bind(s.divisionId, a.relationId, cur.iban_fingerprint, a.actor, at, cur.key_id),
     auditStatement(
       db,
       {

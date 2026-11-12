@@ -6,7 +6,7 @@
  *
  * P9b adds one reader here: the IBAN of a request that is about to be sent (claimed `submitting`).
  */
-import { ibanFingerprint, maskIban } from "@camelthorn/core";
+import { ibanFingerprint, ibanKeyId, maskIban } from "@camelthorn/core";
 
 export interface SupplierRow {
   rowId: number;
@@ -134,6 +134,8 @@ export interface NewPaymentRow {
   /** Full IBAN: stored for sending, never returned. */
   iban: string;
   ibanFingerprint: string;
+  /** Non-secret id of the fingerprint key (S5); null when unknown. */
+  keyId: string | null;
   reference: string;
   payloadHash: string;
   approvalsRequired: string;
@@ -149,9 +151,9 @@ export function insertPaymentStatement(db: D1Database, p: NewPaymentRow): D1Prep
     .prepare(
       `INSERT INTO payments (request_id, division_id, open_item_id, batch_id, bank_account_id, mode,
          amount_minor, currency, eur_minor, eur_rate, beneficiary_name, beneficiary_iban, iban_fingerprint,
-         reference, payload_hash, approvals_required, requested_by, client_key, expires_at, created_at)
+         reference, payload_hash, approvals_required, requested_by, client_key, expires_at, created_at, key_id)
        VALUES (?1, ?2, ?3, (SELECT id FROM payment_batches WHERE request_id = ?4), ?5, ?6, ?7, ?8, ?9, ?10,
-               ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)`,
+               ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)`,
     )
     .bind(
       p.requestId,
@@ -174,6 +176,7 @@ export function insertPaymentStatement(db: D1Database, p: NewPaymentRow): D1Prep
       p.clientKey,
       p.expiresAt,
       p.createdAt,
+      p.keyId,
     );
 }
 
@@ -213,6 +216,28 @@ export async function storedIbansMatch(
     .all<{ beneficiary_iban: string; iban_fingerprint: string }>();
   if (rows.results.length === 0) return false;
   return rows.results.every((r) => ibanFingerprint(r.beneficiary_iban, key) === r.iban_fingerprint);
+}
+
+/**
+ * True when a stored request was made under ANOTHER fingerprint key than the one in force now (the
+ * secret PAYMENTS_IBAN_KEY was rotated, F9a S5). Rows from before key ids carry none and never say yes.
+ */
+export async function storedKeyRotated(
+  db: D1Database,
+  kind: "payment" | "batch",
+  id: number,
+  key: string | null,
+): Promise<boolean> {
+  const now = ibanKeyId(key);
+  if (now === null) return false;
+  const where = kind === "payment" ? "id = ?1" : "batch_id = ?1";
+  const r = await db
+    .prepare(
+      `SELECT 1 AS n FROM payments WHERE ${where} AND key_id IS NOT NULL AND key_id <> ?2 LIMIT 1`,
+    )
+    .bind(id, now)
+    .first();
+  return r !== null;
 }
 
 /** One payment as the submitter needs it: everything to name the payee and the account. */

@@ -36,6 +36,9 @@ const SECRET_NAMES = [
   "REVOLUT_PRIVATE_KEY",
   "TOKEN_ENC_KEY",
   "TOKEN_ENC_KEY_PREVIOUS",
+  // Phase 9 (F9a, S5): the IBAN fingerprint key and the e-mail provider's API key
+  "PAYMENTS_IBAN_KEY",
+  "EMAIL_API_KEY",
 ];
 
 const isObject = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -437,7 +440,7 @@ function isolationProblems(a, aName, b, bName) {
  * Isolation between every environment and production (and between named environments) is
  * checked in every mode.
  */
-export function deployConfigProblems(toml, env = "production") {
+export function deployConfigProblems(toml, env = "production", options = {}) {
   const parsed = parseConfig(toml);
   if (parsed.raw === undefined) return [`wrangler.toml does not parse: ${parsed.error}`];
   const raw = parsed.raw;
@@ -450,6 +453,7 @@ export function deployConfigProblems(toml, env = "production") {
   }
   const { config, inherited } = resolveEnvironment(raw, env);
   const problems = environmentProblems(config);
+  problems.push(...paymentsExecutionProblems(config, env, options.allowPaymentsOn === true));
   if (env !== "production" && inherited.includes("name")) {
     problems.push(
       `[env.${env}] has no name of its own (wrangler would call it ${String(config.name)}): set name`,
@@ -471,6 +475,37 @@ export function deployConfigProblems(toml, env = "production") {
   return [...new Set(problems)];
 }
 
+/** The one value of REVOLUT_PAYMENTS_EXECUTION a deployment may carry besides "off". */
+const PAYMENTS_EXECUTION = "REVOLUT_PAYMENTS_EXECUTION";
+
+/** The value of REVOLUT_PAYMENTS_EXECUTION in a resolved config, or null when it is not a string. */
+export function paymentsExecutionValue(config) {
+  return isObject(config.vars) ? str(config.vars[PAYMENTS_EXECUTION]) : null;
+}
+
+/**
+ * F9a (S6): REVOLUT_PAYMENTS_EXECUTION decides whether this deployment can send a payment to the bank
+ * at all. Only the exact strings "off" and "on" are allowed (the Worker treats anything but "on" as
+ * off, so a typo such as "ON" or "true" would silently mean off; refuse it here instead of
+ * guessing). "on" in PRODUCTION also needs an explicit confirmation at deploy time
+ * (CF_ALLOW_PAYMENTS_ON=yes for that command), so it cannot ride along with an unrelated deploy.
+ * Staging and other named environments may carry "on" (the sandbox drill needs it).
+ */
+export function paymentsExecutionProblems(config, env, allowOn) {
+  const v = paymentsExecutionValue(config);
+  if (v !== "off" && v !== "on") {
+    return [
+      `${PAYMENTS_EXECUTION} must be exactly "off" or "on" (it is ${v === null ? "missing" : JSON.stringify(v)}): the Worker reads only "on" as on`,
+    ];
+  }
+  if (v === "on" && env === "production" && !allowOn) {
+    return [
+      `${PAYMENTS_EXECUTION} is "on" in production: deploy only with the explicit confirmation CF_ALLOW_PAYMENTS_ON=yes (docs/DEPLOY.md, Payments execution), after the staging verification is recorded`,
+    ];
+  }
+  return [];
+}
+
 /**
  * Notices for a deploy that passes: things that are allowed but that the person deploying should
  * know. Currently: Revolut left unconfigured.
@@ -486,4 +521,19 @@ export function deployConfigNotices(toml, env = "production") {
         "Revolut is not configured: Settings, Connections says so, the Revolut connect routes answer server_misconfigured, the webhook endpoint answers 401 and the Revolut jobs skip (revolut_not_configured)",
       ]
     : [];
+}
+
+/**
+ * The line the deploy always prints about the payment switch (S6), so it is read, not assumed. Kept
+ * apart from the notices: a notice is an exception, this is printed on every deploy.
+ */
+export function paymentsExecutionStatement(toml, env = "production") {
+  const parsed = parseConfig(toml);
+  if (parsed.raw === undefined) return "";
+  const names = environmentNames(parsed.raw);
+  if (env !== "production" && !names.includes(env)) return "";
+  const pe = paymentsExecutionValue(resolveEnvironment(parsed.raw, env).config);
+  return pe === "on"
+    ? `${PAYMENTS_EXECUTION} = "on" (${env}): this deployment CAN send payments to the bank once an admin has verified and enabled them`
+    : `${PAYMENTS_EXECUTION} = ${JSON.stringify(pe)} (${env}): this deployment cannot send payments`;
 }
