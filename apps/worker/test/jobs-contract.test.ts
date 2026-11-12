@@ -31,7 +31,7 @@ import {
 import { resetRevolut, seedRevolut, stubRevolut } from "./revolut-helpers";
 import { cpRecord, rawApi, rawLeg, rawTx } from "./revolut-q1-helpers";
 import { fakeRevolut, simpleTx } from "./revolut-r3-helpers";
-import { FakeExact, addDivision, fakeGate, resetSync } from "./sync-helpers";
+import { FakeExact, addDivision, fakeGate, guid, resetSync } from "./sync-helpers";
 import { outboxWipeStatements } from "./outbox-wipe";
 
 const db = env.DB;
@@ -248,6 +248,70 @@ async function bookingFixture(): Promise<{ syncDeps: JobContext["syncDeps"]; eff
   };
 }
 
+/**
+ * dq.checks reads D1 only and writes D1 only (issues, rule status, a run row). The fixture has an
+ * old unmatched bank line, two identical open bills and a supplier with a fresh IBAN change, so
+ * the first run opens issues and the second must change nothing.
+ */
+async function dqFixture(): Promise<{ syncDeps: JobContext["syncDeps"]; effects: Effects }> {
+  const w = await resetWorld();
+  const rel = await addRelation({
+    divisionId: w.divisionId,
+    ibans: [],
+    ibanChangedAt: "2026-07-10T00:00:00.000Z",
+  });
+  for (let i = 0; i < 2; i++) {
+    await addItem({
+      divisionId: w.divisionId,
+      kind: "bill",
+      invoiceNumber: "F-2026-001",
+      openMinor: 10_000,
+      relationExactId: rel.exactId,
+      relationName: "Acme B.V.",
+    });
+  }
+  await addTx({
+    accountId: w.accountId,
+    connectionId: w.revolutConnectionId,
+    amountMinor: 5_000,
+    createdAt: "2026-07-01T08:00:00.000Z",
+    counterpartyName: "Acme B.V.",
+  });
+  return { syncDeps: undefined, effects: { calls: [], writes: [] } };
+}
+
+/**
+ * exact.bank_balances only READS Exact (one ReportingBalance call for the one mapped account) and
+ * writes the balance to D1. The second run reads again and stores the same number.
+ */
+async function bankBalancesFixture(): Promise<{
+  syncDeps: JobContext["syncDeps"];
+  effects: Effects;
+}> {
+  const w = await resetWorld();
+  const div = (await db
+    .prepare("SELECT exact_division AS n FROM divisions WHERE id = ?1")
+    .bind(w.divisionId)
+    .first<{ n: number }>()) as { n: number };
+  await db
+    .prepare(
+      `INSERT INTO gl_accounts (division_id, exact_id, code, name, balance_type, updated_at)
+       VALUES (?1, ?2, '1210', 'Revolut EUR', 'B', '2026-07-14T00:00:00.000Z')`,
+    )
+    .bind(w.divisionId, guid(7001))
+    .run();
+  const fx = new FakeExact(div.n);
+  fx.glBalances = [
+    { account: 1, year: 2026, period: 0, amount: 1000.5 },
+    { account: 1, year: 2026, period: 6, amount: 200 },
+  ];
+  const effects: Effects = { calls: [], writes: [] };
+  return {
+    syncDeps: { transport: recording(fx.transport, effects), gate: fakeGate(), now: () => NOW },
+    effects,
+  };
+}
+
 /** One entry per implemented handler. */
 const FIXTURES: Record<string, Fixture> = {
   "exact.book_matches": { setup: bookingFixture, writes: true },
@@ -257,6 +321,8 @@ const FIXTURES: Record<string, Fixture> = {
   "revolut.backfill": { setup: revolutFixture, teardown: () => revolutStub?.restore() },
   "ecb.fx_import": { setup: ecbFixture, teardown: () => ecbStub?.restore() },
   "bank.match": { setup: matchingFixture, internal: true },
+  "dq.checks": { setup: dqFixture, internal: true },
+  "exact.bank_balances": { setup: bankBalancesFixture },
 };
 
 function contextFor(
@@ -269,9 +335,11 @@ function contextFor(
       ? 240
       : key === "exact.book_matches"
         ? 30
-        : key.startsWith("revolut.") || key === "bank.match"
+        : key.startsWith("revolut.") || key === "bank.match" || key === "dq.checks"
           ? 0
-          : 40;
+          : key === "exact.bank_balances"
+            ? 20
+            : 40;
   return {
     env,
     job: { id: 1, name: key, handler: key, exactBudget: budget },
@@ -318,7 +386,19 @@ describe("handler contract: every implemented handler", () => {
           const wipe = await outboxWipeStatements(db);
           await db.batch(
             DATA_TABLES.flatMap((t) =>
-              t === "exact_write_outbox" ? wipe : [db.prepare(`DELETE FROM ${t}`)],
+              t === "exact_write_outbox"
+                ? wipe
+                : t === "dq_issues"
+                  ? // Open issues cannot be deleted (guard trigger); history can.
+                    [
+                      db.prepare(
+                        "UPDATE dq_issues SET status = 'resolved', resolved_at = '2026-01-01T00:00:00.000Z', snoozed_until = NULL WHERE status <> 'resolved'",
+                      ),
+                      db.prepare("DELETE FROM dq_issues"),
+                      db.prepare("DELETE FROM dq_rule_status"),
+                      db.prepare("DELETE FROM dq_runs"),
+                    ]
+                  : [db.prepare(`DELETE FROM ${t}`)],
             ),
           );
         });

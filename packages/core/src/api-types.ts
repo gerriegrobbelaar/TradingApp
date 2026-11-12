@@ -10,6 +10,14 @@
  * `as_of_in_future`). Shape tests: apps/worker/test/read-api-shapes.test.ts.
  */
 import type { AgeingBucket, BucketAmounts } from "./ageing";
+import type {
+  DqArea,
+  DqDetails,
+  DqFixTarget,
+  DqRuleStatus,
+  DqSeverity,
+  DqThresholdSpec,
+} from "./dq/types";
 import type { BalanceSheet } from "./reports/balance-sheet";
 import type { BalanceSheetSection, ProfitLossSection } from "./reports/classify";
 import type { ProfitLoss } from "./reports/profit-loss";
@@ -1222,4 +1230,132 @@ export interface BookingResolveResponse {
   item: BookingOutboxItemDto;
   /** True when a claimed match that never reached Exact went back to the review queue (row deleted). */
   released?: boolean;
+}
+
+// ---- Data quality (Phase 8, D8a, ADR 0045) -------------------------------------------------------------
+// GET  /api/dq/summary?division=         any role
+// GET  /api/dq/issues?status=&area=&severity=&rule=&limit=&cursor=&division=   any role
+// POST /api/dq/issues/:id/snooze         finance, admin   {until, note}
+// POST /api/dq/issues/:id/resolve-note   finance, admin   {note}
+// GET  /api/dq/rules                     admin
+// PATCH /api/dq/rules/:id                admin, step-up   {enabled?, severity?, threshold?, confirm?, rev}
+
+export type DqIssueStatusDto = "open" | "resolved" | "snoozed";
+
+export interface DqIssueDto {
+  id: number;
+  /** 0 = a global issue (not tied to one administration). */
+  divisionId: number;
+  ruleId: string;
+  area: DqArea;
+  severity: DqSeverity;
+  status: DqIssueStatusDto;
+  /** Short label. Masked: never a full IBAN. */
+  subject: string;
+  message: string;
+  fix: DqFixTarget;
+  /** The web path that "Fix" opens. */
+  fixPath: string;
+  amountMinor: number | null;
+  currency: string | null;
+  details: DqDetails;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  resolvedAt: string | null;
+  resolvedBy: string | null;
+  resolutionNote: string | null;
+  snoozedUntil: string | null;
+  snoozedBy: string | null;
+  snoozeNote: string | null;
+  reopenCount: number;
+  notifiedAt: string | null;
+}
+
+export interface DqIssuesResponse {
+  issues: DqIssueDto[];
+  nextCursor: string | null;
+}
+
+export interface DqRuleStatusDto {
+  ruleId: string;
+  area: DqArea;
+  title: string;
+  severity: DqSeverity;
+  enabled: boolean;
+  status: DqRuleStatus | "never_run";
+  /** Machine code for not_available, not_configured, disabled and error. */
+  reason: string | null;
+  checked: number;
+  openIssues: number;
+  evaluatedAt: string | null;
+}
+
+export interface DqRunDto {
+  id: number;
+  startedAt: string;
+  finishedAt: string | null;
+  status: "ok" | "partial" | "error";
+  divisions: number;
+  rulesEvaluated: number;
+  rulesUnavailable: number;
+  newIssues: number;
+  resolvedIssues: number;
+  openIssues: number;
+}
+
+export interface DqSummaryResponse {
+  divisionId: number;
+  lastRun: DqRunDto | null;
+  /** Counts of OPEN issues (snoozed and resolved are separate). */
+  open: Record<DqSeverity, number>;
+  snoozed: number;
+  byArea: Record<DqArea, Record<DqSeverity, number>>;
+  rules: DqRuleStatusDto[];
+}
+
+export interface DqSnoozeRequest {
+  /** ISO instant in the future, at most 90 days ahead. */
+  until: string;
+  note: string;
+}
+export interface DqResolveRequest {
+  note: string;
+}
+export interface DqIssueResponse {
+  issue: DqIssueDto;
+}
+
+export interface DqRuleDto {
+  id: string;
+  area: DqArea;
+  title: string;
+  description: string;
+  defaultSeverity: DqSeverity;
+  severity: DqSeverity;
+  enabled: boolean;
+  fix: DqFixTarget;
+  thresholdSpec: DqThresholdSpec | null;
+  /** number, list of codes, or null. */
+  threshold: number | string[] | null;
+  isOverridden: boolean;
+  rev: string | null;
+  updatedBy: string | null;
+  updatedAt: string | null;
+}
+export interface DqRulesResponse {
+  rules: DqRuleDto[];
+  /** Typed phrase for loosening a critical rule. */
+  loosenPhrase: string;
+}
+export interface DqRulePatchRequest {
+  enabled?: boolean;
+  severity?: DqSeverity;
+  threshold?: number | string[] | null;
+  /** Required to loosen a rule whose effective severity is critical. */
+  confirm?: string;
+  /** The rev the editor read (null = never overridden); a stale one gets 409. */
+  rev: string | null;
+}
+export interface DqRulePatchResponse {
+  rule: DqRuleDto;
 }

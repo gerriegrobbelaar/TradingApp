@@ -118,7 +118,19 @@ describe("GET /api/jobs", () => {
       nextRunAt: null,
     });
     expect(full.scheduleText).toBeTruthy();
-    const later = byName(body, "dq.checks");
+    // Data quality checks read D1 only, so they are built and ship ON for a new install (ADR 0045).
+    const dq = byName(body, "dq.checks");
+    expect(dq).toMatchObject({ enabled: true, implemented: true, defaultEnabled: true });
+    expect(dq.nextRunAt).not.toBeNull();
+    // Bank balances read Exact: built, but off until the first live checks.
+    expect(byName(body, "exact.bank_balances")).toMatchObject({
+      enabled: false,
+      implemented: true,
+      usesExact: true,
+      defaultEnabled: false,
+      disabledReason: "awaiting_live_verification",
+    });
+    const later = byName(body, "reminders.send");
     expect(later).toMatchObject({ enabled: false, implemented: false, nextRunAt: null });
     // The Revolut jobs are built (R3a) and ship switched off until the first live checks.
     for (const name of ["revolut.sync", "revolut.backfill"]) {
@@ -508,7 +520,7 @@ describe("POST /api/jobs/:id/run (Run now)", () => {
   });
 
   it("refuses a job whose phase is not built, even when it is enabled", async () => {
-    const id = await jobId("dq.checks");
+    const id = await jobId("reminders.send");
     for (const enabled of [false, true]) {
       await db
         .prepare("UPDATE jobs SET enabled = ?2 WHERE id = ?1")

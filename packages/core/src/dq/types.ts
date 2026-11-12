@@ -1,0 +1,313 @@
+/**
+ * Data quality (DQ) rules, pure and I/O free (CLAUDE.md 4.6, ADR 0045). A rule is a definition
+ * plus an evaluator over a plain input object that the Worker loads from D1; the evaluator
+ * returns issues, each with a STABLE fingerprint (rule id + subject key) so that a rerun
+ * recognises the same issue.
+ *
+ * Honesty rule: a rule that cannot be evaluated (the data is not there, or the rule is not
+ * configured) reports `not_available` or `not_configured` with a reason. It NEVER reports `ok`.
+ * Money is integer minor units plus a currency code, never a float.
+ */
+
+export type DqSeverity = "info" | "warning" | "critical";
+export const DQ_SEVERITIES: readonly DqSeverity[] = ["info", "warning", "critical"];
+/** Rank for comparisons: a higher number is more severe. */
+export const SEVERITY_RANK: Record<DqSeverity, number> = { info: 0, warning: 1, critical: 2 };
+
+export type DqArea =
+  "bank" | "payables" | "receivables" | "master_data" | "fx" | "ledger" | "integrations";
+export const DQ_AREAS: readonly DqArea[] = [
+  "bank",
+  "payables",
+  "receivables",
+  "master_data",
+  "fx",
+  "ledger",
+  "integrations",
+];
+
+/**
+ * What a rule run says about the rule itself:
+ *  ok             evaluated, nothing to report
+ *  issues         evaluated, at least one issue
+ *  not_available  the data the rule needs does not exist (yet): never counted as ok
+ *  not_configured the rule needs a setting that is empty (for example suspense account codes)
+ *  disabled       an admin switched the rule off
+ *  error          the evaluator failed; nothing is known
+ */
+export type DqRuleStatus =
+  "ok" | "issues" | "not_available" | "not_configured" | "disabled" | "error";
+
+/** Where "Fix" leads. A key, not a URL: DQ_FIX_PATHS maps it to a route of the web app. */
+export type DqFixTarget =
+  | "bank"
+  | "matching"
+  | "booking"
+  | "payables"
+  | "approvals"
+  | "invoices"
+  | "fx"
+  | "ledger"
+  | "schedules"
+  | "connections";
+
+export const DQ_FIX_PATHS: Record<DqFixTarget, string> = {
+  bank: "/treasury/bank",
+  matching: "/treasury/bank",
+  booking: "/settings/matching",
+  payables: "/purchases/payables",
+  approvals: "/purchases/approvals",
+  invoices: "/invoices",
+  fx: "/settings/fx",
+  ledger: "/reporting/balance-sheet",
+  schedules: "/settings/schedules",
+  connections: "/settings/connections",
+};
+
+/** How a rule's threshold is shaped (and edited). */
+export type DqThresholdSpec =
+  | {
+      kind: "number";
+      /** Shown next to the number. */
+      unit: "days" | "minor" | "count" | "factor" | "calls";
+      default: number;
+      min: number;
+      max: number;
+    }
+  | { kind: "codes"; default: readonly string[]; maxItems: number };
+
+export type DqThreshold = number | readonly string[] | null;
+
+/** Small, non-secret facts about an issue. Never an IBAN, an e-mail body or free bank text. */
+export type DqDetails = Record<string, string | number | boolean | null>;
+
+export interface DqIssue {
+  ruleId: string;
+  /** `${ruleId}:${subjectKey}`; the identity of the issue across runs. */
+  fingerprint: string;
+  severity: DqSeverity;
+  /** Short human label of what is affected. Masked: never a full IBAN. */
+  subject: string;
+  /** Sentence case, leads with the number, no exclamation mark. */
+  message: string;
+  fix: DqFixTarget;
+  amountMinor: number | null;
+  currency: string | null;
+  details: DqDetails;
+}
+
+export interface DqRuleOutcome {
+  status: Exclude<DqRuleStatus, "disabled" | "error">;
+  /** Machine code for not_available / not_configured. */
+  reason?: string;
+  issues: DqIssue[];
+  /** How many subjects were examined (0 with status ok means nothing to check). */
+  checked: number;
+  /** More issues existed than were returned (the cap). Auto-resolve must not trust the list. */
+  truncated: boolean;
+  /** How many issues were found before the cap. */
+  total: number;
+}
+
+export interface DqRuleConfig {
+  enabled: boolean;
+  severity: DqSeverity;
+  threshold: DqThreshold;
+}
+
+export interface DqRuleDef {
+  id: string;
+  area: DqArea;
+  /** `division` rules run once per synced division, `global` rules once per run. */
+  scope: "division" | "global";
+  defaultSeverity: DqSeverity;
+  threshold: DqThresholdSpec | null;
+  title: string;
+  description: string;
+  fix: DqFixTarget;
+  evaluate(input: DqInput, config: DqRuleConfig): DqRuleOutcome;
+}
+
+export interface DqRuleResult {
+  ruleId: string;
+  area: DqArea;
+  scope: "division" | "global";
+  severity: DqSeverity;
+  status: DqRuleStatus;
+  reason: string | null;
+  issues: DqIssue[];
+  checked: number;
+  truncated: boolean;
+  total: number;
+}
+
+// ---- inputs ------------------------------------------------------------------------------------------
+
+export interface DqBankAccountIn {
+  id: number;
+  name: string;
+  currency: string;
+  /** The bank's own balance (Revolut), minor units. */
+  balanceMinor: number | null;
+  balanceAt: string | null;
+  /** The balance of the mapped bank ledger account in Exact (job exact.bank_balances). */
+  exactBalanceMinor: number | null;
+  exactBalanceAt: string | null;
+}
+
+export interface DqBankTxIn {
+  id: number;
+  accountId: number;
+  /** Signed minor units (negative = money out). */
+  amountMinor: number;
+  currency: string;
+  bookedAt: string;
+  matchStatus: "unmatched" | "suggested" | "matched" | "ignored";
+  counterpartyName: string | null;
+  /** Used only to group duplicates; never copied into an issue. */
+  counterpartyKey: string | null;
+  reference: string | null;
+}
+
+export interface DqBookedMatchIn {
+  matchId: number;
+  txId: number;
+  amountMinor: number;
+  currency: string;
+  lineState: string;
+  stateConflict: boolean;
+  bookedAt: string | null;
+}
+
+export interface DqBookingIn {
+  outcomeUnknown: number;
+  manualRequired: number;
+  alreadyMatchedInExact: number;
+  staleSettlements: number;
+}
+
+export interface DqOpenItemIn {
+  id: number;
+  kind: "invoice" | "bill";
+  relationId: string | null;
+  relationName: string | null;
+  invoiceNumber: string | null;
+  currency: string;
+  /** The invoice amount as booked (`open_items.original_minor`); null when the sync did not read it. */
+  originalMinor: number | null;
+  openMinor: number;
+  /** Booked FX rate as a decimal string, or null. */
+  rate: string | null;
+  openDcMinor: number | null;
+  invoiceDate: string | null;
+}
+
+export interface DqPurchaseEntryIn {
+  id: number;
+  entryNumber: string | null;
+  supplierName: string | null;
+  status: "pending_approval" | "approved" | "rejected" | "unknown";
+  submittedAt: string | null;
+  modifiedAt: string | null;
+  entryDate: string | null;
+  /** null = the sync did not see a document field for this entry. */
+  hasPdf: boolean | null;
+  amountMinor: number;
+  currency: string;
+}
+
+export interface DqRelationIn {
+  id: number;
+  name: string;
+  isSupplier: boolean;
+  isCustomer: boolean;
+  email: string | null;
+  vatNumber: string | null;
+  /** ISO 3166 alpha-2 as Exact sends it. */
+  country: string | null;
+  hasIban: boolean;
+  ibanChangedAt: string | null;
+  ibanAddedAt: string | null;
+  openInvoices: number;
+  openBills: number;
+}
+
+export interface DqFxIn {
+  newestRateDate: string | null;
+  stale: boolean;
+  staleReason: string | null;
+  workingDaysOld: number | null;
+  currenciesWithoutRate: { currency: string; items: number }[];
+  unresolvedConflicts: { id: number; currency: string; rateDate: string }[];
+}
+
+export interface DqLedgerIn {
+  /** Balances (debit - credit, division currency) of the configured suspense accounts that exist. */
+  suspense: { code: string; name: string; balanceMinor: number; currency: string }[];
+  /**
+   * Bookings dated in a locked period, or null when the app has no closed-period marker (it has
+   * none today: Phase 11, the Close checklist, adds one).
+   */
+  closedPeriodBookings: { id: number; period: string; amountMinor: number }[] | null;
+}
+
+export interface DqJobIn {
+  name: string;
+  title: string;
+  enabled: boolean;
+  implemented: boolean;
+  /** Length of one schedule interval in ms (null when the schedule has no next run). */
+  intervalMs: number | null;
+  lastSuccessAt: string | null;
+  /** Where waiting starts when there was no success: the first run, else the enable baseline. */
+  referenceAt: string | null;
+  lastStatus: string | null;
+  lastCode: string | null;
+}
+
+export interface DqInput {
+  nowMs: number;
+  /** 0 for the global pass. */
+  divisionId: number;
+  baseCurrency: string;
+  bankAccounts: DqBankAccountIn[] | null;
+  bankTransactions: DqBankTxIn[] | null;
+  bookedMatches: DqBookedMatchIn[] | null;
+  booking: DqBookingIn | null;
+  openItems: DqOpenItemIn[] | null;
+  purchaseEntries: DqPurchaseEntryIn[] | null;
+  relations: DqRelationIn[] | null;
+  fx: DqFxIn | null;
+  ledger: DqLedgerIn | null;
+  jobs: DqJobIn[] | null;
+  webhook: { rejected24h: number; errored24h: number } | null;
+  exactConnection: {
+    status: string;
+    lastError: string | null;
+    refreshExpiresAt: string | null;
+  } | null;
+  /** Exact calls today for this division; null when unknown. */
+  exactBudget: { dailyLimit: number; calls: number; remaining: number | null } | null;
+}
+
+/** An input with nothing loaded: every rule reports not_available. Handy for tests. */
+export function emptyInput(nowMs: number, divisionId = 0, baseCurrency = "EUR"): DqInput {
+  return {
+    nowMs,
+    divisionId,
+    baseCurrency,
+    bankAccounts: null,
+    bankTransactions: null,
+    bookedMatches: null,
+    booking: null,
+    openItems: null,
+    purchaseEntries: null,
+    relations: null,
+    fx: null,
+    ledger: null,
+    jobs: null,
+    webhook: null,
+    exactConnection: null,
+    exactBudget: null,
+  };
+}

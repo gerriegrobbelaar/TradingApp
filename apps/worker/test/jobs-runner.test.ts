@@ -566,7 +566,7 @@ describe("not built yet, and disabled jobs", () => {
 
   it("the real registry registers every not-yet-built default as not_implemented", async () => {
     const { HANDLERS } = await import("../src/jobs/handlers");
-    for (const k of ["exact.bank_balances", "dq.checks", "reminders.send", "fx.revaluation"]) {
+    for (const k of ["reminders.send", "fx.revaluation"]) {
       expect(HANDLERS[k]?.run, k).toBeUndefined();
     }
     for (const k of [
@@ -575,6 +575,8 @@ describe("not built yet, and disabled jobs", () => {
       "revolut.sync",
       "revolut.backfill",
       "ecb.fx_import",
+      "exact.bank_balances",
+      "dq.checks",
     ]) {
       expect(typeof HANDLERS[k]?.run, k).toBe("function");
     }

@@ -87,7 +87,12 @@ export async function recordOpenBefore(db: D1Database, matchId: number): Promise
  * shown the payment (or the item was never re-read, or the baseline is unknown). Phase 8 raises a
  * data-quality issue from this; nothing here releases anything.
  */
-export async function staleSettlements(db: D1Database, nowIso: string): Promise<number> {
+export async function staleSettlements(
+  db: D1Database,
+  nowIso: string,
+  /** Only the matches of this administration (the data-quality rule runs per division). */
+  divisionId?: number,
+): Promise<number> {
   const cutoff = new Date(Date.parse(nowIso) - STALE_SETTLEMENT_HOURS * 3_600_000).toISOString();
   const row = await db
     .prepare(
@@ -95,9 +100,10 @@ export async function staleSettlements(db: D1Database, nowIso: string): Promise<
        FROM match_allocations a
          JOIN matches m ON m.id = a.match_id
          JOIN open_items oi ON oi.id = a.open_item_id
-       WHERE m.exact_state = 'matched_in_exact' AND m.booked_at < ?1 AND ${SETTLEMENT_PREDICATE}`,
+       WHERE m.exact_state = 'matched_in_exact' AND m.booked_at < ?1 AND ${SETTLEMENT_PREDICATE}
+         AND (?2 IS NULL OR m.division_id = ?2)`,
     )
-    .bind(cutoff)
+    .bind(cutoff, divisionId ?? null)
     .first<{ n: number }>();
   return row?.n ?? 0;
 }

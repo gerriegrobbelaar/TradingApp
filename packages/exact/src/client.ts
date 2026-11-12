@@ -1138,12 +1138,20 @@ export function createExactClient(transport: ExactTransport, options: ExactClien
      */
     async listReportingBalancesChunk(
       token: string | null,
-      opts: { year: number; maxPages?: number },
+      opts: { year: number; maxPages?: number; glAccountId?: string },
     ): Promise<ListChunk<ReportingBalanceRow>> {
+      // `glAccountId` narrows the read to one ledger account (the bank balance job, ADR 0045):
+      // `GLAccount eq guid'...' and ReportingYear eq 2026`. Unverified against a live Exact (A-items).
+      const year = `ReportingYear eq ${assertYear(opts.year)}`;
       return ledgerChunk(
         "/financial/ReportingBalance",
         REPORTING_BALANCE_FIELDS,
-        { $filter: `ReportingYear eq ${assertYear(opts.year)}` },
+        {
+          $filter:
+            opts.glAccountId === undefined
+              ? year
+              : `GLAccount eq ${odataGuid(opts.glAccountId)} and ${year}`,
+        },
         mapReportingBalance,
         token,
         opts,

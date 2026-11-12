@@ -241,8 +241,10 @@ export class FakeExact {
         }));
       case "/financial/ReportingBalance": {
         const year = this.yearOf(req);
+        // The bank balance job narrows the read to one ledger account (ADR 0045).
+        const only = /GLAccount eq guid'([^']+)'/.exec(req.query?.["$filter"] ?? "")?.[1];
         return this.glBalances
-          .filter((b) => b.year === year)
+          .filter((b) => b.year === year && (only === undefined || guid(7000 + b.account) === only))
           .map((b) => ({
             GLAccount: guid(7000 + b.account),
             GLAccountCode: String(b.account),

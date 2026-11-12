@@ -975,6 +975,53 @@ booking. Existing databases get the job when the new release starts (default job
   explicitly; check 2 is the proof. VIRTUAL generated columns and partial indexes are standard
   SQLite features that D1 supports.
 
+### Data quality (Phase 8, D8a; ADR 0045)
+
+Two jobs, with different risk:
+
+- **`dq.checks`** (hourly at :20) reads **only D1**: it makes no call to Exact or Revolut and writes
+  only the data quality tables (`dq_issues`, `dq_rule_status`, `dq_runs`). It is switched **on** after
+  a fresh install. A database that already has the job row keeps whatever `enabled` it stored (the
+  seeding never flips a row), so after the upgrade an admin switches it on in Settings, Schedules (or
+  `UPDATE jobs SET enabled = 1 WHERE name = 'dq.checks'`). Nothing alerts yet (no e-mail, no screen:
+  Phase 8 D8b); read the result through the API.
+- **`exact.bank_balances`** reads from Exact (one `financial/ReportingBalance` call per mapped bank
+  account, at most 20 calls per run and administration) and stores `bank_accounts.exact_balance_minor`.
+  It ships **off** (`awaiting_live_verification`). Enable it only after the checks below.
+
+First-live checks, on staging first:
+
+1. After migration 0026 (`wrangler d1 migrations apply <db> --remote`): the tables `dq_rules`,
+   `dq_issues`, `dq_rule_status`, `dq_runs` exist; the four triggers `dq_issues_identity`,
+   `dq_issues_reopen_path`, `dq_issues_counter`, `dq_issues_keep_live` are listed in
+   `sqlite_master` (hashes: `apps/worker/test/fixtures/trigger-hashes.json`); `bank_accounts` has
+   `exact_balance_minor` and `exact_balance_at`.
+2. Press **Run now** on `dq.checks` (Settings, Schedules). Expect `ok` with `rulesEvaluated` > 0.
+   `rulesUnavailable` is normally 5 to 9 (bounced e-mails, disputed invoices, VAT code, closed period,
+   suspense accounts not configured, Exact balance, ...): that is correct, see the next item.
+3. `GET /api/dq/summary` lists all 27 rules. Check that every rule that could not be evaluated says
+   **`not_available` or `not_configured` with a reason**, never `ok`, and that `never_run` is gone.
+   A rule at `error` means a bug: report it (the run is `partial`, `section_failed`).
+4. `GET /api/dq/issues`: spot-check five issues against Exact and Revolut (an old unmatched line, a
+   duplicate bill, a supplier whose IBAN changed). No response may contain a full IBAN.
+5. Run it again: no new issues for the same data, `last_seen_at` moves. Fix a problem in Exact, sync,
+   run again: the issue becomes `resolved` by `system`. Snooze one (`POST
+   /api/dq/issues/<id>/snooze {"until":"<ISO within 90 days>","note":"..."}`) and run again: it stays
+   snoozed.
+6. Suspense accounts: `PATCH /api/dq/rules/ledger.suspense_not_zero` with `{"threshold":["1999"],
+   "rev":null}` (admin, fresh sign-in) to list your GL codes; until then the rule says
+   `not_configured`. Loosening a **critical** rule (switching it off, lowering its severity, a larger
+   window) needs `"confirm":"LOOSEN CRITICAL DATA QUALITY RULE"`.
+7. **`exact.bank_balances`** (before switching it on): Revolut accounts must be mapped (`PUT
+   /api/matching/account-map`) and the chart (`gl_accounts`) synced. Run it once by hand and look at
+   the result: `stored` equals the number of mapped accounts, `calls` the same, `empty_answer` and
+   `incomplete_read` are 0. Compare `bank_accounts.exact_balance_minor` with the balance of that
+   ledger account in Exact's own balance report. **Verify the A-items of ADR 0045**: the filter
+   `GLAccount eq guid'...' and ReportingYear eq <year>` is accepted (a 400 means the filter or a field
+   name is wrong), and the sum of the periods equals Exact's balance. Only then enable the job.
+8. Housekeeping: resolved issues are deleted after 180 days by the run itself; `dq_runs` has one row
+   per run (about 9,000 a year at hourly).
+
 ### Emergency stop of all jobs
 
 Pick the first that works:

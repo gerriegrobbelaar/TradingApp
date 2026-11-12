@@ -14,3 +14,6 @@ export const BOOKING_ENABLE_PHRASE = "ENABLE EXACT BOOKING";
 export function phraseMatches(typed: string, phrase: string): boolean {
   return phrase.length > 0 && typed === phrase;
 }
+
+/** PATCH /api/dq/rules/:id when it loosens a rule whose severity is critical (D8a). */
+export const DQ_LOOSEN_PHRASE = "LOOSEN CRITICAL DATA QUALITY RULE";

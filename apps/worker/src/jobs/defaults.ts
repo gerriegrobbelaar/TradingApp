@@ -14,6 +14,7 @@
 import { nextRun, type Schedule } from "@camelthorn/core";
 import { auditStatement } from "../db/audit";
 import { MAX_CALLS_PER_RUN as BOOKING_CALL_BUDGET } from "../booking/executor";
+import { BANK_BALANCES_BUDGET } from "../exact/bank-balances";
 import { FULL_SYNC_BUDGET, INCREMENTAL_SYNC_BUDGET } from "./exact-handlers";
 
 export const DEFAULT_JOBS_VERSION = 4;
@@ -69,8 +70,10 @@ export const DEFAULT_JOBS: readonly DefaultJob[] = [
     handler: "exact.bank_balances",
     // The Exact bank feed is daily; polling faster only wastes budget (CLAUDE.md 4.1).
     schedule: { kind: "cron", expr: "5 * * * *" },
-    enabled: false, // Phase 8 (data quality): planned for the data-quality phase
-    exactBudget: 20,
+    // Reads from Exact: stays off until the first live checks (docs/DEPLOY.md, ADR 0045).
+    enabled: false,
+    disabledReason: AWAITING_LIVE_VERIFICATION,
+    exactBudget: BANK_BALANCES_BUDGET,
   },
   {
     name: "ecb.fx_import",
@@ -85,7 +88,9 @@ export const DEFAULT_JOBS: readonly DefaultJob[] = [
     name: "dq.checks",
     handler: "dq.checks",
     schedule: { kind: "cron", expr: "20 * * * *" },
-    enabled: false, // Phase 8
+    // Reads D1 only (no Exact or Revolut call), so it ships ON for new installs; existing rows are
+    // never flipped (an admin switches it on, docs/DEPLOY.md).
+    enabled: true,
     exactBudget: 0,
   },
   {

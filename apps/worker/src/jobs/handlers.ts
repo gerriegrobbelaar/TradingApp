@@ -10,6 +10,8 @@ import {
   runEcbImport,
 } from "../fx/ecb-import";
 import { DAILY_BOOKING_CALL_CAP, runBookMatches } from "../booking/executor";
+import { runBankBalances } from "../exact/bank-balances";
+import { runDqChecks } from "../dq/run";
 import { runMatching } from "../matching/run";
 import { loadRevolutConfig } from "../revolut/config";
 import { runRevolutBackfill, runRevolutSync } from "../revolut/sync";
@@ -95,12 +97,15 @@ export const HANDLERS: Record<string, HandlerDef> = {
   "exact.bank_balances": {
     title: "Bank balances from Exact",
     description:
-      "Reads the ING and Rabobank balances that Exact imported. Planned for the data-quality phase (Phase 8): the rule 'Exact balance differs from bank balance' needs it.",
+      "Reads the balance of each mapped bank ledger account from Exact (one call per account, current reporting year) so the data quality rule 'Exact balance differs from bank balance' has something to compare. Reads only; ships switched off until the first live checks (docs/DEPLOY.md).",
     usesExact: true,
-    ...later("Phase 8, Data quality"),
+    phase: null,
+    // The next slot is the retry.
+    maxAttempts: 1,
     // The Exact bank feed is daily; faster polling only wastes budget.
     scheduleRules: { minIntervalMinutes: 30 },
     maxLatenessMs: 2 * HOUR,
+    run: runBankBalances,
   },
   "ecb.fx_import": {
     title: "ECB exchange rates",
@@ -124,11 +129,21 @@ export const HANDLERS: Record<string, HandlerDef> = {
   },
   "dq.checks": {
     title: "Data quality checks",
-    description: "Runs the data quality rules and raises alerts.",
+    description:
+      "Runs the data quality rules on the data already in the database (no call to Exact or Revolut), opens, refreshes and resolves issues, and records which rules could not be evaluated. On by default on new installs.",
     usesExact: false,
-    ...later("Phase 8, Data quality"),
+    phase: null,
+    // The next slot is the retry.
+    maxAttempts: 1,
     scheduleRules: { minIntervalMinutes: 15 },
     maxLatenessMs: 2 * HOUR,
+    run: (ctx) =>
+      runDqChecks(ctx, {
+        describeHandler: (h) => ({
+          title: handlerFor(h)?.title ?? null,
+          implemented: isImplemented(h),
+        }),
+      }),
   },
   "reminders.send": {
     title: "Payment reminders",

@@ -93,9 +93,11 @@ describe("S6: the Exact sync jobs ship disabled (the public ECB import is the on
       const j = DEFAULT_JOBS.find((x) => x.name === n);
       expect(j).toMatchObject({ enabled: false, disabledReason: AWAITING_LIVE_VERIFICATION });
     }
+    // The data quality checks read D1 only (ADR 0045), so they ship on as well.
     expect(DEFAULT_JOBS.filter((j) => j.enabled).map((j) => j.name)).toEqual([
       "bank.match",
       "ecb.fx_import",
+      "dq.checks",
     ]);
     expect(DEFAULT_JOBS.find((j) => j.name === "ecb.fx_import")?.exactBudget).toBe(0);
     await seedDefaultJobs(db);

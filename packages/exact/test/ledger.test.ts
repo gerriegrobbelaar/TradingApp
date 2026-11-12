@@ -168,6 +168,26 @@ describe("reporting balances", () => {
     ).rejects.toMatchObject({ code: "BAD_SHAPE" });
   });
 
+  it("can narrow the read to one ledger account (the bank balance job, ADR 0045)", async () => {
+    const { transport, calls } = scripted([ok(envelope([balance(1, 2026, 1, "5")]))]);
+    await createExactClient(transport, base).listReportingBalancesChunk(null, {
+      year: 2026,
+      glAccountId: G(1).toUpperCase(),
+    });
+    expect(calls[0]?.query?.["$filter"]).toBe(
+      `GLAccount eq guid'${G(1)}' and ReportingYear eq 2026`,
+    );
+    // anything that is not a GUID is refused before a call is made (no filter injection)
+    const none = scripted([]);
+    await expect(
+      createExactClient(none.transport, base).listReportingBalancesChunk(null, {
+        year: 2026,
+        glAccountId: "x' or 1 eq 1",
+      }),
+    ).rejects.toThrow(RangeError);
+    expect(none.calls).toHaveLength(0);
+  });
+
   it("splits periods over status and cost centre in the dimension", async () => {
     const row = balance(1, 2026, 3, "5", "").replace(
       `"Status":null,"CostCenterCode":null`,

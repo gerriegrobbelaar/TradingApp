@@ -67,12 +67,14 @@ describe("default jobs (CLAUDE.md 4.1)", () => {
     expect(sched("exact.full_sync")).toEqual({ kind: "cron", expr: "0 2 * * *" });
     expect(sched("exact.incremental_sync")).toMatchObject({ kind: "cron" });
     expect(sched("fx.revaluation")).toEqual({ kind: "last_working_day", time: "16:30" });
-    // Only the ECB import (public, read-only, no credentials; ADR 0036) and the internal bank
-    // matching (suggestions only; automatic matching has its own switch, ADR 0042) ship enabled.
-    // Later phases are not built and the Exact and Revolut jobs wait for the first live checks.
+    // Only the ECB import (public, read-only, no credentials; ADR 0036), the internal bank
+    // matching (suggestions only; automatic matching has its own switch, ADR 0042) and the data
+    // quality checks (D1 only, ADR 0045) ship enabled. Later phases are not built and the Exact and
+    // Revolut jobs wait for the first live checks.
     expect(rows.filter((r) => r.enabled === 1).map((r) => r.name)).toEqual([
       "bank.match",
       "ecb.fx_import",
+      "dq.checks",
     ]);
     expect(sched("bank.match")).toEqual({ kind: "cron", expr: "2,12,22,32,42,52 * * * *" });
     expect(rows.every((r) => r.timezone === "Europe/Amsterdam" && r.kind === "system")).toBe(true);
@@ -115,7 +117,7 @@ describe("default jobs (CLAUDE.md 4.1)", () => {
          WHERE name = 'exact.full_sync'`,
       )
       .run();
-    await db.prepare("UPDATE jobs SET enabled = 1 WHERE name = 'dq.checks'").run();
+    await db.prepare("UPDATE jobs SET enabled = 0 WHERE name = 'dq.checks'").run();
     // A release added a default job and bumped the version: simulate it by removing one job and
     // lowering the marker.
     await db.prepare("DELETE FROM jobs WHERE name = 'reminders.send'").run();
@@ -130,7 +132,8 @@ describe("default jobs (CLAUDE.md 4.1)", () => {
     const full = rows.find((r) => r.name === "exact.full_sync");
     expect(full).toMatchObject({ enabled: 0, exact_budget: 99 });
     expect(JSON.parse(full?.schedule_json ?? "{}")).toEqual({ kind: "cron", expr: "5 4 * * *" });
-    expect(rows.find((r) => r.name === "dq.checks")?.enabled).toBe(1);
+    // An admin's choice survives (the default is now ON, the row stays off).
+    expect(rows.find((r) => r.name === "dq.checks")?.enabled).toBe(0);
     // The missing job came back with its default.
     expect(rows.find((r) => r.name === "reminders.send")?.enabled).toBe(0);
   });

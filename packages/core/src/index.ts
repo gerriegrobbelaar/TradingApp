@@ -25,3 +25,4 @@ export * from "./fx";
 export * from "./ecb";
 
 export * from "./matching";
+export * from "./dq";
