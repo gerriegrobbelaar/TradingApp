@@ -75,13 +75,18 @@ export function resolveRuleConfig(rule: DqRuleDef, override?: DqRuleOverride | n
   return { enabled: override?.enabled !== false, severity, threshold };
 }
 
+/** Which way a numeric threshold loosens its rule (see DqThresholdSpec.looser). */
+export function looserDirection(spec: Extract<DqThresholdSpec, { kind: "number" }>): "up" | "down" {
+  return spec.looser ?? (spec.unit === "calls" ? "down" : "up");
+}
+
 /**
  * Is `next` a weaker setting than `prev` for a rule? Switching a rule off, lowering its severity,
- * or moving a threshold so that fewer things are reported. For numeric thresholds "fewer" depends
- * on the unit: for days, factor and count a larger value reports less; for the remaining-calls
- * floor and the balance tolerance too (a lower floor reports less; a larger tolerance reports
- * less), so: `calls` loosens when it goes DOWN, every other unit when it goes UP. A codes list
- * loosens when a code is removed.
+ * or moving a threshold so that fewer things are reported. The direction is per rule
+ * (`looserDirection`): an age limit, tolerance or count loosens when it goes UP; a look-back window
+ * (supplier IBAN changed in the last N days), a warning lead time (Exact connection expires within
+ * N days) and the remaining-calls floor loosen when they go DOWN. A codes list loosens when a code
+ * is removed. Every step is judged on its own, so a series of small steps needs the phrase each time.
  */
 export function isLooseningChange(
   rule: DqRuleDef,
@@ -100,7 +105,7 @@ export function isLooseningChange(
   }
   const p = typeof prev.threshold === "number" ? prev.threshold : spec.default;
   const n = typeof next.threshold === "number" ? next.threshold : spec.default;
-  return spec.unit === "calls" ? n < p : n > p;
+  return looserDirection(spec) === "down" ? n < p : n > p;
 }
 
 /** A rule is "critical" for the typed-phrase rule when its effective severity is critical. */
@@ -158,6 +163,7 @@ export function evaluateRules(
         checked: o.checked,
         truncated: o.truncated,
         total: o.total,
+        ...(o.unjudged !== undefined && o.unjudged.length > 0 ? { unjudged: o.unjudged } : {}),
       });
     } catch {
       out.push({
@@ -225,11 +231,14 @@ export function planReconcile(
   const byFingerprint = new Map(existing.map((e) => [e.fingerprint, e] as const));
   const reported = new Set<string>();
   const trusted = new Set<string>();
+  /** Subjects a rule could not judge this run: their issues are left as they are. */
+  const unjudged = new Set<string>();
   const nowMs = Date.parse(nowIso);
   for (const r of results) {
     const vouches = (r.status === "ok" || r.status === "issues") && !r.truncated;
     if (vouches) trusted.add(r.ruleId);
     else plan.untouchedRules.push(r.ruleId);
+    for (const f of r.unjudged ?? []) unjudged.add(f);
     for (const issue of r.issues) {
       if (reported.has(issue.fingerprint)) continue;
       reported.add(issue.fingerprint);
@@ -247,6 +256,7 @@ export function planReconcile(
   }
   for (const e of existing) {
     if (e.status === "resolved" || reported.has(e.fingerprint)) continue;
+    if (unjudged.has(e.fingerprint)) continue;
     if (trusted.has(e.ruleId)) plan.resolve.push(e.id);
   }
   return plan;

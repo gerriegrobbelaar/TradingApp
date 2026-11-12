@@ -69,6 +69,10 @@ export interface IssueParts {
   details?: DqDetails;
 }
 
+/** The fingerprint `makeIssue` gives a subject key (for `unjudged` lists). */
+export const fingerprintOf = (ruleId: string, key: readonly (string | number)[]): string =>
+  `${ruleId}:${subjectKey(key)}`;
+
 export function makeIssue(
   rule: Pick<DqRuleDef, "id" | "fix">,
   config: Pick<DqRuleConfig, "severity">,
@@ -82,7 +86,7 @@ export function makeIssue(
       : null;
   return {
     ruleId: rule.id,
-    fingerprint: `${rule.id}:${subjectKey(key)}`,
+    fingerprint: fingerprintOf(rule.id, key),
     severity: config.severity,
     subject: cleanText(p.subject),
     message: cleanText(p.message, MAX_MESSAGE),
@@ -102,7 +106,11 @@ function sanitizeDetails(d: DqDetails): DqDetails {
 }
 
 /** Orders issues by fingerprint, drops repeated fingerprints (the first wins) and applies the cap. */
-export function finish(issues: DqIssue[], checked: number): DqRuleOutcome {
+export function finish(
+  issues: DqIssue[],
+  checked: number,
+  unjudged: readonly string[] = [],
+): DqRuleOutcome {
   const seen = new Set<string>();
   const unique: DqIssue[] = [];
   for (const i of issues) {
@@ -117,6 +125,7 @@ export function finish(issues: DqIssue[], checked: number): DqRuleOutcome {
     checked,
     truncated: unique.length > kept.length,
     total: unique.length,
+    ...(unjudged.length > 0 ? { unjudged: [...new Set(unjudged)] } : {}),
   };
 }
 

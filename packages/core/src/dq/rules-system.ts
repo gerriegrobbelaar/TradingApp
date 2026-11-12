@@ -5,6 +5,7 @@ import {
   amountText,
   cleanText,
   DAY_MS,
+  fingerprintOf,
   finish,
   HOUR_MS,
   makeIssue,
@@ -220,11 +221,17 @@ const jobStale: DqRuleDef = {
     if (input.jobs === null) return notAvailable("jobs_not_loaded");
     const factor = numberThreshold(config.threshold, 2);
     const issues: DqIssue[] = [];
+    const unjudged: string[] = [];
     let checked = 0;
     for (const j of input.jobs) {
-      if (!j.enabled || !j.implemented || j.intervalMs === null || j.intervalMs <= 0) continue;
+      // A switched-off or unbuilt job is not judged: its old issue no longer applies.
+      if (!j.enabled || !j.implemented) continue;
       const since = ageMs(input.nowMs, j.lastSuccessAt) ?? ageMs(input.nowMs, j.referenceAt);
-      if (since === null) continue;
+      // A schedule or a date that cannot be read says nothing either way.
+      if (j.intervalMs === null || j.intervalMs <= 0 || since === null) {
+        unjudged.push(fingerprintOf(this.id, ["job", j.name]));
+        continue;
+      }
       checked += 1;
       if (since <= factor * j.intervalMs) continue;
       const hours = Math.floor(since / HOUR_MS);
@@ -243,7 +250,7 @@ const jobStale: DqRuleDef = {
       );
     }
     issues.sort((a, b) => a.fingerprint.localeCompare(b.fingerprint));
-    return finish(issues, checked);
+    return finish(issues, checked, unjudged);
   },
 };
 
@@ -281,7 +288,8 @@ const exactConnection: DqRuleDef = {
   area: "integrations",
   scope: "global",
   defaultSeverity: "critical",
-  threshold: { kind: "number", unit: "days", default: 7, min: 1, max: 29 },
+  // A warning lead time: a SHORTER lead time reports less (critical: needs the phrase).
+  threshold: { kind: "number", unit: "days", looser: "down", default: 7, min: 1, max: 29 },
   title: "Exact connection needs attention",
   description:
     "The Exact connection needs a new sign-in, or its refresh token expires within the set number of days.",
@@ -320,7 +328,7 @@ const exactBudget: DqRuleDef = {
   area: "integrations",
   scope: "division",
   defaultSeverity: "warning",
-  threshold: { kind: "number", unit: "calls", default: 500, min: 0, max: 5000 },
+  threshold: { kind: "number", unit: "calls", looser: "down", default: 500, min: 0, max: 5000 },
   title: "Exact calls for today running low",
   description:
     "Fewer calls remain today than the set number (Exact allows 5,000 per administration and day).",

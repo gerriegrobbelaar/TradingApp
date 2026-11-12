@@ -104,7 +104,9 @@ function note(v: unknown): string {
   }
   const t = v.trim();
   if (t.length === 0 || t.length > 200) throw new ApiError("bad_note");
-  return t;
+  // People type IBANs into notes ("verified NL91 ... by phone"): masked before it is stored,
+  // audited or returned (CLAUDE.md 5). Masking never makes the text longer than the column allows.
+  return Array.from(safeText(t)).slice(0, 200).join("");
 }
 
 function idParam(ctx: Ctx): number {
@@ -175,10 +177,10 @@ export function toIssueDto(r: IssueSql): DqIssueDto {
     lastSeenAt: r.last_seen_at,
     resolvedAt: r.resolved_at,
     resolvedBy: r.resolved_by,
-    resolutionNote: r.resolution_note,
+    resolutionNote: r.resolution_note === null ? null : safeText(r.resolution_note),
     snoozedUntil: r.snoozed_until,
     snoozedBy: r.snoozed_by,
-    snoozeNote: r.snooze_note,
+    snoozeNote: r.snooze_note === null ? null : safeText(r.snooze_note),
     reopenCount: r.reopen_count,
     notifiedAt: r.notified_at,
   };

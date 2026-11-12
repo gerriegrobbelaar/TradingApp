@@ -52,7 +52,12 @@ interface DivisionRow {
 }
 
 type Skip =
-  "no_ledger_account" | "currency_differs" | "incomplete_read" | "empty_answer" | "read_failed";
+  | "no_ledger_account"
+  | "currency_differs"
+  | "incomplete_read"
+  | "empty_answer"
+  | "other_account_rows"
+  | "read_failed";
 
 export async function runBankBalances(ctx: JobContext): Promise<HandlerResult> {
   const { env } = ctx;
@@ -93,6 +98,7 @@ export async function runBankBalances(ctx: JobContext): Promise<HandlerResult> {
     currency_differs: 0,
     incomplete_read: 0,
     empty_answer: 0,
+    other_account_rows: 0,
     read_failed: 0,
   };
   let stopped: string | null = null;
@@ -155,7 +161,8 @@ export async function runBankBalances(ctx: JobContext): Promise<HandlerResult> {
           const chunk = await client.listReportingBalancesChunk(null, {
             year,
             glAccountId: a.exact_id,
-            maxPages: PAGES_PER_ACCOUNT,
+            // Never more pages than the budget has left: a read cut short is incomplete below.
+            maxPages: Math.max(1, Math.min(PAGES_PER_ACCOUNT, ctx.budget - calls)),
           });
           if (chunk.error !== undefined) throw new Error("chunk_error");
           if (!chunk.complete) {
@@ -166,6 +173,14 @@ export async function runBankBalances(ctx: JobContext): Promise<HandlerResult> {
             // Nothing came back: an empty answer is not a zero balance (a filter Exact ignored
             // would look the same). Stored only when Exact returned rows.
             skipped.empty_answer += 1;
+            continue;
+          }
+          // Every row must belong to the account asked for. A row of another ledger account means
+          // Exact did not apply the GLAccount filter (A-1): summing it would store a wrong
+          // balance, so nothing is stored.
+          const want = a.exact_id.toLowerCase();
+          if (chunk.items.some((r) => r.glAccountId.toLowerCase() !== want)) {
+            skipped.other_account_rows += 1;
             continue;
           }
           rows = chunk.items;
@@ -232,9 +247,14 @@ export async function runBankBalances(ctx: JobContext): Promise<HandlerResult> {
   if (stopped !== null) {
     return { status: "partial", code: stopped, summary, callsUsed: calls };
   }
+  const failed = skipped.read_failed + skipped.other_account_rows;
   return {
-    status: skipped.read_failed > 0 ? "partial" : "ok",
-    ...(skipped.read_failed > 0 ? { code: "read_failed" } : {}),
+    status: failed > 0 ? "partial" : "ok",
+    ...(skipped.other_account_rows > 0
+      ? { code: "other_account_rows" }
+      : skipped.read_failed > 0
+        ? { code: "read_failed" }
+        : {}),
     summary,
     callsUsed: calls,
   };

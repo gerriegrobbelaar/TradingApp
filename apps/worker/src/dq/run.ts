@@ -110,12 +110,12 @@ export async function runDqChecks(ctx: JobContext, deps: DqRunDeps): Promise<Han
       aborted = true;
       break;
     }
+    const tx = await section("bank_transactions", () => loadBankTransactions(db, d, nowMs));
     const input: DqInput = {
       ...emptyInput(nowMs, d.id, d.baseCurrency),
       bankAccounts: await section("bank_accounts", () => loadBankAccounts(db, d)),
-      bankTransactions: await section("bank_transactions", () =>
-        loadBankTransactions(db, d, nowMs),
-      ),
+      bankTransactions: tx === null ? null : tx.lines,
+      bankTransactionsCapped: tx?.capped ?? false,
       bookedMatches: await section("booked_matches", () => loadBookedMatches(db, d)),
       booking: await section("booking_health", () => loadBookingHealth(db, d, nowMs)),
       openItems: await section("open_items", () => loadOpenItems(db, d)),

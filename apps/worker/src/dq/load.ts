@@ -7,6 +7,7 @@
  */
 import {
   LEDGER_BALANCE_SEMANTICS,
+  MAX_ISSUES_PER_RULE,
   amsterdamParts,
   nextRun,
   signedByAccount,
@@ -32,8 +33,13 @@ import { rejectedLast24h } from "../revolut/webhook-health";
 const DAY = 86_400_000;
 /** More open items than this and the item-based rules say not_available instead of guessing. */
 export const MAX_OPEN_ITEMS = 20_000;
+// Every list cap below is either larger than the per-rule issue cap (so a full list makes the rule
+// `truncated`) or turns the section into not_available: a cut list must never look complete.
 const MAX_UNMATCHED_LINES = 1_000;
-const MAX_RECENT_LINES = 5_000;
+export const MAX_RECENT_LINES = 5_000;
+export const MAX_PURCHASE_ENTRIES = 20_000;
+export const MAX_RELATIONS = 50_000;
+const MAX_BOOKED_MATCHES = 1_000;
 /** How far back duplicate bank lines are looked for. */
 export const DUPLICATE_WINDOW_DAYS = 60;
 export const EXACT_DAILY_LIMIT = 5_000;
@@ -74,11 +80,16 @@ export async function loadBankAccounts(db: D1Database, d: DqDivision): Promise<D
   }));
 }
 
+/**
+ * Final completed lines of a division: the oldest unmatched ones (for the age rule) plus the lines
+ * of the duplicate look-back window. `capped` is true when the window had more lines than are
+ * read; the duplicate rule then resolves nothing.
+ */
 export async function loadBankTransactions(
   db: D1Database,
   d: DqDivision,
   nowMs: number,
-): Promise<DqBankTxIn[]> {
+): Promise<{ lines: DqBankTxIn[]; capped: boolean }> {
   const base = `SELECT t.id, t.bank_account_id, t.amount_minor, t.currency, t.booked_at, t.match_status,
                        t.counterparty_name, COALESCE(t.counterparty_ref, lower(t.counterparty_name)) AS ckey,
                        t.reference
@@ -97,12 +108,14 @@ export async function loadBankTransactions(
       .bind(d.id),
     db
       .prepare(
-        `${base} AND t.booked_at >= ?2 ORDER BY t.booked_at DESC, t.id DESC LIMIT ${MAX_RECENT_LINES}`,
+        `${base} AND t.booked_at >= ?2 ORDER BY t.booked_at DESC, t.id DESC LIMIT ${MAX_RECENT_LINES + 1}`,
       )
       .bind(d.id, since),
   ]);
+  const recentRows = recent?.results ?? [];
+  const capped = recentRows.length > MAX_RECENT_LINES;
   const byId = new Map<number, DqBankTxIn>();
-  for (const r of [...(unmatched?.results ?? []), ...(recent?.results ?? [])]) {
+  for (const r of [...(unmatched?.results ?? []), ...recentRows.slice(0, MAX_RECENT_LINES)]) {
     const id = num(r["id"]);
     if (byId.has(id)) continue;
     byId.set(id, {
@@ -117,7 +130,7 @@ export async function loadBankTransactions(
       reference: (r["reference"] as string | null) ?? null,
     });
   }
-  return [...byId.values()].sort((a, b) => a.id - b.id);
+  return { lines: [...byId.values()].sort((a, b) => a.id - b.id), capped };
 }
 
 export async function loadBookedMatches(db: D1Database, d: DqDivision): Promise<DqBookedMatchIn[]> {
@@ -128,7 +141,7 @@ export async function loadBookedMatches(db: D1Database, d: DqDivision): Promise<
          FROM matches m JOIN bank_transactions t ON t.id = m.bank_transaction_id
          WHERE m.division_id = ?1 AND m.undone_at IS NULL AND m.exact_state = 'matched_in_exact'
            AND (t.state_conflict = 1 OR t.state = 'reverted')
-         ORDER BY m.id LIMIT 1000`,
+         ORDER BY m.id LIMIT ${MAX_BOOKED_MATCHES}`,
       )
       .bind(d.id)
       .all<Record<string, unknown>>()
@@ -207,7 +220,7 @@ export async function loadPurchaseEntries(
   db: D1Database,
   d: DqDivision,
   nowMs: number,
-): Promise<DqPurchaseEntryIn[]> {
+): Promise<DqPurchaseEntryIn[] | null> {
   const since = new Date(nowMs - 400 * DAY).toISOString().slice(0, 10);
   const rows = (
     await db
@@ -216,11 +229,14 @@ export async function loadPurchaseEntries(
                 amount_minor, currency
          FROM purchase_entries
          WHERE division_id = ?1 AND (status = 'pending_approval' OR entry_date >= ?2)
-         ORDER BY id LIMIT 20000`,
+         ORDER BY id LIMIT ${MAX_PURCHASE_ENTRIES + 1}`,
       )
       .bind(d.id, since)
       .all<Record<string, unknown>>()
   ).results;
+  // More than can be judged in one run: not_available, never a silently cut list (whose missing
+  // tail would be auto-resolved).
+  if (rows.length > MAX_PURCHASE_ENTRIES) return null;
   return rows.map((r) => ({
     id: num(r["id"]),
     entryNumber: (r["entry_number"] as string | null) ?? null,
@@ -235,7 +251,7 @@ export async function loadPurchaseEntries(
   }));
 }
 
-export async function loadRelations(db: D1Database, d: DqDivision): Promise<DqRelationIn[]> {
+export async function loadRelations(db: D1Database, d: DqDivision): Promise<DqRelationIn[] | null> {
   const rows = (
     await db
       .prepare(
@@ -247,11 +263,12 @@ export async function loadRelations(db: D1Database, d: DqDivision): Promise<DqRe
                    AND o.relation_id = r.exact_id AND o.kind = 'invoice' AND o.status = 'open') AS open_invoices,
                 (SELECT COUNT(*) FROM open_items o WHERE o.division_id = r.division_id
                    AND o.relation_id = r.exact_id AND o.kind = 'bill' AND o.status = 'open') AS open_bills
-         FROM relations r WHERE r.division_id = ?1 ORDER BY r.id LIMIT 50000`,
+         FROM relations r WHERE r.division_id = ?1 ORDER BY r.id LIMIT ${MAX_RELATIONS + 1}`,
       )
       .bind(d.id)
       .all<Record<string, unknown>>()
   ).results;
+  if (rows.length > MAX_RELATIONS) return null;
   return rows.map((r) => ({
     id: num(r["id"]),
     name: String(r["name"] ?? ""),
@@ -276,7 +293,7 @@ export async function loadFx(db: D1Database, d: DqDivision | null, nowMs: number
   const conflicts = (
     await db
       .prepare(
-        "SELECT id, currency, rate_date FROM fx_rate_conflicts WHERE resolved_at IS NULL ORDER BY id LIMIT 500",
+        `SELECT id, currency, rate_date FROM fx_rate_conflicts WHERE resolved_at IS NULL ORDER BY id LIMIT ${MAX_ISSUES_PER_RULE + 1}`,
       )
       .all<{ id: number; currency: string; rate_date: string }>()
   ).results;
@@ -487,7 +504,9 @@ export async function loadExactBudget(
 ): Promise<{ dailyLimit: number; calls: number; remaining: number | null }> {
   const row = await db
     .prepare("SELECT calls, remaining FROM exact_usage WHERE division = ?1 AND day = ?2")
-    .bind(d.exactDivision, amsterdamParts(nowMs).date)
+    // ExactGate keys exact_usage by the UTC day (gate.ts dayOf), not the Amsterdam date: between
+    // midnight Amsterdam and midnight UTC the Amsterdam date finds no row and would read 0 calls.
+    .bind(d.exactDivision, new Date(nowMs).toISOString().slice(0, 10))
     .first<{ calls: number; remaining: number | null }>();
   return {
     dailyLimit: EXACT_DAILY_LIMIT,

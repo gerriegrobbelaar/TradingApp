@@ -498,7 +498,8 @@ describe("rules: GET and PATCH", () => {
     for (const body of [
       { rev: null, enabled: false },
       { rev: null, severity: "warning" },
-      { rev: null, threshold: 20 },
+      // "expires within N days": a SHORTER lead time warns later, so it is the looser change
+      { rev: null, threshold: 3 },
     ]) {
       const r = await send("admin", "PATCH", `/api/dq/rules/${crit}`, body);
       expect(r.status, JSON.stringify(body)).toBe(422);
@@ -518,7 +519,7 @@ describe("rules: GET and PATCH", () => {
     );
     expect(ok.status).toBe(200);
     expect(ok.body.rule.enabled).toBe(false);
-    // tightening (switching on again, a smaller window is the other way round: more days = looser)
+    // tightening (switching on again; for this rule a LONGER lead time is tighter, review D8a)
     const tighter = await send("admin", "PATCH", `/api/dq/rules/${crit}`, {
       rev: ok.body.rule.rev,
       enabled: true,

@@ -70,6 +70,12 @@ export type DqThresholdSpec =
       kind: "number";
       /** Shown next to the number. */
       unit: "days" | "minor" | "count" | "factor" | "calls";
+      /**
+       * Which way the number LOOSENS the rule (reports less). "up" for an age limit, a tolerance or
+       * a count; "down" for a look-back window ("changed in the last N days"), a warning lead time
+       * ("expires within N days") or a remaining-calls floor. Default: "down" for `calls`, else "up".
+       */
+      looser?: "up" | "down";
       default: number;
       min: number;
       max: number;
@@ -107,6 +113,12 @@ export interface DqRuleOutcome {
   truncated: boolean;
   /** How many issues were found before the cap. */
   total: number;
+  /**
+   * Fingerprints of subjects the rule could NOT judge in this run (a stale balance, a date it
+   * could not read, a flag the sync did not see). Their stored issues are left alone: not seeing
+   * a problem is not the same as seeing that it is gone.
+   */
+  unjudged?: string[];
 }
 
 export interface DqRuleConfig {
@@ -139,6 +151,8 @@ export interface DqRuleResult {
   checked: number;
   truncated: boolean;
   total: number;
+  /** See DqRuleOutcome.unjudged: never auto-resolved by this run. */
+  unjudged?: string[];
 }
 
 // ---- inputs ------------------------------------------------------------------------------------------
@@ -267,6 +281,11 @@ export interface DqJobIn {
 
 export interface DqInput {
   nowMs: number;
+  /**
+   * True when the loader had to cut the list of recent bank lines (the duplicate look-back
+   * window): the duplicate rule then reports what it found but resolves nothing.
+   */
+  bankTransactionsCapped?: boolean;
   /** 0 for the global pass. */
   divisionId: number;
   baseCurrency: string;

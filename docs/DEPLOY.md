@@ -988,6 +988,10 @@ Two jobs, with different risk:
 - **`exact.bank_balances`** reads from Exact (one `financial/ReportingBalance` call per mapped bank
   account, at most 20 calls per run and administration) and stores `bank_accounts.exact_balance_minor`.
   It ships **off** (`awaiting_live_verification`). Enable it only after the checks below.
+  **Existing installs:** before releasing, check `SELECT enabled FROM jobs WHERE name =
+  'exact.bank_balances'`. The job was a placeholder until now, so an admin may have switched its row
+  on; the release would then start reading Exact at once. Switch it off first
+  (`UPDATE jobs SET enabled = 0 WHERE name = 'exact.bank_balances'`) and enable it after check 7.
 
 First-live checks, on staging first:
 
@@ -1015,7 +1019,8 @@ First-live checks, on staging first:
 7. **`exact.bank_balances`** (before switching it on): Revolut accounts must be mapped (`PUT
    /api/matching/account-map`) and the chart (`gl_accounts`) synced. Run it once by hand and look at
    the result: `stored` equals the number of mapped accounts, `calls` the same, `empty_answer` and
-   `incomplete_read` are 0. Compare `bank_accounts.exact_balance_minor` with the balance of that
+   `incomplete_read` and `other_account_rows` are 0 (`other_account_rows` > 0 means Exact ignored
+   the `GLAccount` filter: A-1 failed, keep the job off). Compare `bank_accounts.exact_balance_minor` with the balance of that
    ledger account in Exact's own balance report. **Verify the A-items of ADR 0045**: the filter
    `GLAccount eq guid'...' and ReportingYear eq <year>` is accepted (a 400 means the filter or a field
    name is wrong), and the sum of the periods equals Exact's balance. Only then enable the job.

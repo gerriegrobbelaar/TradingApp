@@ -5,6 +5,7 @@ import {
   amountText,
   cleanText,
   DAY_MS,
+  fingerprintOf,
   finish,
   HOUR_MS,
   makeIssue,
@@ -34,21 +35,38 @@ const balanceMismatch: DqRuleDef = {
     if (accounts === null) return notAvailable("bank_accounts_not_loaded");
     const tolerance = numberThreshold(config.threshold, 100);
     const issues: DqIssue[] = [];
+    // Accounts that could not be compared this run: an issue raised for them earlier stays as it
+    // is (a stale read is not proof that the difference is gone).
+    const unjudged: string[] = [];
     let checked = 0;
     for (const a of accounts) {
-      if (a.exactBalanceMinor === null || a.balanceMinor === null) continue;
+      const skip = (): void => {
+        unjudged.push(fingerprintOf(this.id, ["acc", a.id]));
+      };
+      if (a.exactBalanceMinor === null || a.balanceMinor === null) {
+        skip();
+        continue;
+      }
       const exactAge = ageMs(input.nowMs, a.exactBalanceAt);
       const bankAt = a.balanceAt === null ? NaN : Date.parse(a.balanceAt);
       const exactAt = a.exactBalanceAt === null ? NaN : Date.parse(a.exactBalanceAt);
-      if (exactAge === null || Number.isNaN(bankAt)) continue;
+      if (exactAge === null || Number.isNaN(bankAt)) {
+        skip();
+        continue;
+      }
       // A stale Exact read, or two reads taken far apart, would raise differences that are only
       // timing: they are skipped, and a rule with nothing comparable is not_available below.
       if (exactAge > EXACT_BALANCE_MAX_AGE_MS || Math.abs(bankAt - exactAt) > BALANCE_SKEW_MS) {
+        skip();
         continue;
       }
       checked += 1;
       const diff = a.balanceMinor - a.exactBalanceMinor;
-      if (!Number.isSafeInteger(diff) || Math.abs(diff) <= tolerance) continue;
+      if (!Number.isSafeInteger(diff)) {
+        skip();
+        continue;
+      }
+      if (Math.abs(diff) <= tolerance) continue;
       issues.push(
         makeIssue(this, config, ["acc", a.id], {
           subject: a.name,
@@ -60,7 +78,7 @@ const balanceMismatch: DqRuleDef = {
       );
     }
     if (checked === 0) return notAvailable("no_comparable_exact_balance");
-    return finish(issues, checked);
+    return finish(issues, checked, unjudged);
   },
 };
 
@@ -78,10 +96,15 @@ const unmatchedOld: DqRuleDef = {
     if (input.bankTransactions === null) return notAvailable("bank_transactions_not_loaded");
     const days = numberThreshold(config.threshold, 5);
     const rows: { tx: (typeof input.bankTransactions)[number]; age: number }[] = [];
+    const unjudged: string[] = [];
     for (const tx of input.bankTransactions) {
       if (tx.matchStatus === "matched" || tx.matchStatus === "ignored") continue;
       const age = ageMs(input.nowMs, tx.bookedAt);
-      if (age === null || age <= days * DAY_MS) continue;
+      if (age === null) {
+        unjudged.push(fingerprintOf(this.id, ["tx", tx.id]));
+        continue;
+      }
+      if (age <= days * DAY_MS) continue;
       rows.push({ tx, age });
     }
     rows.sort((a, b) => b.age - a.age || a.tx.id - b.tx.id);
@@ -95,7 +118,7 @@ const unmatchedOld: DqRuleDef = {
         details: { days: d, txId: tx.id },
       });
     });
-    return finish(issues, input.bankTransactions.length);
+    return finish(issues, input.bankTransactions.length, unjudged);
   },
 };
 
@@ -146,7 +169,10 @@ const duplicateLines: DqRuleDef = {
       );
     }
     issues.sort((a, b) => a.fingerprint.localeCompare(b.fingerprint, "en", { numeric: true }));
-    return finish(issues, input.bankTransactions.length);
+    const out = finish(issues, input.bankTransactions.length);
+    // The loader cut the look-back window: the groups found are real, but a group that is gone
+    // from this list may only be outside it, so nothing is auto-resolved.
+    return input.bankTransactionsCapped === true ? { ...out, truncated: true } : out;
   },
 };
 

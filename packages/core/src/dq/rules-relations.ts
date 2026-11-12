@@ -5,6 +5,7 @@ import {
   amountText,
   cleanText,
   DAY_MS,
+  fingerprintOf,
   finish,
   makeIssue,
   notAvailable,
@@ -13,7 +14,10 @@ import {
   wholeDays,
 } from "./util";
 
-/** The 27 EU member states, ISO 3166 alpha-2 (Greece is EL in VAT numbers but GR as a country). */
+/**
+ * The 27 EU member states, ISO 3166 alpha-2 (Greece is EL in VAT numbers but GR as a country; both
+ * are accepted), plus XI (Northern Ireland). Not UK (GB), CH, NO or other EEA states.
+ */
 export const EU_COUNTRIES: ReadonlySet<string> = new Set([
   "AT",
   "BE",
@@ -42,6 +46,10 @@ export const EU_COUNTRIES: ReadonlySet<string> = new Set([
   "SI",
   "ES",
   "SE",
+  // Greece as Exact may send it (EL is the VAT prefix) and Northern Ireland (XI: EU VAT rules for
+  // goods since 2021), so their customers are not silently skipped.
+  "EL",
+  "XI",
 ]);
 
 /** Invoice number as a comparable key: Unicode-normalised, case-folded, spaces and dashes dropped. */
@@ -115,7 +123,8 @@ const missingPdf: DqRuleDef = {
   area: "payables",
   scope: "division",
   defaultSeverity: "info",
-  threshold: { kind: "number", unit: "days", default: 90, min: 1, max: 730 },
+  // A look-back window: a SHORTER window reports less. At most 365 days: the loader reads 400.
+  threshold: { kind: "number", unit: "days", looser: "down", default: 90, min: 1, max: 365 },
   title: "Purchase entries without a document",
   description:
     "Purchase entries of the last 90 days with no document attached in Exact. Based on the Document field of the purchase entry sync; where the sync did not see that field the rule is not available.",
@@ -130,11 +139,21 @@ const missingPdf: DqRuleDef = {
     }
     const window = numberThreshold(config.threshold, 90) * DAY_MS;
     const issues: DqIssue[] = [];
+    const unjudged: string[] = [];
     let checked = 0;
     for (const e of entries) {
-      if (e.hasPdf === null || e.status === "rejected") continue;
+      if (e.status === "rejected") continue;
+      // The flag was not seen (or the date cannot be read) this time: judge nothing about it.
+      if (e.hasPdf === null) {
+        unjudged.push(fingerprintOf(this.id, ["entry", e.id]));
+        continue;
+      }
       const age = ageMs(input.nowMs, e.entryDate);
-      if (age === null || age > window) continue;
+      if (age === null) {
+        unjudged.push(fingerprintOf(this.id, ["entry", e.id]));
+        continue;
+      }
+      if (age > window) continue;
       checked += 1;
       if (e.hasPdf) continue;
       issues.push(
@@ -148,7 +167,7 @@ const missingPdf: DqRuleDef = {
       );
     }
     issues.sort((a, b) => a.fingerprint.localeCompare(b.fingerprint, "en", { numeric: true }));
-    return finish(issues, checked);
+    return finish(issues, checked, unjudged);
   },
 };
 
@@ -157,7 +176,8 @@ const supplierIbanChanged: DqRuleDef = {
   area: "payables",
   scope: "division",
   defaultSeverity: "critical",
-  threshold: { kind: "number", unit: "days", default: 30, min: 1, max: 365 },
+  // A look-back window: a SHORTER window reports less (critical: needs the phrase).
+  threshold: { kind: "number", unit: "days", looser: "down", default: 30, min: 1, max: 365 },
   title: "Supplier bank details changed",
   description:
     "A supplier's IBAN changed, or a first IBAN appeared on a supplier we already knew, within the window. A changed IBAN needs a second approver before it is paid (CLAUDE.md 4.4). Snooze it until the window ends once it is verified.",
@@ -204,6 +224,7 @@ const approvalsOverdue: DqRuleDef = {
     if (input.purchaseEntries === null) return notAvailable("purchase_entries_not_loaded");
     const days = numberThreshold(config.threshold, 3);
     const rows: { e: (typeof input.purchaseEntries)[number]; age: number }[] = [];
+    const unjudged: string[] = [];
     let checked = 0;
     for (const e of input.purchaseEntries) {
       if (e.status !== "pending_approval") continue;
@@ -213,7 +234,11 @@ const approvalsOverdue: DqRuleDef = {
         ageMs(input.nowMs, e.submittedAt) ??
         ageMs(input.nowMs, e.modifiedAt) ??
         ageMs(input.nowMs, e.entryDate);
-      if (age === null || age <= days * DAY_MS) continue;
+      if (age === null) {
+        unjudged.push(fingerprintOf(this.id, ["entry", e.id]));
+        continue;
+      }
+      if (age <= days * DAY_MS) continue;
       rows.push({ e, age });
     }
     rows.sort((a, b) => b.age - a.age || a.e.id - b.e.id);
@@ -227,7 +252,7 @@ const approvalsOverdue: DqRuleDef = {
         details: { days: d, entryId: e.id },
       });
     });
-    return finish(issues, checked);
+    return finish(issues, checked, unjudged);
   },
 };
 
