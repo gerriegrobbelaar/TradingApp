@@ -24,6 +24,11 @@ export const DQ_LOOSEN_PHRASE = "LOOSEN CRITICAL DATA QUALITY RULE";
 export const PAYMENTS_ENABLE_PHRASE = "ENABLE PAYMENTS";
 /** POST /api/payments/verify {confirm} (P9a): the checklist of PAYMENTS_VERIFY_CHECKS was done. */
 export const PAYMENTS_VERIFY_PHRASE = "I VERIFIED THE PAYMENT PATH ON THE REVOLUT SANDBOX";
+/**
+ * POST /api/payments/:id/resolve-not-sent (P9b, ADR 0050): a person states that an unknown payment
+ * was NOT sent, after the lookup by request_id found nothing. Wrong = a possible double payment.
+ */
+export const PAYMENTS_RESOLVE_PHRASE = "MARK PAYMENT AS NOT SENT";
 /** PATCH /api/settings/payments when it loosens a control (limit up, four-eyes off, ...). */
 export const PAYMENTS_LOOSEN_PHRASE = "LOOSEN PAYMENT CONTROLS";
 

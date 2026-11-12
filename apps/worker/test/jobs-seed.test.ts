@@ -74,6 +74,7 @@ describe("default jobs (CLAUDE.md 4.1)", () => {
     expect(rows.filter((r) => r.enabled === 1).map((r) => r.name)).toEqual([
       "bank.match",
       "ecb.fx_import",
+      "payments.reconcile",
       "dq.checks",
       "dq.digest",
     ]);

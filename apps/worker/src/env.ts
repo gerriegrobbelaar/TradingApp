@@ -40,6 +40,13 @@ export interface Env {
    * (`iban_key_missing`). Rotating it voids every supplier IBAN verification (fail closed).
    */
   PAYMENTS_IBAN_KEY?: string;
+  /**
+   * Workers var, default "off". Payment WRITES to Revolut exist in the code (P9b, ADR 0050) but the
+   * gate refuses them, and the submitter reports itself unavailable, unless this is exactly "on".
+   * It is the deploy-level switch; the D1 switch, the verification mark and the typed phrase are
+   * the operational ones. Production stays "off" until the sandbox runbook (docs/DEPLOY.md) passed.
+   */
+  REVOLUT_PAYMENTS_EXECUTION?: string;
   /** Workers secret, optional: API key of the transactional e-mail provider (ADR 0046). */
   EMAIL_API_KEY?: string;
   /** One instance per Revolut connection ("revolut:<connection id>"). */

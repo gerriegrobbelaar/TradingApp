@@ -8,6 +8,7 @@ import {
   RevolutAuthError,
   RevolutBudgetExhaustedError,
   RevolutRateLimitedError,
+  RevolutWriteAuthRetryRefused,
   type RevolutResponse,
 } from "@camelthorn/revolut";
 
@@ -15,6 +16,7 @@ export type WireError =
   | { kind: "rate_limited"; retryAfterMs: number }
   | { kind: "budget"; jobId: string }
   | { kind: "auth"; code: string }
+  | { kind: "write_auth_retry_refused" }
   | { kind: "api"; status: number; code?: string };
 
 export type GateResult = { ok: true; response: RevolutResponse } | { ok: false; error: WireError };
@@ -23,6 +25,7 @@ export function toWire(e: unknown): WireError {
   if (e instanceof RevolutRateLimitedError)
     return { kind: "rate_limited", retryAfterMs: e.retryAfterMs };
   if (e instanceof RevolutBudgetExhaustedError) return { kind: "budget", jobId: e.jobId };
+  if (e instanceof RevolutWriteAuthRetryRefused) return { kind: "write_auth_retry_refused" };
   if (e instanceof RevolutAuthError) return { kind: "auth", code: e.message };
   if (e instanceof RevolutApiError) {
     return { kind: "api", status: e.status, ...(e.code !== undefined ? { code: e.code } : {}) };
@@ -39,6 +42,8 @@ export function fromWire(w: WireError): Error {
       );
     case "budget":
       return new RevolutBudgetExhaustedError(w.jobId);
+    case "write_auth_retry_refused":
+      return new RevolutWriteAuthRetryRefused();
     case "auth":
       return new RevolutAuthError(w.code);
     case "api":

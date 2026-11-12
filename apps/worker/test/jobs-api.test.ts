@@ -99,6 +99,7 @@ describe("GET /api/jobs", () => {
       "bank.match",
       "exact.bank_balances",
       "ecb.fx_import",
+      "payments.reconcile",
       "dq.checks",
       "dq.digest",
       "reminders.send",

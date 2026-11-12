@@ -17,7 +17,7 @@ import { MAX_CALLS_PER_RUN as BOOKING_CALL_BUDGET } from "../booking/executor";
 import { BANK_BALANCES_BUDGET } from "../exact/bank-balances";
 import { FULL_SYNC_BUDGET, INCREMENTAL_SYNC_BUDGET } from "./exact-handlers";
 
-export const DEFAULT_JOBS_VERSION = 6;
+export const DEFAULT_JOBS_VERSION = 7;
 
 /**
  * One-off guards of a version bump (review V1 N7): a job that must be OFF after the upgrade even if an
@@ -92,6 +92,14 @@ export const DEFAULT_JOBS: readonly DefaultJob[] = [
     schedule: { kind: "cron", expr: "15 16 * * *", workingDaysOnly: true },
     // Public, read-only, credential-free source: on by default on NEW installs (ADR 0036).
     // Existing rows are never flipped by the seeding.
+    enabled: true,
+    exactBudget: 0,
+  },
+  {
+    name: "payments.reconcile",
+    handler: "payments.reconcile",
+    // Every five minutes. Inert (no Revolut call) while no payment is in flight; read-only otherwise.
+    schedule: { kind: "cron", expr: "*/5 * * * *" },
     enabled: true,
     exactBudget: 0,
   },

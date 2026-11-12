@@ -1,11 +1,14 @@
 /**
- * THE call boundary to the bank (Phase 9, P9a, ADR 0049). In P9a nothing can pass it:
+ * THE call boundary to the bank (Phase 9, P9a, ADR 0049; P9b, ADR 0050).
  *
  *  - `PaymentSubmitter` is the only thing that may talk to Revolut about a payment. The default is
  *    `DisabledSubmitter`: it is not `available`, so `runSubmission` refuses before it claims anything.
- *  - No route calls `runSubmission`; P9b adds the real submitter and the job that calls it.
- *  - The ExactGate/RevolutGate allow-lists keep every payment endpoint unreachable
- *    (revolut/request.ts); a source scan in test/payments-scan.test.ts pins that.
+ *  - P9b: `submitPayment` is the ONE place that calls `runSubmission`. It takes the gate's payment
+ *    lease first (one submission at a time per Revolut connection, so the daily ceiling and the
+ *    balance reservation cannot race), builds the real submitter (revolut-submitter.ts) only when
+ *    the Workers var REVOLUT_PAYMENTS_EXECUTION is "on", and gives the lease back afterwards.
+ *  - The gate allow-list opens exactly the payment endpoints behind its own D1 switch
+ *    (revolut/request.ts, payments/gate-flag.ts); source scans in test/payments-scan.test.ts pin it.
  *
  * `runSubmission` is the state machine around the call, tested here with fake submitters:
  *   claim (single writer, lease) -> `submitting` -> ONE call -> submitted | rejected | outcome_unknown.
@@ -16,11 +19,17 @@
 import {
   approvalStillValid,
   paymentPayloadHash,
+  verifyCoversMode,
   type PayloadItem,
   type PaymentMode,
 } from "@camelthorn/core";
+import { createRevolutClient, PAYMENT_JOB_ID } from "@camelthorn/revolut";
+import type { Env } from "../env";
+import { revolutClientSleep } from "../revolut/client-timing";
+import { createRevolutGateTransport, getRevolutGate } from "../revolut/gate-transport";
 import { storedIbansMatch } from "./iban-store";
-import { loadPaymentsState, paymentsBlockers } from "./settings";
+import { createRevolutSubmitter } from "./revolut-submitter";
+import { ibanKeyOf, loadPaymentsState, paymentsBlockers } from "./settings";
 import { recheckBeforeSubmit } from "./store";
 import {
   childMoveStatements,
@@ -67,9 +76,21 @@ export const DisabledSubmitter: PaymentSubmitter = {
 
 let current: PaymentSubmitter = DisabledSubmitter;
 
-/** The submitter in force. P9b returns the Revolut one when its own switches allow it. */
-export function getSubmitter(): PaymentSubmitter {
-  return current;
+/**
+ * "A real submitter can exist in this deployment": true only when the Workers var
+ * REVOLUT_PAYMENTS_EXECUTION is exactly "on". It is what the enable blocker `submitter_unavailable`
+ * and the settings view look at. It sends nothing itself: a real submitter is built per submission,
+ * with the gate's lease, in `submitPayment`.
+ */
+const EXECUTION_CAPABLE: PaymentSubmitter = {
+  available: true,
+  submit: () => Promise.resolve({ kind: "rejected", code: "no_lease" }),
+};
+
+/** The submitter in force (tests aside: the disabled one unless the deploy switch is "on"). */
+export function getSubmitter(env?: Pick<Env, "REVOLUT_PAYMENTS_EXECUTION">): PaymentSubmitter {
+  if (current !== DisabledSubmitter) return current;
+  return env?.REVOLUT_PAYMENTS_EXECUTION === "on" ? EXECUTION_CAPABLE : DisabledSubmitter;
 }
 
 /**
@@ -257,6 +278,15 @@ export async function runSubmission(
   const items = await loadItems(db, a.kind, a.id);
   const why = await whyNot(db, a.kind, row, items, a.nowMs);
   if (why !== null) return { status: "refused", code: why };
+  // Review P9b: the request's own mode decides the call. A `pay` request made while the setting was
+  // `pay` is refused once the mark no longer covers the pay round trip (a new drafts-only
+  // verification), even if the setting has gone back to drafts meanwhile. The gate checks it too.
+  if (
+    row.mode === "pay" &&
+    (state.verified === null || !verifyCoversMode(state.verified.checks, "pay"))
+  ) {
+    return { status: "refused", code: "pay_mode_not_verified" };
+  }
   // The pre-checks again with today's facts and today's settings (an invoice paid in Exact since, an
   // IBAN changed, a tightened limit), and the stored IBAN still matches the approved fingerprint.
   const again = await recheckBeforeSubmit(db, {
@@ -464,4 +494,75 @@ export async function markStaleSubmissions(db: D1Database, nowMs: number): Promi
     }
   }
   return n;
+}
+
+export interface SubmitPaymentArgs {
+  kind: SubjectKind;
+  id: number;
+  nowMs: number;
+  /** The signed-in user who sends it (audit and claim owner). */
+  actor: string;
+}
+
+/** Test seam of `submitPayment`: replaces the Revolut client (the gate is always the real one). */
+export interface SubmitPaymentSeams {
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * THE one caller of `runSubmission` (P9b, ADR 0050; a source scan pins it). Order:
+ *  1. the deploy switch is "on" and an active Revolut connection exists, else refused;
+ *  2. the gate's payment lease (a mutex per connection; the gate also re-reads the D1 switch and the
+ *     verification mark); `busy` or closed = refused, nothing claimed, the request stays `ready`;
+ *  3. `runSubmission` with the real submitter, holding the lease;
+ *  4. the lease is given back (it also expires on its own).
+ */
+export async function submitPayment(
+  env: Env,
+  a: SubmitPaymentArgs,
+  seams: SubmitPaymentSeams = {},
+): Promise<SubmissionResult> {
+  const ibanKey = ibanKeyOf(env);
+  const args: SubmissionArgs = { kind: a.kind, id: a.id, nowMs: a.nowMs, owner: a.actor, ibanKey };
+  // Tests pretend a submitter exists; no route or job can set it.
+  if (current !== DisabledSubmitter) return runSubmission(env.DB, current, args);
+  if (env.REVOLUT_PAYMENTS_EXECUTION !== "on")
+    return { status: "refused", code: "payments_disabled" };
+  const conn = await env.DB.prepare(
+    "SELECT id, payments_mode FROM connections WHERE kind = 'revolut' AND status = 'active' ORDER BY id LIMIT 1",
+  ).first<{ id: number; payments_mode: string }>();
+  if (conn === null) return { status: "refused", code: "no_revolut_connection" };
+  const gate = getRevolutGate(env, conn.id);
+  let lease: Awaited<ReturnType<typeof gate.acquirePaymentLease>>;
+  try {
+    lease = await gate.acquirePaymentLease(conn.id, a.actor);
+  } catch {
+    return { status: "refused", code: "gate_unavailable" };
+  }
+  if (!lease.ok) return { status: "refused", code: lease.code };
+  try {
+    const sleep = seams.sleep ?? revolutClientSleep();
+    const client = createRevolutClient(createRevolutGateTransport(env, conn.id), {
+      connectionId: conn.id,
+      jobId: PAYMENT_JOB_ID,
+      priority: "user",
+      ...(sleep ? { sleep } : {}),
+    });
+    const submitter = createRevolutSubmitter({
+      db: env.DB,
+      client,
+      gate,
+      connectionId: conn.id,
+      lease: lease.lease,
+      ibanKey,
+      connectionMode: conn.payments_mode === "pay" ? "pay" : "drafts",
+    });
+    return await runSubmission(env.DB, submitter, args);
+  } finally {
+    try {
+      await gate.releasePaymentLease(lease.lease);
+    } catch {
+      // it expires on its own
+    }
+  }
 }

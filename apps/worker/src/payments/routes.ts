@@ -13,6 +13,12 @@
  *  POST /api/payments/:id/reject    {payloadHash, note}       approver, fresh sign-in, not the requester
  *  POST /api/payments/:id/cancel    {reason?}                 finance (the requester) or admin
  *  the same under /api/payment-batches (create takes {sourceAccountId, items:[{openItemId, amountMinor?}], clientKey})
+ * Sending (P9b, ADR 0050; every one answers 409 with a stable code while the switches are off)
+ *  POST /api/payments/:id/submit            finance, fresh sign-in: sends a `ready` request (also /api/payment-batches/:id/submit)
+ *  POST /api/payments/:id/resolve-not-sent  {confirm}  admin, fresh sign-in: an unknown outcome was NOT sent (after a lookup said so)
+ *  GET  /api/payments/:id/settlement        any role: bank-confirmed and booked in Exact?
+ *  POST /api/payments/preview               {kind, id}  admin, fresh sign-in: the real request bodies and hashes, no call
+ *  PUT  /api/settings/payments/draft-expiry {days}      admin: days before an unapproved Revolut draft expires
  * Supplier IBANs
  *  GET  /api/payments/ibans/:relationId                       finance, approver, admin
  *  POST /api/payments/ibans/verify  {relationId, fingerprint, lastFour}   approver, fresh sign-in
@@ -31,7 +37,9 @@ import {
   PAYMENT_BLOCK_CODES,
   PAYMENTS_VERIFY_CHECKS,
   phraseMatches,
+  PAYMENTS_VERIFY_RUNBOOK,
   sameVerifyChecks,
+  verifyCoversMode,
 } from "@camelthorn/core";
 import { isStepUpFresh } from "../auth/session";
 import { auditStatement } from "../db/audit";
@@ -67,7 +75,15 @@ import {
   expireStale,
   PaymentError,
 } from "./store";
-import { getSubmitter } from "./submit";
+import { previewPayment } from "./preview";
+import {
+  DRAFT_EXPIRY_KEY,
+  loadDraftExpiryDays,
+  MAX_DRAFT_EXPIRY_DAYS,
+  paymentSettlement,
+  resolveNotSent,
+} from "./reconcile";
+import { getSubmitter, submitPayment } from "./submit";
 import type { SubjectKind } from "./transition";
 
 const FINANCE = { roles: ["finance"] } as const;
@@ -204,6 +220,45 @@ function registerSubject(router: Router, kind: SubjectKind, base: string): void 
     }),
   );
 
+  // Sending (P9b): the ONLY way a request reaches `submitPayment`, and so the bank.
+  router.add(
+    "POST",
+    `${base}/:id/submit`,
+    FINANCE_STEP_UP,
+    safely(async (ctx) => {
+      const id = idParam(ctx);
+      await expireStale(ctx.env.DB, ctx.nowMs);
+      const r = await submitPayment(ctx.env, { kind, id, nowMs: ctx.nowMs, actor: actor(ctx) });
+      const dto = await read(ctx.env.DB, id);
+      if (r.status === "refused") {
+        const gone = r.code === "not_found" || r.code === "batch_item";
+        return json({ error: r.code, [name]: dto }, gone ? 404 : 409);
+      }
+      if (r.status === "already_claimed")
+        return json({ error: "already_claimed", [name]: dto }, 409);
+      return json({ result: { to: r.to, code: r.code }, [name]: dto });
+    }),
+  );
+
+  router.add(
+    "POST",
+    `${base}/:id/resolve-not-sent`,
+    ADMIN_STEP_UP,
+    safely(async (ctx) => {
+      const b = await readBody(ctx, ["confirm"]);
+      const id = idParam(ctx);
+      const r = await resolveNotSent(ctx.env.DB, {
+        kind,
+        id,
+        actor: actor(ctx),
+        nowMs: ctx.nowMs,
+        confirm: b["confirm"],
+      });
+      if (!r.ok) throw new PaymentError(r.code, r.code === "not_found" ? 404 : 409);
+      return json({ [name]: await read(ctx.env.DB, id) });
+    }),
+  );
+
   for (const decision of ["approve", "reject"] as const) {
     router.add(
       "POST",
@@ -260,7 +315,7 @@ function registerSubject(router: Router, kind: SubjectKind, base: string): void 
 
 async function settingsView(ctx: Ctx): Promise<Record<string, unknown>> {
   const state = await loadPaymentsState(ctx.env.DB, ibanKeyOf(ctx.env));
-  const submitter = getSubmitter();
+  const submitter = getSubmitter(ctx.env);
   return {
     settings: state.settings,
     defaults: DEFAULT_PAYMENT_SETTINGS,
@@ -272,7 +327,9 @@ async function settingsView(ctx: Ctx): Promise<Record<string, unknown>> {
     approverCount: state.approverCount,
     submitterAvailable: submitter.available,
     blockers: paymentsBlockers(state, submitter.available),
+    draftExpiryDays: await loadDraftExpiryDays(ctx.env.DB),
     verifyChecks: PAYMENTS_VERIFY_CHECKS,
+    verifyRunbook: PAYMENTS_VERIFY_RUNBOOK,
     blockCodes: PAYMENT_BLOCK_CODES,
   };
 }
@@ -310,7 +367,11 @@ async function patchSettings(ctx: Ctx): Promise<Response> {
   }
   if (r.next.mode === "pay" && state.settings.mode !== "pay") {
     // True one-click /pay: only after the verification, and only if the Revolut plan allows it.
-    if (state.verified === null || state.protocolChanged) {
+    if (
+      state.verified === null ||
+      state.protocolChanged ||
+      !verifyCoversMode(state.verified.checks, "pay")
+    ) {
       throw new PaymentError("mode_pay_requires_verification", 409);
     }
     if (state.connectionMode !== "pay") throw new PaymentError("plan_not_company", 409);
@@ -377,7 +438,7 @@ async function verifyHandler(ctx: Ctx): Promise<Response> {
     by: who,
     note: text,
     protocolVersion: before.protocolVersion,
-    checks: [...PAYMENTS_VERIFY_CHECKS],
+    checks: [...(b["checks"] as string[])],
   };
   await db.batch([
     db.prepare(UPSERT_SETTING).bind(PAYMENTS_VERIFIED_KEY, JSON.stringify(mark), who),
@@ -428,7 +489,7 @@ async function switchHandler(ctx: Ctx): Promise<Response> {
   if (typeof b["confirm"] !== "string" || !phraseMatches(b["confirm"], ENABLE_PHRASE)) {
     throw new PaymentError("confirmation_required", 400);
   }
-  const blockers = paymentsBlockers(before, getSubmitter().available).filter(
+  const blockers = paymentsBlockers(before, getSubmitter(ctx.env).available).filter(
     (x) => x !== "payments_disabled",
   );
   if (blockers.length > 0) throw new PaymentError("blocked", 409, { blockers });
@@ -479,7 +540,7 @@ async function switchHandler(ctx: Ctx): Promise<Response> {
     throw new PaymentError("blocked", 409, {
       blockers: paymentsBlockers(
         await loadPaymentsState(db, ibanKeyOf(ctx.env)),
-        getSubmitter().available,
+        getSubmitter(ctx.env).available,
       ).filter((x) => x !== "payments_disabled"),
     });
   }
@@ -616,6 +677,59 @@ export function registerPaymentRoutes(router: Router): void {
     safely(async (ctx) => json(await settingsView(ctx))),
   );
   router.add("PATCH", "/api/settings/payments", ADMIN, safely(patchSettings));
+  router.add(
+    "PUT",
+    "/api/settings/payments/draft-expiry",
+    ADMIN,
+    safely(async (ctx) => {
+      const b = await readBody(ctx, ["days"]);
+      const d = b["days"];
+      if (typeof d !== "number" || !Number.isInteger(d) || d < 1 || d > MAX_DRAFT_EXPIRY_DAYS) {
+        throw new PaymentError("bad_days", 400);
+      }
+      const before = await loadDraftExpiryDays(ctx.env.DB);
+      await ctx.env.DB.batch([
+        ctx.env.DB.prepare(UPSERT_SETTING).bind(DRAFT_EXPIRY_KEY, String(d), actor(ctx)),
+        auditStatement(ctx.env.DB, {
+          actorEmail: actor(ctx),
+          action: "payments.draft_expiry_changed",
+          entity: "settings",
+          entityId: DRAFT_EXPIRY_KEY,
+          before: { days: before },
+          after: { days: d },
+        }),
+      ]);
+      return json(await settingsView(ctx));
+    }),
+  );
+  router.add(
+    "POST",
+    "/api/payments/preview",
+    ADMIN_STEP_UP,
+    safely(async (ctx) => {
+      const b = await readBody(ctx, ["kind", "id"]);
+      if (b["kind"] !== "payment" && b["kind"] !== "batch") throw new PaymentError("bad_kind", 400);
+      const r = await previewPayment(ctx.env.DB, {
+        kind: b["kind"],
+        id: positiveInt(b["id"], "bad_id"),
+        actor: actor(ctx),
+        ibanKey: ibanKeyOf(ctx.env),
+      });
+      if (!r.ok) throw new PaymentError(r.code, r.code === "not_found" ? 404 : 409);
+      return json(r);
+    }),
+  );
+  router.add(
+    "GET",
+    "/api/payments/:id/settlement",
+    ANY,
+    safely(async (ctx) => {
+      const id = idParam(ctx);
+      const dto = await readPayment(ctx.env.DB, id);
+      if (dto === null) throw new PaymentError("not_found", 404);
+      return json({ settlement: await paymentSettlement(ctx.env.DB, id) });
+    }),
+  );
   router.add("POST", "/api/settings/payments/verify", ADMIN_STEP_UP, safely(verifyHandler));
   router.add("PUT", "/api/settings/payments/switch", ADMIN, safely(switchHandler));
 }

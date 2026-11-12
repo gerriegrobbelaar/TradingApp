@@ -37,6 +37,8 @@ const PAYMENT_DELETE_GUARDS = [
   "payments_guard_no_delete",
   "payment_batches_guard_no_delete",
   "supplier_iban_verifications_guard_delete",
+  "payment_payees_guard_delete",
+  "payment_bank_links_guard_delete",
 ] as const;
 
 /**
@@ -56,6 +58,9 @@ export async function paymentsWipeStatements(db: D1Database): Promise<D1Prepared
   }
   return [
     ...PAYMENT_DELETE_GUARDS.map((n) => db.prepare(`DROP TRIGGER ${n}`)),
+    db.prepare("DELETE FROM payment_bank_links"),
+    db.prepare("DELETE FROM payment_reconcile"),
+    db.prepare("DELETE FROM payment_payees"),
     db.prepare("DELETE FROM payment_events"),
     db.prepare("DELETE FROM payment_claims"),
     db.prepare("DELETE FROM payment_approvals"),

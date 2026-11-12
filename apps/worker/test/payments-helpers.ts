@@ -3,7 +3,6 @@ import {
   APPROVAL_MAPPING_VERIFIED_SETTING,
   ibanFingerprint,
   PAYMENTS_VERIFY_CHECKS,
-  paymentsProtocolVersion,
   type PaymentSettings,
 } from "@camelthorn/core";
 import {
@@ -12,6 +11,7 @@ import {
   PAYMENTS_VERIFIED_KEY,
 } from "../src/payments/settings";
 import { env } from "cloudflare:test";
+import { paymentsProtocolVersion } from "../src/payments/protocol-version";
 import { addSession, addUser } from "./helpers";
 import {
   addItem,

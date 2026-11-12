@@ -23,6 +23,23 @@ import {
   type RevolutWebhook,
 } from "./models";
 import { sanitizeForMessage } from "./redact";
+import {
+  buildCreateCounterparty,
+  buildPay,
+  buildPaymentDraft,
+  parseCreatedCounterparty,
+  parseDraftCreated,
+  parsePayAnswer,
+  parsePaymentDraft,
+  parseTransactionStrict,
+  type BuiltRequest,
+  type CounterpartyInput,
+  type CreatedCounterparty,
+  type DraftInput,
+  type PayAccepted,
+  type PayInput,
+  type PaymentDraftView,
+} from "./payments";
 
 export interface RevolutClientOptions {
   connectionId: number;
@@ -139,6 +156,15 @@ export interface TransactionChunk {
   nextCursor: TransactionCursor | null;
 }
 
+/**
+ * What the gate needs to accept a payment WRITE: its payment lease token and the key of its send
+ * ledger (ADR 0050). The client never retries a write; the caller decides what a failure means.
+ */
+export interface PaymentCall {
+  lease: string;
+  ledgerKey: string;
+}
+
 export interface RevolutClient {
   listAccounts(): Promise<RevolutAccount[]>;
   getAccountBankDetails(accountId: string): Promise<RevolutBankDetails[]>;
@@ -159,6 +185,16 @@ export interface RevolutClient {
    */
   getCounterparty(id: string): Promise<RevolutCounterpartyRecord>;
   listCounterparties(): Promise<RevolutCounterpartyRecord[]>;
+  /** Payments (P9b, ADR 0050): every write needs the gate's lease; none is ever retried here. */
+  createCounterparty(input: CounterpartyInput, call: PaymentCall): Promise<CreatedCounterparty>;
+  pay(input: PayInput, call: PaymentCall): Promise<PayAccepted>;
+  createPaymentDraft(input: DraftInput, call: PaymentCall): Promise<{ id: string }>;
+  /** A draft with several payments, approved as one in the Revolut app (needs 2 or more). */
+  createBulkDraft(input: DraftInput, call: PaymentCall): Promise<{ id: string }>;
+  /** Read-only lookup of a payment by OUR request_id; null when Revolut has none (404). */
+  getTransactionByRequestId(requestId: string): Promise<RevolutTransaction | null>;
+  getPaymentDraft(id: string): Promise<PaymentDraftView>;
+  listPaymentDrafts(): Promise<PaymentDraftView[]>;
   listWebhooks(): Promise<RevolutWebhook[]>;
   createWebhook(url: string, events?: readonly string[]): Promise<RevolutCreatedWebhook>;
   deleteWebhook(id: string): Promise<void>;
@@ -310,6 +346,21 @@ export function createRevolutClient(
       headers: { Accept: "application/json" },
       ...(apiVersion ? { apiVersion } : {}),
     });
+
+  async function write(built: BuiltRequest, call: PaymentCall): Promise<RevolutResponse> {
+    if (typeof call?.lease !== "string" || !JOB_ID_RE.test(call.ledgerKey ?? "")) {
+      throw new RangeError("a payment write needs the gate lease and a ledger key");
+    }
+    // ONE attempt: `send` retries only GETs; a POST is never repeated here.
+    return send({
+      method: built.method,
+      path: built.path,
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: built.body,
+      paymentLease: call.lease,
+      paymentRef: call.ledgerKey,
+    });
+  }
 
   function rows(res: RevolutResponse, wrapperKey?: string): unknown[] {
     const parsed = parseJsonRawNumbers(res.body);
@@ -530,6 +581,54 @@ export function createRevolutClient(
         before = new Date(oldest.ms + 1).toISOString();
       }
       throw new RevolutApiError(200, "Counterparty paging exceeded the page limit", "PAGING_LIMIT");
+    },
+
+    async createCounterparty(input, call) {
+      const res = await write(buildCreateCounterparty(input), call);
+      return parseCreatedCounterparty(res.body);
+    },
+
+    async pay(input, call) {
+      const res = await write(buildPay(input), call);
+      return parsePayAnswer(res.body);
+    },
+
+    async createPaymentDraft(input, call) {
+      if (input.payments.length !== 1) throw new RangeError("a single draft has one payment");
+      const res = await write(buildPaymentDraft(input), call);
+      return parseDraftCreated(res.body);
+    },
+
+    async createBulkDraft(input, call) {
+      if (input.payments.length < 2) throw new RangeError("a bulk draft has two or more payments");
+      const res = await write(buildPaymentDraft(input), call);
+      return parseDraftCreated(res.body);
+    },
+
+    async getTransactionByRequestId(requestId) {
+      if (requestId === "") throw new RangeError("request id is required");
+      try {
+        const res = await get(`/transaction/${encodeURIComponent(requestId)}`, {
+          id_type: "request_id",
+        });
+        return parseTransactionStrict(res.body);
+      } catch (e) {
+        if (e instanceof RevolutApiError && e.status === 404) return null;
+        throw e;
+      }
+    },
+
+    async getPaymentDraft(id) {
+      if (id === "") throw new RangeError("id is required");
+      const res = await get(`/payment-drafts/${encodeURIComponent(id)}`);
+      return parsePaymentDraft(parseJsonRawNumbers(res.body));
+    },
+
+    async listPaymentDrafts() {
+      const res = await get("/payment-drafts");
+      const parsed = parseJsonRawNumbers(res.body);
+      const list = Array.isArray(parsed) ? parsed : arrField(asRow(parsed), "payment_drafts");
+      return list.map(parsePaymentDraft);
     },
 
     async listWebhooks() {

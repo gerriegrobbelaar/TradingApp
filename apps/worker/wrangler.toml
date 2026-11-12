@@ -111,6 +111,10 @@ REVOLUT_REDIRECT_URI = ""
 # The `iss` of the client assertion: the HOST of REVOLUT_REDIRECT_URI, without https://
 # (Revolut's rule).
 REVOLUT_ISSUER = ""
+# Deploy-level payment switch (P9b, ADR 0050). Stays "off" until the sandbox runbook in
+# docs/DEPLOY.md passed; the code never moves money while it is not exactly "on". The D1 switch,
+# the verification mark and the typed phrase are separate, operational switches.
+REVOLUT_PAYMENTS_EXECUTION = "off"
 
 [[d1_databases]]
 binding = "DB"
@@ -227,6 +231,8 @@ REVOLUT_CLIENT_ID = ""
 REVOLUT_REDIRECT_URI = ""
 # The host of the staging REVOLUT_REDIRECT_URI.
 REVOLUT_ISSUER = ""
+# Deploy-level payment switch, see the production [vars]. Staging flips it to "on" for the runbook.
+REVOLUT_PAYMENTS_EXECUTION = "off"
 
 [[env.staging.d1_databases]]
 binding = "DB"
