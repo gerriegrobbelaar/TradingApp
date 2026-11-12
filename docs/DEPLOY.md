@@ -984,7 +984,7 @@ Two jobs, with different risk:
   a fresh install. A database that already has the job row keeps whatever `enabled` it stored (the
   seeding never flips a row), so after the upgrade an admin switches it on in Settings, Schedules (or
   `UPDATE jobs SET enabled = 1 WHERE name = 'dq.checks'`). Alerts and the digest are described in the next
-  section (ADR 0046); there is no screen yet (D8c), read the result through the API.
+  section (ADR 0046); the Data health screen (`/data-health`, ADR 0047) shows the result.
 - **`exact.bank_balances`** reads from Exact (one `financial/ReportingBalance` call per mapped bank
   account, at most 20 calls per run and administration) and stores `bank_accounts.exact_balance_minor`.
   It ships **off** (`awaiting_live_verification`). Enable it only after the checks below.
@@ -1041,7 +1041,7 @@ How to enable (staging first, `--env staging` on every command):
 
 1. Pick a transactional e-mail provider with an HTTPS API that accepts `POST /emails` with
    `Authorization: Bearer <key>` and JSON `{from, to[], subject, html, text}` (Resend does). Verify
-   the sender address or domain with the provider (SPF/DKIM) so mail from it is delivered.
+   the sender address or domain with the provider (SPF/DKIM) so mail from it is delivered. **Data protection:** alert and digest bodies carry supplier and customer names, invoice numbers and amounts, so they leave our EU storage for the provider. Choose a provider that processes in the EU and sign its data processing agreement (DPA) before step 2; if that is not possible, do not enable sending until the body can be reduced to counts plus a link (open decision 5, ADR 0046).
 2. Store the key as a secret, never in `wrangler.toml`: `pnpm exec wrangler secret put EMAIL_API_KEY`.
 3. As an admin with a fresh sign-in set the sender and the links:
    `PATCH /api/dq/notifications` with `{"rev": <rev from GET>, "emailProvider": "https", "emailHost":
@@ -1049,6 +1049,9 @@ How to enable (staging first, `--env staging` on every command):
    `GET /api/dq/notifications` must now say `apiKeyPresent: true`, `senderActive: true` and a
    `recipientCount` equal to your admins and finance users on the camelthorncapital.com domain
    (nobody else ever receives mail: recipients come from the users table only).
+   The same settings, the test message of step 4 and the on/off switch are in Settings, Notifications
+   (admins only; the key is shown only as set or not set, and changing the host asks for confirmation).
+   The hour of the digest is set in Settings, Schedules.
 4. **Send a test message to yourself**: `POST /api/dq/notifications/test` (fresh sign-in; answer
    `{"status":"sent"}`). It goes to the calling admin only and is limited to one per minute. Check the
    inbox (not spam), the sender, that the link is clickable. A `failed` answer carries a code

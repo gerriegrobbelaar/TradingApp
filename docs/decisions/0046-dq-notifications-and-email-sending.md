@@ -70,4 +70,10 @@ No log line, error, result summary or audit row contains an address, subject, bo
 
 ## Not done here
 
-Screens (D8c), delivery and bounce callbacks (`delivered`, `bounced`; Phase 10), a Data health path in the web app for summary alerts (`DQ_HEALTH_PATH` in core is a placeholder for D8c), notifications to external accountants (v1 is domain-only; open decision 8), per-user opt-out, an alert for a failed or unknown alert, SMS or chat channels.
+Screens (done: Data health and Today in D8c, ADR 0047; Settings, Notifications in the Phase 8 review), delivery and bounce callbacks (`delivered`, `bounced`; Phase 10), a Data health path in the web app for summary alerts (done: `DQ_HEALTH_PATH` in core is `/data-health`, the D8c route), notifications to external accountants (v1 is domain-only; open decision 8), per-user opt-out, an alert for a failed or unknown alert, SMS or chat channels.
+
+## Notifications screen and where the data goes (Phase 8 review)
+
+Settings, Notifications (admins only, lazy) edits the sender and alert settings with the `rev` of GET /api/dq/notifications (409 reloads and says so), needs a fresh sign-in like the API, validates with the core normalisers, asks for confirmation when the host changes (the API key will be sent to it) and has a "Send test email to me" button (one per 60 seconds, the refusal and the wait are shown). The API key is never shown: only "set" or "not set". The API exposes no `email_log` rows, so the screen shows no delivery history (none was invented).
+
+**Data protection (open decision 5 follow-up).** Alert and digest bodies carry supplier and customer names, invoice numbers and amounts, so they leave the EU storage boundary for the e-mail provider. Before sending is switched on, the provider must process in the EU and a data processing agreement must be signed. The alternative is a minimal body (counts plus a link to Data health). A `bodyMode: full|minimal` setting was not added: the renderers and the worker pass full item data today, so it is more than a trivial core change. It is recorded as a follow-up of open decision 5.

@@ -1,5 +1,5 @@
 /** The Today queue screen (Phase 8, D8c): ranking as served, keyboard, Later, roles, a11y, privacy. */
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { configureAxe } from "vitest-axe";
@@ -10,6 +10,17 @@ import type { Me } from "./api";
 import { ONE_DIVISION } from "./test-fixtures";
 import { mixedQueue, todayItem, todayResponse } from "./test-fixtures-dq";
 import { readLater } from "./lib/later";
+
+/**
+ * Review N10: tests that compare a stored or sent time with "now" run on a fixed clock (only Date
+ * is faked; timers stay real, so userEvent and waitFor work), not on how long the suite took.
+ */
+const NOW = Date.parse("2026-11-12T10:00:00Z");
+function freezeClock(): void {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(NOW);
+}
+afterEach(() => vi.useRealTimers());
 
 const axe = configureAxe({ rules: { "color-contrast": { enabled: false } } });
 const FINANCE: Me = {
@@ -258,6 +269,7 @@ describe("keyboard", () => {
 
 describe("Later (this browser only)", () => {
   it("L hides the item for a day, keeps it across reloads, and Undo brings it back", async () => {
+    freezeClock();
     mockFetch(base());
     const user = userEvent.setup();
     renderApp("/today");
@@ -268,8 +280,8 @@ describe("Later (this browser only)", () => {
     expect(Object.keys(stored)).toEqual(["booking:7"]);
     const until = stored["booking:7"]?.until as number;
     expect(stored["booking:7"]?.priority).toBe(100);
-    expect(until - Date.now()).toBeGreaterThan(23 * 3_600_000);
-    expect(until - Date.now()).toBeLessThanOrEqual(24 * 3_600_000);
+    expect(until - NOW).toBeGreaterThan(23 * 3_600_000);
+    expect(until - NOW).toBeLessThanOrEqual(24 * 3_600_000);
     // The toast announces it (role status); the queue's own live line stays quiet (no double read).
     expect(screen.getByTestId("today-live").textContent).toBe("");
     // The toast offers Undo; Z does the same.
@@ -451,6 +463,7 @@ describe("roles", () => {
 
 describe("snooze and resolve from the queue", () => {
   it("snoozes with a note, waits for the server, then refreshes the queue", async () => {
+    freezeClock();
     let todayCalls = 0;
     const calls = mockFetch(
       base(FINANCE, {
@@ -478,7 +491,7 @@ describe("snooze and resolve from the queue", () => {
     expect(post?.headers["X-Requested-With"]).toBe("camelthorn");
     const body = post?.body as { until: string; note: string };
     expect(body.note).toBe("Called the supplier");
-    const days = (Date.parse(body.until) - Date.now()) / 86_400_000;
+    const days = (Date.parse(body.until) - NOW) / 86_400_000;
     expect(days).toBeGreaterThan(13.9);
     expect(Math.round(days)).toBe(14);
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
@@ -719,6 +732,7 @@ describe("review D8c: honesty, Later edge cases and keyboard safety", () => {
 
 describe("review D8c: snooze limit", () => {
   it("90 days stays inside the server's 90-day limit and every choice is at most 90 days", async () => {
+    freezeClock();
     const calls = mockFetch(
       base(FINANCE, {
         "GET /api/today": () => ({ body: todayResponse([mixedQueue()[1] as never]) }),
@@ -738,7 +752,7 @@ describe("review D8c: snooze limit", () => {
     await user.type(within(dialog).getByLabelText(/Note/), "Known");
     await user.click(within(dialog).getAllByRole("button", { name: "Snooze" })[0] as HTMLElement);
     const body = calls.find((c) => c.method === "POST")?.body as { until: string };
-    const ms = Date.parse(body.until) - Date.now();
+    const ms = Date.parse(body.until) - NOW;
     expect(ms).toBeLessThan(90 * 86_400_000 - 60_000);
     expect(ms).toBeGreaterThan(89.9 * 86_400_000);
   });

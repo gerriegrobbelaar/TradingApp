@@ -80,6 +80,8 @@ const REASONS: Record<string, string> = {
     "No suspense account is chosen yet. An administrator can add its code in the rule settings.",
   no_revolut_connection: "Revolut is not connected.",
   no_exact_connection: "Exact is not connected.",
+  source_never_synced: "The Exact sync has never completed for this administration.",
+  source_stale: "The Exact data is older than 26 hours, so this check cannot vouch for it.",
 };
 
 export function reasonText(reason: string | null): string | null {
