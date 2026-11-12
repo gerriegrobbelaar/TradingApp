@@ -543,7 +543,7 @@ describe("Settings, Payments", () => {
     expect(
       screen.getByText("The part that talks to the bank is not built or not available yet."),
     ).toBeTruthy();
-    expect(screen.getAllByText("Not done")).toHaveLength(8);
+    expect(screen.getAllByText("Not done")).toHaveLength(13);
     expect(screen.getAllByText("Placeholder")).toHaveLength(2);
     expect(screen.getAllByText("Not available yet.").length).toBeGreaterThan(0);
     expect(await screen.findByText("appr@camelthorncapital.com")).toBeTruthy();
@@ -688,7 +688,7 @@ describe("Settings, Payments", () => {
     const user = userEvent.setup();
     renderApp("/settings/payments");
     await screen.findByText(/Verified by gerrie@camelthorncapital.com/);
-    expect(screen.getAllByText("Done")).toHaveLength(8);
+    expect(screen.getAllByText("Done")).toHaveLength(13);
     await user.click(screen.getByRole("button", { name: "Switch payments off" }));
     await user.click(screen.getByRole("button", { name: "Switch off" }));
     await waitFor(() => expect(calls.filter((c) => c.method === "PUT")).toHaveLength(1));

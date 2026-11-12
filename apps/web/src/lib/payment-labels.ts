@@ -474,6 +474,8 @@ export const BLOCKER_TEXT: Record<string, string> = {
   no_revolut_connection: "There is no active Revolut connection.",
   no_approver: "No active user has the approver role.",
   iban_key_missing: "The payment security key (a Workers secret) is not set.",
+  pay_mode_not_verified:
+    "One-click pay is chosen but its sandbox check is not done, so payments stay blocked.",
   payments_disabled: "The switch is off.",
 };
 export const BLOCKER_FALLBACK = "Something else stops payments.";
@@ -484,9 +486,14 @@ export function blockerText(code: string): string {
 export const VERIFY_CHECK_TEXT: Record<string, string> = {
   revolut_plan_known: "The Revolut plan is known (Company or not).",
   sandbox_draft_roundtrip: "A payment draft was created and read back on the Revolut sandbox.",
-  request_id_idempotent_on_sandbox:
-    "The same request id sent twice made one payment on the sandbox.",
-  lost_answer_reconciles_by_request_id: "A lost answer was found again by its request id.",
+  sandbox_counterparty_roundtrip: "A payee was created and read back on the Revolut sandbox.",
+  sandbox_pay_roundtrip:
+    "A direct payment was made and read back on the Revolut sandbox (needed only for one-click pay).",
+  request_id_idempotency_replay: "The same request id sent twice made one payment on the sandbox.",
+  lost_answer_lookup_drill: "A lost answer was found again by looking up its request id.",
+  reference_charset_probe: "The allowed characters and length of a reference were checked.",
+  amount_format_probe: "The amount format was checked with small and large amounts.",
+  webhook_state_sequence: "The order of the bank's status updates was checked.",
   four_eyes_approver_accounts_checked: "The approver accounts were checked.",
   first_iban_verified_out_of_band: "The first supplier account was confirmed out of band.",
   approval_mapping_verified_in_exact: "The approval status mapping was verified in Exact.",
