@@ -130,9 +130,13 @@ describe("the submit boundary is not wired", () => {
     expect(users).toEqual([]);
     const submit = workerFiles["../src/payments/submit.ts"] ?? "";
     expect(submit).toMatch(/export const DisabledSubmitter/);
-    expect(submit).toMatch(
-      /export function getSubmitter\(\): PaymentSubmitter \{\s*return DisabledSubmitter;/,
-    );
+    expect(submit).toMatch(/let current: PaymentSubmitter = DisabledSubmitter;/);
+    // the test seam is mentioned nowhere else in src
+    const seam = read(workerFiles)
+      .filter(([f]) => !f.endsWith("/payments/submit.ts"))
+      .filter(([, t]) => /setSubmitterForTests/.test(t))
+      .map(([f]) => f);
+    expect(seam).toEqual([]);
   });
 
   it("no payments file imports the Revolut gate, client, transport or oauth", () => {

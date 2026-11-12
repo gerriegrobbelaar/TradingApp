@@ -93,7 +93,7 @@ Create takes a client key (8-100 characters); `UNIQUE (requested_by, client_key)
 
 ## The submit boundary
 
-`PaymentSubmitter { available; submit(req) -> accepted(providerId) | rejected(code) | unknown }`; `DisabledSubmitter` has `available = false` and returns `rejected payments_disabled`. The request handed over carries no IBAN (P9b adds one reader in `iban-store.ts`). A claim past its lease (10 minutes) is turned into `outcome_unknown` by `markStaleSubmissions`, never into a retry. `PaymentReconciler.lookup(requestId)` is an interface only. Tested with fake submitters: accepted, rejected, unknown, thrown, garbage answers, parallel runs (one call), stale claims, tamper, removed approver role, expired approval.
+`PaymentSubmitter { available; submit(req) -> accepted(providerId) | rejected(code) | unknown }`; `DisabledSubmitter` has `available = false` and returns `rejected payments_disabled`. The request handed over carries no IBAN (P9b adds one reader in `iban-store.ts`). A claim past its lease (10 minutes) is turned into `outcome_unknown` by `markStaleSubmissions`, never into a retry. `getSubmitter()` returns the disabled one; `setSubmitterForTests` (mentioned nowhere else in `src/`, pinned by the scan) lets tests pretend one exists so the enabling SQL is exercised. `PaymentReconciler.lookup(requestId)` is an interface only. Tested with fake submitters: accepted, rejected, unknown, thrown, garbage answers, parallel runs (one call), stale claims, tamper, removed approver role, expired approval.
 
 ## Deliberate deviations from the task text (stricter, or different)
 

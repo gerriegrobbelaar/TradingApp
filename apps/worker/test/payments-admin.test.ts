@@ -10,11 +10,13 @@ import {
   PAYMENTS_VERIFY_PHRASE,
   paymentsProtocolVersion,
 } from "@camelthorn/core";
+import { setSubmitterForTests, type PaymentSubmitter } from "../src/payments/submit";
 import { addSession, authed } from "./helpers";
 import {
   db,
   OTHER_IBAN,
   payWorld,
+  setMappingVerified,
   setSwitch,
   setVerified,
   SUPPLIER_IBAN,
@@ -475,5 +477,75 @@ describe("verification and the switch (fail closed)", () => {
     expect(a).toHaveLength(1);
     expect(a[0]?.actor_email).toBe(w.emails.admin);
     expect((await sw({ enabled: false }, "approver")).status).toBe(403);
+  });
+});
+
+describe("switching on once a submitter exists (a fake one, P9b will bring the real one)", () => {
+  const present: PaymentSubmitter = {
+    available: true,
+    submit: () => Promise.resolve({ kind: "unknown" }),
+  };
+  const sw = (body: unknown, who: Who = "admin") =>
+    send<Record<string, unknown>>(who, "PUT", "/api/settings/payments/switch", body);
+  const on = { enabled: true, confirm: PAYMENTS_ENABLE_PHRASE };
+  const enabled = async () =>
+    (
+      await db
+        .prepare("SELECT value_json FROM settings WHERE key = 'payments.enabled'")
+        .first<{ value_json: string }>()
+    )?.value_json ?? null;
+
+  beforeEach(async () => {
+    setSubmitterForTests(present);
+    await setSwitch(false);
+  });
+  afterEach(() => setSubmitterForTests(null));
+
+  it("works when every precondition holds, and is audited with the protocol version", async () => {
+    const r = await sw(on);
+    expect(r.status, r.text).toBe(200);
+    expect(r.body).toMatchObject({ enabled: true, blockers: [], submitterAvailable: true });
+    expect(await enabled()).toBe("true");
+    const a = await audits("payments.enabled");
+    expect(a).toHaveLength(1);
+    expect(JSON.parse(a[0]?.after_json ?? "{}")).toMatchObject({
+      enabled: true,
+      protocolVersion: paymentsProtocolVersion(),
+      fourEyesEnabled: true,
+    });
+  });
+
+  it("is refused for each missing precondition, with its code, and stays off", async () => {
+    const expectBlocked = async (code: string) => {
+      const r = await sw(on);
+      expect(r.status, code).toBe(409);
+      expect(r.body["blockers"] as string[], code).toContain(code);
+      expect(await enabled()).toBe("false");
+    };
+    await setVerified(false);
+    await expectBlocked("not_verified");
+    await setVerified(true, "f".repeat(64));
+    await expectBlocked("protocol_changed");
+    await setVerified(true);
+    await setMappingVerified(false);
+    await expectBlocked("approval_mapping_unverified");
+    await setMappingVerified(true);
+    await db.prepare("UPDATE connections SET status = 'disabled' WHERE kind = 'revolut'").run();
+    await expectBlocked("no_revolut_connection");
+    await db.prepare("UPDATE connections SET status = 'active' WHERE kind = 'revolut'").run();
+    await db.prepare("DELETE FROM user_roles WHERE role = 'approver'").run();
+    await expectBlocked("no_approver");
+    expect(await audits("payments.enabled")).toHaveLength(0);
+  });
+
+  it("a verification recorded afterwards switches it off again", async () => {
+    expect((await sw(on)).status).toBe(200);
+    const v = await send("admin", "POST", "/api/settings/payments/verify", {
+      confirm: PAYMENTS_VERIFY_PHRASE,
+      checks: [...PAYMENTS_VERIFY_CHECKS],
+      note: "Second drill, same day",
+    });
+    expect(v.status).toBe(200);
+    expect(await enabled()).toBe("false");
   });
 });

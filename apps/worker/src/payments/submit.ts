@@ -63,9 +63,20 @@ export const DisabledSubmitter: PaymentSubmitter = {
   submit: () => Promise.resolve({ kind: "rejected", code: "payments_disabled" }),
 };
 
+let current: PaymentSubmitter = DisabledSubmitter;
+
 /** The submitter in force. P9b returns the Revolut one when its own switches allow it. */
 export function getSubmitter(): PaymentSubmitter {
-  return DisabledSubmitter;
+  return current;
+}
+
+/**
+ * TESTS ONLY: lets a test pretend a submitter exists so the enabling SQL can run. No route or job
+ * can reach it, and a source scan (test/payments-scan.test.ts) fails if any file in src/ other than
+ * this one mentions it.
+ */
+export function setSubmitterForTests(s: PaymentSubmitter | null): void {
+  current = s ?? DisabledSubmitter;
 }
 
 /**
