@@ -244,7 +244,14 @@ describe("content and ranking", () => {
       `match:${sug}`,
       `approval:${approvalNew}`,
     ]);
-    expect(r.counts).toEqual({ approval: 2, match: 1, booking: 2, dq: 2 });
+    expect(r.counts).toEqual({
+      approval: 2,
+      match: 1,
+      booking: 2,
+      dq: 2,
+      payment_approval: 0,
+      payment_ready: 0,
+    });
     expect(r.total).toBe(7);
     const first = r.items[0]!;
     expect(first).toMatchObject({
@@ -423,7 +430,7 @@ describe("privacy and read only", () => {
 });
 
 describe("cost", () => {
-  const plan = async (sql: string, ...binds: number[]): Promise<string> =>
+  const plan = async (sql: string, ...binds: (number | string)[]): Promise<string> =>
     (
       await db
         .prepare(`EXPLAIN QUERY PLAN ${sql}`)
@@ -434,15 +441,15 @@ describe("cost", () => {
       .join("\n");
 
   it("uses an index for every query; only the matching rows of a source are sorted", async () => {
-    const queries: [string, string, number[]][] = [
+    const queries: [string, string, (number | string)[]][] = [
       ["approvals", APPROVALS_SQL, [1]],
       ["approvals count", APPROVALS_COUNT_SQL, [1]],
       ["matches", MATCHES_SQL, []],
       ["matches count", MATCHES_COUNT_SQL, []],
       ["booking", BOOKING_SQL, [1]],
       ["booking count", BOOKING_COUNT_SQL, [1]],
-      ["dq", DQ_SQL, [1]],
-      ["dq count", DQ_COUNT_SQL, [1]],
+      ["dq", DQ_SQL, [1, -1, "2026-01-01T00:00:00.000Z"]],
+      ["dq count", DQ_COUNT_SQL, [1, -1, "2026-01-01T00:00:00.000Z"]],
     ];
     for (const [name, sql, binds] of queries) {
       const p = await plan(sql, ...binds);
@@ -451,7 +458,7 @@ describe("cost", () => {
       expect(p, name).not.toMatch(/SCAN (purchase_entries|bank_transactions|dq_issues)\b/);
     }
     expect(await plan(APPROVALS_SQL, 1)).toContain("idx_purchase_entries_list");
-    expect(await plan(DQ_SQL, 1)).toContain("idx_dq_issues_list");
+    expect(await plan(DQ_SQL, 1, -1, "2026-01-01T00:00:00.000Z")).toContain("idx_dq_issues_list");
   });
 
   it("reads at most the cap from a source and says so", async () => {

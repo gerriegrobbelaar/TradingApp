@@ -94,7 +94,13 @@ describe("registry", () => {
     const ids = DQ_RULES.map((r) => r.id);
     expect(new Set(ids).size).toBe(ids.length);
     for (const r of DQ_RULES) {
-      expect(r.id.startsWith(`${r.area === "master_data" ? "master" : r.area}.`)).toBe(true);
+      // Payment rules (ADR 0053) are filed under the bank area: its table has no payments area.
+      const prefix = r.id.startsWith("payments.")
+        ? "payments"
+        : r.area === "master_data"
+          ? "master"
+          : r.area;
+      expect(r.id.startsWith(`${prefix}.`)).toBe(true);
       expect(DQ_FIX_PATHS[r.fix]).toMatch(/^\//);
       expect(r.title.length).toBeGreaterThan(5);
       expect(r.title).not.toMatch(/!/);

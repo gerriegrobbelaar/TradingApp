@@ -21,6 +21,7 @@ import {
   dqSummary,
   mixedQueue,
   notifications,
+  todayItem,
   todayResponse,
 } from "../src/test-fixtures-dq";
 
@@ -60,6 +61,35 @@ let browser: Browser;
 
 type Scene = "full" | "empty" | "nocheck" | "limited";
 
+const PAYMENT_ITEMS = [
+  todayItem({
+    kind: "payment_approval",
+    id: "payment_approval:5",
+    title: "2 hours waiting for a second approver",
+    subtitle: "Payment 5 · expires in 22 hours",
+    priority: 85,
+    amountMinor: 125_000,
+    currency: "EUR",
+    fix: "payment_approvals",
+    fixPath: "/purchases/approvals?tab=payments",
+    actions: ["open"],
+    issueId: null,
+  }),
+  todayItem({
+    kind: "payment_ready",
+    id: "payment_ready:batch-3",
+    title: "5 hours since the request, approved but not sent",
+    subtitle: "Batch 3 · expires in 19 hours",
+    priority: 70,
+    amountMinor: 250_000,
+    currency: "EUR",
+    fix: "payments",
+    fixPath: "/treasury/bank?tab=payments",
+    actions: ["open"],
+    issueId: null,
+  }),
+];
+
 function api(path: string, scene: Scene): unknown {
   switch (path) {
     case "/api/auth/me":
@@ -74,10 +104,13 @@ function api(path: string, scene: Scene): unknown {
         return todayResponse([], {
           dqLastRun: null,
           approvalMappingVerified: false,
-          notChecked: ["approval", "booking"],
+          notChecked: ["approval", "booking", "payment_approval", "payment_ready"],
         });
       }
-      return scene === "empty" ? todayResponse([]) : todayResponse(mixedQueue());
+      // Review F9b: the payment kinds are on the full queue too (contrast and layout in a browser).
+      return scene === "empty"
+        ? todayResponse([])
+        : todayResponse([...mixedQueue(), ...PAYMENT_ITEMS]);
     case "/api/dq/summary":
       return scene === "nocheck"
         ? dqSummary(
@@ -397,7 +430,7 @@ describe("Today keyboard in a real browser", () => {
     await page.waitForSelector("[role='option']", { timeout: 15_000 });
     const count = () =>
       page.evaluate<number>(() => document.querySelectorAll("[role='option']").length);
-    expect(await count()).toBe(4);
+    expect(await count()).toBe(4 + PAYMENT_ITEMS.length);
     await page.keyboard.press("j");
     await page.waitForSelector("[role='option'][aria-selected='true'][id$='dq-4']");
     // Focus follows in the effect after the selection renders: wait for it (flaky under load).
@@ -405,10 +438,10 @@ describe("Today keyboard in a real browser", () => {
     expect(await page.evaluate<string>(() => document.activeElement?.id ?? "")).toMatch(/dq-4$/);
     await page.keyboard.press("l");
     await page.waitForSelector(".toast");
-    expect(await count()).toBe(3);
+    expect(await count()).toBe(3 + PAYMENT_ITEMS.length);
     await page.keyboard.press("z");
     await page.waitForSelector("[role='option'][id$='dq-4']");
-    expect(await count()).toBe(4);
+    expect(await count()).toBe(4 + PAYMENT_ITEMS.length);
     await page.close();
   });
 });

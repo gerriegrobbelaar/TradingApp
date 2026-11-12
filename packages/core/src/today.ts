@@ -8,7 +8,14 @@
 import type { DqFixTarget, DqSeverity } from "./dq";
 import type { Role } from "./roles";
 
-export const TODAY_KINDS = ["approval", "match", "booking", "dq"] as const;
+export const TODAY_KINDS = [
+  "approval",
+  "match",
+  "booking",
+  "dq",
+  "payment_approval",
+  "payment_ready",
+] as const;
 export type TodayKind = (typeof TODAY_KINDS)[number];
 
 /** Server-side actions. "Later" is not here: it lives in the browser (ADR 0047). */
@@ -16,7 +23,10 @@ export type TodayAction = "open" | "snooze" | "resolve";
 
 export interface TodayItemDto {
   kind: TodayKind;
-  /** Stable across reloads: `approval:12`, `match:34`, `booking:56`, `booking:stale-78`, `dq:90`. */
+  /**
+   * Stable across reloads: `approval:12`, `match:34`, `booking:56`, `booking:stale-78`, `dq:90`,
+   * `payment_approval:5`, `payment_approval:batch-2`, `payment_ready:7`, `payment_ready:batch-3`.
+   */
   id: string;
   /** Leads with the number (days waiting, score, age). */
   title: string;
@@ -69,6 +79,10 @@ export const TODAY_PRIORITY = {
   bookingManualRequired: 80,
   staleSettlements: 75,
   dqWarning: 60,
+  /** A payment waiting for a second person (approvers only); it expires 24 h after the request. */
+  paymentApproval: 85,
+  /** Approved but not sent (finance). */
+  paymentReady: 70,
   approvalLate: 55,
   matchSuggested: 45,
   approvalWaiting: 40,
@@ -84,6 +98,12 @@ export const TODAY_DQ_SKIPPED_RULES: readonly string[] = [
   "payables.approvals_overdue",
 ];
 export const TODAY_STALE_SETTLEMENT_RULE = "bank.stale_settlements";
+/**
+ * The DQ rule about a ready payment. Its issue is hidden from the queue ONLY for a viewer who sees
+ * that same payment as a `payment_ready` item (same payment, same administration); everybody else
+ * still gets the issue.
+ */
+export const TODAY_PAYMENT_READY_RULE = "payments.ready_not_sent";
 
 export function approvalPriority(ageDays: number | null): number {
   return ageDays !== null && ageDays > TODAY_APPROVAL_LATE_DAYS
@@ -112,6 +132,11 @@ export function todayActions(
     case "approval":
     case "match":
       return ["open"];
+    case "payment_approval":
+      // The sheet to approve is in the app (the link); only an approver gets the item at all.
+      return hasRole(roles, "approver") ? ["open"] : [];
+    case "payment_ready":
+      return hasRole(roles, "finance") ? ["open"] : [];
     case "booking":
       // Needs an admin; the others only see that something is waiting.
       if (!hasRole(roles, "admin")) return [];
@@ -178,7 +203,9 @@ export function encodeTodayCursor(item: SortKey): string {
   return b64(JSON.stringify([item.priority, sinceKey(item), item.id]));
 }
 
-const ID_RE = /^(approval|match|booking|dq):(stale-)?[1-9]\d{0,12}$/;
+/** Exactly the ids issued: `stale-` only on bookings, `batch-` only on the payment kinds. */
+const ID_RE =
+  /^(?:(?:approval|match|dq):|booking:(?:stale-)?|(?:payment_approval|payment_ready):(?:batch-)?)[1-9]\d{0,12}$/;
 
 /** Null for anything we did not issue (strict shape). */
 export function decodeTodayCursor(raw: string): TodayCursor | null {

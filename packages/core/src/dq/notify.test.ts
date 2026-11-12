@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { DQ_FIX_PATHS } from "./types";
 import {
   DEFAULT_NOTIFICATION_SETTINGS,
   alertKey,
@@ -14,6 +15,7 @@ import {
   renderAlert,
   renderAlertSummary,
   renderDigest,
+  safeAppPath,
   type DigestData,
 } from "./notify";
 
@@ -340,5 +342,59 @@ describe("review D8b: hosts, links and field caps", () => {
     for (const m of r) {
       expect(m.subject + m.text + m.html.replace("<!doctype html>", "")).not.toContain("!");
     }
+  });
+});
+
+describe("safeAppPath keeps our own fix paths, tab queries included (ADR 0053)", () => {
+  it("passes every DQ_FIX_PATHS value unchanged", () => {
+    for (const p of Object.values(DQ_FIX_PATHS)) expect(safeAppPath(p), p).toBe(p);
+    expect(safeAppPath("/treasury/bank?tab=payments")).toBe("/treasury/bank?tab=payments");
+  });
+  it.each([
+    "//evil.com",
+    "/treasury/bank?tab=payments&next=//evil.com",
+    "/treasury/bank?tab=other",
+    "/a?x=1",
+    "/treasury/bank?tab=payments#x",
+    "https://evil.com",
+    // review F9b: adversarial near-misses of the two allowed query paths
+    "/TREASURY/BANK?tab=payments",
+    "/treasury/bank?TAB=payments",
+    "/treasury/bank?tab=payments ",
+    " /treasury/bank?tab=payments",
+    "/treasury/bank?tab=payments\n",
+    "/treasury/bank?tab=payments%0d%0aSet-Cookie:x",
+    "/treasury/bank?tab=payments&tab=x",
+    "/treasury/bank/?tab=payments",
+    "/treasury//bank?tab=payments",
+    "/\\evil.com?tab=payments",
+    "//evil.com/treasury/bank?tab=payments",
+    "javascript:alert(1)",
+    "javascript:/treasury/bank?tab=payments",
+    "/purchases/approvals?tab=payments\u2028",
+    '/purchases/approvals?tab=payments"><script>',
+    "/treasury/bank?tab=payments@evil.com",
+    "constructor",
+    "__proto__",
+    "",
+  ])("still degrades %j to the root", (p) => {
+    expect(safeAppPath(p)).toBe("/");
+  });
+  it("a link built from an allowed query path stays on our host, HTML-escaped", () => {
+    const out = renderAlert(
+      {
+        ruleTitle: "Payment with an unknown outcome for over 30 minutes",
+        area: "bank",
+        subject: "Payment 12",
+        message: "45 minutes: EUR 1,250.00 payment with an unknown outcome. Do not pay again.",
+        fixPath: DQ_FIX_PATHS.payments,
+        firstSeenAt: "2026-11-12T10:00:00.000Z",
+        reopenCount: 0,
+      },
+      "https://app.example.nl",
+    );
+    const all = JSON.stringify(out);
+    expect(all).toContain("https://app.example.nl/treasury/bank?tab=payments");
+    expect(all).not.toMatch(/href="(?!https:\/\/app\.example\.nl\/)/);
   });
 });
