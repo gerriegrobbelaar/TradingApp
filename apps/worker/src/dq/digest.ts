@@ -10,6 +10,7 @@
  */
 import {
   DQ_AREAS,
+  DQ_CHECKS_STALE_MS,
   DQ_FIX_PATHS,
   DQ_RULES,
   amsterdamParts,
@@ -38,13 +39,24 @@ import { safeText } from "./store";
 
 const DAY_MS = 86_400_000;
 const NOT_EVALUATED_CAP = 30;
+/** Issues of a rule that an admin switched off are not counted (the same rule as /api/dq/summary). */
+const LIVE_RULE = `(SELECT 1 FROM dq_rules r WHERE r.id = dq_issues.rule_id AND r.enabled = 0)`;
 
 export async function loadDigestData(db: D1Database, nowMs: number): Promise<DigestData> {
   const d = emptyDigest(amsterdamParts(nowMs).date);
+  const lastRun = await db
+    .prepare("SELECT started_at, status FROM dq_runs ORDER BY id DESC LIMIT 1")
+    .first<{ started_at: string; status: "ok" | "partial" | "error" }>();
+  const lastMs = lastRun === null ? NaN : Date.parse(lastRun.started_at);
+  d.checks = {
+    lastRunAt: lastRun?.started_at ?? null,
+    lastStatus: lastRun?.status ?? null,
+    stale: !Number.isFinite(lastMs) || nowMs - lastMs > DQ_CHECKS_STALE_MS,
+  };
   const counts = (
     await db
       .prepare(
-        "SELECT severity, area, COUNT(*) AS n FROM dq_issues WHERE status = 'open' GROUP BY severity, area",
+        `SELECT severity, area, COUNT(*) AS n FROM dq_issues WHERE status = 'open' AND NOT EXISTS ${LIVE_RULE} GROUP BY severity, area`,
       )
       .all<{ severity: DqSeverity; area: DqArea; n: number }>()
   ).results;
@@ -56,14 +68,17 @@ export async function loadDigestData(db: D1Database, nowMs: number): Promise<Dig
   d.snoozed =
     (
       await db
-        .prepare("SELECT COUNT(*) AS n FROM dq_issues WHERE status = 'snoozed'")
+        .prepare(
+          `SELECT COUNT(*) AS n FROM dq_issues WHERE status = 'snoozed' AND NOT EXISTS ${LIVE_RULE}`,
+        )
         .first<{ n: number }>()
     )?.n ?? 0;
   d.newSinceYesterday =
     (
       await db
         .prepare(
-          "SELECT COUNT(*) AS n FROM dq_issues WHERE status = 'open' AND first_seen_at >= ?1",
+          `SELECT COUNT(*) AS n FROM dq_issues WHERE status = 'open' AND first_seen_at >= ?1
+             AND NOT EXISTS ${LIVE_RULE}`,
         )
         .bind(new Date(nowMs - DAY_MS).toISOString())
         .first<{ n: number }>()
@@ -71,6 +86,7 @@ export async function loadDigestData(db: D1Database, nowMs: number): Promise<Dig
   const oldest = await db
     .prepare(
       `SELECT subject, severity, first_seen_at FROM dq_issues WHERE status = 'open'
+         AND NOT EXISTS ${LIVE_RULE}
        ORDER BY first_seen_at, id LIMIT 1`,
     )
     .first<{ subject: string; severity: DqSeverity; first_seen_at: string }>();
@@ -85,6 +101,7 @@ export async function loadDigestData(db: D1Database, nowMs: number): Promise<Dig
     await db
       .prepare(
         `SELECT rule_id, area, severity, subject, message, fix FROM dq_issues WHERE status = 'open'
+           AND NOT EXISTS ${LIVE_RULE}
          ORDER BY severity_rank DESC, first_seen_at, id LIMIT 10`,
       )
       .all<{
@@ -108,7 +125,8 @@ export async function loadDigestData(db: D1Database, nowMs: number): Promise<Dig
     await db
       .prepare(
         `SELECT DISTINCT rule_id, reason FROM dq_rule_status
-         WHERE status IN ('not_available', 'not_configured', 'error', 'disabled')`,
+         WHERE status IN ('not_available', 'not_configured', 'error')
+           AND NOT EXISTS (SELECT 1 FROM dq_rules r WHERE r.id = dq_rule_status.rule_id AND r.enabled = 0)`,
       )
       .all<{ rule_id: string; reason: string | null }>()
   ).results;
@@ -181,6 +199,9 @@ export async function runDigest(ctx: JobContext, deps: DigestDeps = {}): Promise
     if (res.status === "sent") sent += 1;
     else if (res.status === "failed") failed += 1;
     else unknown += 1;
+    // Rate limited: the recipients left are retried by the job retry, not hammered now.
+    if (res.status === "failed" && res.code === "http_429") break;
+    if (sender.spacingMs) await new Promise((r) => setTimeout(r, sender.spacingMs));
   }
   const summary = {
     recipients: recipients.length,

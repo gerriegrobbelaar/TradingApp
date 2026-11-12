@@ -15,6 +15,8 @@ import {
   evaluateRules,
   resolveAllConfigs,
   type DqInput,
+  type DqSection,
+  type DqSourceReason,
   type DqRuleResult,
 } from "@camelthorn/core";
 import type { HandlerResult, JobContext } from "../jobs/types";
@@ -26,6 +28,7 @@ import {
   loadExactBudget,
   loadExactConnection,
   loadFx,
+  loadSourceFreshness,
   loadJobs,
   loadLedger,
   loadOpenItems,
@@ -129,19 +132,38 @@ export async function runDqChecks(ctx: JobContext, deps: DqRunDeps): Promise<Han
       aborted = true;
       break;
     }
-    const tx = await section("bank_transactions", () => loadBankTransactions(db, d, nowMs));
+    // A source that was never synchronised, or whose last complete sync is older than ~26 hours,
+    // cannot vouch for "ok" (review V1 S5): its section is left out and the rules say why.
+    const sourceReasons: Partial<Record<DqSection, DqSourceReason>> = (await section(
+      "source_freshness",
+      () => loadSourceFreshness(db, d, nowMs),
+    )) ?? {
+      // The freshness itself could not be read: nothing may be vouched for.
+      bankAccounts: "source_stale",
+      bankTransactions: "source_stale",
+      openItems: "source_stale",
+      purchaseEntries: "source_stale",
+      relations: "source_stale",
+      ledger: "source_stale",
+    };
+    const gated = <T>(name: DqSection, load: () => Promise<T>): Promise<T | null> =>
+      sourceReasons[name] ? Promise.resolve(null) : section(name, load);
+    const tx = sourceReasons.bankTransactions
+      ? null
+      : await section("bank_transactions", () => loadBankTransactions(db, d, nowMs));
     const input: DqInput = {
       ...emptyInput(nowMs, d.id, d.baseCurrency),
-      bankAccounts: await section("bank_accounts", () => loadBankAccounts(db, d)),
+      sourceReasons,
+      bankAccounts: await gated("bankAccounts", () => loadBankAccounts(db, d)),
       bankTransactions: tx === null ? null : tx.lines,
       bankTransactionsCapped: tx?.capped ?? false,
       bookedMatches: await section("booked_matches", () => loadBookedMatches(db, d)),
       booking: await section("booking_health", () => loadBookingHealth(db, d, nowMs)),
-      openItems: await section("open_items", () => loadOpenItems(db, d)),
-      purchaseEntries: await section("purchase_entries", () => loadPurchaseEntries(db, d, nowMs)),
-      relations: await section("relations", () => loadRelations(db, d)),
+      openItems: await gated("openItems", () => loadOpenItems(db, d)),
+      purchaseEntries: await gated("purchaseEntries", () => loadPurchaseEntries(db, d, nowMs)),
+      relations: await gated("relations", () => loadRelations(db, d)),
       fx: await section("fx", () => loadFx(db, d, nowMs)),
-      ledger: await section("ledger", () => loadLedger(db, d, nowMs, suspenseCodes)),
+      ledger: await gated("ledger", () => loadLedger(db, d, nowMs, suspenseCodes)),
       exactBudget: await section("exact_budget", () => loadExactBudget(db, d, nowMs)),
     };
     const res = evaluateRules(input, "division", configs);
@@ -213,7 +235,11 @@ export async function runDqChecks(ctx: JobContext, deps: DqRunDeps): Promise<Han
       ...(alerts
         ? {
             alertCandidates: alerts.candidates,
-            alertsSent: alerts.alerted,
+            // Mails the provider accepted (a claim is not a delivery).
+            alertsSent: alerts.sent,
+            alertsClaimed: alerts.alerted + alerts.retried,
+            alertsSuppressed: alerts.suppressed,
+            alertsRateLimited: alerts.rateLimited ? 1 : 0,
             alertsFolded: alerts.folded,
             alertsFailed: alerts.failed,
             alertsUnknown: alerts.unknown,

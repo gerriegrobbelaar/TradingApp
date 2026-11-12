@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_NOTIFICATION_SETTINGS,
   alertKey,
+  legacyAlertKey,
   applySettingsPatch,
   emptyDigest,
   escapeHtml,
@@ -189,7 +190,8 @@ describe("settings validation", () => {
     expect(s.emailProvider).toBe("disabled");
   });
   it("alert key carries fingerprint and reopen count", () => {
-    expect(alertKey("a.b:1", 2)).toBe("dq-alert:a.b:1:2");
+    expect(alertKey(17, 2)).toBe("dq-alert:17:2");
+    expect(legacyAlertKey("a.b:1", 2)).toBe("dq-alert:a.b:1:2");
   });
 });
 

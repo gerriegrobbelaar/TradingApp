@@ -6,6 +6,7 @@
  * tracking pixels and no external resources. Copy: sentence case, no exclamation marks, the number
  * first.
  */
+import { amsterdamParts } from "../local-time";
 import { DQ_AREAS, SEVERITY_RANK, type DqArea, type DqSeverity } from "./types";
 
 // ---- e-mail types (shared by every sender) -------------------------------------------------------------
@@ -27,7 +28,7 @@ export interface EmailMessage {
  */
 export type EmailSendResult =
   | { status: "sent"; providerMessageId: string | null }
-  | { status: "failed"; code: string }
+  | { status: "failed"; code: string; retryAfterSeconds?: number }
   | { status: "unknown"; code: string }
   | { status: "skipped_not_configured" };
 
@@ -156,7 +157,18 @@ export function normalizeEmailHost(raw: string): string | null {
 export function normalizeFromAddress(raw: string): string | null {
   const s = raw.trim().toLowerCase();
   if (s === "") return "";
-  return /^[a-z0-9._+-]{1,64}@[a-z0-9.-]{1,190}\.[a-z]{2,}$/.test(s) && s.length <= 254 ? s : null;
+  if (s.length > 254) return null;
+  const at = s.indexOf("@");
+  if (at < 1 || at !== s.lastIndexOf("@")) return null;
+  const local = s.slice(0, at);
+  const domain = s.slice(at + 1);
+  // Dot-atom: no leading, trailing or doubled dot in the local part; every domain label starts and
+  // ends with a letter or digit; at least two labels and an alphabetic last label of 2+ letters.
+  if (local.length > 64 || !/^[a-z0-9_+-]+(\.[a-z0-9_+-]+)*$/.test(local)) return null;
+  if (domain.length > 190 || !/^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/.test(domain)) {
+    return null;
+  }
+  return s;
 }
 
 export type SettingsPatchResult =
@@ -257,7 +269,15 @@ export function parseStoredSettings(json: string | null): DqNotificationSettings
 
 // ---- idempotency keys ---------------------------------------------------------------------------------
 
-export const alertKey = (fingerprint: string, reopenCount: number): string =>
+/**
+ * One alert per life of an issue ROW: `dq-alert:<dq_issues.id>:<reopen count>`. The fingerprint is
+ * not unique (two administrations can report the same subject, and a row deleted by retention can be
+ * inserted again), the row id is (AUTOINCREMENT never reuses one). Review V1 B1.
+ */
+export const alertKey = (issueId: number, reopenCount: number): string =>
+  `dq-alert:${issueId}:${reopenCount}`;
+/** The key format before review V1; only recognised (never written) so an upgrade does not re-alert. */
+export const legacyAlertKey = (fingerprint: string, reopenCount: number): string =>
   `dq-alert:${fingerprint}:${reopenCount}`;
 export const alertSummaryKey = (jobRunId: number, chunk: number): string =>
   `dq-alert-summary:${jobRunId}:${chunk}`;
@@ -425,9 +445,23 @@ export interface DigestItem {
   fixPath: string;
 }
 
+/** What the digest knows about the check job itself (review V1 S4). */
+export interface DigestChecks {
+  /** Start of the last `dq.checks` run, or null when it has never run. */
+  lastRunAt: string | null;
+  lastStatus: "ok" | "partial" | "error" | null;
+  /** True when the last run is older than DQ_CHECKS_STALE_MS (or there is none). */
+  stale: boolean;
+}
+
+/** The checks run hourly; a digest whose last run is older than this says so instead of a count. */
+export const DQ_CHECKS_STALE_MS = 6 * 3_600_000;
+
 export interface DigestData {
   /** Amsterdam calendar date, YYYY-MM-DD. */
   date: string;
+  /** Absent only in tests of the plain renderer; the worker always supplies it. */
+  checks?: DigestChecks;
   bySeverity: Record<DqSeverity, number>;
   byArea: Record<DqArea, Record<DqSeverity, number>>;
   snoozed: number;
@@ -473,12 +507,31 @@ export function renderDigest(raw: DigestData, baseUrl: string): RenderedEmail {
     })),
   };
   const open = d.bySeverity.critical + d.bySeverity.warning + d.bySeverity.info;
-  const head = plural(open, "open data quality issue", "open data quality issues");
+  const checks = d.checks;
+  const never = checks !== undefined && checks.lastRunAt === null;
+  const lastRunMs = checks?.lastRunAt != null ? Date.parse(checks.lastRunAt) : NaN;
+  const sinceDate = Number.isFinite(lastRunMs) ? amsterdamParts(lastRunMs).date : null;
+  const stale = checks !== undefined && !never && checks.stale;
+  // Lead with the state of the checks, never with a count that may be a stale or empty zero.
+  const notice = never
+    ? "The data quality checks have never run, so the issue counts are not known."
+    : stale
+      ? `The data quality checks have not run since ${sinceDate ?? "an unknown date"}. The counts below are from that run.`
+      : checks?.lastStatus === "partial" || checks?.lastStatus === "error"
+        ? "The last run of the checks did not finish all rules. The counts may be incomplete."
+        : null;
+  const head = never
+    ? "Data quality checks have never run"
+    : stale
+      ? `Data quality checks have not run since ${sinceDate ?? "an unknown date"}`
+      : plural(open, "open data quality issue", "open data quality issues");
   const subject = oneLine(
-    `${head}${d.bySeverity.critical > 0 ? `, ${d.bySeverity.critical} critical` : ""}`,
+    never || stale
+      ? head
+      : `${head}${d.bySeverity.critical > 0 ? `, ${d.bySeverity.critical} critical` : ""}`,
   );
   const sevLine = SEV_ORDER.map((s) => `${d.bySeverity[s]} ${s}`).join(", ");
-  const summary = `${sevLine}. ${d.newSinceYesterday} new since yesterday. ${d.snoozed} snoozed.`;
+  const summary = `${sevLine}. ${d.newSinceYesterday} new since yesterday. ${d.snoozed} snoozed. All administrations.`;
   // Stable sort keeps the caller's order (oldest first) within a severity.
   const top = [...d.top]
     .sort((a, b) => SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity])
@@ -491,10 +544,14 @@ export function renderDigest(raw: DigestData, baseUrl: string): RenderedEmail {
     : null;
   const notHead = `${plural(d.notEvaluated.length, "rule was", "rules were")} not evaluated`;
 
-  const lines: string[] = [`${head} on ${d.date}`, summary];
-  if (areas.length > 0) lines.push("", "By area", ...areas.map((a) => `- ${areaLine(a)}`));
-  if (oldestLine) lines.push("", oldestLine);
-  if (top.length > 0) {
+  const title = never || stale ? head : `${head} on ${d.date}`;
+  const lines: string[] = [title];
+  if (notice) lines.push(notice);
+  if (!never) lines.push(summary);
+  if (areas.length > 0 && !never)
+    lines.push("", "By area", ...areas.map((a) => `- ${areaLine(a)}`));
+  if (oldestLine && !never) lines.push("", oldestLine);
+  if (top.length > 0 && !never) {
     lines.push(
       "",
       `Top ${top.length}`,
@@ -513,13 +570,14 @@ export function renderDigest(raw: DigestData, baseUrl: string): RenderedEmail {
   }
 
   const html = wrapHtml(
-    `<h2 style="margin:0 0 8px">${escapeHtml(head)} on ${escapeHtml(d.date)}</h2>` +
-      `<p>${escapeHtml(summary)}</p>` +
-      (areas.length > 0
+    `<h2 style="margin:0 0 8px">${escapeHtml(title)}</h2>` +
+      (notice ? `<p><strong>${escapeHtml(notice)}</strong></p>` : "") +
+      (never ? "" : `<p>${escapeHtml(summary)}</p>`) +
+      (areas.length > 0 && !never
         ? `<h3>By area</h3><ul>${areas.map((a) => `<li>${escapeHtml(areaLine(a))}</li>`).join("")}</ul>`
         : "") +
-      (oldestLine ? `<p>${escapeHtml(oldestLine)}</p>` : "") +
-      (top.length > 0
+      (oldestLine && !never ? `<p>${escapeHtml(oldestLine)}</p>` : "") +
+      (top.length > 0 && !never
         ? `<h3>Top ${top.length}</h3><ul>${top
             .map(
               (t) =>

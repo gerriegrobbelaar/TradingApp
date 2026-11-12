@@ -1,5 +1,6 @@
 /** FX, ledger and integration rules (CLAUDE.md 3, 4.6). Pure. */
-import type { DqIssue, DqRuleDef } from "./types";
+import { nextRun } from "../schedule";
+import { DQ_DELIBERATE_SKIP_CODES, type DqIssue, type DqJobIn, type DqRuleDef } from "./types";
 import {
   ageMs,
   amountText,
@@ -207,6 +208,30 @@ const closedPeriod: DqRuleDef = {
 
 // ---- integrations ----------------------------------------------------------------------------------
 
+/**
+ * Scheduled slots that passed in (sinceMs, nowMs], counted up to `limit` (the walk stops there).
+ * Null when the schedule cannot be read. Weekends, TARGET holidays and last-working-day schedules
+ * are the schedule's own business (nextRun), so a Friday success of a working-day job is not stale
+ * on Monday.
+ */
+export function slotsPassed(
+  schedule: NonNullable<DqJobIn["schedule"]>,
+  sinceMs: number,
+  nowMs: number,
+  limit: number,
+): number | null {
+  let count = 0;
+  let at = sinceMs;
+  while (count < limit) {
+    const next = nextRun(schedule, at);
+    if (next === null) return count === 0 ? null : count;
+    if (next > nowMs) break;
+    count += 1;
+    at = next;
+  }
+  return count;
+}
+
 const jobStale: DqRuleDef = {
   id: "integrations.job_stale",
   area: "integrations",
@@ -215,7 +240,7 @@ const jobStale: DqRuleDef = {
   threshold: { kind: "number", unit: "factor", default: 2, min: 1, max: 20 },
   title: "A scheduled job has not succeeded in time",
   description:
-    "An enabled job whose last successful run is older than the set multiple of its schedule interval. Jobs that are switched off are not judged.",
+    "An enabled job that missed the set number of scheduled runs in a row (weekends and TARGET holidays do not count). Jobs that are switched off, or whose last run was a deliberate skip such as no e-mail provider, are not judged.",
   fix: "schedules",
   evaluate(input, config) {
     if (input.jobs === null) return notAvailable("jobs_not_loaded");
@@ -226,14 +251,33 @@ const jobStale: DqRuleDef = {
     for (const j of input.jobs) {
       // A switched-off or unbuilt job is not judged: its old issue no longer applies.
       if (!j.enabled || !j.implemented) continue;
+      // A job whose last run was a deliberate skip (no e-mail provider, notifications off) is
+      // working as configured; it is not stale.
+      if (
+        j.lastStatus === "skipped" &&
+        j.lastCode !== null &&
+        DQ_DELIBERATE_SKIP_CODES.includes(j.lastCode)
+      ) {
+        continue;
+      }
       const since = ageMs(input.nowMs, j.lastSuccessAt) ?? ageMs(input.nowMs, j.referenceAt);
+      const baseAt = j.lastSuccessAt ?? j.referenceAt;
+      const baseMs = baseAt === null ? NaN : Date.parse(baseAt);
+      let stale: boolean | null = null;
+      if (j.schedule && since !== null && Number.isFinite(baseMs)) {
+        // Stale when at least `factor` scheduled slots have passed without a success.
+        const passed = slotsPassed(j.schedule, baseMs, input.nowMs, Math.ceil(factor));
+        stale = passed === null ? null : passed >= factor;
+      } else if (!j.schedule && j.intervalMs !== null && j.intervalMs > 0 && since !== null) {
+        stale = since > factor * j.intervalMs;
+      }
       // A schedule or a date that cannot be read says nothing either way.
-      if (j.intervalMs === null || j.intervalMs <= 0 || since === null) {
+      if (stale === null || since === null) {
         unjudged.push(fingerprintOf(this.id, ["job", j.name]));
         continue;
       }
       checked += 1;
-      if (since <= factor * j.intervalMs) continue;
+      if (!stale) continue;
       const hours = Math.floor(since / HOUR_MS);
       issues.push(
         makeIssue(this, config, ["job", j.name], {

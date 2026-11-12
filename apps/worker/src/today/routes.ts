@@ -250,6 +250,13 @@ interface IssueRow {
   first_seen_at: string;
 }
 
+/**
+ * A bank line that has a match suggestion already shows as a match item; its "unmatched for too long"
+ * issue would list the same line twice (review V1 N3).
+ */
+const NOT_SUGGESTED_LINE = `NOT (i.rule_id = 'bank.unmatched_old' AND EXISTS (
+    SELECT 1 FROM bank_transactions t
+    WHERE t.id = json_extract(i.payload_json, '$.txId') AND t.match_status = 'suggested'))`;
 const SKIPPED = TODAY_DQ_SKIPPED_RULES.map((r) => `'${r}'`).join(", ");
 /**
  * One query per scope (the division, then the global id 0), in queue order: the priority of
@@ -261,6 +268,7 @@ export const DQ_SQL = `SELECT i.id, i.rule_id, i.severity, i.subject, i.message,
   FROM dq_issues i LEFT JOIN dq_rules r ON r.id = i.rule_id
   WHERE i.division_id = ?1 AND i.status = 'open' AND i.severity_rank >= 1 AND COALESCE(r.enabled, 1) = 1
     AND i.rule_id NOT IN (${SKIPPED})
+    AND ${NOT_SUGGESTED_LINE}
   ORDER BY CASE WHEN i.rule_id = '${TODAY_STALE_SETTLEMENT_RULE}' THEN ${TODAY_PRIORITY.staleSettlements}
                 WHEN i.severity_rank = 2 THEN ${TODAY_PRIORITY.dqCritical}
                 ELSE ${TODAY_PRIORITY.dqWarning} END DESC,
@@ -269,6 +277,7 @@ export const DQ_COUNT_SQL = `SELECT i.rule_id AS rule_id, COUNT(*) AS n
   FROM dq_issues i LEFT JOIN dq_rules r ON r.id = i.rule_id
   WHERE i.division_id = ?1 AND i.status = 'open' AND i.severity_rank >= 1 AND COALESCE(r.enabled, 1) = 1
     AND i.rule_id NOT IN (${SKIPPED})
+    AND ${NOT_SUGGESTED_LINE}
   GROUP BY i.rule_id`;
 
 function issueItem(r: IssueRow, ref: Ref): TodayItemDto {

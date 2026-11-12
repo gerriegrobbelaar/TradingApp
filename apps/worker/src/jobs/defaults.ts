@@ -17,7 +17,18 @@ import { MAX_CALLS_PER_RUN as BOOKING_CALL_BUDGET } from "../booking/executor";
 import { BANK_BALANCES_BUDGET } from "../exact/bank-balances";
 import { FULL_SYNC_BUDGET, INCREMENTAL_SYNC_BUDGET } from "./exact-handlers";
 
-export const DEFAULT_JOBS_VERSION = 5;
+export const DEFAULT_JOBS_VERSION = 6;
+
+/**
+ * One-off guards of a version bump (review V1 N7): a job that must be OFF after the upgrade even if an
+ * admin switched its (then placeholder) row on earlier. Applied once, in the same batch as the
+ * version marker, audited with the before state. Existing rows are otherwise never touched.
+ *  - 6: `exact.bank_balances` became a real job that reads from Exact; it waits for the first live
+ *       checks (docs/DEPLOY.md, ADR 0045).
+ */
+export const FORCE_OFF_AT_VERSION: readonly { name: string; version: number }[] = [
+  { name: "exact.bank_balances", version: 6 },
+];
 const MARKER = "seed.default_jobs";
 
 export interface DefaultJob {
@@ -180,8 +191,33 @@ export async function seedDefaultJobs(
         next === null ? null : new Date(next).toISOString(),
       );
   });
+  const forceOff = FORCE_OFF_AT_VERSION.filter(
+    (f) => (marked?.v ?? 0) < f.version && f.version <= DEFAULT_JOBS_VERSION,
+  ).flatMap((f) => [
+    db
+      .prepare(
+        `UPDATE jobs SET enabled = 0, next_run_at = NULL, rev = lower(hex(randomblob(16))), updated_at = ?2,
+           updated_by = 'system'
+         WHERE name = ?1 AND enabled = 1 AND ${stale}`,
+      )
+      .bind(f.name, now),
+    // Only when the statement before changed the row.
+    auditStatement(
+      db,
+      {
+        actorEmail: "system",
+        action: "job.forced_off",
+        entity: "job",
+        entityId: f.name,
+        before: { enabled: true },
+        after: { enabled: false, reason: AWAITING_LIVE_VERIFICATION, version: f.version },
+      },
+      { sql: "changes() = 1", binds: [] },
+    ),
+  ]);
   await db.batch([
     ...statements,
+    ...forceOff,
     // One audit row per applied version; the guard makes a concurrent second isolate write none.
     auditStatement(
       db,

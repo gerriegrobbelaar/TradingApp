@@ -10,9 +10,9 @@ import {
   type DqRulesResponse,
   type DqSummaryResponse,
 } from "@camelthorn/core";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { addSession, addUser, authed, call, resetDb } from "./helpers";
-import { db, issues, resetDq, runDq } from "./dq-helpers";
+import { db, issues, NOW, resetDq, runDq } from "./dq-helpers";
 import { addItem, addRelation, addTx, resetWorld, type World } from "./matching-helpers";
 import { auditRows } from "./sync-helpers";
 
@@ -62,7 +62,11 @@ async function seed(): Promise<void> {
   await runDq();
 }
 
+// The server reads the clock for snooze limits and sessions: freeze it (review V1 N10), so no test
+// depends on when it runs. Only Date is faked; timers and I/O stay real.
 beforeEach(async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(NOW);
   await resetDb();
   await resetDq();
   w = await resetWorld();
@@ -72,6 +76,10 @@ beforeEach(async () => {
   tokens.staleAdmin = await addSession(await addUser("stale@camelthorncapital.com", ["admin"]), {
     lastAuthAgoMs: 20 * 60_000,
   });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe("access rules", () => {
@@ -286,7 +294,7 @@ describe("GET /api/dq/issues", () => {
 });
 
 describe("POST /api/dq/issues/:id/snooze", () => {
-  const until = (days: number) => new Date(Date.now() + days * DAY).toISOString();
+  const until = (days: number) => new Date(NOW + days * DAY).toISOString();
 
   it("snoozes an open issue, audits it once, and an identical repeat is a quiet success", async () => {
     await seed();
@@ -334,7 +342,7 @@ describe("POST /api/dq/issues/:id/snooze", () => {
     };
     await bad({ until: "not a date", note: "n" }, "bad_until");
     await bad({ until: 5, note: "n" }, "bad_until");
-    await bad({ until: new Date(Date.now() - DAY).toISOString(), note: "n" }, "until_in_past");
+    await bad({ until: new Date(NOW - DAY).toISOString(), note: "n" }, "until_in_past");
     await bad({ until: until(91), note: "n" }, "until_too_far");
     await bad({ until: until(2) }, "bad_note");
     await bad({ until: until(2), note: "" }, "bad_note");
@@ -401,7 +409,7 @@ describe("POST /api/dq/issues/:id/resolve-note", () => {
     await seed();
     const id = (await issues("status = 'open'"))[0]?.id as number;
     await send("finance", "POST", `/api/dq/issues/${id}/snooze`, {
-      until: new Date(Date.now() + 2 * DAY).toISOString(),
+      until: new Date(NOW + 2 * DAY).toISOString(),
       note: "wait",
     });
     const r = await send<{ issue: DqIssueDto }>(

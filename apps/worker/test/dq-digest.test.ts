@@ -10,7 +10,15 @@ import { UNSYNCED_GRACE_DAYS } from "../src/dq/store";
 import { pruneEmailLog } from "../src/email/log";
 import { addUser, resetDb } from "./helpers";
 import { db, dqContext, issues, resetDq, runDq } from "./dq-helpers";
-import { addCritical, ctxAt, emailRows, fakeSender, NOW, seedUsers } from "./dq-notify-helpers";
+import {
+  addCheckRun,
+  addCritical,
+  ctxAt,
+  emailRows,
+  fakeSender,
+  NOW,
+  seedUsers,
+} from "./dq-notify-helpers";
 import { addItem, addRelation, resetWorld, type World } from "./matching-helpers";
 import { auditRows } from "./sync-helpers";
 
@@ -22,6 +30,7 @@ beforeEach(async () => {
   await resetDq();
   w = await resetWorld();
   await seedUsers();
+  await addCheckRun();
 });
 
 describe("dq.digest", () => {
@@ -95,7 +104,7 @@ describe("dq.digest", () => {
     const s = fakeSender((_n, msg) => {
       if (msg.to[0] === "admin@camelthorncapital.com" && failOnce) {
         failOnce = false;
-        return { status: "failed", code: "http_429" };
+        return { status: "failed", code: "http_422" };
       }
       if (msg.to[0] === "fin@camelthorncapital.com") return { status: "unknown", code: "timeout" };
       return { status: "sent", providerMessageId: "m" };
@@ -111,6 +120,18 @@ describe("dq.digest", () => {
     // admin: 2 sends in total (refused, then accepted); fin: 1 (unknown, never again)
     expect(s.sent.filter((m) => m.to[0] === "admin@camelthorncapital.com")).toHaveLength(2);
     expect(s.sent.filter((m) => m.to[0] === "fin@camelthorncapital.com")).toHaveLength(1);
+  });
+
+  it("a 429 ends the run's sending; the recipients left follow in the retry", async () => {
+    await addCritical();
+    const s = fakeSender((n) =>
+      n === 1 ? { status: "failed", code: "http_429" } : { status: "sent", providerMessageId: "m" },
+    );
+    const first = await runDigest(ctxAt(), { sender: s });
+    expect(s.calls).toBe(1);
+    expect(first).toMatchObject({ status: "partial", code: "send_failed" });
+    const second = await runDigest(ctxAt(NOW + 600_000), { sender: s });
+    expect(second).toMatchObject({ status: "ok", summary: { sent: 2 } });
   });
 
   it("escapes hostile issue and rule text", async () => {

@@ -12,6 +12,7 @@ import {
   type DqRuleConfig,
   type DqRuleDef,
   type DqRuleResult,
+  type DqSection,
   type DqSeverity,
   type DqThreshold,
   type DqThresholdSpec,
@@ -125,6 +126,16 @@ export function resolveAllConfigs(overrides: DqOverrides = {}): Map<string, DqRu
  * Runs the rules of one scope. A disabled rule is not evaluated. An evaluator that throws gives
  * status `error` (nothing is known, so nothing is auto-resolved) and never `ok`.
  */
+/** The reason a rule gives when a section is null, and the section it belongs to. */
+const NOT_LOADED_SECTION: Record<string, DqSection> = {
+  bank_accounts_not_loaded: "bankAccounts",
+  bank_transactions_not_loaded: "bankTransactions",
+  open_items_not_loaded: "openItems",
+  purchase_entries_not_loaded: "purchaseEntries",
+  relations_not_loaded: "relations",
+  ledger_not_loaded: "ledger",
+};
+
 export function evaluateRules(
   input: DqInput,
   scope: "division" | "global",
@@ -154,6 +165,11 @@ export function evaluateRules(
     }
     try {
       const o = rule.evaluate(input, config);
+      // A section that was left out because its source is not synchronised (or too old) says why.
+      const section =
+        o.status === "not_available" && o.reason ? NOT_LOADED_SECTION[o.reason] : undefined;
+      const sourceReason = section ? input.sourceReasons?.[section] : undefined;
+      if (sourceReason) o.reason = sourceReason;
       // Defensive: an evaluator must not claim ok/issues without data; its own outcome decides.
       out.push({
         ...base,

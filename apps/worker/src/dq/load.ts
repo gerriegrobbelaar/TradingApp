@@ -19,6 +19,8 @@ import {
   type DqJobIn,
   type DqLedgerIn,
   type DqOpenItemIn,
+  type DqSection,
+  type DqSourceReason,
   type DqPurchaseEntryIn,
   type DqRelationIn,
   type LedgerBalance,
@@ -27,6 +29,7 @@ import {
 import { CREDENTIALS_REJECTED } from "../exact/gate";
 import { currenciesWithoutRate } from "../fx/rate-table";
 import { fxStaleness } from "../fx/staleness";
+import { OPEN_ITEMS_MAX_AGE_MS } from "../matching/run";
 import { staleSettlements } from "../matching/settlement";
 import { rejectedLast24h } from "../revolut/webhook-health";
 
@@ -43,6 +46,11 @@ const MAX_BOOKED_MATCHES = 1_000;
 /** How far back duplicate bank lines are looked for. */
 export const DUPLICATE_WINDOW_DAYS = 60;
 export const EXACT_DAILY_LIMIT = 5_000;
+
+/** A source whose last complete synchronisation is this old (or missing) cannot vouch for "ok". */
+export const SOURCE_MAX_AGE_MS = OPEN_ITEMS_MAX_AGE_MS;
+/** The IBAN read and the ledger are full-run only and may need several nights (ADR 0019, 0024). */
+export const SLOW_SOURCE_MAX_AGE_MS = 4 * DAY;
 
 export interface DqDivision {
   id: number;
@@ -403,6 +411,81 @@ export async function loadLedger(
   };
 }
 
+type Sources = Partial<Record<DqSection, DqSourceReason>>;
+
+function judgeAge(
+  at: string | null | undefined,
+  maxMs: number,
+  nowMs: number,
+): DqSourceReason | null {
+  if (at === null || at === undefined) return "source_never_synced";
+  const t = Date.parse(at);
+  if (!Number.isFinite(t)) return "source_never_synced";
+  return nowMs - t < maxMs ? null : "source_stale";
+}
+
+/** Never beats stale: a source that never completed is reported as such. */
+function worst(...r: (DqSourceReason | null)[]): DqSourceReason | null {
+  if (r.includes("source_never_synced")) return "source_never_synced";
+  return r.includes("source_stale") ? "source_stale" : null;
+}
+
+/**
+ * Which input sections cannot vouch for "ok" because their source was never synchronised or its last
+ * COMPLETE synchronisation is too old (review V1 S5; the same signal as the Phase 7 matching gate,
+ * sync_state.last_completed_at younger than 26 hours). Exact data per division, Revolut data per
+ * active Revolut connection (revolut_sync_state.last_completed_at). Reads D1 only.
+ */
+export async function loadSourceFreshness(
+  db: D1Database,
+  d: DqDivision,
+  nowMs: number,
+): Promise<Sources> {
+  const exact = new Map(
+    (
+      await db
+        .prepare(
+          `SELECT entity, last_completed_at FROM sync_state
+           WHERE division_id = ?1 AND entity IN ('receivables', 'payables', 'relations',
+                                                 'relation_ibans', 'purchase_entries', 'gl_balances')`,
+        )
+        .bind(d.id)
+        .all<{ entity: string; last_completed_at: string | null }>()
+    ).results.map((r) => [r.entity, r.last_completed_at] as const),
+  );
+  const fast = (e: string): DqSourceReason | null =>
+    judgeAge(exact.get(e), SOURCE_MAX_AGE_MS, nowMs);
+  const out: Sources = {};
+  const set = (k: DqSection, r: DqSourceReason | null): void => {
+    if (r !== null) out[k] = r;
+  };
+  set("openItems", worst(fast("receivables"), fast("payables")));
+  set("purchaseEntries", fast("purchase_entries"));
+  set(
+    "relations",
+    worst(fast("relations"), judgeAge(exact.get("relation_ibans"), SLOW_SOURCE_MAX_AGE_MS, nowMs)),
+  );
+  set("ledger", judgeAge(exact.get("gl_balances"), SLOW_SOURCE_MAX_AGE_MS, nowMs));
+
+  // Revolut: every active connection must have a fresh complete read. No connection, no judgement
+  // (there are then no Revolut accounts or lines to be wrong about).
+  const rv = (
+    await db
+      .prepare(
+        `SELECT c.id,
+                (SELECT last_completed_at FROM revolut_sync_state WHERE connection_id = c.id AND entity = 'accounts') AS accounts_at,
+                (SELECT last_completed_at FROM revolut_sync_state WHERE connection_id = c.id AND entity = 'transactions') AS tx_at
+         FROM connections c WHERE c.kind = 'revolut' AND c.status = 'active'`,
+      )
+      .all<{ id: number; accounts_at: string | null; tx_at: string | null }>()
+  ).results;
+  if (rv.length > 0) {
+    set("bankAccounts", worst(...rv.map((r) => judgeAge(r.accounts_at, SOURCE_MAX_AGE_MS, nowMs))));
+    set("bankTransactions", worst(...rv.map((r) => judgeAge(r.tx_at, SOURCE_MAX_AGE_MS, nowMs))));
+  }
+  return out;
+}
+
 /** Length of one interval of a schedule in ms, or null when it has no two consecutive runs. */
 export function scheduleIntervalMs(schedule: Schedule, nowMs: number): number | null {
   const a = nextRun(schedule, nowMs);
@@ -433,10 +516,13 @@ export async function loadJobs(
   const out: DqJobIn[] = [];
   for (const r of rows) {
     let interval: number | null = null;
+    let schedule: Schedule | null = null;
     try {
-      interval = scheduleIntervalMs(JSON.parse(String(r["schedule_json"])) as Schedule, nowMs);
+      schedule = JSON.parse(String(r["schedule_json"])) as Schedule;
+      interval = scheduleIntervalMs(schedule, nowMs);
     } catch {
       interval = null;
+      schedule = null;
     }
     const handler = String(r["handler"]);
     const code = (r["last_code"] as string | null) ?? null;
@@ -445,6 +531,7 @@ export async function loadJobs(
       title: describe(handler).title ?? String(r["name"]),
       enabled: bool(r["enabled"]),
       implemented: describe(handler).implemented,
+      schedule,
       intervalMs: interval,
       lastSuccessAt: (r["last_ok"] as string | null) ?? null,
       referenceAt:

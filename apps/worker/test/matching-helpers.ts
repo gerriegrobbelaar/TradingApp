@@ -39,12 +39,50 @@ export async function resetWorld(opts: { mapped?: boolean } = {}): Promise<World
   if (opts.mapped !== false) await mapAccount(accountId, div.id);
   // Fresh open items by default (S4); tests of staleness overwrite this.
   await markOpenItemsSynced(div.id, new Date(NOW - 3_600_000).toISOString());
+  // The data quality rules want every source freshly synchronised too (review V1 S5).
+  await markSourcesSynced(div.id, revolutConnectionId, new Date(NOW - 3_600_000).toISOString());
   return {
     divisionId: div.id,
     exactConnectionId: div.connectionId,
     revolutConnectionId,
     accountId,
   };
+}
+
+/** Stamps the other Exact entities and the Revolut reads as completed at `at` (null = never). */
+export async function markSourcesSynced(
+  divisionId: number,
+  revolutConnectionId: number,
+  at: string | null,
+): Promise<void> {
+  const exact = ["relations", "relation_ibans", "purchase_entries", "gl_balances"];
+  await db.batch([
+    ...exact.map((e) =>
+      db
+        .prepare("DELETE FROM sync_state WHERE division_id = ?1 AND entity = ?2")
+        .bind(divisionId, e),
+    ),
+    db.prepare("DELETE FROM revolut_sync_state WHERE connection_id = ?1").bind(revolutConnectionId),
+  ]);
+  if (at === null) return;
+  await db.batch([
+    ...exact.map((e) =>
+      db
+        .prepare(
+          `INSERT INTO sync_state (division_id, entity, last_completed_at, last_finished_at, last_status)
+           VALUES (?1, ?2, ?3, ?3, 'ok')`,
+        )
+        .bind(divisionId, e, at),
+    ),
+    ...["accounts", "transactions"].map((e) =>
+      db
+        .prepare(
+          `INSERT INTO revolut_sync_state (connection_id, entity, last_completed_at, last_finished_at, last_status)
+           VALUES (?1, ?2, ?3, ?3, 'ok')`,
+        )
+        .bind(revolutConnectionId, e, at),
+    ),
+  ]);
 }
 
 /** Stamps the last complete open-items pass of a division (null = never completed). */

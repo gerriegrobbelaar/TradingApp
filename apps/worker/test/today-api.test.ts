@@ -75,6 +75,7 @@ async function addIssue(o: {
   subject?: string;
   firstSeen?: string;
   fix?: string;
+  payload?: string;
 }): Promise<number> {
   n += 1;
   const status = o.status ?? "open";
@@ -82,7 +83,7 @@ async function addIssue(o: {
     .prepare(
       `INSERT INTO dq_issues (division_id, rule_id, fingerprint, area, severity, status, subject, message, fix,
          amount_minor, currency, payload_json, first_seen_at, last_seen_at, resolved_at, snoozed_until)
-       VALUES (?1, ?2, ?3, 'bank', ?4, ?5, ?6, ?7, ?8, NULL, NULL, '{}', ?9, ?9, ?10, ?11)`,
+       VALUES (?1, ?2, ?3, 'bank', ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?12, ?9, ?9, ?10, ?11)`,
     )
     .bind(
       o.division ?? w.divisionId,
@@ -96,6 +97,7 @@ async function addIssue(o: {
       o.firstSeen ?? daysAgo(2),
       status === "resolved" ? NOW_ISO() : null,
       status === "snoozed" ? new Date(Date.now() + 86_400_000).toISOString() : null,
+      o.payload ?? "{}",
     )
     .run();
   return r.meta.last_row_id;
@@ -184,6 +186,23 @@ describe("content and ranking", () => {
     expect(r.body.nextCursor).toBeNull();
     expect(r.body.capped).toBe(false);
     expect(r.body.approvalMappingVerified).toBe(false);
+  });
+
+  it("a suggested bank line older than the limit is listed once, as the match item (V1 N3)", async () => {
+    const sug = await suggested("Customer X", 92, daysAgo(9));
+    const plain = await addTx({
+      accountId: w.accountId,
+      connectionId: w.revolutConnectionId,
+      amountMinor: 7_000,
+      counterpartyName: "Customer Y",
+      createdAt: daysAgo(9),
+    });
+    await addIssue({ payload: JSON.stringify({ days: 9, txId: sug }) });
+    const keep = await addIssue({ payload: JSON.stringify({ days: 9, txId: plain }) });
+    const ids = (await get("admin")).body.items.map((i) => i.id);
+    expect(ids).toContain(`match:${sug}`);
+    expect(ids).toContain(`dq:${keep}`);
+    expect(ids.filter((id) => id.startsWith("dq:"))).toEqual([`dq:${keep}`]);
   });
 
   it("merges the four sources in priority order", async () => {

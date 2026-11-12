@@ -435,8 +435,12 @@ sync panel on the test division.
     creditors and debtors ageing, and `exact_usage` with the remaining-calls header. When this
     passes, enable `exact.full_sync` and then `exact.incremental_sync` in Settings, Schedules, and
     re-run the Run now check of step 9 (expect `OK`). The "First sync procedure" below spells this
-    item out step by step. Mind the budget: the defaults cost up to 1,960
-    of Exact's 5,000 daily calls per administration (ADR 0021); the gate stops jobs at 4,500.
+    item out step by step. Mind the budget: the full and incremental sync cost up to 1,960
+    of Exact's 5,000 daily calls per administration (ADR 0021). `exact.bank_balances` (D8a) adds up to
+    20 calls per run and an hourly run fires 24 times a day (25 on the autumn clock change), so at most
+    480 (500) calls per administration and day; in practice one call per mapped bank account per run
+    (24 x accounts a day). Both together: at most 2,460 (the scheduler refuses a change that projects
+    more than 3,000). `exact.book_matches` is separate and ships off. The gate stops jobs at 4,500.
 11. **Subrequest limit and D1 batches.** Which per-invocation subrequest limit the account has
     (we assume 1,000, `SUBREQUEST_LIMIT`), and whether one `db.batch` of up to 100 statements
     counts as one subrequest (we count it as one). Run a full pass on the largest division and
@@ -890,7 +894,8 @@ Proposed by the Phase 4 final review. Follow it on staging, then on production.
    (none left over); `GET /api/approvals/status-codes` against Exact's UI (item 16).
 4. Read `exact_usage` (`wrangler d1 execute <db> --remote --env staging --command "SELECT * FROM exact_usage ORDER
    BY 1 DESC LIMIT 20"`) and the remaining-calls header. A first full cycle costs a few hundred
-   calls; the defaults allow up to 1,960 per administration and day (ADR 0021).
+   calls; the sync defaults allow up to 1,960 per administration and day (ADR 0021), 2,460 with
+   `exact.bank_balances` switched on (at most 20 calls x 24 hourly runs, usually 24 x mapped accounts).
 5. Enable `exact.full_sync` (nightly, 02:00) in Settings, Schedules. Look at the next morning's run.
 6. Then enable the hourly `exact.incremental_sync`. Check one day of hourly runs (2 to 4 calls
    each) and the daily total in `exact_usage`.
@@ -983,15 +988,24 @@ Two jobs, with different risk:
   only the data quality tables (`dq_issues`, `dq_rule_status`, `dq_runs`). It is switched **on** after
   a fresh install. A database that already has the job row keeps whatever `enabled` it stored (the
   seeding never flips a row), so after the upgrade an admin switches it on in Settings, Schedules (or
-  `UPDATE jobs SET enabled = 1 WHERE name = 'dq.checks'`). Alerts and the digest are described in the next
-  section (ADR 0046); there is no screen yet (D8c), read the result through the API.
+  `UPDATE jobs SET enabled = 1 WHERE name = 'dq.checks'`). **The digest job `dq.digest` is different:
+  it does not exist before this release, so the next start inserts it ENABLED, while `dq.checks` stays
+  off on an upgraded install.** That is harmless and honest: the digest only records a skipped row until
+  an e-mail provider is set, and once it is, it opens with "Data quality checks have never run" (or "have
+  not run since <date>") instead of "0 open issues". Switch `dq.checks` on first. Alerts and the digest
+  are described in the next section (ADR 0046); there is no screen yet (D8c), read the result through
+  the API.
 - **`exact.bank_balances`** reads from Exact (one `financial/ReportingBalance` call per mapped bank
   account, at most 20 calls per run and administration) and stores `bank_accounts.exact_balance_minor`.
   It ships **off** (`awaiting_live_verification`). Enable it only after the checks below.
-  **Existing installs:** before releasing, check `SELECT enabled FROM jobs WHERE name =
-  'exact.bank_balances'`. The job was a placeholder until now, so an admin may have switched its row
-  on; the release would then start reading Exact at once. Switch it off first
-  (`UPDATE jobs SET enabled = 0 WHERE name = 'exact.bank_balances'`) and enable it after check 7.
+  **Existing installs:** the job was a placeholder until now, so an admin may have switched its row on.
+  The release therefore forces it off once: `DEFAULT_JOBS_VERSION` 6 carries a one-off guard
+  (`FORCE_OFF_AT_VERSION`) that, at the first start after the upgrade, sets `enabled = 0` on an enabled
+  `exact.bank_balances` row and writes the audit row `job.forced_off` (before and after, reason
+  `awaiting_live_verification`). No manual SQL is needed. It runs only once; an admin who switches the
+  job on afterwards (after check 7) is not overruled by a later start. Look for the audit row to see
+  whether it fired. The account tried longest ago is read first (setting
+  `exact.bank_balances.attempts`), so an account that never yields a balance cannot starve the others.
 
 First-live checks, on staging first:
 
@@ -1002,7 +1016,11 @@ First-live checks, on staging first:
    `exact_balance_minor` and `exact_balance_at`.
 2. Press **Run now** on `dq.checks` (Settings, Schedules). Expect `ok` with `rulesEvaluated` > 0.
    `rulesUnavailable` is normally 5 to 9 (bounced e-mails, disputed invoices, VAT code, closed period,
-   suspense accounts not configured, Exact balance, ...): that is correct, see the next item.
+   suspense accounts not configured, Exact balance, ...): that is correct, see the next item. Before the
+   first Exact sync (and the first Revolut read) many more rules are unavailable with the reason
+   **`source_never_synced`**; once a source's last complete sync is older than 26 hours (4 days for the
+   IBAN read and the ledger) the reason is **`source_stale`**. Both are correct and never `ok`: run the
+   syncs, then the checks. Old issues stay open meanwhile.
 3. `GET /api/dq/summary` lists all 27 rules. Check that every rule that could not be evaluated says
    **`not_available` or `not_configured` with a reason**, never `ok`, and that `never_run` is gone.
    A rule at `error` means a bug: report it (the run is `partial`, `section_failed`).
@@ -1036,6 +1054,16 @@ Both are silent until an e-mail provider is configured: they record `skipped_not
 
 Existing installs: the next Worker start adds the job row `dq.digest` (enabled; it only records a
 skipped row until step 3), and migration 0027 replaces the `email_log` table (it was never written).
+Note the combination on an upgraded install: **`dq.digest` arrives enabled while `dq.checks` keeps
+whatever it had (off on installs that never switched it on)**. Nothing is wrong: with no provider the
+digest ends `skipped / email_not_configured`, and the staleness check does not count that as a failure
+(a job whose last run is a deliberate skip, `email_not_configured`, `notifications_disabled` or
+`no_recipients`, is not judged by `integrations.job_stale`). Once a provider is configured and
+`dq.checks` is still off, the digest says "Data quality checks have never run" (or "have not run since
+<date>", when the last run is older than 6 hours) instead of a count of zero: switch `dq.checks` on.
+Alert keys changed in this release (`dq-alert:<issue id>:<reopen count>`; before, the fingerprint): open
+issues that were already alerted keep their `notified_at` and old `email_log` rows are still recognised
+for the same issue row, so nobody is alerted twice by the upgrade.
 
 How to enable (staging first, `--env staging` on every command):
 
@@ -1055,16 +1083,27 @@ How to enable (staging first, `--env staging` on every command):
    (`http_401` wrong key, `http_403`/`http_422` unverified sender or payload); `unknown` means a
    timeout or a 5xx: check the provider dashboard before trying again.
 5. First-live checks: run `dq.digest` once by hand (Settings, Schedules, fresh sign-in). Expect one
-   mail per admin or finance user, a subject that starts with the number, counts that match
-   `GET /api/dq/summary`, links that open the right screen, and a list of rules that were not
-   evaluated with reasons. Run it again the same day: `sent: 0, already: N` and no second mail.
+   mail per admin or finance user, a subject that starts with the number (or, when the checks have
+   not run lately, "Data quality checks have never run" / "have not run since <date>"), counts that
+   match `GET /api/dq/summary` **for all administrations** (the digest always covers every
+   administration and the global checks; the summary covers the administration you ask for plus the
+   global ones, so compare with the sum over administrations; both leave out issues of rules that are
+   switched off and show snoozed issues apart), links that open the right screen, and a list of rules
+   that were not evaluated with reasons (rules switched off are not listed). Run it again the same day: `sent: 0, already: N` and no second mail.
 6. Instant alert: with a harmless critical issue present (for example switch `payables.supplier_iban_changed`
    threshold or wait for a real one), the next `dq.checks` run sends **one** mail and sets
    `dq_issues.notified_at`. Check `SELECT kind, status, recipients_count, error_code FROM email_log`.
    A second run sends nothing. `GET /api/jobs` shows `alertsSent`, `alertsFailed`, `alertsUnknown` in
    the last result.
-7. Limits and what to watch: at most 10 single alerts per run (`maxAlertsPerRun`, 1 to 50), the rest in
-   summary mails of up to 80 issues. A row with status `unknown` means the provider's answer was unclear
+7. Limits and what to watch: at most 10 mails per run (`maxAlertsPerRun`, 1 to 50; retries and single
+   alerts together), everything else that is pending in **one** summary mail (it lists ten and states the
+   total). Sends are 300 ms apart. The same issue fingerprint is alerted at most once in 24 hours (a
+   problem that resolves and returns inside that time is left to the daily digest). A provider answer
+   of 429 (rate limit) ends the run's sending at once; what was not sent stays pending for the next
+   hourly run. A summary the provider refuses gives its issues back, so the next run sends them; refused
+   single alerts are retried no sooner than 15 minutes later, three attempts in total.
+   `alertsSent` in the job result counts mails the provider accepted; `alertsClaimed` counts claims.
+   A row with status `unknown` means the provider's answer was unclear
    (timeout, 5xx) or the Worker stopped between claim and send: it is **never** sent again by the code,
    so look at the provider log. If the mail did not go out, the next daily digest still lists the issue.
    `failed` rows are retried up to three times.

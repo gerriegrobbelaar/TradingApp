@@ -21,6 +21,8 @@ import {
   addRelation,
   addTx,
   CUSTOMER_IBAN,
+  markOpenItemsSynced,
+  markSourcesSynced,
   resetWorld,
   type World,
 } from "./matching-helpers";
@@ -28,6 +30,13 @@ import {
 let w: World;
 const DAY = 86_400_000;
 const T0 = "2026-07-01T08:00:00.000Z"; // 14 days before NOW
+
+/** Every source synchronised an hour before `atMs` (a run far after NOW would otherwise find them stale). */
+async function freshAt(atMs: number): Promise<void> {
+  const at = new Date(atMs - 3_600_000).toISOString();
+  await markOpenItemsSynced(w.divisionId, at);
+  await markSourcesSynced(w.divisionId, w.revolutConnectionId, at);
+}
 
 async function seedProblems(): Promise<{ txId: number; itemIds: number[]; relId: number }> {
   const rel = await addRelation({
@@ -273,6 +282,7 @@ describe("dq.checks: reruns, auto-resolve and snooze", () => {
     let row = (await issues(`fingerprint = '${fp}'`))[0];
     expect(row).toMatchObject({ status: "snoozed", snoozed_until: until });
     expect(row?.last_seen_at).toBe(new Date(NOW + 3_600_000).toISOString());
+    await freshAt(NOW + 2 * DAY);
     await runDq({ now: () => NOW + 2 * DAY });
     row = (await issues(`fingerprint = '${fp}'`))[0];
     expect(row).toMatchObject({ status: "open", snoozed_until: null });
@@ -285,6 +295,7 @@ describe("dq.checks: reruns, auto-resolve and snooze", () => {
       .prepare("UPDATE bank_transactions SET booked_at = ?1")
       .bind(new Date(NOW).toISOString())
       .run();
+    await freshAt(NOW + 2 * DAY + 3_600_000);
     await runDq({ now: () => NOW + 2 * DAY + 3_600_000 });
     expect((await issues(`fingerprint = '${fp}'`))[0]).toMatchObject({
       status: "resolved",

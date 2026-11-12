@@ -58,28 +58,33 @@ export async function addCritical(
     notified?: boolean;
     reopenCount?: number;
     firstSeenAt?: string;
+    /** Same fingerprint in two divisions, or a re-inserted row. */
+    fingerprint?: string;
+    divisionId?: number;
   } = {},
 ): Promise<{ id: number; fingerprint: string }> {
   const ruleId = over.ruleId ?? "integrations.exact_connection";
   seq += 1;
-  const fingerprint = `${ruleId}:t${seq}`;
+  const fingerprint = over.fingerprint ?? `${ruleId}:t${seq}`;
+  const divisionId = over.divisionId ?? 0;
   const status = over.status ?? "open";
   await db
     .prepare(
       `INSERT OR IGNORE INTO dq_rule_status (division_id, rule_id, status, reason, checked, issue_count, evaluated_at)
-       VALUES (0, ?1, ?2, ?3, 1, 0, '2026-07-15T09:00:00.000Z')`,
+       VALUES (?4, ?1, ?2, ?3, 1, 0, '2026-07-15T09:00:00.000Z')`,
     )
     .bind(
       ruleId,
       over.ruleStatus ?? "issues",
       (over.ruleStatus ?? "issues") === "not_available" ? "no_data" : null,
+      divisionId,
     )
     .run();
   const r = await db
     .prepare(
       `INSERT INTO dq_issues (division_id, rule_id, fingerprint, area, severity, status, subject, message, fix,
          payload_json, first_seen_at, last_seen_at, resolved_at, snoozed_until, reopen_count, notified_at)
-       VALUES (0, ?1, ?2, 'integrations', ?3, ?4, ?5, ?6, 'connections', '{}', ?7, ?7, ?8, ?9, ?10, ?11)`,
+       VALUES (?12, ?1, ?2, 'integrations', ?3, ?4, ?5, ?6, 'connections', '{}', ?7, ?7, ?8, ?9, ?10, ?11)`,
     )
     .bind(
       ruleId,
@@ -93,6 +98,7 @@ export async function addCritical(
       status === "snoozed" ? "2026-08-01T00:00:00.000Z" : null,
       over.reopenCount ?? 0,
       over.notified ? "2026-07-14T00:00:00.000Z" : null,
+      divisionId,
     )
     .run();
   return { id: r.meta.last_row_id, fingerprint };
@@ -136,4 +142,18 @@ export async function seedUsers(): Promise<void> {
   await addUser("gone@camelthorncapital.com", ["admin"], { disabled: true });
   const ext = await addUser("accountant@camelthorncapital.com", ["finance"]);
   await db.prepare("UPDATE users SET is_external = 1 WHERE id = ?1").bind(ext).run();
+}
+
+/** A finished run of the checks job (what the digest reads to know the checks are alive). */
+export async function addCheckRun(
+  startedAtMs: number = NOW - 30 * 60_000,
+  status: "ok" | "partial" | "error" = "ok",
+): Promise<void> {
+  const at = new Date(startedAtMs).toISOString();
+  await db
+    .prepare(
+      `INSERT INTO dq_runs (started_at, finished_at, status, engine_version) VALUES (?1, ?1, ?2, '1')`,
+    )
+    .bind(at, status)
+    .run();
 }

@@ -24,6 +24,8 @@ import {
 
 export interface EmailSender {
   readonly kind: "disabled" | "https";
+  /** Pause a caller leaves between two sends of one run (rate limits are per second); default 0. */
+  readonly spacingMs?: number;
   send(msg: EmailMessage): Promise<EmailSendResult>;
 }
 
@@ -33,6 +35,10 @@ export const disabledSender: EmailSender = {
 };
 
 export const SEND_TIMEOUT_MS = 10_000;
+/** Pause between two mails of one run (transactional APIs limit requests per second). */
+export const SEND_SPACING_MS = 300;
+/** A Retry-After longer than this is capped (the value is only reported, never slept on). */
+const MAX_RETRY_AFTER_S = 3_600;
 /** The provider's answer is read up to this many bytes (only for the message id). */
 export const MAX_ANSWER_BYTES = 16_384;
 const MAX_RECIPIENTS = 100;
@@ -87,6 +93,7 @@ export interface HttpsSenderOptions {
 export function httpsSender(opts: HttpsSenderOptions): EmailSender {
   return {
     kind: "https",
+    spacingMs: SEND_SPACING_MS,
     async send(msg: EmailMessage): Promise<EmailSendResult> {
       if (msg.to.length === 0) return { status: "failed", code: "no_recipients" };
       // Defence in depth: the settings were validated when saved and the recipients come from the
@@ -145,6 +152,18 @@ export function httpsSender(opts: HttpsSenderOptions): EmailSender {
       }
       // Drain nothing: the answer text is never read or logged.
       void res.body?.cancel().catch(() => undefined);
+      if (s === 429) {
+        // Rate limited: a definite refusal. Retry-After (whole seconds) is passed on so the caller
+        // can back off; a date form or garbage is ignored.
+        const ra = Number(res.headers.get("retry-after"));
+        return {
+          status: "failed",
+          code: "http_429",
+          ...(Number.isInteger(ra) && ra > 0
+            ? { retryAfterSeconds: Math.min(ra, MAX_RETRY_AFTER_S) }
+            : {}),
+        };
+      }
       if (s >= 400 && s < 500 && s !== 408) return { status: "failed", code: `http_${s}` };
       return { status: "unknown", code: `http_${s}` };
     },

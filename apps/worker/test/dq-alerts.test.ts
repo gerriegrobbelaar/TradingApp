@@ -5,7 +5,7 @@
  */
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { runAlerts, SUMMARY_CHUNK } from "../src/dq/alerts";
+import { ID_CHUNK, runAlerts } from "../src/dq/alerts";
 import { SETTING_NOTIFICATIONS } from "../src/dq/notify-settings";
 import { resetDb } from "./helpers";
 import { db, resetDq } from "./dq-helpers";
@@ -28,6 +28,10 @@ async function setSettings(s: Record<string, unknown>): Promise<void> {
     .bind(SETTING_NOTIFICATIONS, JSON.stringify(s))
     .run();
 }
+
+/** Run `n` happens n x 20 minutes after NOW: past the retry back-off of a refused alert. */
+const DAY = 86_400_000;
+const later = (n: number): number => NOW + n * 20 * 60_000;
 
 beforeEach(async () => {
   await resetDb();
@@ -148,20 +152,21 @@ describe("what is alerted", () => {
         )
         .bind(id),
     ]);
-    await runAlerts(ctxAt(), 2, { sender: s });
-    await runAlerts(ctxAt(), 3, { sender: s });
+    // Past the 24 hour cooldown of the fingerprint (inside it the reopen is left to the digest).
+    await runAlerts(ctxAt(NOW + DAY + 3_600_000), 2, { sender: s });
+    await runAlerts(ctxAt(NOW + DAY + 3_600_000), 3, { sender: s });
     expect(s.calls).toBe(2);
     const keys = (await emailRows()).map((r) => r.idempotency_key);
-    expect(keys).toHaveLength(2);
+    expect(keys).toEqual([`dq-alert:${id}:0`, `dq-alert:${id}:1`]);
     expect(keys[0]?.endsWith(":0")).toBe(true);
     expect(keys[1]?.endsWith(":1")).toBe(true);
   });
 
   it("claims, marks the issue and writes the audit row in one step", async () => {
-    const { id, fingerprint } = await addCritical();
+    const { id } = await addCritical();
     await runAlerts(ctxAt(), 1, { sender: fakeSender() });
     expect(await notifiedIds()).toEqual([id]);
-    const audit = await auditRows("email.claimed", `dq-alert:${fingerprint}:0`);
+    const audit = await auditRows("email.claimed", `dq-alert:${id}:0`);
     expect(audit).toHaveLength(1);
     expect(audit[0]?.actor_email).toBe("system");
     expect(audit[0]?.after_json).toContain("dq.alert.v1");
@@ -229,14 +234,15 @@ describe("cap and fold", () => {
     expect(s.calls).toBe(11);
   });
 
-  it("the cap is a setting, and summaries are chunked", async () => {
+  it("the cap is a setting; everything beyond it is ONE summary, however long the backlog", async () => {
     await setSettings({ maxAlertsPerRun: 2 });
-    const total = 2 + SUMMARY_CHUNK + 5;
+    const total = 2 + ID_CHUNK + 5;
     for (let i = 0; i < total; i++) await addCritical();
     const s = fakeSender();
     const out = await runAlerts(ctxAt(), 1, { sender: s });
-    expect(out).toMatchObject({ alerted: 2, folded: SUMMARY_CHUNK + 5, summaries: 2 });
-    expect(s.calls).toBe(4);
+    expect(out).toMatchObject({ alerted: 2, folded: ID_CHUNK + 5, summaries: 1, sent: 3 });
+    expect(s.calls).toBe(3);
+    expect(s.sent[2]?.subject.startsWith(`${ID_CHUNK + 5} more critical data issues`)).toBe(true);
     expect(await notifiedIds()).toHaveLength(total);
   });
 
@@ -281,30 +287,32 @@ describe("duplicate prevention", () => {
     const s = fakeSender();
     await Promise.all([runAlerts(ctxAt(), 1, { sender: s }), runAlerts(ctxAt(), 2, { sender: s })]);
     expect(await notifiedIds()).toHaveLength(5);
-    const summaries = (await emailRows()).filter((r) => r.kind === "dq_alert_summary");
+    const rows = await emailRows();
+    const summaries = rows.filter((r) => r.kind === "dq_alert_summary");
     expect(summaries.length).toBeLessThanOrEqual(2);
-    // Every issue is covered by exactly one message.
-    expect((await emailRows()).filter((r) => r.kind === "dq_alert")).toHaveLength(
-      (await emailRows()).filter((r) => r.kind === "dq_alert").length,
-    );
-    expect(s.calls).toBe((await emailRows()).length);
+    // A run that lost every issue to the other one leaves an honest 'failed / nothing_to_send' row
+    // and sends nothing; every message that did go out is a sent row.
+    const empty = rows.filter((r) => r.error_code === "nothing_to_send");
+    expect(s.calls).toBe(rows.length - empty.length);
+    expect(rows.filter((r) => r.status === "sent")).toHaveLength(s.calls);
+    // Every issue is covered by exactly one message: singles plus the issues the summaries list.
+    const listed = s.sent
+      .filter((m) => /more critical data issue/.test(m.subject))
+      .reduce((n, m) => n + Number(/^(\d+) more/.exec(m.subject)?.[1] ?? 0), 0);
+    expect(rows.filter((r) => r.kind === "dq_alert")).toHaveLength(5 - listed);
   });
 
   it("a crash between claim and send is never sent again; the stale claim becomes unknown", async () => {
     const { id } = await addCritical();
     // Simulate the crash: the claim batch ran (log row + notified_at), the send never happened.
     const crashed = new Date(NOW - 30 * 60_000).toISOString();
-    const fp = (await db
-      .prepare("SELECT fingerprint FROM dq_issues WHERE id = ?1")
-      .bind(id)
-      .first<{ fingerprint: string }>())!.fingerprint;
     await db.batch([
       db
         .prepare(
           `INSERT INTO email_log (idempotency_key, kind, template, recipients_count, status, dq_issue_id, created_at, updated_at)
            VALUES (?1, 'dq_alert', 'dq.alert.v1', 2, 'claimed', ?2, ?3, ?3)`,
         )
-        .bind(`dq-alert:${fp}:0`, id, crashed),
+        .bind(`dq-alert:${id}:0`, id, crashed),
       db.prepare("UPDATE dq_issues SET notified_at = ?2 WHERE id = ?1").bind(id, crashed),
     ]);
     const s = fakeSender();
@@ -318,7 +326,7 @@ describe("duplicate prevention", () => {
   });
 
   it("a fresh claim (still in flight) is left alone", async () => {
-    const { id, fingerprint } = await addCritical();
+    const { id } = await addCritical();
     const recent = new Date(NOW - 60_000).toISOString();
     await db.batch([
       db
@@ -326,7 +334,7 @@ describe("duplicate prevention", () => {
           `INSERT INTO email_log (idempotency_key, kind, template, recipients_count, status, dq_issue_id, created_at, updated_at)
            VALUES (?1, 'dq_alert', 'dq.alert.v1', 2, 'claimed', ?2, ?3, ?3)`,
         )
-        .bind(`dq-alert:${fingerprint}:0`, id, recent),
+        .bind(`dq-alert:${id}:0`, id, recent),
       db.prepare("UPDATE dq_issues SET notified_at = ?2 WHERE id = ?1").bind(id, recent),
     ]);
     const s = fakeSender();
@@ -361,7 +369,7 @@ describe("duplicate prevention", () => {
   it("a definite refusal is retried by the next run, at most three times in total", async () => {
     await addCritical();
     const s = fakeSender(() => ({ status: "failed", code: "http_422" }));
-    for (let run = 1; run <= 6; run++) await runAlerts(ctxAt(), run, { sender: s });
+    for (let run = 1; run <= 6; run++) await runAlerts(ctxAt(later(run)), run, { sender: s });
     expect(s.calls).toBe(3);
     expect(await emailRows()).toMatchObject([
       { status: "failed", attempts: 3, error_code: "http_422" },
@@ -375,9 +383,9 @@ describe("duplicate prevention", () => {
         ? { status: "failed", code: "http_429" }
         : { status: "sent", providerMessageId: "ok" },
     );
-    await runAlerts(ctxAt(), 1, { sender: s });
-    await runAlerts(ctxAt(), 2, { sender: s });
-    await runAlerts(ctxAt(), 3, { sender: s });
+    await runAlerts(ctxAt(later(1)), 1, { sender: s });
+    await runAlerts(ctxAt(later(2)), 2, { sender: s });
+    await runAlerts(ctxAt(later(3)), 3, { sender: s });
     expect(s.calls).toBe(2);
     expect(await emailRows()).toMatchObject([
       { status: "sent", attempts: 2, provider_message_id: "ok" },
@@ -393,8 +401,11 @@ describe("duplicate prevention", () => {
         ? { status: "failed", code: "http_400" }
         : { status: "sent", providerMessageId: "x" };
     });
-    await runAlerts(ctxAt(), 1, { sender: s });
-    await Promise.all([runAlerts(ctxAt(), 2, { sender: s }), runAlerts(ctxAt(), 3, { sender: s })]);
+    await runAlerts(ctxAt(later(1)), 1, { sender: s });
+    await Promise.all([
+      runAlerts(ctxAt(later(2)), 2, { sender: s }),
+      runAlerts(ctxAt(later(2)), 3, { sender: s }),
+    ]);
     expect(s.calls).toBe(2);
   });
 
@@ -406,7 +417,7 @@ describe("duplicate prevention", () => {
       .prepare("UPDATE dq_issues SET status = 'resolved', resolved_at = ?2 WHERE id = ?1")
       .bind(id, "2026-07-15T10:30:00.000Z")
       .run();
-    await runAlerts(ctxAt(), 2, { sender: s });
+    await runAlerts(ctxAt(later(2)), 2, { sender: s });
     expect(s.calls).toBe(1);
   });
 });

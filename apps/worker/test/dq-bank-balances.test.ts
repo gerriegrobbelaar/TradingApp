@@ -11,7 +11,11 @@ import {
 } from "@camelthorn/exact";
 import { describe, expect, it } from "vitest";
 import { CREDENTIALS_REJECTED } from "../src/exact/gate";
-import { BANK_BALANCES_BUDGET, runBankBalances } from "../src/exact/bank-balances";
+import {
+  ATTEMPTS_SETTING,
+  BANK_BALANCES_BUDGET,
+  runBankBalances,
+} from "../src/exact/bank-balances";
 import type { JobContext } from "../src/jobs/types";
 import { jobContext, NOW, resetWorld, type World } from "./matching-helpers";
 import { FakeExact, db, fakeGate, guid } from "./sync-helpers";
@@ -21,6 +25,7 @@ let exactDivision: number;
 
 async function setup(over: { code?: string | null } = {}): Promise<FakeExact> {
   w = await resetWorld();
+  await db.prepare("DELETE FROM settings WHERE key = ?1").bind(ATTEMPTS_SETTING).run();
   exactDivision = (
     (await db
       .prepare("SELECT exact_division AS n FROM divisions WHERE id = ?1")
@@ -225,7 +230,7 @@ describe("exact.bank_balances", () => {
     });
   });
 
-  it("reads the account with the oldest balance first", async () => {
+  it("reads the account tried longest ago first", async () => {
     const fx = await setup();
     const other = await db
       .prepare(
@@ -254,7 +259,18 @@ describe("exact.bank_balances", () => {
       )
       .bind(w.divisionId, guid(7002))
       .run();
-    // only one call is allowed: the account with the OLDER balance (the second) is read first
+    // The first account was tried more recently than the second.
+    await db
+      .prepare("INSERT INTO settings (key, value_json, updated_by) VALUES (?1, ?2, 't')")
+      .bind(
+        ATTEMPTS_SETTING,
+        JSON.stringify({
+          [String(w.accountId)]: "2026-07-14T00:00:00.000Z",
+          [String(other.meta.last_row_id)]: "2026-07-01T00:00:00.000Z",
+        }),
+      )
+      .run();
+    // only one call is allowed: the account tried longest ago (the second) is read first
     const res = await runBankBalances(ctxFor(fx, { budget: 1 }));
     expect(res).toMatchObject({ status: "partial", code: "budget", summary: { stored: 1 } });
     const second = await db
@@ -263,6 +279,49 @@ describe("exact.bank_balances", () => {
       .first<{ m: number }>();
     expect(second?.m).toBe(9999900);
     expect((await account())?.m).toBeNull();
+  });
+
+  it("an account that never stores a balance does not go first for ever", async () => {
+    const fx = await setup();
+    // Account 1 (the first mapped one) always answers empty; the second one has rows.
+    fx.glBalances = [{ account: 2, year: 2026, period: 1, amount: 50 }];
+    const other = await db
+      .prepare(
+        `INSERT INTO bank_accounts (connection_id, external_id, name, currency, is_active)
+         VALUES (?1, 'acc-2', 'Second', 'EUR', 1)`,
+      )
+      .bind(w.revolutConnectionId)
+      .run();
+    await db
+      .prepare(
+        `INSERT INTO bank_account_exact_map (bank_account_id, division_id, journal_code, bank_gl_account_code, created_by, updated_by)
+         VALUES (?1, ?2, '91', '1220', 't', 't')`,
+      )
+      .bind(other.meta.last_row_id, w.divisionId)
+      .run();
+    await db
+      .prepare(
+        `INSERT INTO gl_accounts (division_id, exact_id, code, name, is_active, updated_at)
+         VALUES (?1, ?2, '1220', 'Second', 1, '2026-07-14T00:00:00.000Z')`,
+      )
+      .bind(w.divisionId, guid(7002))
+      .run();
+    const first = await runBankBalances(ctxFor(fx, { budget: 1 }));
+    expect(first).toMatchObject({
+      status: "partial",
+      code: "budget",
+      summary: { empty_answer: 1 },
+    });
+    // The next run starts with the account that was NOT tried last time.
+    const second = await runBankBalances(
+      ctxFor(fx, { budget: 1, now: () => NOW + 3_600_000 }, fakeGate()),
+    );
+    expect(second.summary).toMatchObject({ stored: 1 });
+    const stored = await db
+      .prepare("SELECT exact_balance_minor AS m FROM bank_accounts WHERE id = ?1")
+      .bind(other.meta.last_row_id)
+      .first<{ m: number }>();
+    expect(stored?.m).toBe(5000);
   });
 
   it("is registered as a read-only Exact job that ships off", async () => {

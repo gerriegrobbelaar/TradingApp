@@ -9,6 +9,8 @@
  * Money is integer minor units plus a currency code, never a float.
  */
 
+import type { Schedule } from "../schedule";
+
 export type DqSeverity = "info" | "warning" | "critical";
 export const DQ_SEVERITIES: readonly DqSeverity[] = ["info", "warning", "critical"];
 /** Rank for comparisons: a higher number is more severe. */
@@ -270,6 +272,12 @@ export interface DqJobIn {
   title: string;
   enabled: boolean;
   implemented: boolean;
+  /**
+   * The schedule (cron in Europe/Amsterdam, working days only, last working day). When present the
+   * staleness rule counts the scheduled slots that passed since the last success (weekends, TARGET
+   * holidays and monthly schedules are then judged correctly); `intervalMs` is the fallback.
+   */
+  schedule?: Schedule | null;
   /** Length of one schedule interval in ms (null when the schedule has no next run). */
   intervalMs: number | null;
   lastSuccessAt: string | null;
@@ -279,8 +287,27 @@ export interface DqJobIn {
   lastCode: string | null;
 }
 
+/**
+ * Why a section of the input is missing although its loader worked (review V1 S5): the source data
+ * has never been synchronised, or its last complete synchronisation is too old to vouch for "ok".
+ * The rules that need the section then say `not_available` with this reason, never `ok`.
+ */
+export const DQ_SOURCE_REASONS = ["source_never_synced", "source_stale"] as const;
+export type DqSourceReason = (typeof DQ_SOURCE_REASONS)[number];
+export type DqSection =
+  "bankAccounts" | "bankTransactions" | "openItems" | "purchaseEntries" | "relations" | "ledger";
+
+/** Job result codes of a deliberate skip: a job that ends this way is not judged by job_stale. */
+export const DQ_DELIBERATE_SKIP_CODES: readonly string[] = [
+  "email_not_configured",
+  "notifications_disabled",
+  "no_recipients",
+];
+
 export interface DqInput {
   nowMs: number;
+  /** Per section: why it is null although it could be read (source never synced or stale). */
+  sourceReasons?: Partial<Record<DqSection, DqSourceReason>>;
   /**
    * True when the loader had to cut the list of recent bank lines (the duplicate look-back
    * window): the duplicate rule then reports what it found but resolves nothing.

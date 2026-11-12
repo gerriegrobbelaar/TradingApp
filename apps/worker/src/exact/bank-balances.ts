@@ -14,7 +14,7 @@
  *  - Balance = sum of the periods 0..99 of the current Amsterdam year (LEDGER_BALANCE_SEMANTICS,
  *    debit - credit; ADR 0024). An incomplete read (more pages than allowed) stores nothing.
  *  - Stops at the deadline or when the budget is gone; the accounts left wait for the next run
- *    (accounts with the oldest balance are read first, so none is starved).
+ *    (the account tried longest ago goes first, setting exact.bank_balances.attempts, so none is starved).
  *  - ING and Rabobank: they have no row in bank_accounts (only Revolut accounts do), so there is no
  *    second number to compare with; this job does not cover them (ADR 0045, open item).
  */
@@ -59,6 +59,41 @@ type Skip =
   | "other_account_rows"
   | "read_failed";
 
+/** Setting that holds {bank account id: ISO time of the last attempt}. */
+export const ATTEMPTS_SETTING = "exact.bank_balances.attempts";
+
+async function loadAttempts(db: D1Database): Promise<Record<string, string>> {
+  const row = await db
+    .prepare("SELECT value_json FROM settings WHERE key = ?1")
+    .bind(ATTEMPTS_SETTING)
+    .first<{ value_json: string }>();
+  const out: Record<string, string> = {};
+  if (row === null) return out;
+  try {
+    const raw: unknown = JSON.parse(row.value_json);
+    if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+      for (const [k, v] of Object.entries(raw)) {
+        if (/^\d{1,12}$/.test(k) && typeof v === "string" && Number.isFinite(Date.parse(v)))
+          out[k] = v;
+      }
+    }
+  } catch {
+    // An unreadable value is the same as none: every account is then tried in id order.
+  }
+  return out;
+}
+
+async function saveAttempts(db: D1Database, attempts: Record<string, string>): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO settings (key, value_json, updated_by) VALUES (?1, ?2, 'system')
+       ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, updated_by = 'system',
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+    )
+    .bind(ATTEMPTS_SETTING, JSON.stringify(attempts))
+    .run();
+}
+
 export async function runBankBalances(ctx: JobContext): Promise<HandlerResult> {
   const { env } = ctx;
   const db = env.DB;
@@ -90,6 +125,8 @@ export async function runBankBalances(ctx: JobContext): Promise<HandlerResult> {
   if (divisions.length === 0) return { status: "skipped", code: "no_divisions", summary: {} };
 
   const year = Number(amsterdamParts(nowMs).date.slice(0, 4));
+  const attempts = await loadAttempts(db);
+  let attemptsChanged = false;
   let read = 0;
   let stored = 0;
   let calls = 0;
@@ -112,12 +149,19 @@ export async function runBankBalances(ctx: JobContext): Promise<HandlerResult> {
                      AND g.is_active = 1 AND trim(g.code) = m.bank_gl_account_code LIMIT 1) AS exact_id
            FROM bank_account_exact_map m JOIN bank_accounts ba ON ba.id = m.bank_account_id
            WHERE m.division_id = ?1 AND ba.is_active = 1
-           ORDER BY COALESCE(ba.exact_balance_at, ''), ba.id`,
+           ORDER BY ba.id`,
         )
         .bind(d.id)
         .all<AccountRow>()
     ).results;
     if (accounts.length === 0) continue;
+    // The account tried LONGEST AGO goes first (review V1 N5). Ordering by the stored balance's age
+    // put an account that never stores one (no rows, a currency or ledger mismatch) first for ever,
+    // so a small budget never reached the others. The last attempt is kept in a setting.
+    accounts.sort(
+      (x, y) =>
+        (attempts[String(x.id)] ?? "").localeCompare(attempts[String(y.id)] ?? "") || x.id - y.id,
+    );
 
     const jobId = `bankbal:${d.exact_division}:r${ctx.run.id}`;
     const gate: JobGate = deps.gate ?? {
@@ -148,6 +192,8 @@ export async function runBankBalances(ctx: JobContext): Promise<HandlerResult> {
           stopped = ctx.signal.aborted ? "aborted" : calls >= ctx.budget ? "budget" : "time_limit";
           break;
         }
+        attempts[String(a.id)] = new Date(clock()).toISOString();
+        attemptsChanged = true;
         if (a.currency !== d.base_currency) {
           skipped.currency_differs += 1;
           continue;
@@ -242,6 +288,7 @@ export async function runBankBalances(ctx: JobContext): Promise<HandlerResult> {
     if (stopped !== null) break;
   }
 
+  if (attemptsChanged) await saveAttempts(db, attempts);
   const skippedTotal = Object.values(skipped).reduce((x, y) => x + y, 0);
   const summary = { read, stored, skipped: skippedTotal, ...skipped, calls };
   if (stopped !== null) {
