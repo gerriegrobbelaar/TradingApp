@@ -252,11 +252,13 @@ interface IssueRow {
 
 /**
  * A bank line that has a match suggestion already shows as a match item; its "unmatched for too long"
- * issue would list the same line twice (review V1 N3).
+ * issue would list the same line twice (review V1 N3). The filter is the one of MATCHES_SQL, so a line
+ * is hidden here only when it really is listed as a match item.
  */
 const NOT_SUGGESTED_LINE = `NOT (i.rule_id = 'bank.unmatched_old' AND EXISTS (
     SELECT 1 FROM bank_transactions t
-    WHERE t.id = json_extract(i.payload_json, '$.txId') AND t.match_status = 'suggested'))`;
+    WHERE t.id = json_extract(i.payload_json, '$.txId') AND t.match_status = 'suggested'
+      AND t.is_final = 1 AND t.state = 'completed'))`;
 const SKIPPED = TODAY_DQ_SKIPPED_RULES.map((r) => `'${r}'`).join(", ");
 /**
  * One query per scope (the division, then the global id 0), in queue order: the priority of

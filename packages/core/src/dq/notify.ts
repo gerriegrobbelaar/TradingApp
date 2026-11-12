@@ -488,7 +488,15 @@ export const emptyDigest = (date: string): DigestData => ({
   notEvaluated: [],
 });
 
-const reasonText = (code: string): string => cap(code.replace(/_/g, " "));
+/** Plain words for the reasons a reader of the digest must act on (review V1 S5); others as code. */
+const DIGEST_REASONS: Record<string, string> = {
+  source_never_synced: "The data has never been fully read from Exact or Revolut",
+  source_stale: "The last complete read from Exact or Revolut is too old",
+};
+const reasonText = (code: string): string =>
+  Object.hasOwn(DIGEST_REASONS, code)
+    ? (DIGEST_REASONS[code] as string)
+    : cap(code.replace(/_/g, " "));
 
 export function renderDigest(raw: DigestData, baseUrl: string): RenderedEmail {
   const d: DigestData = {

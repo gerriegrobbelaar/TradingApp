@@ -93,9 +93,55 @@ describe("job_stale counts scheduled slots (S2)", () => {
     expect(jobStale(at("2026-07-15T09:30:00.000Z"), { ...base, lastSuccessAt: last }).status).toBe(
       "ok",
     );
+    // 10:21: the 10:20 run may still be going, so only the 09:20 slot counts as missed (grace).
     expect(jobStale(at("2026-07-15T10:21:00.000Z"), { ...base, lastSuccessAt: last }).status).toBe(
+      "ok",
+    );
+    expect(jobStale(at("2026-07-15T10:36:00.000Z"), { ...base, lastSuccessAt: last }).status).toBe(
       "issues",
     );
+  });
+
+  it("one failure plus a run in progress is not two missed slots (grace)", () => {
+    const every10 = { kind: "cron", expr: "*/10 * * * *" } as const;
+    const base = {
+      schedule: every10,
+      intervalMs: 600_000,
+      lastSuccessAt: "2026-07-15T08:00:30.000Z",
+    };
+    // 08:10 failed, the 08:20 run is still going at 08:20:40.
+    expect(jobStale(at("2026-07-15T08:20:40.000Z"), base).status).toBe("ok");
+    // 08:20 failed too: two missed slots once the grace of the second has passed.
+    expect(jobStale(at("2026-07-15T08:35:01.000Z"), base).status).toBe("issues");
+  });
+
+  it("the slot walk is bounded by the limit and handles the DST change days", () => {
+    const hourly = { kind: "cron", expr: "0 * * * *" } as const;
+    // Autumn 2026: 25 October, 03:00 CEST -> 02:00 CET, the 02:00 hour fires twice.
+    const since = at("2026-10-24T23:30:00.000Z"); // 01:30 CEST
+    const now = at("2026-10-25T03:30:00.000Z"); // 04:30 CET: 4 real hours later
+    expect(slotsPassed(hourly, since, now, 20)).toBe(4);
+    // Spring 2026: 29 March, 02:00 CET -> 03:00 CEST, no 02:00 hour.
+    expect(
+      slotsPassed(hourly, at("2026-03-29T00:30:00.000Z"), at("2026-03-29T03:30:00.000Z"), 20),
+    ).toBe(3);
+    // A restricted hour inside the gap fires once, at 03:00 local.
+    const daily0230 = { kind: "cron", expr: "30 2 * * *" } as const;
+    expect(
+      slotsPassed(daily0230, at("2026-03-28T12:00:00.000Z"), at("2026-03-30T12:00:00.000Z"), 20),
+    ).toBe(2);
+    // The limit bounds the walk even for a schedule that fires every minute for a year.
+    expect(
+      slotsPassed(
+        { kind: "cron", expr: "* * * * *" },
+        at("2025-07-15T00:00:00Z"),
+        at("2026-07-15T00:00:00Z"),
+        20,
+      ),
+    ).toBe(20);
+    // A schedule that cannot be read is null, never a loop.
+    expect(slotsPassed({ kind: "cron", expr: "61 * * * *" }, since, now, 20)).toBeNull();
+    expect(slotsPassed({ kind: "last_working_day", time: "25:00" }, since, now, 20)).toBeNull();
   });
 
   it("never succeeded: counts from the reference time; unreadable schedule is unjudged", () => {
@@ -176,6 +222,25 @@ describe("source reasons (S5)", () => {
 
 describe("digest leads with the state of the checks (S4)", () => {
   const base = emptyDigest("2026-07-15");
+  it("names a source that is not synchronised in words, escaped in HTML", () => {
+    const m = renderDigest(
+      {
+        ...base,
+        checks: { lastRunAt: "2026-07-15T07:20:00.000Z", lastStatus: "ok", stale: false },
+        notEvaluated: [
+          { ruleTitle: "Duplicate <supplier> invoices", reason: "source_stale" },
+          { ruleTitle: "Supplier without bank account", reason: "source_never_synced" },
+          { ruleTitle: "Other", reason: "fx_not_loaded" },
+        ],
+      },
+      "",
+    );
+    expect(m.text).toContain("The last complete read from Exact or Revolut is too old");
+    expect(m.text).toContain("The data has never been fully read from Exact or Revolut");
+    expect(m.text).toContain("Fx not loaded");
+    expect(m.html).toContain("Duplicate &lt;supplier&gt; invoices");
+    expect(m.html).not.toContain("<supplier>");
+  });
   it("never run", () => {
     const m = renderDigest(
       { ...base, checks: { lastRunAt: null, lastStatus: null, stale: true } },

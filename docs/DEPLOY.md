@@ -1101,7 +1101,8 @@ How to enable (staging first, `--env staging` on every command):
    problem that resolves and returns inside that time is left to the daily digest). A provider answer
    of 429 (rate limit) ends the run's sending at once; what was not sent stays pending for the next
    hourly run. A summary the provider refuses gives its issues back, so the next run sends them; refused
-   single alerts are retried no sooner than 15 minutes later, three attempts in total.
+   single alerts are retried no sooner than 15 minutes later, three attempts in total (a 429 counts as
+   one, so a provider that rate-limits for ever cannot cause endless retries; the issue stays in the digest).
    `alertsSent` in the job result counts mails the provider accepted; `alertsClaimed` counts claims.
    A row with status `unknown` means the provider's answer was unclear
    (timeout, 5xx) or the Worker stopped between claim and send: it is **never** sent again by the code,

@@ -209,10 +209,18 @@ const closedPeriod: DqRuleDef = {
 // ---- integrations ----------------------------------------------------------------------------------
 
 /**
- * Scheduled slots that passed in (sinceMs, nowMs], counted up to `limit` (the walk stops there).
- * Null when the schedule cannot be read. Weekends, TARGET holidays and last-working-day schedules
- * are the schedule's own business (nextRun), so a Friday success of a working-day job is not stale
- * on Monday.
+ * A slot counts as missed only once this long has passed since it fired: a run may take up to
+ * 13 minutes (the runner's time limit) plus queue delay. Without it a job whose run of the current
+ * slot is still going (the checks run at :20, like other jobs) would be counted as missing it, so
+ * one failure plus one run in progress read as two missed slots (review V1, reviewer).
+ */
+export const JOB_SLOT_GRACE_MS = 15 * 60_000;
+
+/**
+ * Scheduled slots that fired in (sinceMs, nowMs - JOB_SLOT_GRACE_MS], counted up to `limit` (the
+ * walk stops there, so it is bounded by `limit` nextRun calls). Null when the schedule cannot be
+ * read. Weekends, TARGET holidays and last-working-day schedules are the schedule's own business
+ * (nextRun), so a Friday success of a working-day job is not stale on Monday.
  */
 export function slotsPassed(
   schedule: NonNullable<DqJobIn["schedule"]>,
@@ -222,10 +230,12 @@ export function slotsPassed(
 ): number | null {
   let count = 0;
   let at = sinceMs;
+  const until = nowMs - JOB_SLOT_GRACE_MS;
   while (count < limit) {
     const next = nextRun(schedule, at);
     if (next === null) return count === 0 ? null : count;
-    if (next > nowMs) break;
+    // nextRun is strictly after `at`; the guard keeps the walk finite even if it were not.
+    if (next > until || next <= at) break;
     count += 1;
     at = next;
   }

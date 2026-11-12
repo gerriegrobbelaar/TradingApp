@@ -148,7 +148,11 @@ export async function loadDigestData(db: D1Database, nowMs: number): Promise<Dig
 
 export interface DigestDeps {
   sender?: EmailSender;
+  /** Test seam for the pause between two sends; production waits for real. */
+  sleep?: (ms: number) => Promise<void>;
 }
+
+const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 export async function runDigest(ctx: JobContext, deps: DigestDeps = {}): Promise<HandlerResult> {
   const db = ctx.env.DB;
@@ -179,6 +183,8 @@ export async function runDigest(ctx: JobContext, deps: DigestDeps = {}): Promise
   let already = 0;
   let failed = 0;
   let unknown = 0;
+  let mails = 0;
+  const sleep = deps.sleep ?? realSleep;
   for (const r of recipients) {
     if (ctx.signal.aborted) break;
     const key = digestKey(date, r.id);
@@ -189,6 +195,9 @@ export async function runDigest(ctx: JobContext, deps: DigestDeps = {}): Promise
       already += 1;
       continue;
     }
+    // Spaced from the previous mail (never after the last one, and not before the first).
+    if (mails > 0 && sender.spacingMs) await sleep(sender.spacingMs);
+    mails += 1;
     const res = await deliver(
       db,
       sender,
@@ -201,7 +210,6 @@ export async function runDigest(ctx: JobContext, deps: DigestDeps = {}): Promise
     else unknown += 1;
     // Rate limited: the recipients left are retried by the job retry, not hammered now.
     if (res.status === "failed" && res.code === "http_429") break;
-    if (sender.spacingMs) await new Promise((r) => setTimeout(r, sender.spacingMs));
   }
   const summary = {
     recipients: recipients.length,
