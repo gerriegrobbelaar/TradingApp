@@ -45,7 +45,7 @@ import {
 } from "./payments-exec-helpers";
 import { gateExecution, SOURCE_ACCOUNT_UUID } from "./payments-fake-revolut";
 import { setSwitch, setVerified, SUPPLIER_IBAN } from "./payments-helpers";
-import { fakeRevolutClock, revolutGate, rreq } from "./revolut-helpers";
+import { fakeRevolutClock, refreshOk, revolutGate, rreq } from "./revolut-helpers";
 import { setSetting } from "./matching-helpers";
 
 let w: ExecWorld;
@@ -218,6 +218,27 @@ describe("2. every gate layer on its own blocks a payment write (zero network ca
       expect(w.fake.stub.apiCalls, name).toHaveLength(0);
     });
   }
+
+  it("the switch read AFTER the door: turned off while the call waits for its token, nothing is sent", async () => {
+    const l = (await gate().acquirePaymentLease(w.revolutConnectionId, "t")) as {
+      ok: true;
+      lease: string;
+    };
+    // the stored token is stale, so the gate refreshes it between the door check and the fetch
+    await db
+      .prepare("UPDATE connections SET expires_at = ?2 WHERE id = ?1")
+      .bind(w.revolutConnectionId, new Date(Date.now() - 1000).toISOString())
+      .run();
+    w.fake.stub.token = async (_f, n) => {
+      await setSwitch(false);
+      return refreshOk(n);
+    };
+    const r = await gate().call(payReq(l.lease));
+    expect(r).toMatchObject({ ok: false, error: { code: "payments_payments_disabled" } });
+    expect(w.fake.stub.tokenCalls.length).toBeGreaterThan(0);
+    expect(w.fake.stub.apiCalls).toHaveLength(0);
+    expect(await gate().paymentSendState(RID)).toBe("never_attempted");
+  });
 
   it("the ledger key used once: a second write with everything valid is refused", async () => {
     const l = (await gate().acquirePaymentLease(w.revolutConnectionId, "t")) as {
