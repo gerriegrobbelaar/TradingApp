@@ -32,6 +32,7 @@ import { resetRevolut, seedRevolut, stubRevolut } from "./revolut-helpers";
 import { cpRecord, rawApi, rawLeg, rawTx } from "./revolut-q1-helpers";
 import { fakeRevolut, simpleTx } from "./revolut-r3-helpers";
 import { FakeExact, addDivision, fakeGate, resetSync } from "./sync-helpers";
+import { outboxWipeStatements } from "./outbox-wipe";
 
 const db = env.DB;
 const NOW = Date.parse("2026-07-15T00:00:00Z"); // 02:00 CEST
@@ -314,7 +315,12 @@ describe("handler contract: every implemented handler", () => {
     for (const trigger of ["schedule", "manual"] as const) {
       describe(`${key} (${trigger})`, () => {
         beforeEach(async () => {
-          await db.batch(DATA_TABLES.map((t) => db.prepare(`DELETE FROM ${t}`)));
+          const wipe = await outboxWipeStatements(db);
+          await db.batch(
+            DATA_TABLES.flatMap((t) =>
+              t === "exact_write_outbox" ? wipe : [db.prepare(`DELETE FROM ${t}`)],
+            ),
+          );
         });
 
         it("run twice with the same context: no duplicated external effect, stable rows, counts and codes only", async () => {

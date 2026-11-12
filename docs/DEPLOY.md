@@ -620,7 +620,10 @@ sync panel on the test division.
        Exact integration import the lines?): changing it later switches booking off and clears the
        verification. Make sure the test bank line has NO Revolut fee: lines with a fee are not
        booked in v1 (`fee_not_supported_v1`); on the Revolut sandbox, look at one payment with a fee
-       and record whether the leg amount includes it (A17).
+       and record whether the leg amount includes it (A17). A line with NO fee field is read as "no
+       fee" (Revolut omits a zero fee). Lines stored before migration 0015 never had the fee column
+       filled: run the Revolut backfill (Settings, Connections, "Backfill") before enabling so the
+       lines the matches point at are refreshed while still unmatched.
     2. **Create the test match** in the app (a test bank line against the test invoice). It shows
        "cannot book yet: <code>" if a control account or the opening balance is missing; `GET
        /api/booking/settings` lists `control_accounts_missing` / `journal_unmapped` as blockers.
@@ -648,6 +651,19 @@ sync panel on the test division.
          `cashflow/Receivables` for the invoice with and without `IsFullyPaid eq true`; check that
          the bank entry alone (before the MatchSet) did not already settle the invoice (A16: if it
          does, every match would end `manual_required` `already_settled_in_exact`).
+       - **A15c, the bank line as an item:** before the MatchSet, read `cashflow/Receivables` with
+         `Account eq guid'<debtor>' and EntryNumber eq <entry number of the bank line>`: one row,
+         open, `AmountFC` = minus the bank amount (the MatchSet line's own amount). After the
+         MatchSet the same read (and the `IsFullyPaid eq true` read) shows it closed. The executor
+         relies on this ONLY to accept a match as booked after a lost or unclear MatchSet answer;
+         if the bank line does not show this way (for example a feed line booked to another
+         account), those cases end `manual_required` (`bank_line_readback_inconclusive`), never
+         booked: safe, but record it.
+       - **A12b, first entry of an empty journal:** if the test journal had no entry, the first
+         bank entry opens with the admin's `openingBalanceMinor`. Check in the Exact UI that Exact
+         accepted that opening balance, that it equals the bank statement balance before the first
+         booked line, and that the next entry opens with the first one's closing balance. If the
+         admin changes the opening balance while a row waits, the row ends `bank_balance_changed`.
        - A11: POST the same bank entry body twice: two entries (Exact has no idempotency, which is
          why the probe, the item read-back and the balance check are mandatory). Reverse the test
          entries afterwards.
@@ -660,12 +676,16 @@ sync panel on the test division.
        `I VERIFIED THE EXACT WRITE PATH ON A TEST DIVISION`; the note is stored with your email,
        the time, the protocol version, the ticked checks and the booking mode. Verifying always
        leaves booking off.
-    6. **Limits, then enable for ONE division.** `PUT /api/booking/settings {"divisions":[<our
-       division id of the TEST division>],"maxPerRun":1}` (adding a division needs a fresh
-       sign-in). Then "Enable" (fresh sign-in, phrase `ENABLE EXACT BOOKING`): this sets the
-       watermark `bookingFrom` to now, so only matches made from now on are booked; the dialog
-       shows how many older matches stay untouched (`backlogCount`). `GET /api/booking/settings`
-       must show no blockers.
+    6. **Enable for ONE division.** "Enable" in the Booking card (fresh sign-in, phrase `ENABLE
+       EXACT BOOKING`), tick ONLY the test division and keep "Matches booked per run" at 1; the
+       call is `PUT /api/booking/settings {"enabled":true,"confirm":"ENABLE EXACT BOOKING",
+       "divisions":[<our id of the TEST division>],"maxPerRun":1}`. Enabling sets the watermark
+       `bookingFrom` to now (a value sent along can only move it later), so only matches made from
+       now on are booked; the dialog shows how many older matches stay untouched (`backlogCount`).
+       `GET /api/booking/settings` must show no blockers. Moving the watermark EARLIER later on
+       re-opens older matches: look first with `GET /api/booking/settings?bookingFrom=<ISO>`
+       (`proposed.reopenedCount`), then `PUT {"bookingFrom":"<ISO>"}` (fresh sign-in, audited with
+       the count).
     7. **Book one.** Create one real test match in the app (a test bank line against the test
        invoice, made AFTER the switch-on), wait out the 10-minute undo window, and press **Run
        now** on `exact.book_matches` (admin, fresh sign-in; the job itself ships disabled). Expect
@@ -680,7 +700,9 @@ sync panel on the test division.
        `bank_balance_changed`. (e) Settle the test invoice in Exact by hand AFTER the match was
        made (stale D1): the row must end `manual_required` `already_settled_in_exact` with NOTHING
        posted. (f) Change `createsBankEntries` on the Revolut connection: booking must switch off
-       and the verification disappear.
+       and the verification disappear. (g) Lost MatchSet answer, then somebody settles the invoice
+       by hand with ANOTHER payment: after `retry` the row must end `manual_required`
+       `already_settled_in_exact` (our bank line is still open), never `matched_in_exact`.
     9. **Production.** Only then on production, with `exact.book_matches` still disabled: repeat
        steps 2 to 7 for ONE real match (division allow-list = the production division, `maxPerRun`
        1, a fresh watermark), check it in Exact, and keep `maxPerRun` at 1 for a few days. Raise

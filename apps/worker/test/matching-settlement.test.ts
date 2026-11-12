@@ -20,6 +20,7 @@ import {
 } from "../src/matching/settlement";
 import { applyMatch, claimMatchForBooking, flagMatchesForReview } from "../src/matching/store";
 import { addItem, addTx, db, resetWorld, type World } from "./matching-helpers";
+import { withoutTriggers } from "./booking-helpers";
 
 let w: World;
 beforeEach(async () => {
@@ -669,10 +670,13 @@ describe("outbox payload retention (N3)", () => {
       .run();
     const id = r.meta.last_row_id;
     if (status !== "pending") {
-      await db
-        .prepare("UPDATE exact_write_outbox SET status = ?2, updated_at = ?3 WHERE id = ?1")
-        .bind(id, status, updatedAt)
-        .run();
+      // Setup only: forced into the status (migration 0024's transition guard is lifted for it).
+      await withoutTriggers(["outbox_guard_status"], () =>
+        db
+          .prepare("UPDATE exact_write_outbox SET status = ?2, updated_at = ?3 WHERE id = ?1")
+          .bind(id, status, updatedAt)
+          .run(),
+      );
     }
     return id;
   }
@@ -765,18 +769,20 @@ describe("outbox payload retention (N3)", () => {
     const fail = (set: string): Promise<unknown> =>
       db.prepare(`UPDATE exact_write_outbox SET ${set} WHERE id = ?1`).bind(id).run();
     const R = `'${REDACTED_PAYLOAD}'`;
-    await expect(fail(`payload_json = '{"v":1,"stage":"none"}'`)).rejects.toThrow(/terminal/);
+    // Several guards may refuse first (0024 adds the status table and the sent facts).
+    const REFUSED = /booking_err:(terminal|bad_transition|sent_facts)/;
+    await expect(fail(`payload_json = '{"v":1,"stage":"none"}'`)).rejects.toThrow(REFUSED);
     // The OLD fixed placeholder, or the redacted form with anything else kept, is refused.
-    await expect(fail(`payload_json = '{"v":1,"stage":"redacted"}'`)).rejects.toThrow(/terminal/);
+    await expect(fail(`payload_json = '{"v":1,"stage":"redacted"}'`)).rejects.toThrow(REFUSED);
     await expect(
       fail(
         `payload_json = '{"v":1,"stage":"redacted","input":{"bankEntryNumber":null},"name":"Jan"}'`,
       ),
-    ).rejects.toThrow(/terminal/);
+    ).rejects.toThrow(REFUSED);
     await expect(
       fail(`payload_json = '{"v":1,"stage":"redacted","input":{"bankEntryNumber":99}}'`),
-    ).rejects.toThrow(/terminal/);
-    await expect(fail(`status = 'pending'`)).rejects.toThrow(/terminal/);
+    ).rejects.toThrow(REFUSED);
+    await expect(fail(`status = 'pending'`)).rejects.toThrow(REFUSED);
     for (const other of [
       "status = 'given_up'",
       "updated_at = '2030-01-01T00:00:00.000Z'",
@@ -792,14 +798,18 @@ describe("outbox payload retention (N3)", () => {
       "created_at = 'x'",
       `payload_hash = '${"z".repeat(64)}'`,
       "id = id + 1000",
+      // columns of migration 0024
+      "creates_bank_entries = 1",
+      "admin_resolved_by = 'a@b.c'",
+      "admin_resolved_at = 'x'",
     ]) {
-      await expect(fail(`payload_json = ${R}, ${other}`), other).rejects.toThrow(/terminal/);
+      await expect(fail(`payload_json = ${R}, ${other}`), other).rejects.toThrow(REFUSED);
     }
-    await expect(fail(`payload_hash = '${"z".repeat(64)}'`)).rejects.toThrow(/terminal/);
+    await expect(fail(`payload_hash = '${"z".repeat(64)}'`)).rejects.toThrow(REFUSED);
     // The allowed change works, and cannot be repeated or undone.
     await fail(`payload_json = ${R}`);
-    await expect(fail(`payload_json = ${R}`)).rejects.toThrow(/terminal/);
-    await expect(fail(`payload_json = '{"v":1,"stage":"plan"}'`)).rejects.toThrow(/terminal/);
+    await expect(fail(`payload_json = ${R}`)).rejects.toThrow(REFUSED);
+    await expect(fail(`payload_json = '{"v":1,"stage":"plan"}'`)).rejects.toThrow(REFUSED);
   });
 
   it("the trigger still locks identity columns of an unfinished row", async () => {

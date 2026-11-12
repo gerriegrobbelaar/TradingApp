@@ -84,7 +84,7 @@ describe("migration 0024 on a populated database", () => {
         .all<Record<string, unknown>>()
     ).results;
 
-    await applyD1Migrations(mdb, all.slice(idx, idx + 1));
+    await applyD1Migrations(mdb, all.slice(idx));
 
     expect((await mdb.prepare("PRAGMA foreign_key_check").all()).results).toEqual([]);
     expect(

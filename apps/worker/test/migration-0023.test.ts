@@ -56,15 +56,30 @@ describe("migration 0023 on a populated database", () => {
       await mdb.prepare("SELECT * FROM matches ORDER BY id").all<Record<string, unknown>>()
     ).results;
 
-    await applyD1Migrations(mdb, all.slice(idx, idx + 1)); // this migration only (later ones have their own test)
+    await applyD1Migrations(mdb, all.slice(idx)); // this migration and every later one (app code reads their columns)
 
     expect((await mdb.prepare("PRAGMA foreign_key_check").all()).results).toEqual([]);
     const after = (
       await mdb.prepare("SELECT * FROM matches ORDER BY id").all<Record<string, unknown>>()
     ).results;
     expect(after).toHaveLength(1);
-    const { booked_at, exact_note, ...rest } = after[0] ?? {};
+    // 0023's columns, and the empty columns of the later booking migration (0024).
+    const {
+      booked_at,
+      exact_note,
+      booking_deferred_at,
+      booking_deferred_code,
+      manually_booked,
+      op_nonce,
+      ...rest
+    } = after[0] ?? {};
     expect([booked_at, exact_note]).toEqual([null, null]);
+    expect([booking_deferred_at, booking_deferred_code, manually_booked, op_nonce]).toEqual([
+      null,
+      null,
+      0,
+      null,
+    ]);
     expect(rest).toEqual(before[0]);
     expect(
       (await mdb.prepare("SELECT COUNT(*) AS n FROM match_allocations").first<{ n: number }>())?.n,
@@ -122,6 +137,7 @@ describe("migration 0023 on a populated database", () => {
           "UPDATE exact_write_outbox SET status = 'bogus' WHERE match_id = 1 AND kind = 'bank_entry'",
         )
         .run(),
-    ).rejects.toThrow(/CHECK/);
+      // the CHECK of 0023, or (since 0024) the transition guard that fires before it
+    ).rejects.toThrow(/CHECK|booking_err:bad_transition/);
   });
 });
