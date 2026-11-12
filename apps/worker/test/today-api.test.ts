@@ -205,6 +205,18 @@ describe("content and ranking", () => {
     expect(ids.filter((id) => id.startsWith("dq:"))).toEqual([`dq:${keep}`]);
   });
 
+  it("a suggested line that is not listed as a match item (still pending) keeps its issue (reviewer, N3)", async () => {
+    const sug = await suggested("Customer Z", 90, daysAgo(9));
+    await db
+      .prepare("UPDATE bank_transactions SET state = 'pending' WHERE id = ?1")
+      .bind(sug)
+      .run();
+    const issue = await addIssue({ payload: JSON.stringify({ days: 9, txId: sug }) });
+    const ids = (await get("admin")).body.items.map((i) => i.id);
+    expect(ids).not.toContain(`match:${sug}`);
+    expect(ids).toContain(`dq:${issue}`);
+  });
+
   it("merges the four sources in priority order", async () => {
     const approvalLate = await addEntry({ submittedAt: daysAgo(6), name: "Late Supplier B.V." });
     const approvalNew = await addEntry({ submittedAt: daysAgo(1) });
