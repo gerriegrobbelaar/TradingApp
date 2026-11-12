@@ -428,17 +428,19 @@ describe("Overview", () => {
     expect(screen.getByRole("contentinfo")).toBeTruthy();
   });
 
-  it("is the landing page and Today stays reachable", async () => {
+  it("is reached from the menu and links to Data health", async () => {
     mockFetch({ ...me(), ...divs(), "GET /api/overview": () => ({ body: overview() }) });
-    renderApp("/");
+    renderApp("/overview");
     expect(await screen.findByRole("heading", { level: 1, name: "Overview" })).toBeTruthy();
+    const link = screen.getAllByRole("link", { name: "Data health" })[0] as HTMLAnchorElement;
+    expect(link.getAttribute("href")).toBe("/data-health");
   });
 
-  it("keeps Today reachable as a placeholder", async () => {
+  it("opens Today at / (the home route since Phase 8)", async () => {
     mockFetch({ ...me(), ...divs() });
-    renderApp("/today");
+    renderApp("/");
     expect(await screen.findByRole("heading", { level: 1, name: "Today" })).toBeTruthy();
-    expect(screen.getByText(/not built yet/)).toBeTruthy();
+    expect(screen.queryByText(/not built yet/)).toBeNull();
   });
 });
 

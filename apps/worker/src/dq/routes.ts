@@ -167,7 +167,8 @@ function details(json_: string): DqDetails {
 }
 
 export function toIssueDto(r: IssueSql): DqIssueDto {
-  const fix = (r.fix in DQ_FIX_PATHS ? r.fix : "bank") as DqFixTarget;
+  // Own keys only: `"constructor" in DQ_FIX_PATHS` is true.
+  const fix = (Object.hasOwn(DQ_FIX_PATHS, r.fix) ? r.fix : "bank") as DqFixTarget;
   return {
     id: r.id,
     divisionId: r.division_id,

@@ -119,7 +119,7 @@ describe("session ending while signed in", () => {
     mockFetch(ME_OK(ADMIN));
     renderApp("/?auth=denied");
     expect(await screen.findByText(STEP_UP_DENIED_MESSAGE)).toBeTruthy();
-    expect(await screen.findByRole("heading", { level: 1, name: "Overview" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { level: 1, name: "Today" })).toBeTruthy();
   });
 
   it("signs out with the CSRF header and reloads even if the session was already gone", async () => {
@@ -156,10 +156,10 @@ describe("navigation", () => {
     expect(screen.getByRole("link", { name: "Skip to main content" })).toBeTruthy();
   });
 
-  it("redirects / to Overview", async () => {
+  it("redirects / to Today, the home route", async () => {
     mockFetch(ME_OK(VIEWER));
     renderApp("/");
-    expect(await screen.findByRole("heading", { level: 1, name: "Overview" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { level: 1, name: "Today" })).toBeTruthy();
   });
 
   it("opens a dropdown by keyboard, lists its links and closes on Escape", async () => {
