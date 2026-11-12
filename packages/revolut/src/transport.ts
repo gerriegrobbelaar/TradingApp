@@ -20,6 +20,13 @@ export interface RevolutRequest {
   jobId: string;
   /** Default '1.0'; webhooks use '2.0'. */
   apiVersion?: "1.0" | "2.0";
+  /**
+   * Payment WRITES only (P9b, ADR 0050): the gate's payment lease token, and the key under which
+   * the gate records, BEFORE it calls Revolut, that it attempted this payment (the request_id for
+   * /pay and drafts). A payment write without both is refused by the gate.
+   */
+  paymentLease?: string;
+  paymentRef?: string;
 }
 
 export interface RevolutResponse {

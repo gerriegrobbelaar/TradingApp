@@ -5,3 +5,4 @@ export * from "./auth";
 export * from "./webhook";
 export { maskIban, maskIbans, sanitizeForMessage } from "./redact";
 export { parseJsonRawNumbers } from "./json";
+export * from "./payments";
